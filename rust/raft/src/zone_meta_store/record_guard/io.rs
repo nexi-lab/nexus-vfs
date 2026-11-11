@@ -40,6 +40,39 @@ fn open_lock(path: &Path) -> Result<File, ConditionalMetadataError> {
 }
 
 impl ZoneMetaStore {
+    pub(super) fn record_io_owner_state(
+        &self,
+        storage_key: &str,
+    ) -> Result<kernel::extensions::guarded_records::RecordOwnerState, ConditionalMetadataError>
+    {
+        let node = self.conditional_node()?;
+        bridge_block_on(
+            &self.runtime,
+            node.with_state_machine(|state| state.record_io_owner_state(storage_key)),
+        )
+        .map_err(map_error)
+    }
+
+    pub(super) fn check_unscoped_record_io(
+        &self,
+        storage_key: &str,
+    ) -> Result<(), ConditionalMetadataError> {
+        // Deferred provider discovery cannot decide this until the real node
+        // is resolved. Managed membership does not offer record ownership;
+        // ordinary I/O must retain the same behavior before and after resolve.
+        // Resolution failures still propagate, and scoped operations continue
+        // to require conditional_node.
+        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        if !node.supports_conditional_metadata() {
+            return Ok(());
+        }
+        bridge_block_on(
+            &self.runtime,
+            node.with_state_machine(|state| state.check_unscoped_record_io(storage_key)),
+        )
+        .map_err(map_error)
+    }
+
     pub fn admit_record_io_owner(
         &self,
         path: &str,

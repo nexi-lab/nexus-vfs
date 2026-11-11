@@ -143,6 +143,18 @@ impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
         self.to_zone_key(path)
     }
 
+    fn check_unscoped_io(&self, storage_key: &str) -> Result<(), ConditionalMetadataError> {
+        Self::check_unscoped_record_io(self, storage_key)
+    }
+
+    fn record_owner_state(
+        &self,
+        storage_key: &str,
+    ) -> Result<kernel::extensions::guarded_records::RecordOwnerState, ConditionalMetadataError>
+    {
+        Self::record_io_owner_state(self, storage_key)
+    }
+
     fn admit_record_io_owner(
         &self,
         path: &str,

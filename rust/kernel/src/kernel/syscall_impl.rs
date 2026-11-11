@@ -125,6 +125,25 @@ struct ResolvedRead {
     entry: Option<FileMetadata>,
 }
 
+type ReadGroup = (String, String, usize, usize);
+
+impl ResolvedRead {
+    fn group_key(&self, content_id: &str) -> ReadGroup {
+        (
+            self.route.mount_point.clone(),
+            content_id.to_string(),
+            self.route
+                .metastore
+                .as_ref()
+                .map_or(0, |store| Arc::as_ptr(store).cast::<()>() as usize),
+            self.route
+                .backend
+                .as_ref()
+                .map_or(0, |backend| Arc::as_ptr(backend).cast::<()>() as usize),
+        )
+    }
+}
+
 /// Build a per-consumer `SysReadResult` from the lead request's shared result.
 ///
 /// On success the caller's `offset` + `len` window is sliced out of the
@@ -266,6 +285,7 @@ impl Kernel {
         &self,
         path: &str,
         ctx: &OperationContext,
+        route: &crate::vfs_router::RouteResult,
     ) -> Result<SysReadResult, KernelError> {
         let not_found = || KernelError::FileNotFound(path.to_string());
 
@@ -275,8 +295,12 @@ impl Kernel {
             return Err(not_found());
         }
 
-        // No permission check or hooks — Phase B fan-out, auth already done.
-        self.sys_read_after_auth(path, ctx, 1, 5000, 0)
+        // Directory aliases re-enter the gated target. Otherwise keep the
+        // exact metadata/backend pair authorized in Phase A through I/O.
+        if let Some(target) = self.directory_link_target(path, &ctx.zone_id)? {
+            return self.sys_read_single(&target, ctx, 0, 5000, 0);
+        }
+        self.sys_read_from_route(path, ctx, 1, 5000, 0, route)
     }
 
     /// Gated DT_STREAM offset read (blocking when `timeout_ms > 0`).
@@ -356,6 +380,23 @@ impl Kernel {
             Some(r) => r,
             None => return Err(not_found()),
         };
+        let route = self.capture_metastore_route(route);
+
+        self.sys_read_from_route(path, ctx, max_link_hops, timeout_ms, offset, &route)
+    }
+
+    /// Read using one captured metadata/backend pair, including policy checks.
+    fn sys_read_from_route(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+        max_link_hops: u8,
+        timeout_ms: u64,
+        offset: u64,
+        route: &crate::vfs_router::RouteResult,
+    ) -> Result<SysReadResult, KernelError> {
+        let not_found = || KernelError::FileNotFound(path.to_string());
+        self.check_unscoped_content_io(path, route)?;
 
         // 3. MetaStore lookup. The metastore impl serves cache hits from
         // its own internal `DashMap` projection (see
@@ -363,75 +404,80 @@ impl Kernel {
         // `ZoneMetaStore.cache`), so this is the same hot-path cost as
         // the legacy `dcache.get_entry` lookup — relocated inside
         // `MetaStore::get` instead of a kernel-global side cache.
-        let entry: FileMetadata = match self
-            .with_metastore_route(&route, |ms| ms.get(path).ok().flatten())
-            .flatten()
-        {
-            Some(meta) => meta,
-            None => {
-                // A CAS file's content address comes from its metadata. The
-                // path alone supplies no object identity, even when it looks
-                // like a known hash. Path-addressed backends can discover a
-                // file directly in their own namespace.
-                if route.is_cas {
+        let entry: FileMetadata =
+            match Self::with_captured_metastore_route(route, |ms| ms.get(path).ok().flatten())
+                .flatten()
+            {
+                Some(meta) => meta,
+                None => {
+                    // A CAS file's content address comes from its metadata. The
+                    // path alone supplies no object identity, even when it looks
+                    // like a known hash. Path-addressed backends can discover a
+                    // file directly in their own namespace.
+                    if route.is_cas {
+                        return Err(not_found());
+                    }
+                    if let Some(data) = backend_read_or_miss(
+                        route
+                            .backend
+                            .as_ref()
+                            .map(|b| b.read_content(&route.backend_path, ctx)),
+                    )? {
+                        let size = data.len() as u64;
+                        // Lazy metadata materialization — single duality gate
+                        // inside the helper.  For a local-user ctx
+                        // (`propagates_cross_node = false`) this is a near-
+                        // zero-cost early return.  For a peer-served ctx (set
+                        // at the BlobFetcher entry) this proposes metadata
+                        // so the next cross-node read takes the fast
+                        // `try_remote_fetch` path with `last_writer_address`
+                        // pointing here.
+                        // Stamp `content_id = Some(backend_path)` so subsequent
+                        // metastore-hit reads (writer's own read, or peer-served
+                        // `try_remote_fetch` reads that route to this node)
+                        // successfully round-trip through `backend.read_content`
+                        // instead of dead-ending in the `content_id_opt.is_none()`
+                        // → try_remote_fetch → self → FileNotFound loop.  This is
+                        // the same content_id semantics `sys_read`'s
+                        // metastore-miss branch already uses at line ~231
+                        // (`b.read_content(&route.backend_path, ctx)`); stamping
+                        // it into metastore makes the warm path (metastore hit →
+                        // backend read via content_id) SSOT-symmetric with the
+                        // cold path (metastore miss → backend read via
+                        // backend_path).
+                        if ctx.propagates_cross_node() {
+                            Self::with_captured_metastore_route(route, |store| {
+                                self.observe_backend_content_in_store(
+                                    path,
+                                    size,
+                                    Some(route.backend_path.clone()),
+                                    &route.zone_id,
+                                    ctx,
+                                    store,
+                                );
+                            });
+                        }
+                        return Ok(SysReadResult {
+                            data: Some(data),
+                            post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
+                            content_id: None,
+                            gen: 0,
+                            entry_type: DT_REG,
+                            stream_next_offset: None,
+                        });
+                    }
+                    // Local backend miss on a metastore-miss path → the entry
+                    // does not exist here.  No peer fan-out: under the
+                    // ObserverBackend contract the metastore is authoritative
+                    // for cross-node existence (each backed node eagerly
+                    // syncs its own contents into it), so a genuine miss is a
+                    // genuine miss.  Deterministic routing to a known writer
+                    // still happens on the metastore-HIT path via
+                    // `try_remote_fetch(last_writer_address)` — this branch is
+                    // only reached when no row exists at all.
                     return Err(not_found());
                 }
-                if let Some(data) = backend_read_or_miss(
-                    route
-                        .backend
-                        .as_ref()
-                        .map(|b| b.read_content(&route.backend_path, ctx)),
-                )? {
-                    let size = data.len() as u64;
-                    // Lazy metadata materialization — single duality gate
-                    // inside the helper.  For a local-user ctx
-                    // (`propagates_cross_node = false`) this is a near-
-                    // zero-cost early return.  For a peer-served ctx (set
-                    // at the BlobFetcher entry) this proposes metadata
-                    // so the next cross-node read takes the fast
-                    // `try_remote_fetch` path with `last_writer_address`
-                    // pointing here.
-                    // Stamp `content_id = Some(backend_path)` so subsequent
-                    // metastore-hit reads (writer's own read, or peer-served
-                    // `try_remote_fetch` reads that route to this node)
-                    // successfully round-trip through `backend.read_content`
-                    // instead of dead-ending in the `content_id_opt.is_none()`
-                    // → try_remote_fetch → self → FileNotFound loop.  This is
-                    // the same content_id semantics `sys_read`'s
-                    // metastore-miss branch already uses at line ~231
-                    // (`b.read_content(&route.backend_path, ctx)`); stamping
-                    // it into metastore makes the warm path (metastore hit →
-                    // backend read via content_id) SSOT-symmetric with the
-                    // cold path (metastore miss → backend read via
-                    // backend_path).
-                    self.observe_backend_content(
-                        path,
-                        size,
-                        Some(route.backend_path.clone()),
-                        &route.zone_id,
-                        ctx,
-                    );
-                    return Ok(SysReadResult {
-                        data: Some(data),
-                        post_hook_needed: self.read_hook_count.load(Ordering::Relaxed) > 0,
-                        content_id: None,
-                        gen: 0,
-                        entry_type: DT_REG,
-                        stream_next_offset: None,
-                    });
-                }
-                // Local backend miss on a metastore-miss path → the entry
-                // does not exist here.  No peer fan-out: under the
-                // ObserverBackend contract the metastore is authoritative
-                // for cross-node existence (each backed node eagerly
-                // syncs its own contents into it), so a genuine miss is a
-                // genuine miss.  Deterministic routing to a known writer
-                // still happens on the metastore-HIT path via
-                // `try_remote_fetch(last_writer_address)` — this branch is
-                // only reached when no row exists at all.
-                return Err(not_found());
-            }
-        };
+            };
 
         // 3a. DT_LINK transparent follow
         // (KERNEL-ARCHITECTURE.html "DT_LINK — Path-Internal Symlink").
@@ -473,12 +519,12 @@ impl Kernel {
 
         // DT_STREAM — Rust IPC registry: offset-based read with optional blocking.
         if entry.entry_type == DT_STREAM {
-            let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+            let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(route));
             let mut target_ctx = ctx.clone();
             target_ctx.zone_id = address.zone.clone();
             self.check_permission_with_route(
                 &address.path,
-                Some(&route),
+                Some(route),
                 Permission::Read,
                 &target_ctx,
             )?;
@@ -605,7 +651,7 @@ impl Kernel {
             }),
             // Project the authorized route into the peer's zone namespace.
             None => {
-                let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(&route));
+                let address = super::StreamAddress::from_route(path, &ctx.zone_id, Some(route));
                 self.try_remote_fetch(path, &address, &entry)
             }
         }
@@ -2479,15 +2525,16 @@ impl Kernel {
             Some(r) => r,
             None => return miss(),
         };
-        let dst_route = match self.vfs_router.route(dst_path, &ctx.zone_id) {
-            Some(r) => r,
-            None => return miss(),
-        };
+        let src_route = self.capture_metastore_route(src_route);
+        // Copy can publish a metadata alias without reading any bytes. Check
+        // source ownership before every strategy and any destination effect.
+        self.check_unscoped_content_io(src_path, &src_route)?;
         // 3. Get source metadata via the routed metastore (internal
         //    cache fast path) — full VFS paths (R20.3 contract).
-        let src_meta: FileMetadata = match self
-            .with_metastore_route(&src_route, |ms| ms.get(src_path).ok().flatten())
-            .flatten()
+        let src_meta: FileMetadata = match Self::with_captured_metastore_route(&src_route, |ms| {
+            ms.get(src_path).ok().flatten()
+        })
+        .flatten()
         {
             Some(e) => e,
             None => return Err(KernelError::FileNotFound(src_path.to_string())),
@@ -2515,6 +2562,20 @@ impl Kernel {
             return Err(KernelError::InvalidPath(format!(
                 "sys_copy: source is not a regular file (entry_type={}): {}",
                 src_meta.entry_type, src_path
+            )));
+        }
+
+        let dst_route = match self.vfs_router.route(dst_path, &ctx.zone_id) {
+            Some(r) => r,
+            None => return miss(),
+        };
+        let dst_route = self.capture_metastore_route(dst_route);
+        // Copy requires a metadata commit. Refuse before touching destination
+        // bytes when no store was captured, even if one appears during I/O.
+        if dst_route.metastore.is_none() {
+            return Err(KernelError::IOError(format!(
+                "sys_copy: no metastore for {}",
+                dst_route.mount_point
             )));
         }
 
@@ -2554,9 +2615,9 @@ impl Kernel {
 
         // Snapshot destination state under the VFS locks. Copy-overwrite
         // is a content mutation, so it bumps the destination generation/version.
-        let old_dst_meta: Option<FileMetadata> = self
-            .with_metastore_route(&dst_route, |ms| ms.get(dst_path).ok().flatten())
-            .flatten();
+        let old_dst_meta: Option<FileMetadata> =
+            Self::with_captured_metastore_route(&dst_route, |ms| ms.get(dst_path).ok().flatten())
+                .flatten();
         if let Some(meta) = old_dst_meta.as_ref() {
             if meta.entry_type != DT_REG {
                 release_locks(&self.lock_manager, lock1, lock2);
@@ -2629,14 +2690,18 @@ impl Kernel {
             }
         }
 
-        // 7. Copy content (strategy depends on same-mount vs cross-mount)
-        let same_mount = src_route.mount_point == dst_route.mount_point;
+        // Mount spelling can survive replacement. Fast copy requires the
+        // captured backend itself to be shared by source and destination.
+        let same_backend = matches!(
+            (src_route.backend.as_ref(), dst_route.backend.as_ref()),
+            (Some(src), Some(dst)) if Arc::ptr_eq(src, dst)
+        );
 
         // Track whether this operation created destination bytes so rollback only
         // deletes bytes we wrote (not pre-existing untracked backend objects).
         let mut wrote_dst_bytes = false;
 
-        let copy_result: Result<(String, u64), KernelError> = if same_mount {
+        let copy_result: Result<(String, u64), KernelError> = if same_backend {
             // Try server-side copy first (PAS backends)
             match src_route
                 .backend
@@ -2678,7 +2743,7 @@ impl Kernel {
                 }
             }
         } else {
-            // Cross-mount: read from src backend, write to dst backend
+            // Distinct captured backends: read from source, write to destination.
             let r = self.copy_via_read_write(&src_route, &dst_route, &src_meta, ctx);
             if r.is_ok() {
                 wrote_dst_bytes = true;
@@ -2718,14 +2783,14 @@ impl Kernel {
         );
         // 9. Atomic commit — metastore is the SSOT; its internal cache
         // is updated write-through by `put`.
-        let put_result = self
-            .with_metastore(&dst_route.mount_point, move |ms| ms.put(dst_path, meta))
-            .ok_or_else(|| {
-                KernelError::IOError(format!(
-                    "sys_copy: no metastore for {}",
-                    dst_route.mount_point
-                ))
-            });
+        let put_result =
+            Self::with_captured_metastore_route(&dst_route, move |ms| ms.put(dst_path, meta))
+                .ok_or_else(|| {
+                    KernelError::IOError(format!(
+                        "sys_copy: no metastore for {}",
+                        dst_route.mount_point
+                    ))
+                });
         let put_result = match put_result {
             Ok(r) => r,
             Err(e) => {
@@ -3526,12 +3591,15 @@ impl Kernel {
                     continue;
                 }
             };
+            // Capture the global fallback too: later mount/global changes
+            // cannot pair another store's policy or metadata with this backend.
+            let route = self.capture_metastore_route(route);
             // 4. Metadata lookup (best-effort; None means cold-cache /
-            //    backend-only file — Phase B falls through to sys_read_single
-            //    which has its own backend fallback path).
-            let entry = self
-                .with_metastore_route(&route, |ms| ms.get(&req.path).ok().flatten())
-                .flatten();
+            //    backend-only file — Phase B uses this captured backend's
+            //    path fallback without resolving a newly installed store).
+            let entry =
+                Self::with_captured_metastore_route(&route, |ms| ms.get(&req.path).ok().flatten())
+                    .flatten();
             // Reject pipe/stream — they have blocking IPC semantics that
             // don't belong in batch reads.
             if let Some(m) = entry.as_ref() {
@@ -3569,6 +3637,10 @@ impl Kernel {
             // file. Phase A has already run §13 permission + §11 native
             // PRE-read hook for this path, so returning empty bytes for
             // a proven-existing DT_REG file is authoritative.
+            if let Err(error) = self.check_unscoped_content_io(&req.path, &route) {
+                results[i] = Some(Err(error));
+                continue;
+            }
             if req.len == Some(0) {
                 if let Some(m) = entry.as_ref() {
                     if m.entry_type != crate::meta_store::DT_LINK {
@@ -3591,7 +3663,7 @@ impl Kernel {
         let cap = self.read_batch_max_aggregate_bytes();
         if cap < usize::MAX {
             use std::collections::HashMap;
-            let mut sizes: HashMap<(String, String), usize> = HashMap::new();
+            let mut sizes: HashMap<ReadGroup, usize> = HashMap::new();
             let mut declared: usize = 0;
             // Indices to clear from `resolved` after the scan.
             let mut reject: Vec<usize> = Vec::new();
@@ -3624,7 +3696,7 @@ impl Kernel {
                 if cid.is_empty() {
                     declared = declared.saturating_add(blob_size);
                 } else {
-                    let key = (r.route.mount_point.clone(), cid);
+                    let key = r.group_key(&cid);
                     let prev = sizes.entry(key).or_insert(0);
                     if blob_size > *prev {
                         declared = declared.saturating_add(blob_size - *prev);
@@ -3649,9 +3721,10 @@ impl Kernel {
             }
         }
 
-        // Phase B — group surviving requests by (mount_point, content_id).
+        // Coalesce only within one captured storage pair. Equal mount names
+        // and content IDs do not identify a backend after mount replacement.
         use std::collections::HashMap;
-        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        let mut groups: HashMap<ReadGroup, Vec<usize>> = HashMap::new();
         let mut singletons: Vec<usize> = Vec::new();
         for (i, slot) in resolved.iter().enumerate() {
             if results[i].is_some() {
@@ -3666,13 +3739,10 @@ impl Kernel {
                 .as_ref()
                 .and_then(|e| e.content_id.as_deref())
                 .unwrap_or("");
-            if cid.is_empty() {
+            if cid.is_empty() || r.route.metastore.is_none() || r.route.backend.is_none() {
                 singletons.push(i);
             } else {
-                groups
-                    .entry((r.route.mount_point.clone(), cid.to_string()))
-                    .or_default()
-                    .push(i);
+                groups.entry(r.group_key(cid)).or_default().push(i);
             }
         }
 
@@ -3684,7 +3754,7 @@ impl Kernel {
             Singleton { idx: usize },
         }
 
-        let group_vec: Vec<((String, String), Vec<usize>)> = groups.into_iter().collect();
+        let group_vec: Vec<(ReadGroup, Vec<usize>)> = groups.into_iter().collect();
         let mut units: Vec<Unit> = Vec::with_capacity(group_vec.len() + singletons.len());
         for (_key, indices) in group_vec {
             units.push(Unit::Group { indices });
@@ -3706,27 +3776,11 @@ impl Kernel {
                         Unit::Group { indices } => {
                             let lead = indices[0];
                             let req = &reqs[lead];
-                            // Route stability check — if the lead's mount has
-                            // shifted since Phase A, fall back to full
-                            // sys_read_single so authz + hooks run against the
-                            // *current* mount. Otherwise use
-                            // sys_read_content_only since Phase A already
-                            // authorized this exact route.
-                            let phase_a_mount = resolved
-                                .get(lead)
-                                .and_then(|o| o.as_ref())
-                                .map(|r| r.route.mount_point.as_str())
-                                .unwrap_or("");
-                            let route_stable = self
-                                .vfs_router
-                                .route(&req.path, &ctx.zone_id)
-                                .map(|r| r.mount_point == phase_a_mount)
-                                .unwrap_or(false);
-                            let shared = if route_stable {
-                                self.sys_read_content_only(&req.path, ctx)
-                            } else {
-                                self.sys_read_single(&req.path, ctx, 1, 5000, 0)
-                            };
+                            let lead_route = &resolved[lead]
+                                .as_ref()
+                                .expect("resolved set in Phase A")
+                                .route;
+                            let shared = self.sys_read_content_only(&req.path, ctx, lead_route);
                             let lead_cid = shared.as_ref().ok().and_then(|r| r.content_id.clone());
                             for &i in indices.iter() {
                                 let consumer_route = resolved
@@ -3734,18 +3788,17 @@ impl Kernel {
                                     .and_then(|o| o.as_ref())
                                     .map(|r| &r.route)
                                     .expect("resolved set in Phase A");
-                                let consumer_route_stable = self
-                                    .vfs_router
-                                    .route(&reqs[i].path, &ctx.zone_id)
-                                    .map(|r| r.mount_point == consumer_route.mount_point)
-                                    .unwrap_or(false);
-                                if !consumer_route_stable {
-                                    let r = self.sys_read_single(&reqs[i].path, ctx, 1, 5000, 0);
-                                    local.push((i, slice_read_result(r, &reqs[i])));
+                                // A path may have been enrolled since Phase A.
+                                // Recheck its own policy before sharing any bytes,
+                                // even when an ordinary path leads the group.
+                                if let Err(error) =
+                                    self.check_unscoped_content_io(&reqs[i].path, consumer_route)
+                                {
+                                    local.push((i, Err(error)));
                                     continue;
                                 }
-                                let fresh_meta = self
-                                    .with_metastore_route(consumer_route, |ms| {
+                                let fresh_meta =
+                                    Self::with_captured_metastore_route(consumer_route, |ms| {
                                         ms.get(&reqs[i].path).ok().flatten()
                                     })
                                     .flatten();
@@ -3761,28 +3814,22 @@ impl Kernel {
                                         clone_read_result(&shared, &reqs[i], fresh_meta.as_ref()),
                                     ));
                                 } else {
-                                    let r = self.sys_read_content_only(&reqs[i].path, ctx);
+                                    let r = self.sys_read_content_only(
+                                        &reqs[i].path,
+                                        ctx,
+                                        consumer_route,
+                                    );
                                     local.push((i, slice_read_result(r, &reqs[i])));
                                 }
                             }
                         }
                         Unit::Singleton { idx } => {
                             let req = &reqs[*idx];
-                            let phase_a_mount = resolved
-                                .get(*idx)
-                                .and_then(|o| o.as_ref())
-                                .map(|r| r.route.mount_point.as_str())
-                                .unwrap_or("");
-                            let route_stable = self
-                                .vfs_router
-                                .route(&req.path, &ctx.zone_id)
-                                .map(|r| r.mount_point == phase_a_mount)
-                                .unwrap_or(false);
-                            let r = if route_stable {
-                                self.sys_read_content_only(&req.path, ctx)
-                            } else {
-                                self.sys_read_single(&req.path, ctx, 1, 5000, 0)
-                            };
+                            let route = &resolved[*idx]
+                                .as_ref()
+                                .expect("resolved set in Phase A")
+                                .route;
+                            let r = self.sys_read_content_only(&req.path, ctx, route);
                             local.push((*idx, slice_read_result(r, req)));
                         }
                     }

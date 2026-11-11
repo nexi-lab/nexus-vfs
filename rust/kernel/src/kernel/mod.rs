@@ -12,7 +12,7 @@
 //!   - LockManager is Arc-shared so external distributed-lock
 //!     coordinators can hold their own handle to the advisory
 //!     backend HAL.
-//!   - MetaStore (Box<dyn MetaStore>) wraps any impl (LocalMetaStore
+//!   - MetaStore (Arc<dyn MetaStore>) wraps any impl (LocalMetaStore
 //!     on redb, RemoteMetaStore over gRPC, ZoneMetaStore over Raft).
 //!     Each impl owns its own internal cache; there is no kernel-global
 //!     metadata cache.
@@ -93,6 +93,7 @@ mod dispatch;
 pub mod guarded_content;
 pub mod record_control;
 pub mod record_protection;
+mod record_wal;
 // The service-boot declaration type consumed by `Kernel::bring_up_services`.
 // Re-exported so service crates + the composition/assembly binary can build
 // `ServiceDecl`s without reaching into the private `dispatch` submodule.
@@ -570,11 +571,12 @@ pub struct Kernel {
     trie: Trie,
     // Unified lock manager: I/O lock + advisory lock + optional Raft.
     lock_manager: Arc<LockManager>,
-    // MetaStore (Box<dyn MetaStore>), behind parking_lot::RwLock so
+    // Shared metadata snapshots survive replacement until their I/O finishes.
+    // The slot stays behind parking_lot::RwLock so
     // the setter paths (``set_metastore_path`` / ``release_metastores``)
     // don't need ``&mut self`` — lets the host hold an ``Arc<Kernel>``
     // for the apply-side federation-mount callback.
-    metastore: parking_lot::RwLock<Option<Box<dyn crate::meta_store::MetaStore>>>,
+    metastore: parking_lot::RwLock<Option<Arc<dyn crate::meta_store::MetaStore>>>,
     // VFS lock timeout for blocking acquire (ms) — ``AtomicU64`` so
     // ``set_vfs_lock_timeout`` stays ``&self``; reads are lock-free.
     vfs_lock_timeout_ms: AtomicU64,
@@ -809,7 +811,7 @@ impl Kernel {
             vfs_router: Arc::new(VFSRouter::new()),
             trie: Trie::new(),
             lock_manager: Arc::new(LockManager::new()),
-            metastore: parking_lot::RwLock::new(Some(Box::new(boot_metastore))),
+            metastore: parking_lot::RwLock::new(Some(Arc::new(boot_metastore))),
             vfs_lock_timeout_ms: AtomicU64::new(5000),
             read_batch_max_concurrency: AtomicUsize::new(16),
             read_batch_max_aggregate_bytes: AtomicUsize::new(usize::MAX),
@@ -992,15 +994,13 @@ impl Kernel {
     pub fn set_metastore_path(&self, path: &str) -> Result<(), KernelError> {
         let ms = LocalMetaStore::open(std::path::Path::new(path))
             .map_err(|e| KernelError::IOError(format!("LocalMetaStore: {e:?}")))?;
-        *self.metastore.write() = Some(Box::new(ms));
+        *self.metastore.write() = Some(Arc::new(ms));
         Ok(())
     }
 
-    /// Drop the global metastore + every per-mount metastore so the
-    /// underlying redb file handles are released. Python ``NexusFS.close``
-    /// calls this so a subsequent kernel can reopen the same redb path
-    /// without the ``"Database already open"`` error (Issue #3765 Cat-5/6
-    /// SQLite-lifecycle regression).
+    /// Drop the kernel's global and per-mount metadata references.
+    /// Captured I/O retains its store until completion. After consumers drain,
+    /// the underlying redb handles close and another kernel can reopen the path.
     pub fn release_metastores(&self) {
         *self.metastore.write() = None;
         // Drop per-mount metastores by clearing their slot on each
@@ -1029,14 +1029,15 @@ impl Kernel {
                 return Some(f(ms_arc.as_ref()));
             }
         }
-        self.metastore.read().as_ref().map(|ms| f(ms.as_ref()))
+        let store = self.metastore.read().as_ref().map(Arc::clone)?;
+        Some(f(store.as_ref()))
     }
 
     /// Same as [`Self::with_metastore`], but consumes the per-mount
     /// metastore Arc already populated on [`crate::vfs_router::RouteResult`]
     /// — saves the second `get_canonical` lookup `with_metastore`
-    /// otherwise performs on top of `route()`. Hot-path callers
-    /// (sys_read, sys_stat, sys_unlink) prefer this entry.
+    /// otherwise performs on top of `route()`. Operations that retain a route
+    /// across I/O must capture its fallback and use `with_captured_metastore_route`.
     pub(crate) fn with_metastore_route<F, R>(
         &self,
         route: &crate::vfs_router::RouteResult,
@@ -1048,7 +1049,29 @@ impl Kernel {
         if let Some(ms) = route.metastore.as_ref() {
             return Some(f(ms.as_ref()));
         }
-        self.metastore.read().as_ref().map(|ms| f(ms.as_ref()))
+        let store = self.metastore.read().as_ref().map(Arc::clone)?;
+        Some(f(store.as_ref()))
+    }
+
+    /// Snapshot the global fallback together with the mounted backend. Absence
+    /// is a final result for this operation, not permission to resolve it later.
+    fn capture_metastore_route(
+        &self,
+        mut route: crate::vfs_router::RouteResult,
+    ) -> crate::vfs_router::RouteResult {
+        route.metastore = route.resolve_metastore(self.metastore.read().as_ref());
+        route
+    }
+
+    /// Consume an already captured store without consulting mutable routing.
+    fn with_captured_metastore_route<F, R>(
+        route: &crate::vfs_router::RouteResult,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&dyn crate::meta_store::MetaStore) -> R,
+    {
+        route.metastore.as_deref().map(f)
     }
 
     // ── MetaStore routing ────────────────────────────────────────────
@@ -1198,13 +1221,36 @@ impl Kernel {
             return;
         }
 
+        let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
+        self.with_metastore(&mount_point, |store| {
+            self.observe_backend_content_in_store(path, size, content_id, zone_id, ctx, store);
+        });
+    }
+
+    /// Publish an already gated observation to the store that supplied its route.
+    fn observe_backend_content_in_store(
+        &self,
+        path: &str,
+        size: u64,
+        content_id: Option<String>,
+        zone_id: &str,
+        ctx: &OperationContext,
+        store: &dyn crate::meta_store::MetaStore,
+    ) {
         // Delegate the idempotent build-and-propose to the shared
         // primitive (SSOT for the "materialize a backend entry"
         // mechanics).  Fire the FileWrite observer event only when a NEW
         // row was actually proposed, so search-index / audit hooks see
         // the materialization the same way they see an explicit
         // sys_write — and don't double-fire on an idempotent re-observe.
-        if self.observe_backend_entry(path, crate::meta_store::DT_REG, zone_id, size, content_id) {
+        if self.observe_backend_entry_in_store(
+            path,
+            crate::meta_store::DT_REG,
+            zone_id,
+            size,
+            content_id,
+            store,
+        ) {
             self.dispatch_mutation(
                 crate::core::dispatch::FileEventType::FileWrite,
                 path,
@@ -1260,8 +1306,24 @@ impl Kernel {
         size: u64,
         content_id: Option<String>,
     ) -> bool {
+        let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
+        self.with_metastore(&mount_point, |store| {
+            self.observe_backend_entry_in_store(path, entry_type, zone_id, size, content_id, store)
+        })
+        .unwrap_or(false)
+    }
+
+    fn observe_backend_entry_in_store(
+        &self,
+        path: &str,
+        entry_type: u8,
+        zone_id: &str,
+        size: u64,
+        content_id: Option<String>,
+        store: &dyn crate::meta_store::MetaStore,
+    ) -> bool {
         // Idempotency: never clobber an existing row.
-        if matches!(self.metastore_get(path), Ok(Some(_))) {
+        if matches!(store.get(path), Ok(Some(_))) {
             return false;
         }
 
@@ -1283,7 +1345,7 @@ impl Kernel {
             /* modified_at_ms */ Some(now_ms),
         );
 
-        if let Err(e) = self.metastore_put(path, meta) {
+        if let Err(e) = store.put(path, meta) {
             // Best-effort — a transient raft hiccup must not fail the
             // read/reconcile that triggered the propose; the next
             // reconcile tick retries.
@@ -2009,10 +2071,12 @@ impl Kernel {
         zone: &str,
     ) -> Result<SysSetAttrResult, KernelError> {
         let address = self.stream_address(path, zone);
-        let route = self.vfs_router.route(path, zone);
+        let route = self
+            .vfs_router
+            .route(path, zone)
+            .map(|route| self.capture_metastore_route(route));
         let meta = match route.as_ref() {
-            Some(route) => self
-                .with_metastore_route(route, |ms| ms.get(path))
+            Some(route) => Self::with_captured_metastore_route(route, |ms| ms.get(path))
                 .transpose()
                 .map_err(|e| KernelError::IOError(format!("stream inode: {e:?}")))?
                 .flatten(),
@@ -2030,7 +2094,13 @@ impl Kernel {
                     // Without this a peer sending to someone else's message stream,
                     // or reading a mailbox created on the other machine, hits
                     // StreamNotFound. The inode already exists, so no re-write.
-                    self.install_stream_backend(&address, capacity, io_profile)?;
+                    self.install_stream_backend(
+                        &address,
+                        capacity,
+                        io_profile,
+                        path,
+                        route.as_ref(),
+                    )?;
                 }
                 return Ok(SysSetAttrResult {
                     path: path.to_string(),
@@ -2050,7 +2120,8 @@ impl Kernel {
             )));
         }
 
-        let (shm_path, data_rd_fd) = self.install_stream_backend(&address, capacity, io_profile)?;
+        let (shm_path, data_rd_fd) =
+            self.install_stream_backend(&address, capacity, io_profile, path, route.as_ref())?;
         self.write_stream_inode_at(path, zone, capacity)?;
 
         Ok(SysSetAttrResult {
@@ -2104,8 +2175,10 @@ impl Kernel {
         &self,
         address: &StreamAddress,
         retention: u64,
+        source_path: &str,
+        source_route: Option<&crate::vfs_router::RouteResult>,
     ) -> Result<bool, KernelError> {
-        match self.wal_backend_for(address, retention)? {
+        match self.wal_backend_for(address, retention, source_path, source_route)? {
             Some(backend) => {
                 self.stream_manager
                     .register(&address.key(), backend)
@@ -2124,7 +2197,15 @@ impl Kernel {
         &self,
         address: &StreamAddress,
         retention: u64,
+        source_path: &str,
+        source_route: Option<&crate::vfs_router::RouteResult>,
     ) -> Result<Option<Arc<dyn crate::stream::StreamBackend>>, KernelError> {
+        // Both explicit reopen and miss-materialization retain the mounted
+        // inode's original store. A coordinator for another store cannot
+        // authorize this path merely because the zone/key spelling matches.
+        if let Some(route) = source_route {
+            self.check_unscoped_content_io(source_path, route)?;
+        }
         let store = match self
             .distributed_coordinator()
             .metastore_for_zone(self, &address.zone)
@@ -2132,6 +2213,8 @@ impl Kernel {
             Ok(store) => store,
             Err(_) => return Ok(None),
         };
+        crate::extensions::guarded_records::check_unscoped_record_io(store.as_ref(), &address.path)
+            .map_err(|error| KernelError::IOError(error.to_string()))?;
         // A prior writer may have keyed data by a mount spelling. Refuse to
         // open a different log as empty; recovering those records needs an
         // explicit migration that preserves offsets and reader positions.
@@ -2204,6 +2287,8 @@ impl Kernel {
         address: &StreamAddress,
         capacity: usize,
         io_profile: &str,
+        source_path: &str,
+        source_route: Option<&crate::vfs_router::RouteResult>,
     ) -> Result<(Option<String>, Option<i32>), KernelError> {
         for profile in io_profile.split(',') {
             match profile {
@@ -2230,7 +2315,12 @@ impl Kernel {
                     // (federation wired); if not, fall through to the next
                     // backend in the waterfall. `capacity` is the stream's
                     // cold-storage retention budget (0 = keep-forever).
-                    if self.install_wal_stream(address, capacity as u64)? {
+                    if self.install_wal_stream(
+                        address,
+                        capacity as u64,
+                        source_path,
+                        source_route,
+                    )? {
                         return Ok((None, None));
                     }
                 }

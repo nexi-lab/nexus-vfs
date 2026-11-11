@@ -342,6 +342,12 @@ impl WalStreamCore {
     }
 
     fn record_io(&self) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalMetadataError> {
+        if self.record_owner.is_none() {
+            crate::extensions::guarded_records::check_unscoped_record_io(
+                self.store.as_ref(),
+                &self.stream_id,
+            )?;
+        }
         self.record_owner
             .as_ref()
             .map(|owner| {

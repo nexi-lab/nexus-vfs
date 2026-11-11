@@ -91,6 +91,7 @@ tonic-prost-build = { version = "0.14", optional = true }
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+backends = { workspace = true, default-features = false, features = ["driver-cas-local", "driver-path-local"] }
 regex = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 

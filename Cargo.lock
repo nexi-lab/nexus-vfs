@@ -3569,6 +3569,7 @@ name = "raft"
 version = "0.1.0"
 dependencies = [
  "a2a",
+ "backends",
  "base64 0.22.1",
  "bincode",
  "blake3",

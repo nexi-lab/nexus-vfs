@@ -49,6 +49,25 @@ impl Kernel {
         Some(Arc::new(KernelColdSegmentStore {
             kernel: self.cold_segment_store.get()?.clone(),
             zone: zone.to_owned(),
+            captured: None,
+        }))
+    }
+
+    /// Keep an admitted WAL's content backend paired with its captured store.
+    /// Later mount replacement must not redirect its cold I/O to another owner.
+    pub(crate) fn cold_segment_store_for_backend(
+        &self,
+        zone: &str,
+        stream_id: &str,
+        backend: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ColdSegmentStore>> {
+        Some(Arc::new(KernelColdSegmentStore {
+            kernel: self.cold_segment_store.get()?.clone(),
+            zone: zone.to_owned(),
+            captured: Some(CapturedContent {
+                stream_id: stream_id.to_owned(),
+                backend,
+            }),
         }))
     }
 
@@ -110,17 +129,7 @@ impl Kernel {
         let backend = self
             .stream_content_backend(stream_path, zone_id)
             .ok_or_else(|| format!("no content backend for stream {stream_path}"))?;
-        let ctx = OperationContext::new(
-            "system", zone_id, /* is_admin */ true, None, /* is_system */ true,
-        );
-        // Path-addressed caches are shared by zones. Include the owning zone
-        // so equal stream paths and offsets cannot overwrite each other's blobs.
-        // CAS backends derive their identifier from the bytes instead.
-        let seg_key = format!("/__stream_segments__/{zone_id}{stream_path}/{base}");
-        let wr = backend
-            .write_content(bytes, &seg_key, &ctx, 0)
-            .map_err(|e| format!("write cold segment ({stream_path} base {base}): {e:?}"))?;
-        Ok(wr.content_id)
+        write_cold_segment_to(backend.as_ref(), stream_path, zone_id, base, bytes)
     }
 
     /// Read a sealed segment blob by `content_id`: the local content backend,
@@ -133,13 +142,28 @@ impl Kernel {
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String> {
+        self.read_cold_segment_from(
+            zone_id,
+            content_id,
+            origin,
+            self.stream_content_backend(stream_path, zone_id),
+        )
+    }
+
+    fn read_cold_segment_from(
+        &self,
+        zone_id: &str,
+        content_id: &str,
+        origin: &str,
+        backend: Option<Arc<dyn ObjectStore>>,
+    ) -> Result<Vec<u8>, String> {
         let ctx = OperationContext::new(
             "system", zone_id, /* is_admin */ true, None, /* is_system */ true,
         );
 
         // Local content store first (the writer node, or any node that has
         // fetched it before under a shared/replicated backend).
-        if let Some(backend) = self.stream_content_backend(stream_path, zone_id) {
+        if let Some(backend) = backend {
             if let Ok(data) = backend.read_content(content_id, &ctx) {
                 return Ok(data);
             }
@@ -238,11 +262,51 @@ impl Kernel {
     }
 }
 
+/// One segment encoding/addressing path for current and captured backends.
+fn write_cold_segment_to(
+    backend: &dyn ObjectStore,
+    stream_path: &str,
+    zone_id: &str,
+    base: u64,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let ctx = OperationContext::new(
+        "system", zone_id, /* is_admin */ true, None, /* is_system */ true,
+    );
+    // Path-addressed caches include the owning zone; CAS derives its address
+    // from the bytes. Both handles retain the same original segment format.
+    let seg_key = format!("/__stream_segments__/{zone_id}{stream_path}/{base}");
+    let wr = backend
+        .write_content(bytes, &seg_key, &ctx, 0)
+        .map_err(|e| format!("write cold segment ({stream_path} base {base}): {e:?}"))?;
+    Ok(wr.content_id)
+}
+
+struct CapturedContent {
+    stream_id: String,
+    backend: Arc<dyn ObjectStore>,
+}
+
 /// `ColdSegmentStore` bridge: a `Weak<Kernel>` so an in-flight seal thread that
 /// outlives the kernel degrades to a clean error instead of keeping it alive.
 struct KernelColdSegmentStore {
     kernel: Weak<Kernel>,
     zone: String,
+    captured: Option<CapturedContent>,
+}
+
+impl KernelColdSegmentStore {
+    fn captured_backend(&self, stream_id: &str) -> Result<Option<Arc<dyn ObjectStore>>, String> {
+        self.captured
+            .as_ref()
+            .map(|captured| {
+                if captured.stream_id != stream_id {
+                    return Err("captured WAL content identifies a different stream".into());
+                }
+                Ok(Arc::clone(&captured.backend))
+            })
+            .transpose()
+    }
 }
 
 impl ColdSegmentStore for KernelColdSegmentStore {
@@ -254,7 +318,12 @@ impl ColdSegmentStore for KernelColdSegmentStore {
 
     fn write_segment(&self, stream_id: &str, base: u64, bytes: &[u8]) -> Result<String, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
-        k.write_cold_segment(stream_id, &self.zone, base, bytes)
+        match self.captured_backend(stream_id)? {
+            Some(backend) => {
+                write_cold_segment_to(backend.as_ref(), stream_id, &self.zone, base, bytes)
+            }
+            None => k.write_cold_segment(stream_id, &self.zone, base, bytes),
+        }
     }
 
     fn read_segment(
@@ -264,7 +333,12 @@ impl ColdSegmentStore for KernelColdSegmentStore {
         origin: &str,
     ) -> Result<Vec<u8>, String> {
         let k = self.kernel.upgrade().ok_or("kernel dropped")?;
-        k.read_cold_segment(stream_id, &self.zone, content_id, origin)
+        match self.captured_backend(stream_id)? {
+            Some(backend) => {
+                k.read_cold_segment_from(&self.zone, content_id, origin, Some(backend))
+            }
+            None => k.read_cold_segment(stream_id, &self.zone, content_id, origin),
+        }
     }
 }
 

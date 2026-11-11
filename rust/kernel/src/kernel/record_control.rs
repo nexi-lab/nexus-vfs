@@ -5,17 +5,57 @@
 
 use std::sync::Arc;
 
-use crate::extensions::guarded_records::RecordIoGuard;
+use crate::extensions::guarded_records::{RecordIoGuard, RecordOwnerState};
 use crate::meta_store::{ConditionalMetadataError, ConditionalMetadataResult, MetaStoreError};
+use crate::vfs_router::RouteResult;
 
 use super::conditional_content::{ConditionalContentError, ConditionalContentResult};
-use super::{Kernel, OperationContext};
+use super::{Kernel, KernelError, OperationContext};
 
 fn storage_error(error: MetaStoreError) -> ConditionalContentError {
     ConditionalMetadataError::Failed(error).into()
 }
 
 impl Kernel {
+    /// Inspect the original owner decision through the trusted control plane.
+    /// This supports unknown-outcome/restart readback while generic content
+    /// reads stay refused. A retired result requires separate I/O exclusion
+    /// before reclamation; it grants no permission to delete shared content.
+    pub fn record_content_owner_state(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<RecordOwnerState, ConditionalContentError> {
+        let (path, route) = self.record_control_route(path, ctx)?;
+        self.with_metastore_route(&route, |store| {
+            let records = store
+                .as_guarded_records()
+                .ok_or(ConditionalContentError::Unsupported)?;
+            records
+                .record_owner_state(&records.record_storage_key(&path))
+                .map_err(ConditionalContentError::from)
+        })
+        .ok_or(ConditionalContentError::Unsupported)?
+    }
+
+    /// Ordinary reads cannot materialize content owned by an enrolled service.
+    /// Resolve the canonical key through the same captured route/store as I/O.
+    pub(super) fn check_unscoped_content_io(
+        &self,
+        path: &str,
+        route: &RouteResult,
+    ) -> Result<(), KernelError> {
+        Self::with_captured_metastore_route(route, |store| {
+            if let Some(records) = store.as_guarded_records() {
+                records
+                    .check_unscoped_io(&records.record_storage_key(path))
+                    .map_err(|error| KernelError::IOError(error.to_string()))?;
+            }
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
+    }
+
     /// Enroll a fresh or quiescent protected owner for actual content I/O.
     /// The service must retire pre-enrollment consumers before calling this.
     /// Protect its immutable image with `protect_record_content` first. This
@@ -48,20 +88,7 @@ impl Kernel {
         ctx: &OperationContext,
         owner_version: &[u8],
     ) -> Result<(), ConditionalContentError> {
-        let (path, route) = self.record_control_route(path, ctx)?;
-        let (owner_path, owner_route) = self.record_control_route(owner_path, ctx)?;
-        let same_store = match (&route.metastore, &owner_route.metastore) {
-            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-            (None, None) => true,
-            _ => false,
-        };
-        if route.mount_point != owner_route.mount_point
-            || route.zone_id != owner_route.zone_id
-            || !same_store
-            || !matches!((&route.backend, &owner_route.backend), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
-        {
-            return Err(ConditionalContentError::Unsupported);
-        }
+        let (path, owner_path, route) = self.record_control_pair(path, owner_path, ctx)?;
         self.with_metastore_route(&route, |store| {
             let records = store
                 .as_guarded_records()
@@ -77,6 +104,29 @@ impl Kernel {
                 .map_err(ConditionalContentError::from)
         })
         .ok_or(ConditionalContentError::Unsupported)?
+    }
+
+    pub(super) fn record_control_pair(
+        &self,
+        path: &str,
+        owner_path: &str,
+        ctx: &OperationContext,
+    ) -> Result<(String, String, RouteResult), ConditionalContentError> {
+        let (path, route) = self.record_control_route(path, ctx)?;
+        let (owner_path, owner_route) = self.record_control_route(owner_path, ctx)?;
+        let same_store = match (&route.metastore, &owner_route.metastore) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        if route.mount_point != owner_route.mount_point
+            || route.zone_id != owner_route.zone_id
+            || !same_store
+            || !matches!((&route.backend, &owner_route.backend), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
+        {
+            return Err(ConditionalContentError::Unsupported);
+        }
+        Ok((path, owner_path, route))
     }
 
     /// Permanently retire an owner without changing its immutable bytes.

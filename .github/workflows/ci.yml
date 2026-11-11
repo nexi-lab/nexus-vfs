@@ -37,6 +37,8 @@ jobs:
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
       - name: Owned WAL I/O and background retirement on the native filesystem
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
+      - name: Trusted Kernel WAL admission and platform refusal
+        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal_service::'
 
   # CAS has a different kernel feature/build graph. On Windows, compiling it
   # after both completed bootstrap suites exhausted the 25-minute job budget
