@@ -32,12 +32,11 @@ impl RaftStorage {
                     self.state.name(),
                 ))
                 .map_err(storage_error)?;
-            let first = state
-                .get(KEY_FIRST_INDEX)
-                .map_err(storage_error)?
-                .map(|value| decode_index(value.value()))
-                .transpose()?
-                .unwrap_or(1);
+            let first_record = state.get(KEY_FIRST_INDEX).map_err(storage_error)?;
+            let first = reader_format::LogBoundary::decode(
+                first_record.as_ref().map(|value| value.value()),
+            )?
+            .index;
             if entries[0].index < first {
                 return Err(storage_error("append would overwrite compacted entries"));
             }

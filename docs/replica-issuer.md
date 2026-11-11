@@ -51,6 +51,16 @@ and minimum storage-reader format. The format requirement increases monotonicall
 at the existing storage-admission key and survives compaction and snapshots.
 Boot and snapshot admission check that the reader supports the retained format
 and that its membership policy qualifies the stored records.
+
+Every participating node also prepares its local Raft reader format before
+qualifying for replica-control activation. The mandatory `first_index` record
+holds the log boundary and its reader dialect together. This covers witnesses,
+whose business state machine stores no control records. Compaction and snapshot
+installation preserve that local format; earlier readers refuse it at Raft
+startup. Ordinary stores retain the original eight-byte index representation.
+This durable local format upgrade and the replicated activation fact have
+separate purposes: the former defines which program can open the files, while
+the latter enables commands for the zone after authenticated member checks.
 Generic control writes are refused for this owned namespace. EC admission
 requires these mutations to use the consensus path.
 
