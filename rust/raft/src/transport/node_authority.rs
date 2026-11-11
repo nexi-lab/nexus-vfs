@@ -56,6 +56,19 @@ pub(super) fn authenticated_node_id(extensions: &http::Extensions) -> Result<Opt
     Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
 }
 
+/// Storage format preparation requires Node authority even on a development
+/// listener. Numeric replica identity alone carries no control authority.
+pub(super) fn require_authenticated_control_node(
+    extensions: &http::Extensions,
+) -> Result<(), Status> {
+    match authenticated_peer(extensions)? {
+        Some(AuthenticatedPeer::Node(_)) => Ok(()),
+        _ => Err(Status::permission_denied(
+            "storage reader preparation requires a cluster Node mTLS connection",
+        )),
+    }
+}
+
 /// Authorize before parsing payloads, learning routes or reading zone data.
 #[inline(never)] // Share admission code across all typed RPC handlers.
 pub(super) fn authorize_data_zone(

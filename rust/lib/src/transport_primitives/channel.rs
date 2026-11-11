@@ -2,6 +2,7 @@
 
 use super::config::{ClientConfig, TlsConfig};
 use super::error::TransportError;
+use super::peer_verifier::ExpectedPeer;
 use std::{future::Future, pin::Pin};
 
 type ConnectFuture<'a> =
@@ -41,14 +42,33 @@ pub fn create_peer_channel<'a>(
     config: &'a ClientConfig,
     expected: std::num::NonZeroU64,
 ) -> ConnectFuture<'a> {
-    Box::pin(connect_channel(endpoint, config, Some(expected)))
+    Box::pin(connect_channel(
+        endpoint,
+        config,
+        Some(ExpectedPeer::Replication(expected)),
+    ))
+}
+
+/// Connect to an exact cluster Node. An owner replica with the same numeric ID
+/// is a different authority and cannot serve this channel, including reconnects.
+#[inline(never)]
+pub fn create_node_channel<'a>(
+    endpoint: &'a str,
+    config: &'a ClientConfig,
+    expected: std::num::NonZeroU64,
+) -> ConnectFuture<'a> {
+    Box::pin(connect_channel(
+        endpoint,
+        config,
+        Some(ExpectedPeer::Node(expected)),
+    ))
 }
 
 #[allow(clippy::result_large_err)]
 async fn connect_channel(
     endpoint: &str,
     config: &ClientConfig,
-    expected: Option<std::num::NonZeroU64>,
+    expected: Option<ExpectedPeer>,
 ) -> Result<tonic::transport::Channel, TransportError> {
     if expected.is_some() && config.tls.is_none() {
         return Err(TransportError::Connection(
@@ -73,7 +93,7 @@ async fn connect_channel(
 fn configured_endpoint(
     endpoint: &str,
     config: &ClientConfig,
-    expected: Option<std::num::NonZeroU64>,
+    expected: Option<ExpectedPeer>,
 ) -> Result<tonic::transport::Endpoint, TransportError> {
     let mut uri: tonic::codegen::http::Uri = endpoint
         .parse()
@@ -141,7 +161,7 @@ pub fn ensure_crypto_provider() {
 fn apply_tls(
     ep: tonic::transport::Endpoint,
     tls: &TlsConfig,
-    expected: Option<std::num::NonZeroU64>,
+    expected: Option<ExpectedPeer>,
 ) -> Result<tonic::transport::Endpoint, TransportError> {
     ensure_crypto_provider();
     let identity = tonic::transport::Identity::from_pem(&tls.cert_pem, &tls.key_pem);

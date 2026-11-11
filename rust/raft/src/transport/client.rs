@@ -11,10 +11,11 @@ use super::proto::nexus::raft::{
     DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetCrlRequest,
     GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListForeignCasRequest,
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
-    MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
-    RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
-    ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
-    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
+    MintSessionAgentRequest, PrepareReplicaControlReaderRequest, ProposeRequest, PutMetadata,
+    QueryRequest, RaftCommand, RaftQuery, RegisterForeignCaRequest, ReleaseLock,
+    RemoveVoterRequest, RenewSessionAgentRequest, ReplicateEntriesRequest, RevokeAgentCertRequest,
+    RevokeKeyRequest, SnapshotEcStateRequest, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use std::collections::HashMap;
@@ -162,6 +163,12 @@ struct CachedClient {
     tls: Option<super::TlsConfig>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerRole {
+    Replication,
+    Node,
+}
+
 /// A pool of gRPC clients for connecting to Raft peers.
 ///
 /// Provides lazy TTL-based eviction: on each `get()`, if the cached client
@@ -170,7 +177,7 @@ struct CachedClient {
 #[derive(Clone)]
 pub struct RaftClientPool {
     config: ClientConfig,
-    clients: Arc<RwLock<HashMap<u64, CachedClient>>>,
+    clients: Arc<RwLock<HashMap<(u64, PeerRole), CachedClient>>>,
     client_ttl: Duration,
 }
 
@@ -207,6 +214,17 @@ impl RaftClientPool {
     ///
     /// Cached clients older than the TTL are evicted and reconnected.
     pub async fn get(&self, addr: &NodeAddress) -> Result<RaftClient> {
+        self.get_for_role(addr, PeerRole::Replication).await
+    }
+
+    /// Connect to the exact cluster Node for control operations. Role is part
+    /// of the cache key and of every TLS handshake on the retained channel.
+    pub async fn get_node(&self, addr: &NodeAddress) -> Result<RaftClient> {
+        self.get_for_role(addr, PeerRole::Node).await
+    }
+
+    async fn get_for_role(&self, addr: &NodeAddress, role: PeerRole) -> Result<RaftClient> {
+        let key = (addr.id, role);
         // Reuse a still-fresh cached client. Otherwise record whether we are
         // refreshing a stale entry (routine, TTL-driven) or connecting with no
         // prior entry, so the lifecycle event below logs at the right level
@@ -214,7 +232,7 @@ impl RaftClientPool {
         let (stale_age_secs, tls_snapshot) = {
             let clients = self.clients.read().await;
             let tls = self.config.tls.read().unwrap();
-            let age = match clients.get(&addr.id) {
+            let age = match clients.get(&key) {
                 Some(cached)
                     if cached.created_at.elapsed() < self.client_ttl
                         && cached.client.endpoint() == addr.endpoint
@@ -231,10 +249,15 @@ impl RaftClientPool {
         };
 
         // Create new client (may replace a stale one).
-        let expected = if tls_snapshot.is_some() {
-            Some(std::num::NonZeroU64::new(addr.id).ok_or_else(|| {
-                TransportError::Connection("authenticated peer requires a nonzero Node ID".into())
-            })?)
+        let expected = if tls_snapshot.is_some() || role == PeerRole::Node {
+            Some((
+                std::num::NonZeroU64::new(addr.id).ok_or_else(|| {
+                    TransportError::Connection(
+                        "authenticated peer requires a nonzero Node ID".into(),
+                    )
+                })?,
+                role,
+            ))
         } else {
             None
         };
@@ -256,7 +279,7 @@ impl RaftClientPool {
                 ));
             }
             clients.insert(
-                addr.id,
+                key,
                 CachedClient {
                     client: client.clone(),
                     created_at: Instant::now(),
@@ -284,7 +307,9 @@ impl RaftClientPool {
     /// Remove a client from the pool (e.g., after connection failure).
     pub async fn remove(&self, node_id: u64) {
         let mut clients = self.clients.write().await;
-        clients.remove(&node_id);
+        for role in [PeerRole::Replication, PeerRole::Node] {
+            clients.remove(&(node_id, role));
+        }
     }
 
     /// Get the number of active connections.
@@ -306,6 +331,7 @@ pub struct RaftClient {
     #[allow(dead_code)]
     config: ClientConfig,
     inner: ZoneTransportServiceClient<Channel>,
+    is_node_channel: bool,
 }
 
 fn decode_step_response(response: StepMessageResponse) -> Result<()> {
@@ -330,7 +356,7 @@ impl RaftClient {
         endpoint: &str,
         config: ClientConfig,
         tls_snapshot: Option<super::TlsConfig>,
-        expected: Option<std::num::NonZeroU64>,
+        expected: Option<(std::num::NonZeroU64, PeerRole)>,
     ) -> Result<Self> {
         // Pre-dial diagnostic only (surfaces a hang inside `create_channel`);
         // the operator-facing lifecycle signal is emitted by the caller
@@ -343,8 +369,12 @@ impl RaftClient {
 
         let channel_config = channel_config(&config, tls_snapshot);
         let channel = match expected {
-            Some(expected) => {
+            Some((expected, PeerRole::Replication)) => {
                 lib::transport_primitives::create_peer_channel(endpoint, &channel_config, expected)
+                    .await?
+            }
+            Some((expected, PeerRole::Node)) => {
+                lib::transport_primitives::create_node_channel(endpoint, &channel_config, expected)
                     .await?
             }
             None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
@@ -355,12 +385,30 @@ impl RaftClient {
             endpoint: endpoint.to_string(),
             config,
             inner,
+            is_node_channel: matches!(expected, Some((_, PeerRole::Node))),
         })
     }
 
     /// Get the endpoint this client is connected to.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Prepare the original remote reader through its owning Raft driver.
+    /// A successful reply acknowledges local durability, not protocol activation.
+    /// Errors retain the original request; this method has no legacy fallback.
+    pub async fn prepare_replica_control_reader(&mut self, zone_id: &str) -> Result<()> {
+        if !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "storage reader preparation requires an exact cluster Node channel".into(),
+            ));
+        }
+        self.inner
+            .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
+                zone_id: zone_id.to_owned(),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Send a raw raft-rs message to this node.
@@ -1555,7 +1603,7 @@ mod tests {
         {
             let mut clients = pool.clients.write().await;
             clients.insert(
-                42,
+                (42, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     tls: None,
@@ -1566,7 +1614,7 @@ mod tests {
 
         // The cached entry should still be present (within TTL)
         let clients = pool.clients.read().await;
-        let cached = clients.get(&42).unwrap();
+        let cached = clients.get(&(42, PeerRole::Replication)).unwrap();
         assert!(cached.created_at.elapsed() < pool.client_ttl);
     }
 
@@ -1581,7 +1629,7 @@ mod tests {
         {
             let mut clients = pool.clients.write().await;
             clients.insert(
-                99,
+                (99, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     tls: None,
@@ -1592,7 +1640,7 @@ mod tests {
 
         // Verify the entry is stale
         let clients = pool.clients.read().await;
-        let cached = clients.get(&99).unwrap();
+        let cached = clients.get(&(99, PeerRole::Replication)).unwrap();
         assert!(cached.created_at.elapsed() >= pool.client_ttl);
     }
 
@@ -1606,7 +1654,7 @@ mod tests {
             let mut clients = pool.clients.write().await;
             // Fresh client (10s old)
             clients.insert(
-                1,
+                (1, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     tls: None,
@@ -1615,7 +1663,7 @@ mod tests {
             );
             // Stale client (120s old, past 60s TTL)
             clients.insert(
-                2,
+                (2, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     tls: None,
@@ -1624,7 +1672,7 @@ mod tests {
             );
             // Fresh client (59s old, just under TTL)
             clients.insert(
-                3,
+                (3, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     tls: None,
@@ -1636,11 +1684,32 @@ mod tests {
         let clients = pool.clients.read().await;
 
         // Client 1: fresh (10s < 60s TTL)
-        assert!(clients.get(&1).unwrap().created_at.elapsed() < ttl);
+        assert!(
+            clients
+                .get(&(1, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                < ttl
+        );
         // Client 2: stale (120s > 60s TTL)
-        assert!(clients.get(&2).unwrap().created_at.elapsed() >= ttl);
+        assert!(
+            clients
+                .get(&(2, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                >= ttl
+        );
         // Client 3: fresh (59s < 60s TTL)
-        assert!(clients.get(&3).unwrap().created_at.elapsed() < ttl);
+        assert!(
+            clients
+                .get(&(3, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                < ttl
+        );
     }
 
     /// Create a dummy RaftClient for testing pool management.
@@ -1652,6 +1721,7 @@ mod tests {
             endpoint: "http://[::1]:1".to_string(),
             config: ClientConfig::default(),
             inner: ZoneTransportServiceClient::new(channel),
+            is_node_channel: false,
         }
     }
 }

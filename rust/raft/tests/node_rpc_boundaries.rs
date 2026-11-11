@@ -2,6 +2,8 @@
 //! consensus data are isolated; no fleet endpoint or model is used.
 #![cfg(all(feature = "grpc", has_protos))]
 mod common;
+#[path = "node_rpc_boundaries/reader_preparation.rs"]
+mod reader_preparation;
 #[path = "node_rpc_boundaries/storage_transport.rs"]
 mod storage_transport;
 
@@ -99,9 +101,15 @@ impl PeerServer {
     }
 
     async fn shutdown(self) {
+        drop(self.shutdown_preserving_storage().await);
+    }
+
+    async fn shutdown_preserving_storage(self) -> tempfile::TempDir {
         self.stop.send(()).unwrap();
         self.task.await.unwrap();
         self.registry.shutdown_all();
+        drop(self.registry);
+        self._directory
     }
 }
 

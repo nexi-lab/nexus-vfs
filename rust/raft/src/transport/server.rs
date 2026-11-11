@@ -21,10 +21,11 @@ use super::proto::nexus::raft::{
     ListKeysRequest, ListKeysResponse, ListMetadataResult, ListSessionMintersRequest,
     ListSessionMintersResponse, ListedKey, LockInfoResult, LockResult, MintAgentRequest,
     MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
-    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
-    QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse,
-    RemoveVoterRequest, RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
+    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, PrepareReplicaControlReaderRequest,
+    PrepareReplicaControlReaderResponse, ProposeRequest, ProposeResponse, QueryRequest,
+    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
+    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
     ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
     RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
@@ -579,6 +580,18 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
 // ZoneTransportService (internal node-to-node transport)
 // =============================================================================
 
+/// Full nodes and witnesses acknowledge the same durable driver operation.
+async fn prepare_replica_control_reader<S: crate::raft::StateMachine + Send + Sync + 'static>(
+    node: ZoneConsensus<S>,
+) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+    node.prepare_replica_control_reader()
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!("reader preparation failed: {error}"))
+        })?;
+    Ok(Response::new(PrepareReplicaControlReaderResponse {}))
+}
+
 /// Zone-routed implementation of the ZoneTransportService gRPC trait.
 ///
 /// All raft-rs message types (~15 types including votes, heartbeats, appends)
@@ -670,6 +683,15 @@ impl ZoneTransportServiceImpl {
 
 #[tonic::async_trait]
 impl ZoneTransportService for ZoneTransportServiceImpl {
+    async fn prepare_replica_control_reader_v1(
+        &self,
+        request: Request<PrepareReplicaControlReaderRequest>,
+    ) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+        super::node_authority::require_authenticated_control_node(request.extensions())?;
+        let node = get_zone_node(&self.registry, &request.get_ref().zone_id)?;
+        prepare_replica_control_reader(node).await
+    }
+
     /// Handle a raw raft-rs message forwarded from another node.
     ///
     /// Routes by zone_id to the correct Raft group's ZoneConsensus.
@@ -2950,6 +2972,18 @@ impl WitnessServiceImpl {
 
 #[tonic::async_trait]
 impl ZoneTransportService for WitnessServiceImpl {
+    async fn prepare_replica_control_reader_v1(
+        &self,
+        request: Request<PrepareReplicaControlReaderRequest>,
+    ) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+        super::node_authority::require_authenticated_control_node(request.extensions())?;
+        let node = self
+            .registry
+            .get_node(&request.get_ref().zone_id)
+            .ok_or_else(|| Status::not_found("zone is not hosted on this witness"))?;
+        prepare_replica_control_reader(node).await
+    }
+
     /// Handle a raw raft-rs message forwarded from another node.
     ///
     /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
