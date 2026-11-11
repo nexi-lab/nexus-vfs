@@ -39,6 +39,7 @@
 //! | false | non-empty | any | unset | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
 //! | false | non-empty | any | set | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
 //! | false | empty | non-empty | set | [`BootAction::FailLoud`] — ambiguous (Phase A) |
+//! | false | empty (identity.zones non-empty) | empty | unset | [`BootAction::FailLoud`] — zones with no seed |
 //!
 //! ### Symmetric-boot race
 //!
@@ -105,12 +106,10 @@ pub struct BootConfig {
     /// raft state are the authoritative SSOT.
     pub has_disk_state: bool,
 
-    /// Per-zone membership snapshot loaded from `identity.json` (S3
-    /// Phase B).  Populated by the ConfChange apply callback whenever
-    /// this node participates in a ConfState change (`voters ∪
-    /// learners`).  Used by [`plan_boot_action`] to promote row-4
-    /// returning-joiner from a no-op into an auto-JoinZone dispatch
-    /// against each remembered zone.
+    /// Per-zone role intent loaded from `identity.json` (S3 Phase B),
+    /// recorded when each zone was set up on this node.  Used by
+    /// [`plan_boot_action`] to promote row-4 returning-joiner from a
+    /// no-op into an auto-JoinZone dispatch against each remembered zone.
     pub identity_zones: Vec<IdentityZone>,
 }
 
@@ -160,10 +159,9 @@ pub enum BootAction {
 
     /// Restart from disk — `data_dir_has_root=true` means the raft
     /// state machines rehydrate from persisted redb state and the
-    /// daemon simply resumes.  `identity.zones` and `identity.peers`
-    /// are consulted for transport peer seeding but do NOT drive
-    /// fresh JoinZone RPCs; the DT_MOUNT + ConfState entries already
-    /// on disk are the authoritative SSOT.  Overrides all other
+    /// daemon simply resumes.  `identity.zones` does NOT drive fresh
+    /// JoinZone RPCs; the DT_MOUNT + ConfState entries already on disk
+    /// are the authoritative SSOT.  Overrides all other
     /// operator inputs (`--peers` and `NEXUS_FEDERATION_ZONES` are
     /// treated as advisory when the daemon has persisted state) —
     /// stale env vars from a container recipe should not clobber
@@ -199,6 +197,12 @@ pub const REASON_SPLIT_BRAIN_IDENTITY_AND_ZONES: &str = "split_brain_identity_an
 /// sharing zone names.  Refuse rather than roll dice.
 pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_founder_with_peers";
 
+/// Reason tag: `identity.json` remembers zones this node participates in,
+/// but no seed address (CLI `--peers` or `identity.peers`) exists to rejoin
+/// them through. Founding them again would split them from their surviving
+/// members, so the boot refuses instead.
+pub const REASON_ZONES_WITHOUT_SEEDS: &str = "identity_zones_without_seed_addresses";
+
 /// Decide what the daemon should do at the federation branch of boot.
 ///
 /// Total function — no `Result` return; misconfig is surfaced via
@@ -216,11 +220,13 @@ pub const REASON_AMBIGUOUS_FRESH_FOUNDER_WITH_PEERS: &str = "ambiguous_fresh_fou
 /// | 4 | false      | non-empty | any       | unset   | [`BootAction::JoinFederationZones`] — joiner (return, identity.zones) |
 /// | 5 | false      | non-empty | any       | set     | [`BootAction::FailLoud`] — split-brain trap (PR #112) |
 /// | 6 | false      | empty     | non-empty | set     | [`BootAction::FailLoud`] — ambiguous (Phase A NEW) |
+/// | 7 | false      | empty, identity.zones non-empty | empty | unset | [`BootAction::FailLoud`] — zones with no seed |
 ///
 /// Precedence: row 0 (`has_disk_state=true`) dominates unconditionally
 /// — persisted raft state is authoritative, env vars are advisory.
 /// Otherwise rows 5 + 6 fire first (fail-loud), then row 1 (founder),
-/// then rows 3/4 (joiner), then row 2 (dynamic fallback).  Row 5 vs
+/// then row 7 (fail-loud), then rows 3/4 (joiner), then row 2 (dynamic
+/// fallback).  Row 5 vs
 /// row 6: when both identity peers AND CLI peers exist alongside
 /// zones, row 5 wins — the identity signal is more persistent.
 ///
@@ -314,16 +320,30 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
         };
     }
 
-    // Rows 3 + 4: peers OR identity.zones known + no zones declared
-    // → joiner path.  Phase B: if identity carries a zones snapshot
-    // from a prior ConfChange apply, seed the JoinZone targets from
-    // it — this is the S3 auto-reconnect after `data_dir` wipe.
-    // identity.zones alone (with peers empty) is enough to enter the
-    // joiner path: the wipe took the peers away too, but the zones
-    // snapshot's members list is a peer seed.  When both peers and
-    // identity_zones are empty, fall through to row 2 (root-only founder).
+    // Row 7: identity remembers zones, but nothing to rejoin them through.
     let identity_has_zones = !cfg.identity_zones.is_empty();
-    if identity_has_peers || cli_has_peers || identity_has_zones {
+    if identity_has_zones && !identity_has_peers && !cli_has_peers {
+        let zones: Vec<&str> = cfg
+            .identity_zones
+            .iter()
+            .map(|z| z.zone_id.as_str())
+            .collect();
+        return BootAction::FailLoud {
+            reason: REASON_ZONES_WITHOUT_SEEDS,
+            hint: format!(
+                "identity.json records zones {zones:?} for this node, the data dir holds \
+                 none of them, and no seed address is known (no --peers, no identity \
+                 peers).  Pass --peers <host:port> of a live member to rejoin them, or \
+                 remove the identity file to start this node afresh."
+            ),
+        };
+    }
+
+    // Rows 3 + 4: peers known + no zones declared → joiner path.  Phase
+    // B: identity.zones names the zones to rejoin after a `data_dir`
+    // wipe — the S3 auto-reconnect.  When peers are empty, fall through
+    // to row 2 (root-only founder).
+    if identity_has_peers || cli_has_peers {
         let zones_from_identity: Vec<String> = cfg
             .identity_zones
             .iter()
@@ -400,12 +420,10 @@ mod tests {
         }
     }
 
-    fn identity_zone(zone_id: &str, members: Vec<&str>) -> IdentityZone {
+    fn identity_zone(zone_id: &str) -> IdentityZone {
         IdentityZone {
             zone_id: zone_id.to_string(),
-            members: members.into_iter().map(str::to_string).collect(),
             as_role: crate::identity::IdentityZoneRole::Voter,
-            last_confirmed_unix_secs: None,
         }
     }
 
@@ -697,10 +715,7 @@ mod tests {
         // identity.zones non-empty: JoinFederationZones carries the
         // remembered zone_ids.  Wipe-recovery path.
         let mut cfg = cfg_with(vec!["100.64.0.21:2126"], vec![], vec![], BTreeMap::new());
-        cfg.identity_zones = vec![
-            identity_zone("sharedzone", vec!["100.64.0.21:2126"]),
-            identity_zone("corp-eng", vec!["100.64.0.22:2126"]),
-        ];
+        cfg.identity_zones = vec![identity_zone("sharedzone"), identity_zone("corp-eng")];
         match plan_boot_action(&cfg) {
             BootAction::JoinFederationZones {
                 zones,
@@ -740,12 +755,7 @@ mod tests {
         let mut cfg = cfg_with(vec!["100.64.0.27:2126"], vec![], vec![], BTreeMap::new());
         cfg.identity_zones = vec![IdentityZone {
             zone_id: "sharedzone".to_string(),
-            members: vec![
-                "100.64.0.27:2126".to_string(),
-                "100.64.0.21:2126".to_string(),
-            ],
             as_role: crate::identity::IdentityZoneRole::Learner,
-            last_confirmed_unix_secs: None,
         }];
         match plan_boot_action(&cfg) {
             BootAction::JoinFederationZones {
@@ -779,12 +789,7 @@ mod tests {
         let mut cfg = cfg_with(vec!["100.64.0.27:2126"], vec![], vec![], BTreeMap::new());
         cfg.identity_zones = vec![IdentityZone {
             zone_id: "sharedzone".to_string(),
-            members: vec![
-                "100.64.0.27:2126".to_string(),
-                "100.64.0.21:2126".to_string(),
-            ],
             as_role: crate::identity::IdentityZoneRole::Voter,
-            last_confirmed_unix_secs: None,
         }];
         match plan_boot_action(&cfg) {
             BootAction::JoinFederationZones {
@@ -826,6 +831,37 @@ mod tests {
     }
 
     #[test]
+    fn row7_identity_zones_without_a_seed_fail_loud() {
+        // A wiped node that remembers zones but knows no seed address has
+        // no way to reach their members; founding them again would split
+        // the zones.
+        let mut cfg = cfg_with(vec![], vec![], vec![], BTreeMap::new());
+        cfg.identity_zones = vec![identity_zone("sharedzone")];
+        match plan_boot_action(&cfg) {
+            BootAction::FailLoud { reason, hint } => {
+                assert_eq!(reason, REASON_ZONES_WITHOUT_SEEDS);
+                assert!(
+                    hint.contains("sharedzone") && hint.contains("--peers"),
+                    "{hint}"
+                );
+            }
+            other => panic!("expected FailLoud, got {other:?}"),
+        }
+        // A seed from either source rejoins instead.
+        let mut cli = cfg_with(
+            vec![],
+            vec![cli_peer("nexus-1", 2126)],
+            vec![],
+            BTreeMap::new(),
+        );
+        cli.identity_zones = vec![identity_zone("sharedzone")];
+        assert!(matches!(
+            plan_boot_action(&cli),
+            BootAction::JoinFederationZones { .. }
+        ));
+    }
+
+    #[test]
     fn row5_identity_zones_do_not_override_split_brain_guard() {
         // A row-5 misconfig (identity.peers non-empty + zones set) MUST
         // still fail loud even when identity.zones is also populated.
@@ -836,7 +872,7 @@ mod tests {
             vec!["sharedzone"],
             mount("/shared", "sharedzone"),
         );
-        cfg.identity_zones = vec![identity_zone("sharedzone", vec!["100.64.0.21:2126"])];
+        cfg.identity_zones = vec![identity_zone("sharedzone")];
         assert!(matches!(
             plan_boot_action(&cfg),
             BootAction::FailLoud { .. }

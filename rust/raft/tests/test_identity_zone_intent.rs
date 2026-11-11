@@ -1,19 +1,16 @@
-//! End-to-end coverage for the S3 Phase B ConfState apply → identity
-//! mirror pipeline.
+//! End-to-end coverage for the S3 Phase B zone setup → identity role
+//! intent pipeline.
 //!
-//! Contract: after a JoinZone RPC lands and the ConfChange commits on
-//! the joiner side, the driver's apply callback (installed by
-//! `ZoneRaftRegistry::set_identity_dir`) must have persisted the
-//! zone's membership into `identity.json` — the durable snapshot that
-//! powers the "wipe `data_dir`, keep identity → daemon auto-rejoins"
-//! promise.
+//! Contract: setting a zone up on a node whose registry has an identity
+//! directory (`ZoneRaftRegistry::set_identity_dir`) records the zone and
+//! the role the node asked for in `identity.json` — the durable intent
+//! that powers the "wipe `data_dir`, keep identity → daemon auto-rejoins"
+//! promise.  Member addresses are replicated zone state, never part of it.
 //!
 //! The scenarios below exercise:
 //!
-//! 1. Owner + joiner-as-learner converge → joiner's identity.json
-//!    carries a `zones` entry with the sharedzone id + this node's
-//!    role (Learner).  Members list reflects `voters ∪ learners`
-//!    projected through the peer map.
+//! 1. Owner + joiner-as-learner → joiner's identity.json carries a
+//!    `zones` entry with the sharedzone id + the Learner intent.
 //!
 //! 2. A subsequent `plan_boot_action` fed with the loaded identity
 //!    dispatches `JoinFederationZones { zones: [sharedzone], ... }` —
@@ -68,8 +65,8 @@ async fn make_node(
         None,
     )
     .expect("ZoneManager");
-    // Wire the identity mirror BEFORE registering any zone so the
-    // apply callback is installed at zone-setup time.
+    // Wire the identity directory BEFORE registering any zone so zone
+    // setup records its intent.
     if let Some(id_dir) = identity_dir {
         zm.registry().set_identity_dir(id_dir.to_path_buf());
     }
@@ -79,16 +76,13 @@ async fn make_node(
 async fn wait_for_zone_in_identity(
     identity_dir: &Path,
     zone_id: &str,
-    self_addr: &str,
     deadline_ms: u64,
 ) -> identity::Identity {
     let start = std::time::Instant::now();
     while start.elapsed().as_millis() < deadline_ms as u128 {
         if let Ok(ident) = identity::load(identity_dir) {
-            if let Some(z) = ident.zones.iter().find(|z| z.zone_id == zone_id) {
-                if z.members.iter().any(|m| m == self_addr) {
-                    return ident;
-                }
+            if ident.zones.iter().any(|z| z.zone_id == zone_id) {
+                return ident;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -101,7 +95,7 @@ async fn wait_for_zone_in_identity(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn conf_state_apply_persists_zone_membership_on_joiner() {
+async fn joiner_zone_setup_records_role_intent_that_drives_rejoin() {
     let dir_owner_data = TempDir::new().expect("owner data");
     let dir_joiner_data = TempDir::new().expect("joiner data");
     let dir_joiner_id = TempDir::new().expect("joiner identity");
@@ -112,9 +106,9 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
     write_node_id(dir_owner_data.path(), id_owner);
     write_node_id(dir_joiner_data.path(), id_joiner);
 
-    // Owner: no identity mirror (test focuses on joiner-side apply).
+    // Owner: no identity directory (the test focuses on the joiner).
     let (zm_owner, bind_owner) = make_node(id_owner, dir_owner_data.path(), None).await;
-    // Joiner: identity mirror ON.
+    // Joiner: identity directory set.
     let (zm_joiner, bind_joiner) = make_node(
         id_joiner,
         dir_joiner_data.path(),
@@ -153,18 +147,7 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
     .expect("JoinZone RPC");
     assert!(r.success, "JoinZone must succeed: {:?}", r.error);
 
-    // Wait for the joiner's apply-cb to fire and land on disk.  The
-    // joiner's ConfState apply happens once the leader's snapshot /
-    // append-entries stream commits the ConfChange on the joiner
-    // side.
-    let self_addr_operator = format!("http://{bind_joiner}");
-    let ident = wait_for_zone_in_identity(
-        dir_joiner_id.path(),
-        "sharedzone",
-        &self_addr_operator,
-        3000,
-    )
-    .await;
+    let ident = wait_for_zone_in_identity(dir_joiner_id.path(), "sharedzone", 3000).await;
 
     let zone_entry = ident
         .zones
@@ -176,15 +159,6 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
         IdentityZoneRole::Learner,
         "joiner joined as learner",
     );
-    assert!(
-        zone_entry.members.iter().any(|m| m == &self_addr_operator),
-        "self must appear in the members list; got {:?}",
-        zone_entry.members,
-    );
-    assert!(
-        zone_entry.last_confirmed_unix_secs.is_some(),
-        "apply cb must stamp last_confirmed",
-    );
 
     // Round-trip: feed the loaded identity into plan_boot_action with
     // no CLI peers and no --cluster-init.  Row 4 dispatch
@@ -195,8 +169,9 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
     // "identity survives, data_dir was wiped" — the exact S3 Phase B
     // auto-rejoin promise.  Under Phase G, `has_disk_state=true`
     // would collapse to `Resume` regardless of identity contents.
+    // The joiner's seed (the owner) is what a wiped node rejoins through.
     let boot_cfg = BootConfig {
-        identity_persisted_peers: ident.peers.clone(),
+        identity_persisted_peers: vec![bind_owner.clone()],
         cli_peer_addrs: vec![],
         federation_zones: vec![],
         federation_mounts: BTreeMap::new(),
@@ -213,10 +188,10 @@ async fn conf_state_apply_persists_zone_membership_on_joiner() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_cb_no_op_when_identity_dir_unset() {
-    // If ZoneRaftRegistry has no identity_dir, the callback is never
-    // installed and no identity file materializes.  This is the test
-    // harness / embedded-mode contract.
+async fn zone_setup_records_nothing_when_identity_dir_unset() {
+    // If ZoneRaftRegistry has no identity_dir, zone setup records nothing
+    // and no identity file materializes.  This is the test harness /
+    // embedded-mode contract.
     let dir_owner_data = TempDir::new().expect("owner data");
     let dir_maybe_id = TempDir::new().expect("would-be identity");
 
@@ -232,7 +207,7 @@ async fn apply_cb_no_op_when_identity_dir_unset() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Wait a beat for any apply that might fire.
+    // Wait a beat for anything that might write.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert!(

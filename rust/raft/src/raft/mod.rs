@@ -76,7 +76,7 @@ pub use membership_policy::MembershipPolicy;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use node::MemberRegistration;
 #[cfg(feature = "consensus")]
-pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
+pub use node::{RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 #[cfg(feature = "consensus")]

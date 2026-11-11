@@ -870,8 +870,8 @@ enum Cmd {
     /// Reset this node to a truly-fresh state: remove BOTH the data-dir and the
     /// identity file. A `rm -rf <data-dir>` alone is NOT a fresh node —
     /// `identity.json` (at the platform user-data path unless `--identity-dir`
-    /// overrides) survives a data-dir wipe by design (it carries the peer
-    /// address book + per-zone membership for auto-rejoin), so a data-only wipe
+    /// overrides) survives a data-dir wipe by design (it carries the seed
+    /// addresses + per-zone role intent for auto-rejoin), so a data-only wipe
     /// leaves the node rejoining its OLD cluster with stale identity. Offline:
     /// run with the daemon stopped. Prints what it would remove unless `--yes`.
     Reset {
@@ -967,9 +967,8 @@ enum Cmd {
     ///    swap without transfer).
     /// 2. Operator on any live node runs `nexusd-cluster remove-voter
     ///    <A_host>:<port> sharedzone --target <B_old_node_id>`.
-    /// 3. B's ghost id is dropped from `ConfState`, and the Phase B
-    ///    apply callback mirrors the new membership into
-    ///    `identity.json` on every live node.
+    /// 3. B's ghost id is dropped from `ConfState` and its member-address
+    ///    record is deleted on every live node.
     ///
     /// ### Consequences the operator picks up
     ///
@@ -993,8 +992,8 @@ enum Cmd {
         /// Zone whose ConfState should be pruned.
         zone_id: String,
         /// The stale node id to remove.  Learn it from `nexusd-cluster
-        /// doctor` output, cluster status logs, or `identity.zones`
-        /// members list on a surviving node.
+        /// doctor` output, cluster status logs, or `GetClusterInfo` on a
+        /// surviving node.
         #[arg(long)]
         target: u64,
     },
@@ -1643,19 +1642,18 @@ struct ZoneManagerBundle {
     cli_peer_addrs: Vec<NodeAddress>,
     /// Identity ∪ CLI union re-persisted to `identity.json` at boot.
     /// Two consumers:
-    ///   (a) `ZoneManager`'s transport peer_map seed — reconnect hint
-    ///       that survives `data_dir` wipe (S3 identity contract).
+    ///   (a) `ZoneManager`'s seed addresses — RPC targets that survive a
+    ///       `data_dir` wipe (S3 identity contract).
     ///   (b) split-brain guard around `bootstrap_static` — non-empty
     ///       here + `--cluster-init` set = both-founder
     ///       misconfig, fail loud rather than wedge downstream.
     /// MUST NOT flow into `bootstrap_or_join_zone(peers=)` for root —
     /// see the `cli_peer_addrs` docstring above.
     identity_persisted_peers: Vec<String>,
-    /// Snapshot of `identity.json`'s per-zone membership at boot.
-    /// Populated by the ConfChange apply callback in prior boots.
-    /// Empty on fresh nodes.  Feeds `BootConfig::identity_zones` so
-    /// the S3 Phase B auto-reconnect path knows which zones to
-    /// JoinZone against.
+    /// `identity.json`'s per-zone role intent at boot, recorded when each
+    /// zone was set up on this node.  Empty on fresh nodes.  Feeds
+    /// `BootConfig::identity_zones` so the S3 Phase B auto-reconnect path
+    /// knows which zones to JoinZone against.
     identity_zones: Vec<nexus_raft::identity::IdentityZone>,
 }
 
@@ -1927,10 +1925,9 @@ fn open_zone_manager(
     .map_err(|e| zone_manager_error(common, "ZoneManager::with_node_id", e))?;
 
     // S3 Phase B: hand the identity directory to the zone registry so
-    // every future zone install (both static founder and JoinZone
-    // joiner paths) installs the ConfState apply mirror.  Must happen
-    // BEFORE `bootstrap_or_join_zone` / `bootstrap_static_async` so
-    // the first ConfChange apply is already covered.
+    // every future zone setup (both static founder and JoinZone joiner
+    // paths) records its role intent.  Must happen BEFORE
+    // `bootstrap_or_join_zone` / `bootstrap_static_async`.
     zm.registry().set_identity_dir(identity_dir.clone());
 
     // Return CLI-only cli_peer_addrs (root bootstrap consumer) +
@@ -3013,30 +3010,17 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     );
                 }
             } else {
-                // Phase B row 4: `zones` came from identity.zones.  When CLI
-                // --peers was not passed on this boot the daemon still needs
-                // *some* addresses to send JoinZone against.  Precedence:
-                //   1. CLI --peers (operator override).
-                //   2. identity.peers (union widened at prior boot's persist).
-                //   3. identity.zones[i].members (populated by the apply cb;
-                //      the "wipe took data_dir + peers but the apply cb had
-                //      already stamped the members list before" case).
+                // Phase B row 4: `zones` came from identity.zones.  JoinZone
+                // targets: CLI --peers (operator override), else
+                // identity.peers (union widened at prior boot's persist).
                 let peers_for_join = if !peers.is_empty() {
                     peers
                 } else {
-                    let use_tls = !common.no_tls;
-                    let mut seed = identity_persisted_peers.clone();
-                    if seed.is_empty() {
-                        for z in &identity_zones {
-                            for m in &z.members {
-                                if !seed.iter().any(|s| s == m) {
-                                    seed.push(m.clone());
-                                }
-                            }
-                        }
-                    }
-                    NodeAddress::parse_peer_list_operator(&seed.join(","), use_tls)
-                        .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
+                    NodeAddress::parse_peer_list_operator(
+                        &identity_persisted_peers.join(","),
+                        !common.no_tls,
+                    )
+                    .map_err(|e| anyhow::anyhow!("identity peers reparse: {}", e))?
                 };
                 assert_eq!(
                     as_learner_per_zone.len(),
@@ -3073,9 +3057,9 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // re-derive federation mounts from peers on every boot — the
             // `mount -a` model — idempotently (see
             // `reconcile_federation_from_peers`).  Peer precedence mirrors the
-            // Join branch: CLI --peers → identity.peers → identity.zones[].members.
+            // Join branch: CLI --peers → identity.peers.
             let use_tls = !common.no_tls;
-            let mut seed: Vec<String> = if !cli_peer_addrs.is_empty() {
+            let seed: Vec<String> = if !cli_peer_addrs.is_empty() {
                 cli_peer_addrs
                     .iter()
                     .map(NodeAddress::to_operator_str)
@@ -3083,15 +3067,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             } else {
                 identity_persisted_peers.clone()
             };
-            if seed.is_empty() {
-                for z in &identity_zones {
-                    for m in &z.members {
-                        if !seed.iter().any(|s| s == m) {
-                            seed.push(m.clone());
-                        }
-                    }
-                }
-            }
             let resume_peers = if seed.is_empty() {
                 Vec::new()
             } else {
@@ -3115,8 +3090,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // REJOIN — never re-found a SOLO zone of the same name, which would
             // split-brain against the survivors (raft §4).  Two guards keep this
             // safe: (1) gate on `resume_peers.is_empty()` — if this node knows
-            // ANY peer/member (CLI --peers / identity.peers / identity.zones[]
-            // .members), the zone lives on them, so the
+            // ANY peer (CLI --peers / identity.peers), the zone lives on them,
+            // so the
             // `reconcile_federation_from_peers` call below REJOINS it and we skip
             // founding here; (2) even when peerless, `bootstrap_static` skips any
             // zone already on disk, so a normal restart only re-stages the
@@ -4700,7 +4675,7 @@ async fn run_join(
 /// Handler for `nexusd-cluster reset` — make a truly-fresh node by clearing
 /// BOTH the data-dir and the identity file. The data-dir holds regenerable
 /// raft/metastore state; `identity.json` (at the platform path unless
-/// overridden) carries the peer address book + per-zone membership and SURVIVES
+/// overridden) carries the seed addresses + per-zone role intent and SURVIVES
 /// a data-dir wipe by design — so `rm -rf <data-dir>` alone leaves a node that
 /// auto-rejoins its OLD cluster with stale identity (the phantom-voter deadlock
 /// this change set addresses). Destructive → requires `--yes`.

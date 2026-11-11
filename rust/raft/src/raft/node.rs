@@ -524,18 +524,6 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// [`Self::refresh_registered_routes`]. Ordinary applies never set it.
     #[cfg(all(feature = "grpc", has_protos))]
     routes_stale: bool,
-    /// Optional apply-callback invoked after every successful
-    /// `set_conf_state` in the ConfChange apply path.  Installed by
-    /// `ZoneRegistry` when the coordinator has an `identity_dir` in
-    /// hand.  Wires the ConfState apply → `identity::persist_zone_members`
-    /// flow that powers S3 完全体 Phase B auto-reconnect after
-    /// `data_dir` wipe.  See `docs/federation-architecture.md` § 6.3.1.
-    ///
-    /// Invoked SYNCHRONOUSLY inside the driver actor.  Kept synchronous
-    /// because ConfChanges are rare (join/leave only) and the disk
-    /// write is a bounded ~1-20 ms fsync — cheap relative to the
-    /// downstream cost of a wipe-rejoin operator escalation.
-    conf_state_applied_cb: Option<ConfStateAppliedCb>,
     /// EC replication WAL (shared with handle via Arc).
     /// Used by the transport loop for EC background replication.
     replication_log: Option<Arc<ReplicationLog>>,
@@ -565,17 +553,6 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// this gate. Updated on snapshot create AND on inbound snapshot install.
     last_index_at_snapshot: u64,
 }
-
-/// Callback fired after every successful ConfState apply.  Installed
-/// by [`ZoneConsensusDriver::set_conf_state_applied_cb`].  The callback
-/// receives a reference to the freshly-committed `ConfState` plus this
-/// node's own id (`self.config.id`) so implementations can determine
-/// this node's role (voter iff `cs.voters.contains(&self_id)`).
-///
-/// `zone_id` is captured by the installing closure (one closure per
-/// zone) — the driver does not need to thread zone identity through
-/// its own state, and a single writeback impl can serve many zones.
-pub type ConfStateAppliedCb = Arc<dyn Fn(&ConfState, u64) + Send + Sync + 'static>;
 
 // ---------------------------------------------------------------------------
 // ZoneConsensus (handle) implementation
@@ -876,7 +853,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             dial_uses_tls: false,
             #[cfg(all(feature = "grpc", has_protos))]
             routes_stale: true,
-            conf_state_applied_cb: None,
             replication_log: handle.replication_log.clone(),
             snapshot_threshold: std::env::var("NEXUS_SC_SNAPSHOT_THRESHOLD")
                 .ok()
@@ -1839,15 +1815,6 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.dial_uses_tls = dial_uses_tls;
     }
 
-    /// Install a callback to fire after every ConfState apply.  See
-    /// [`ConfStateAppliedCb`] for the signature contract.  Must be
-    /// called before the transport loop starts — mirrors
-    /// [`Self::set_peer_map`].  Optional: driver runs unchanged when
-    /// no callback is set (test harnesses, embedded mode).
-    pub fn set_conf_state_applied_cb(&mut self, cb: ConfStateAppliedCb) {
-        self.conf_state_applied_cb = Some(cb);
-    }
-
     /// Get the EC replication log (if present).
     /// Used by the transport loop for EC background replication.
     pub fn replication_log(&self) -> Option<&Arc<ReplicationLog>> {
@@ -2570,15 +2537,6 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         ),
                     )?;
 
-                    // S3 Phase B: mirror the fresh ConfState into
-                    // `identity.json` so a subsequent `data_dir` wipe
-                    // can auto-rejoin.  Sync inline — see field
-                    // docstring for the latency budget.  `zone_id` is
-                    // captured by the callback closure.
-                    if let Some(ref cb) = self.conf_state_applied_cb {
-                        cb(&cs, self.config.id);
-                    }
-
                     self.update_cached_status();
 
                     // Notify waiting JoinZone caller (if any)
@@ -2650,11 +2608,6 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         entry.index,
                         &super::member_address::conf_change_commands(&changes, &cc.context),
                     )?;
-
-                    // S3 Phase B: same identity mirror as the V1 arm.
-                    if let Some(ref cb) = self.conf_state_applied_cb {
-                        cb(&cs, self.config.id);
-                    }
 
                     self.update_cached_status();
 

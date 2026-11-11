@@ -232,14 +232,12 @@ pub struct ZoneRaftRegistry {
     /// Operator seed addresses — plain configuration handed to each managed
     /// zone's member-address self-registration as `Propose` targets.
     seeds: RwLock<Vec<NodeAddress>>,
-    /// Optional identity directory for the S3 Phase B ConfState apply
-    /// mirror.  When set, every zone the registry creates or joins
-    /// installs a [`crate::raft::ConfStateAppliedCb`] that mirrors the
-    /// fresh ConfState into `identity.json` via
-    /// [`crate::identity::persist_zone_members`] so a subsequent
-    /// `data_dir` wipe can auto-rejoin without operator sidecar.
-    /// Empty (default) disables the mirror — matches test-harness
-    /// and embedded-mode expectations.  Set once at boot via
+    /// Optional identity directory.  When set, every zone the registry
+    /// sets up records this node's role intent for it in `identity.json`
+    /// via [`crate::identity::persist_zone_intent`], so a subsequent
+    /// `data_dir` wipe can auto-rejoin without an operator sidecar.
+    /// Empty (default) records nothing — matches test-harness and
+    /// embedded-mode expectations.  Set once at boot via
     /// [`Self::set_identity_dir`].
     identity_dir: Arc<RwLock<Option<PathBuf>>>,
     /// The replicated deletion-epoch authority (R12), injected at boot via
@@ -402,10 +400,9 @@ impl ZoneRaftRegistry {
         self.seeds.read().unwrap().clone()
     }
 
-    /// Set the identity directory for the S3 Phase B ConfState apply
-    /// mirror.  Call before any zone is created; already-created zones
-    /// carry a snapshot of the value at their setup time (the callback
-    /// is installed at zone-setup time, not runtime-poked).
+    /// Set the identity directory that zone setup records role intent in.
+    /// Call before any zone is created; zones already set up keep what was
+    /// recorded for them.
     pub fn set_identity_dir(&self, dir: PathBuf) {
         *self.identity_dir.write().unwrap() = Some(dir);
     }
@@ -866,9 +863,9 @@ impl ZoneRaftRegistry {
         mut config: RaftConfig,
         runtime_handle: &tokio::runtime::Handle,
         // This node's DURABLE role intent for the zone (voter/learner as
-        // declared at join). Persisted once here as the SSOT for "what role
-        // do I want"; the apply cb persists only the members list, never the
-        // ephemeral achieved role. See `identity::persist_zone_intent`.
+        // declared at join). Persisted here as the SSOT for "what role do I
+        // want"; the achieved role is ConfState-derived and never
+        // persisted. See `identity::persist_zone_intent`.
         intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
         let node_id = config.id;
@@ -1068,18 +1065,9 @@ impl ZoneRaftRegistry {
 
         driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
 
-        // S3 Phase B: install ConfState apply mirror if the coordinator
-        // has an identity_dir in scope.  Callback captures zone_id +
-        // identity_dir + shared_peers (for u64 → NodeAddress lookup) +
-        // this zone's node ID (for self-address inclusion when peer_map has
-        // not yet learned it).  Emits `persist_zone_members` calls that
-        // survive `data_dir` wipes and drive the joiner auto-reconnect
-        // path in [`crate::bootstrap`].
+        // Record the DURABLE role intent — the SSOT for "what role do I
+        // want" that boot reads to reissue JoinZone after a data-dir wipe.
         if let Some(id_dir) = self.identity_dir() {
-            // Record the DURABLE role intent ONCE, up front — the SSOT for
-            // "what role do I want" that boot reads to reissue JoinZone.
-            // The apply cb below persists ONLY the members address book and
-            // never the (ephemeral, ConfState-derived) achieved role.
             match crate::identity::load(&id_dir) {
                 Ok(existing) => {
                     if let Err(e) = crate::identity::persist_zone_intent(
@@ -1101,60 +1089,6 @@ impl ZoneRaftRegistry {
                     "identity load failed before intent persist — setup continues",
                 ),
             }
-
-            let zone_id_owned = zone_id.to_string();
-            let peers_for_cb = shared_peers.clone();
-            let self_addr_for_cb = self.self_address();
-            let self_node_id_for_cb = node_id;
-            let cb: crate::raft::ConfStateAppliedCb =
-                Arc::new(move |cs: &raft::eraftpb::ConfState, _self_id: u64| {
-                    let all_ids: Vec<u64> = cs
-                        .voters
-                        .iter()
-                        .chain(cs.learners.iter())
-                        .copied()
-                        .collect();
-                    let members: Vec<String> = {
-                        let peers = peers_for_cb.read().unwrap();
-                        all_ids
-                            .iter()
-                            .filter_map(|id| {
-                                if *id == self_node_id_for_cb {
-                                    // peer_map does not carry self —
-                                    // fill in from the registry.
-                                    (!self_addr_for_cb.is_empty()).then(|| self_addr_for_cb.clone())
-                                } else {
-                                    peers.route(*id).map(NodeAddress::to_operator_str)
-                                }
-                            })
-                            .collect()
-                    };
-                    // Members only — the durable address book. The role
-                    // intent is owned by `persist_zone_intent` above and is
-                    // NOT overwritten with the achieved ConfState role here.
-                    match crate::identity::load(&id_dir) {
-                        Ok(existing) => {
-                            if let Err(e) = crate::identity::persist_zone_members(
-                                &id_dir,
-                                &existing,
-                                &zone_id_owned,
-                                members,
-                            ) {
-                                tracing::warn!(
-                                    zone = %zone_id_owned,
-                                    error = %e,
-                                    "identity persist_zone_members failed — apply continues",
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            zone = %zone_id_owned,
-                            error = %e,
-                            "identity load failed inside apply callback — apply continues",
-                        ),
-                    }
-                });
-            driver.set_conf_state_applied_cb(cb);
         }
 
         let client_config = ClientConfig {
