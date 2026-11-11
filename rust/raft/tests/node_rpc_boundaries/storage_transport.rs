@@ -53,6 +53,16 @@ async fn versioned_step_retains_sender_identity_and_storage_activation_gates() {
         matches!(error, TransportError::Status(ref status) if status.code() == tonic::Code::PermissionDenied)
     );
     assert!(server.registry.get_node("unopened").is_none());
+    client
+        .step_storage_v1(message(2, 7), "unopened".into(), "127.0.0.1:19998".into())
+        .await
+        .unwrap();
+    assert!(server.registry.get_node("unopened").is_some());
+    assert!(server
+        .registry
+        .get_peers("unopened")
+        .unwrap()
+        .contains_key(&2));
     assert!(!server.registry.get_peers("root").unwrap().contains_key(&9));
 
     let node = server.registry.get_node("root").unwrap();

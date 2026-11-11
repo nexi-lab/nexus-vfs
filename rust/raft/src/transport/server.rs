@@ -607,6 +607,35 @@ async fn apply_ec_entry(
 }
 
 impl ZoneTransportServiceImpl {
+    // Zone creation is synchronous setup. Keep its allocations and error paths
+    // outside the future polled for every Raft message on both wire versions.
+    #[cold]
+    #[inline(never)]
+    fn join_step_zone(
+        &self,
+        zone_id: &str,
+    ) -> std::result::Result<ZoneConsensus<FullStateMachine>, Status> {
+        if !self.registry.permits_automatic_zone_join() {
+            return Err(Status::not_found("zone is not admitted on this runtime"));
+        }
+        if self.registry.is_auto_join_suppressed(zone_id) {
+            return Err(Status::not_found(format!(
+                "zone '{zone_id}' was recently removed on this node"
+            )));
+        }
+        let root_peers = self
+            .registry
+            .get_peers(contracts::ROOT_ZONE_ID)
+            .ok_or_else(|| Status::not_found(format!("zone '{zone_id}' not found on this node")))?;
+        // The transport authenticates the sender. The peer map supplies current
+        // addresses; the registry applies zone admission and membership rules.
+        let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
+        let handle = tokio::runtime::Handle::current();
+        self.registry
+            .join_zone(zone_id, peers, false, &handle)
+            .map_err(|e| Status::internal(format!("failed to auto-join zone '{zone_id}': {e}")))
+    }
+
     async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
@@ -624,42 +653,7 @@ impl ZoneTransportServiceImpl {
         let req = request.into_inner();
         let node = match self.registry.get_node(&req.zone_id) {
             Some(n) => n,
-            None => {
-                if !self.registry.permits_automatic_zone_join() {
-                    return Err(Status::not_found("zone is not admitted on this runtime"));
-                }
-                if self.registry.is_auto_join_suppressed(&req.zone_id) {
-                    return Err(Status::not_found(format!(
-                        "zone '{}' was recently removed on this node",
-                        req.zone_id
-                    )));
-                }
-                let root_peers = self
-                    .registry
-                    .get_peers(contracts::ROOT_ZONE_ID)
-                    .ok_or_else(|| {
-                        Status::not_found(format!("zone '{}' not found on this node", req.zone_id))
-                    })?;
-                // Auto-join membership is gated by the transport
-                // layer's mTLS (when enabled).  Sender address is
-                // learned from `req.sender_address` after the
-                // join — under the opaque-ID contract the
-                // peer-map is the runtime SSOT (populated by inbound
-                // StepMessage), so a static "is sender in root
-                // peer-map" check was self-defeating: it rejected
-                // legit fresh joiners whose addresses had not yet
-                // been learned.
-                let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
-                let handle = tokio::runtime::Handle::current();
-                self.registry
-                    .join_zone(&req.zone_id, peers, false, &handle)
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "failed to auto-join zone '{}': {}",
-                            req.zone_id, e
-                        ))
-                    })?
-            }
+            None => self.join_step_zone(&req.zone_id)?,
         };
 
         // Learn the connected peer's address before stepping. Relayed requests
