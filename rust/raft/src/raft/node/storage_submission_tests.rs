@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use tempfile::TempDir;
 
 mod activation;
+mod reader_preparation;
 
 fn node(
     policy: MembershipPolicy,

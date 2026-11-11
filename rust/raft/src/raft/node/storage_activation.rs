@@ -41,6 +41,14 @@ pub struct StorageSubmission {
 }
 
 impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
+    pub(super) fn prepare_replica_control_reader(&self) -> Result<()> {
+        self.config.membership_policy.require_managed()?;
+        if self.failed {
+            return Err(RaftError::InvalidState("Raft driver has failed".into()));
+        }
+        self.raw_node.store().prepare_replica_control_reader()
+    }
+
     pub(super) fn storage_activation_view(&self) -> Result<StorageActivationView> {
         self.config.membership_policy.require_managed()?;
         if self.failed {

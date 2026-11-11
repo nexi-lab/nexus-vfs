@@ -29,6 +29,15 @@ service ZoneTransportService {
   // committed protocol activation are checked independently by the receiver.
   rpc StepStorageV1(StepMessageRequest) returns (StepMessageResponse);
 
+  // Persist the local Raft reader floor for replica-control preparation on an
+  // already hosted Managed zone. Only an authenticated cluster Node may call
+  // this method. Success follows the owning driver's durable transaction on
+  // full nodes, learners and witnesses. Retrying this request is idempotent;
+  // an uncertain response preserves the original zone and destination.
+  // Replicated activation and membership qualification are separate operations.
+  rpc PrepareReplicaControlReaderV1(PrepareReplicaControlReaderRequest)
+      returns (PrepareReplicaControlReaderResponse);
+
   // ReplicateEntries sends EC (eventually consistent) entries to a peer.
   // This is NOT Raft consensus — EC writes bypass Raft and use async replication.
   // Used by the background replication loop (Phase C) for peer data sync.
@@ -235,6 +244,11 @@ service ZoneApiService {
   // LOCAL control-zone replica (a read). Same node-cert gate.
   rpc ListForeignCas(ListForeignCasRequest) returns (ListForeignCasResponse);
 }
+
+message PrepareReplicaControlReaderRequest {
+  string zone_id = 1;
+}
+message PrepareReplicaControlReaderResponse {}
 
 message AgentCsrCapabilitiesRequest {}
 message AgentCsrCapabilitiesResponse {

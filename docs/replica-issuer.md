@@ -58,6 +58,19 @@ holds the log boundary and its reader dialect together. This covers witnesses,
 whose business state machine stores no control records. Compaction and snapshot
 installation preserve that local format; earlier readers refuse it at Raft
 startup. Ordinary stores retain the original eight-byte index representation.
+The owning Raft driver serializes local preparation with its message handling
+and acknowledges it after the storage transaction commits. Followers, learners
+and witnesses prepare the same local reader format without becoming leaders.
+Retries preserve that format after a lost response. A stopped driver refuses
+preparation through its closed request channel.
+`PrepareReplicaControlReaderV1` carries this operation between authenticated
+cluster Nodes for an already hosted zone. The client pins the destination's
+Node role and ID throughout TLS reconnects; the server authenticates the caller
+before resolving the zone. The connection pool includes that role in its cache
+key. Ordinary Agent credentials, owner replicas and plaintext listeners carry
+their existing data-plane roles rather than storage-format control authority.
+The response acknowledges the original local preparation; member-set validation
+and the versioned replication exchange remain part of activation qualification.
 This durable local format upgrade and the replicated activation fact have
 separate purposes: the former defines which program can open the files, while
 the latter enables commands for the zone after authenticated member checks.

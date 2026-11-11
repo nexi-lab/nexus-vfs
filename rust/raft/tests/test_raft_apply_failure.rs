@@ -12,6 +12,7 @@ use nexus_raft::{
 };
 use raft::{eraftpb::Entry, Storage};
 use std::{
+    future::Future,
     path::Path,
     sync::{atomic::AtomicU64, Arc, RwLock},
     time::Duration,
@@ -97,6 +98,12 @@ async fn failed_apply_keeps_the_committed_suffix_for_cold_replay() {
         let caller = node.clone();
         let later = tokio::spawn(async move { caller.propose(write("/later")).await });
         assert!(driver.recv_and_handle().await);
+        let mut preparation = Box::pin(node.prepare_replica_control_reader());
+        std::future::poll_fn(|cx| {
+            assert!(preparation.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         let error = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match driver.advance().await {
@@ -126,6 +133,21 @@ async fn failed_apply_keeps_the_committed_suffix_for_cold_replay() {
         .await
         .expect("failed driver retained a linearizable read")
         .is_err());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), preparation)
+                .await
+                .expect("failed driver retained queued reader preparation"),
+            Err(RaftError::ChannelClosed)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                node.prepare_replica_control_reader()
+            )
+            .await
+            .expect("failed driver retained reader preparation"),
+            Err(RaftError::ChannelClosed)
+        ));
         assert!(node
             .with_state_machine(|s| s.inner.get_metadata("/later").unwrap())
             .await
@@ -133,6 +155,7 @@ async fn failed_apply_keeps_the_committed_suffix_for_cold_replay() {
     }
     {
         let storage = RaftStorage::open(directory.path().join("raft")).unwrap();
+        assert!(!storage.replica_control_reader_required().unwrap());
         let commit = storage.initial_state_impl().unwrap().hard_state.commit;
         assert!(
             commit >= before + 2,

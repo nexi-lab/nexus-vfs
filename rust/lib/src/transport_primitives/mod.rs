@@ -27,7 +27,9 @@ mod server_limits;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
-pub use channel::{create_channel, create_peer_channel, ensure_crypto_provider};
+pub use channel::{
+    create_channel, create_node_channel, create_peer_channel, ensure_crypto_provider,
+};
 pub use config::{ClientConfig, ServerConfig, TlsConfig};
 pub use crl::{
     ca_spki_sha256, canonical_certificate_serial, verify_signed_crl, VerifiedCrl,

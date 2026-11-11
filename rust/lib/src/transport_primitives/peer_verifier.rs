@@ -14,12 +14,26 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 #[derive(Debug)]
 pub(super) struct PeerVerifier {
-    expected: NonZeroU64,
+    expected: ExpectedPeer,
     chain: Arc<WebPkiServerVerifier>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ExpectedPeer {
+    Replication(NonZeroU64),
+    Node(NonZeroU64),
+}
+
+impl ExpectedPeer {
+    fn id(self) -> NonZeroU64 {
+        match self {
+            Self::Replication(id) | Self::Node(id) => id,
+        }
+    }
+}
+
 impl PeerVerifier {
-    pub(super) fn new(ca: &[u8], expected: NonZeroU64) -> Result<Arc<Self>, String> {
+    pub(super) fn new(ca: &[u8], expected: ExpectedPeer) -> Result<Arc<Self>, String> {
         let mut roots = RootCertStore::empty();
         let certificates = pem::parse_many(ca).map_err(|error| error.to_string())?;
         if certificates.is_empty() {
@@ -45,17 +59,22 @@ impl PeerVerifier {
             return Err("trailing bytes in peer certificate".into());
         }
         let (node, name) = match super::replica_node_id_from_x509(&leaf)? {
-            Some(node) => (
-                node,
-                super::user_runtime_name_from_x509(&leaf)?
-                    .ok_or("replica requires owner runtime server capability")?,
-            ),
+            Some(node) => {
+                if matches!(self.expected, ExpectedPeer::Node(_)) {
+                    return Err("server certificate must name a cluster Node".into());
+                }
+                (
+                    node,
+                    super::user_runtime_name_from_x509(&leaf)?
+                        .ok_or("replica requires owner runtime server capability")?,
+                )
+            }
             None => (
                 super::node_identity_from_x509(&leaf)?.1,
                 super::TlsConfig::CLUSTER_SERVER_NAME.to_owned(),
             ),
         };
-        if node != self.expected.get() {
+        if node != self.expected.id().get() {
             return Err("server certificate does not name the expected replication peer".into());
         }
         ServerName::try_from(name).map_err(|error| error.to_string())
