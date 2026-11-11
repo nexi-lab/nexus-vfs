@@ -86,9 +86,7 @@ async fn discover_zones_returns_dt_mount_entries_from_root_state_machine() {
     let (zm, bind) = make_node(id, dir.path()).await;
 
     // Bootstrap root as 1-voter SOLO.
-    let root_handle = zm
-        .create_zone("root", vec![format!("{id}@{bind}")])
-        .expect("create root");
+    let root_handle = zm.create_zone("root").expect("create root");
     for _ in 0..100 {
         if root_handle.is_leader() {
             break;
@@ -102,7 +100,6 @@ async fn discover_zones_returns_dt_mount_entries_from_root_state_machine() {
     mounts.insert("/corp/eng".to_string(), MountDecl::whole_zone("corp-eng"));
     zm.bootstrap_static_async(
         vec!["sharedzone".to_string(), "corp-eng".to_string()],
-        vec![format!("{id}@{bind}")],
         mounts.clone(),
     )
     .await
@@ -160,9 +157,7 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
     write_node_id(dir.path(), id);
     let (zm, bind) = make_node(id, dir.path()).await;
 
-    let root_handle = zm
-        .create_zone("root", vec![format!("{id}@{bind}")])
-        .expect("create root");
+    let root_handle = zm.create_zone("root").expect("create root");
     for _ in 0..100 {
         if root_handle.is_leader() {
             break;
@@ -174,13 +169,9 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
     // Install a first federation zone + mount via bootstrap_static.
     let mut initial = BTreeMap::new();
     initial.insert("/shared".to_string(), MountDecl::whole_zone("sharedzone"));
-    zm.bootstrap_static_async(
-        vec!["sharedzone".to_string()],
-        vec![format!("{id}@{bind}")],
-        initial.clone(),
-    )
-    .await
-    .expect("bootstrap_static_async");
+    zm.bootstrap_static_async(vec!["sharedzone".to_string()], initial.clone())
+        .await
+        .expect("bootstrap_static_async");
     drive_apply_topology_to_convergence(&zm, "root").await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -202,9 +193,7 @@ async fn discover_zones_picks_up_dt_mount_entries_added_at_runtime() {
     // `nexusd-cluster share --mount-at`).  Create the zone, then
     // mount it under root — the same code path `share_subtree_core`
     // triggers.
-    let extra_handle = zm
-        .create_zone("corp-eng", vec![format!("{id}@{bind}")])
-        .expect("create corp-eng");
+    let extra_handle = zm.create_zone("corp-eng").expect("create corp-eng");
     for _ in 0..100 {
         if extra_handle.is_leader() {
             break;

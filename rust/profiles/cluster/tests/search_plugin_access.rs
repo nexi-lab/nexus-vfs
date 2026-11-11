@@ -98,7 +98,7 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
 
     let registry = ZoneRaftRegistry::new(tmp.path().join("raft"), 1);
     let runtime = tokio::runtime::Handle::current();
-    let node = registry.create_zone("root", vec![], &runtime).unwrap();
+    let node = registry.create_zone("root", &runtime).unwrap();
     node.campaign().await.unwrap();
     let keys = RaftAuthKeyStore::new_arc(node.clone(), runtime.clone());
     let tuples = Arc::new(RaftReBACTupleStore::new(node, runtime));

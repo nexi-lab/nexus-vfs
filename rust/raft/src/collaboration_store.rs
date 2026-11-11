@@ -120,7 +120,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let node = registry
-            .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+            .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
             .unwrap();
         node.campaign().await.unwrap();
         ready(&node).await;
@@ -161,7 +161,7 @@ mod tests {
 
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let node = registry
-            .open_persisted_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+            .open_persisted_zone(contracts::CONTROL_ZONE_ID, &runtime)
             .unwrap();
         node.campaign().await.unwrap();
         ready(&node).await;

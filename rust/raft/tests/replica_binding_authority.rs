@@ -26,9 +26,7 @@ struct LocalAuthority {
 impl LocalAuthority {
     fn open(dir: &std::path::Path) -> Self {
         let manager = ZoneManager::isolated(dir.to_str().unwrap()).unwrap();
-        let root = manager
-            .create_zone(contracts::ROOT_ZONE_ID, vec![])
-            .unwrap();
+        let root = manager.create_zone(contracts::ROOT_ZONE_ID).unwrap();
         assert!(root.wait_for_leader(std::time::Duration::from_secs(5)));
         let node = root.consensus_node();
         let runtime = manager.runtime_handle();
@@ -348,7 +346,7 @@ async fn managed_control_refuses_before_unactivated_command_enters_the_log() {
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(dir.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

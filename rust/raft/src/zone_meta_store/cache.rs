@@ -111,7 +111,7 @@ mod tests {
     fn dropped_mount_releases_its_cache_while_the_zone_actor_stays_live() {
         let directory = tempfile::tempdir().unwrap();
         let manager = crate::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
-        let zone = manager.create_zone("root", vec![]).unwrap();
+        let zone = manager.create_zone("root").unwrap();
         let observers = zone.consensus_node().apply_observers_slot().unwrap();
         let baseline = observers.read().len();
         for index in 0..64 {
@@ -136,7 +136,7 @@ mod tests {
     fn deferred_mount_shares_one_subscription_across_concurrent_first_reads() {
         let directory = tempfile::tempdir().unwrap();
         let manager = crate::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
-        let zone = manager.create_zone("root", vec![]).unwrap();
+        let zone = manager.create_zone("root").unwrap();
         let observers = zone.consensus_node().apply_observers_slot().unwrap();
         let baseline = observers.read().len();
         let store = super::super::ZoneMetaStore::deferred_arc(

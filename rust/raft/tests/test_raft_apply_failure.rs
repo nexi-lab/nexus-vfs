@@ -161,7 +161,7 @@ async fn transport_loop_terminates_and_releases_requests_after_apply_failure() {
     let directory = tempfile::tempdir().unwrap();
     let (node, mut driver) = open(directory.path(), true);
     ready(&node, &mut driver).await;
-    let peers = Arc::new(RwLock::new(PeerMap::with_peers(1, Default::default())));
+    let peers = Arc::new(RwLock::new(PeerMap::new(1)));
     let transport = TransportLoop::new(driver, peers, RaftClientPool::new());
     let (_shutdown, receiver) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(transport.run(receiver));

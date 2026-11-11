@@ -1,0 +1,448 @@
+//! The member-address record: the one place that builds, decodes and
+//! interprets the control-store entry mapping a zone member's Raft node id to
+//! its dial address. See `docs/member-address.md`.
+//!
+//! Key = the member's node id in decimal. Value = its bare advertise
+//! authority (`host:port`) in the operator-address parser's canonical form.
+//! The `http`/`https` scheme is never stored: each reader derives its dial
+//! endpoint from its own TLS posture.
+
+use super::Command;
+
+pub(crate) use contracts::constants::CONTROL_NS_MEMBER_ADDRESS as NAMESPACE;
+
+/// The record key for `node_id`.
+#[cfg(feature = "consensus")]
+pub(crate) fn key(node_id: u64) -> String {
+    node_id.to_string()
+}
+
+/// Decode one stored record. Only a canonical non-zero decimal key and a UTF-8
+/// value form a record.
+pub(crate) fn decode(key: &str, value: &[u8]) -> Option<(u64, String)> {
+    let node_id: u64 = key.parse().ok()?;
+    if node_id == 0 || node_id.to_string() != key {
+        return None;
+    }
+    let address = std::str::from_utf8(value).ok()?;
+    Some((node_id, address.to_string()))
+}
+
+/// The canonical bare `host:port` form of `address` (a scheme prefix is
+/// accepted and dropped), or `None` when it is not a dial address. A build
+/// without the network transport has no dial addresses.
+#[cfg(feature = "consensus")]
+pub(crate) fn canonical(address: &str) -> Option<String> {
+    #[cfg(feature = "grpc")]
+    {
+        lib::transport_primitives::PeerAddress::parse_operator_addr(address, false)
+            .ok()
+            .map(|parsed| parsed.to_operator_str())
+    }
+    #[cfg(not(feature = "grpc"))]
+    {
+        let _ = address;
+        None
+    }
+}
+
+/// Record `address` for `node_id`, or `None` when `address` is not a dial
+/// address.
+#[cfg(feature = "consensus")]
+pub(crate) fn put(node_id: u64, address: &str) -> Option<Command> {
+    Some(Command::PutControlState {
+        namespace: NAMESPACE.to_string(),
+        key: key(node_id),
+        value: canonical(address)?.into_bytes(),
+        if_absent: false,
+    })
+}
+
+/// Remove `node_id`'s record.
+#[cfg(feature = "consensus")]
+pub(crate) fn delete(node_id: u64) -> Command {
+    Command::DeleteControlState {
+        namespace: NAMESPACE.to_string(),
+        key: key(node_id),
+    }
+}
+
+/// The address effect of one committed membership entry: a put for each add
+/// whose `context` names a dial address, a delete for each removal, in change
+/// order. A `ConfChangeV2` carries one shared `context`, which names the
+/// address of its single add; with several adds it names none. The result is
+/// a function of the entry bytes alone, so every replica derives the same
+/// records.
+#[cfg(feature = "consensus")]
+pub(crate) fn conf_change_commands(
+    changes: &[(raft::eraftpb::ConfChangeType, u64)],
+    context: &[u8],
+) -> Vec<Command> {
+    use raft::eraftpb::ConfChangeType;
+    let adds = changes
+        .iter()
+        .filter(|(change_type, _)| *change_type != ConfChangeType::RemoveNode)
+        .count();
+    let address = if adds == 1 {
+        std::str::from_utf8(context).ok()
+    } else {
+        None
+    };
+    changes
+        .iter()
+        .filter_map(|&(change_type, node_id)| match change_type {
+            ConfChangeType::RemoveNode => Some(delete(node_id)),
+            ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => put(node_id, address?),
+        })
+        .collect()
+}
+
+/// Whether `command` writes a member-address record. Such a command changes
+/// state only as a committed Raft entry: the consistency classifier refuses it
+/// on the EC and local write paths, and an applied batch that contains one
+/// refreshes the derived peer map.
+pub(crate) fn is_record_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::PutControlState { namespace, .. } | Command::DeleteControlState { namespace, .. }
+            if namespace == NAMESPACE
+    )
+}
+
+/// The `(node_id, address)` a member-address put records, when its key and
+/// value are both canonical; `None` for any other command.
+#[cfg(feature = "grpc")]
+pub(crate) fn registration(command: &Command) -> Option<(u64, &str)> {
+    let Command::PutControlState {
+        namespace,
+        key,
+        value,
+        ..
+    } = command
+    else {
+        return None;
+    };
+    if namespace != NAMESPACE {
+        return None;
+    }
+    let address = std::str::from_utf8(value).ok()?;
+    let (node_id, _) = decode(key, value)?;
+    (canonical(address).as_deref() == Some(address)).then_some((node_id, address))
+}
+
+/// Admission of a member-address command arriving on the `Propose` RPC.
+///
+/// A delete is refused: RemoveNode is its only source. A put must carry a
+/// canonical record. An original (`forwarded=false`) request from an
+/// authenticated `caller` registers only that caller's own address, and only
+/// while the caller is a member of the zone; a forwarded request is a node
+/// relaying one it admitted.
+#[cfg(feature = "grpc")]
+pub(crate) fn admit_rpc(
+    command: &Command,
+    forwarded: bool,
+    caller: Option<u64>,
+    is_member: impl FnOnce(u64) -> bool,
+) -> Result<(), &'static str> {
+    if !is_record_command(command) {
+        return Ok(());
+    }
+    let Some((node_id, _)) = registration(command) else {
+        return Err(match command {
+            Command::DeleteControlState { .. } => {
+                "member-address records are removed only by a committed RemoveNode"
+            }
+            _ => "member-address put must carry a node id and a canonical host:port",
+        });
+    };
+    match caller {
+        Some(caller) if !forwarded && caller != node_id => {
+            Err("a node registers only its own member address")
+        }
+        Some(caller) if !forwarded && !is_member(caller) => {
+            Err("only a member of the zone registers a member address")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The dial endpoint for a recorded `address`, schemed by the reading node's
+/// TLS posture.
+#[cfg(feature = "grpc")]
+pub(crate) fn endpoint(
+    node_id: u64,
+    address: &str,
+    use_tls: bool,
+) -> Option<lib::transport_primitives::NodeAddress> {
+    let mut parsed =
+        lib::transport_primitives::PeerAddress::parse_operator_addr(address, use_tls).ok()?;
+    parsed.id = node_id;
+    Some(parsed)
+}
+
+#[cfg(all(test, feature = "grpc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_stores_the_canonical_bare_authority() {
+        for given in [
+            "10.0.0.2:2126",
+            "http://10.0.0.2:2126",
+            "https://10.0.0.2:2126",
+        ] {
+            let Some(Command::PutControlState {
+                namespace,
+                key,
+                value,
+                if_absent,
+            }) = put(42, given)
+            else {
+                panic!("{given} is a dial address");
+            };
+            assert_eq!(namespace, NAMESPACE);
+            assert_eq!(key, "42");
+            assert_eq!(value, b"10.0.0.2:2126");
+            assert!(
+                !if_absent,
+                "a member's address is replaced, never CAS-gated"
+            );
+        }
+        assert_eq!(canonical("[::1]:2126").as_deref(), Some("[::1]:2126"));
+    }
+
+    #[test]
+    fn put_refuses_what_is_not_a_dial_address() {
+        for given in [
+            "",
+            "nexus-2",
+            "nexus-2:0",
+            "7@nexus-2:2126",
+            "::1:2126",
+            "\u{0}",
+        ] {
+            assert!(
+                put(42, given).is_none(),
+                "{given:?} must not become a record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_membership_entry_names_the_address_of_its_single_add() {
+        use raft::eraftpb::ConfChangeType::{AddLearnerNode, AddNode, RemoveNode};
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(AddLearnerNode, 2)], b"https://nexus-2:2126")
+            ),
+            format!("{:?}", vec![put(2, "nexus-2:2126").unwrap()])
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(AddNode, 2)], b"nexus-2:2126")
+            ),
+            format!("{:?}", vec![put(2, "nexus-2:2126").unwrap()])
+        );
+        assert_eq!(
+            format!("{:?}", conf_change_commands(&[(RemoveNode, 2)], b"")),
+            format!("{:?}", vec![delete(2)])
+        );
+        // An empty or unparsable context writes nothing.
+        assert!(conf_change_commands(&[(AddNode, 2)], b"").is_empty());
+        assert!(conf_change_commands(&[(AddNode, 2)], b"nexus-2").is_empty());
+        assert!(conf_change_commands(&[(AddNode, 2)], &[0xff]).is_empty());
+        // A shared V2 context cannot name several adds.
+        assert!(
+            conf_change_commands(&[(AddLearnerNode, 2), (AddLearnerNode, 3)], b"nexus-2:2126")
+                .is_empty()
+        );
+        // Removals keep their effect beside a single add.
+        assert_eq!(
+            format!(
+                "{:?}",
+                conf_change_commands(&[(RemoveNode, 3), (AddNode, 2)], b"nexus-2:2126")
+            ),
+            format!("{:?}", vec![delete(3), put(2, "nexus-2:2126").unwrap()])
+        );
+    }
+
+    #[test]
+    fn the_propose_rpc_admits_only_a_members_own_registration() {
+        let own = put(7, "nexus-7:9000").unwrap();
+        let member = |id| id == 7 || id == 8;
+        assert_eq!(admit_rpc(&own, false, Some(7), member), Ok(()));
+        assert!(
+            admit_rpc(&own, false, Some(8), member).is_err(),
+            "a node cannot register another node's address"
+        );
+        assert!(
+            admit_rpc(&own, false, Some(7), |_| false).is_err(),
+            "a non-member cannot register"
+        );
+        assert_eq!(
+            admit_rpc(&own, true, Some(8), member),
+            Ok(()),
+            "a node relays a registration it admitted"
+        );
+        assert_eq!(
+            admit_rpc(&own, false, None, member),
+            Ok(()),
+            "a plaintext listener has no caller identity to compare"
+        );
+        for forwarded in [false, true] {
+            assert!(admit_rpc(&delete(7), forwarded, Some(7), member).is_err());
+            assert!(admit_rpc(&delete(7), forwarded, None, member).is_err());
+        }
+        let malformed = Command::PutControlState {
+            namespace: NAMESPACE.into(),
+            key: "7".into(),
+            value: b"https://nexus-7:9000".to_vec(),
+            if_absent: false,
+        };
+        assert!(admit_rpc(&malformed, true, Some(7), member).is_err());
+        let other_namespace = Command::DeleteControlState {
+            namespace: contracts::CONTROL_NS_AUTH.into(),
+            key: "7".into(),
+        };
+        assert_eq!(admit_rpc(&other_namespace, false, Some(8), member), Ok(()));
+        assert_eq!(admit_rpc(&Command::Noop, false, Some(8), member), Ok(()));
+        assert_eq!(registration(&own), Some((7, "nexus-7:9000")));
+        assert_eq!(registration(&malformed), None);
+    }
+
+    #[test]
+    fn decode_accepts_only_canonical_keys() {
+        assert_eq!(
+            decode("42", b"nexus-2:2126"),
+            Some((42, "nexus-2:2126".to_string()))
+        );
+        for key in ["0", "042", "+42", "-1", "x", "", "18446744073709551616"] {
+            assert_eq!(decode(key, b"nexus-2:2126"), None, "{key:?}");
+        }
+        assert_eq!(decode("42", &[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn records_round_trip_through_the_command_pair() {
+        let Some(Command::PutControlState { key, value, .. }) = put(7, "nexus-7:9000") else {
+            unreachable!()
+        };
+        assert_eq!(decode(&key, &value), Some((7, "nexus-7:9000".to_string())));
+        assert!(is_record_command(&put(7, "nexus-7:9000").unwrap()));
+        assert!(is_record_command(&delete(7)));
+        assert!(!is_record_command(&Command::PutControlState {
+            namespace: contracts::CONTROL_NS_AUTH.into(),
+            key: "7".into(),
+            value: b"nexus-7:9000".to_vec(),
+            if_absent: false,
+        }));
+        assert!(!is_record_command(&Command::Noop));
+    }
+
+    fn state_machine() -> crate::raft::FullStateMachine {
+        let store = crate::storage::RedbStore::open_temporary().unwrap();
+        crate::raft::FullStateMachine::new(&store).unwrap()
+    }
+
+    #[test]
+    fn committed_puts_and_deletes_are_the_records_and_survive_a_snapshot() {
+        use crate::raft::StateMachine;
+        let mut sm = state_machine();
+        sm.apply(1, &put(7, "nexus-7:9000").unwrap()).unwrap();
+        sm.apply(2, &put(8, "nexus-8:9000").unwrap()).unwrap();
+        sm.apply(3, &put(7, "nexus-7:9100").unwrap()).unwrap();
+        sm.apply(4, &delete(8)).unwrap();
+        // A record in another namespace is not a member address.
+        sm.apply(
+            5,
+            &Command::PutControlState {
+                namespace: contracts::CONTROL_NS_AUTH.into(),
+                key: "9".into(),
+                value: b"nexus-9:9000".to_vec(),
+                if_absent: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sm.member_addresses().unwrap(),
+            vec![(7, "nexus-7:9100".to_string())]
+        );
+
+        let snapshot = sm.snapshot().unwrap();
+        let mut restored = state_machine();
+        restored.apply(1, &put(99, "stale:1").unwrap()).unwrap();
+        restored.restore_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            restored.member_addresses().unwrap(),
+            vec![(7, "nexus-7:9100".to_string())],
+            "a snapshot install replaces the records with the snapshot's cut"
+        );
+        assert_eq!(restored.last_applied_index(), 5);
+    }
+
+    #[test]
+    fn records_change_only_through_committed_entries() {
+        use crate::raft::StateMachine;
+        let mut sm = state_machine();
+        for command in [put(7, "nexus-7:9000").unwrap(), delete(7)] {
+            assert!(sm.requires_strong_consistency(&command).unwrap());
+            assert!(sm.apply_local(&command).is_err(), "EC origin refuses it");
+            assert!(matches!(
+                sm.apply_ec_with_lww(&command, u64::MAX),
+                Ok(crate::raft::CommandResult::Success)
+            ));
+        }
+        assert!(
+            sm.member_addresses().unwrap().is_empty(),
+            "neither the local nor the peer EC path wrote a record"
+        );
+        let witness = crate::raft::WitnessStateMachineInMemory::new();
+        assert!(witness
+            .requires_strong_consistency(&put(7, "nexus-7:9000").unwrap())
+            .unwrap());
+        assert!(witness.member_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_membership_entry_commits_its_records_with_its_index() {
+        use crate::raft::StateMachine;
+        let mut sm = state_machine();
+        sm.apply_membership(
+            3,
+            &[
+                put(7, "nexus-7:9000").unwrap(),
+                put(8, "nexus-8:9000").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sm.last_applied_index(), 3);
+        assert_eq!(sm.member_addresses().unwrap().len(), 2);
+        // A replayed entry at or below the marker writes nothing.
+        sm.apply_membership(3, &[delete(7)]).unwrap();
+        assert_eq!(sm.member_addresses().unwrap().len(), 2);
+        sm.apply_membership(4, &[delete(7)]).unwrap();
+        assert_eq!(
+            sm.member_addresses().unwrap(),
+            vec![(8, "nexus-8:9000".to_string())]
+        );
+        // An entry with no address effect advances only the marker.
+        sm.apply_membership(5, &[]).unwrap();
+        assert_eq!(sm.last_applied_index(), 5);
+        assert_eq!(sm.member_addresses().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn endpoint_follows_the_reading_nodes_tls_posture() {
+        let plain = endpoint(7, "nexus-7:9000", false).unwrap();
+        assert_eq!(
+            (plain.id, plain.endpoint.as_str()),
+            (7, "http://nexus-7:9000")
+        );
+        let tls = endpoint(7, "nexus-7:9000", true).unwrap();
+        assert_eq!((tls.id, tls.endpoint.as_str()), (7, "https://nexus-7:9000"));
+        assert_eq!(tls.to_operator_str(), "nexus-7:9000");
+        assert!(endpoint(7, "nexus-7", true).is_none());
+    }
+}

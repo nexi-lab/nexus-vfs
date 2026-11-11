@@ -261,6 +261,71 @@ async fn joint_membership_and_leadership_changes_refuse_probe_reuse() {
 }
 
 #[tokio::test]
+async fn empty_v2_joint_exit_keeps_original_view_invalid() {
+    let (handle, mut driver, _dir) = node(MembershipPolicy::Managed);
+    apply_local(&mut driver, handle.campaign()).await.unwrap();
+    let original = apply_local(&mut driver, handle.storage_activation_view())
+        .await
+        .unwrap();
+    let original_configuration = driver.raw_node.raft.prs().conf().to_conf_state();
+    let original_epoch = driver.membership_epoch.unwrap();
+
+    // A redundant voter addition enters joint consensus without changing the
+    // final voter set. The empty V2 then leaves the joint configuration.
+    let mut enter = ConfChangeV2::default();
+    enter.set_transition(ConfChangeTransition::Explicit);
+    let mut existing = ConfChangeSingle::default();
+    existing.set_change_type(ConfChangeType::AddNode);
+    existing.node_id = 1;
+    enter.changes.push(existing);
+    driver.raw_node.propose_conf_change(vec![], enter).unwrap();
+    while driver.has_ready() {
+        let _ = driver.advance().await.unwrap();
+    }
+    assert_eq!(driver.membership_epoch, Some(original_epoch + 1));
+    assert_eq!(
+        driver
+            .raw_node
+            .raft
+            .prs()
+            .conf()
+            .to_conf_state()
+            .voters_outgoing,
+        vec![1]
+    );
+    assert!(driver.storage_activation_view().is_err());
+
+    driver
+        .raw_node
+        .propose_conf_change(vec![], ConfChangeV2::default())
+        .unwrap();
+    while driver.has_ready() {
+        let _ = driver.advance().await.unwrap();
+    }
+    assert_eq!(driver.membership_epoch, Some(original_epoch + 2));
+    assert_eq!(
+        driver.raw_node.raft.prs().conf().to_conf_state(),
+        original_configuration
+    );
+    let fresh = apply_local(&mut driver, handle.storage_activation_view())
+        .await
+        .unwrap();
+    driver.validate_storage_activation_view(&fresh).unwrap();
+    let last = driver.raw_node.raft.raft_log.last_index();
+    let before = handle.state_machine.read().await.snapshot().unwrap();
+    assert!(driver
+        .validate_storage_activation_view(&original)
+        .unwrap_err()
+        .to_string()
+        .contains("configuration changed during qualification"));
+    assert_eq!(driver.raw_node.raft.raft_log.last_index(), last);
+    assert_eq!(
+        handle.state_machine.read().await.snapshot().unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn actor_refuses_wrong_storage_authority_before_allocating_a_log_entry() {
     let (handle, mut driver, _dir) = node(MembershipPolicy::FixedLocal);
     apply_local(&mut driver, handle.campaign()).await.unwrap();

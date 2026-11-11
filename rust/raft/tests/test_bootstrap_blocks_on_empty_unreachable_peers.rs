@@ -120,9 +120,7 @@ async fn test_late_founder_unblocks_waiting_joiner() {
             None,
         )
         .expect("ZoneManager A");
-        let zone = zm
-            .create_zone("root", vec![format!("{id_a}@{bind_a_clone}")])
-            .expect("create root on A");
+        let zone = zm.create_zone("root").expect("create root on A");
         // Self-elect as 1-voter leader.
         for _ in 0..100 {
             if zone.is_leader() {
@@ -140,8 +138,7 @@ async fn test_late_founder_unblocks_waiting_joiner() {
 
     // Local register first (skip_bootstrap=true) so the leader can
     // append-replicate to B once AddNode commits.
-    zm_b.join_zone("root", vec![format!("{id_a}@{bind_a}")], false)
-        .expect("local join_zone on B");
+    zm_b.join_zone("root", false).expect("local join_zone on B");
 
     // Retry JoinZone RPC against A every 100ms for up to 5s.
     let mut joined = false;

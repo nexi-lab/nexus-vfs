@@ -141,9 +141,9 @@ impl ZoneRuntimeBackend {
 
     /// Create a zone — tenant-create admission (full 3–63/charset/edge/
     /// reserved rules), single executor per operation id, physical
-    /// read-back. `ZoneManager::create_zone` is itself idempotent per
-    /// address book, so an operation retried under a NEW operation id
-    /// after a crash mid-flight yields ALREADY_PRESENT, not a second zone.
+    /// read-back. `ZoneManager::create_zone` is itself idempotent, so an
+    /// operation retried under a NEW operation id after a crash mid-flight
+    /// yields ALREADY_PRESENT, not a second zone.
     pub fn zone_create(&self, req: &ZoneCreateRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
@@ -187,7 +187,7 @@ impl ZoneRuntimeBackend {
         // CREATED/ALREADY_PRESENT wording may differ from what a peer would
         // report — the cluster-facts read-back below is the physical truth.
         let existed = self.zm.get_zone(&req.zone_id).is_some();
-        if let Err(e) = self.zm.create_zone(&req.zone_id, req.peers.clone()) {
+        if let Err(e) = self.zm.create_zone(&req.zone_id) {
             return self.fail(
                 &header.operation_id,
                 map_raft_err(e),
@@ -248,10 +248,7 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
-        if let Err(e) = self
-            .zm
-            .join_zone(&req.zone_id, req.peers.clone(), req.learner)
-        {
+        if let Err(e) = self.zm.join_zone(&req.zone_id, req.learner) {
             return self.fail(&header.operation_id, map_raft_err(e), "join", &req.zone_id);
         }
         let mut facts = self.cluster_facts_caught_up(&req.zone_id);
@@ -891,6 +888,7 @@ impl ZoneRuntimeBackend {
             leader_id: status.leader_id,
             voter_count: status.voter_count as u32,
             witness_count: status.witness_count as u32,
+            leader_contact_age_ms: status.leader_contact_age_ms,
         }
     }
 }
@@ -994,11 +992,6 @@ fn record_from_journal(rec: JournalRecord) -> ZoneOperationRecord {
 
 fn map_raft_err(e: RaftError) -> ZoneRuntimeError {
     match e {
-        RaftError::ZoneAlreadyExistsWithDifferentMembership { actual, requested } => {
-            ZoneRuntimeError::Conflict(format!(
-                "zone already exists with different membership: have {actual:?}, requested {requested:?}"
-            ))
-        }
         RaftError::InvalidState(m) => ZoneRuntimeError::Conflict(m),
         other => ZoneRuntimeError::Internal(format!("{other:?}")),
     }
@@ -1105,7 +1098,7 @@ mod tests {
         )
         .expect("ZoneManager");
         let zone = zm
-            .create_zone(contracts::CONTROL_ZONE_ID, vec![])
+            .create_zone(contracts::CONTROL_ZONE_ID)
             .expect("control zone");
         let node = zone.consensus_node();
         let handle = zone.runtime_handle();

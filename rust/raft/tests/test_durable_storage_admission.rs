@@ -64,7 +64,7 @@ struct Runtime(Arc<ZoneManager>);
 impl Runtime {
     fn open(path: &Path) -> Self {
         let manager = ZoneManager::isolated(path.to_str().unwrap()).unwrap();
-        let root = manager.create_zone("root", vec![]).unwrap();
+        let root = manager.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(5)));
         Self(manager)
     }
@@ -388,7 +388,7 @@ fn snapshot_only_restart_refuses_before_restoring_into_an_empty_store() {
                 )
                 .unwrap(),
             );
-            let root = runtime.0.create_zone("root", vec![]).unwrap();
+            let root = runtime.0.create_zone("root").unwrap();
             assert!(root.wait_for_leader(Duration::from_secs(5)));
             assert!(
                 runtime

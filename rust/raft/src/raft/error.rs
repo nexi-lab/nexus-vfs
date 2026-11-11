@@ -16,7 +16,7 @@ pub enum RaftError {
     /// Node is not the leader.
     ///
     /// `leader_hint` carries the operator-form address (`host:port`) of
-    /// the known leader when the local peer_map has an entry.  It is
+    /// the known leader when the local peer map routes to it.  It is
     /// intentionally NOT the raw u64 node_id: operators and peer AIs
     /// reading the resulting Display line commonly mistake a bare
     /// node_id (locally derived from `hostname_to_node_id(hostname)`)
@@ -85,19 +85,6 @@ pub enum RaftError {
     /// survives the hop into this vocabulary; see that variant for why it is typed.
     #[error("data dir already open by another process: {0}")]
     DataDirLocked(String),
-
-    /// `create_zone` was called for a zone that already exists with a
-    /// different peer-address-book.  Idempotency holds when the
-    /// requested address book matches the existing one (same set of
-    /// `(hostname, port)` tuples); a different set is operator error
-    /// — surface it loudly rather than silently mutating ConfState.
-    #[error(
-        "zone already exists with different membership: actual={actual:?} requested={requested:?}"
-    )]
-    ZoneAlreadyExistsWithDifferentMembership {
-        actual: Vec<String>,
-        requested: Vec<String>,
-    },
 }
 
 impl RaftError {

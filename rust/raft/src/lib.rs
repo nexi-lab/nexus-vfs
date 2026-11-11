@@ -198,12 +198,12 @@ pub mod stream_wakeup;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod stream_retention_gc;
 
-/// Node-bound peer address book persistence — `identity.json` at a
-/// platform-native user-data location.  Survives `<NEXUS_DATA_DIR>`
-/// wipes so cold-boot does not need operator re-specifying `--peers`.
-/// Deliberately narrow: peer list only, no `node_id` (raft's
-/// per-Progress heartbeat invariant requires wipe = id-rotation; see
-/// `docs/federation-architecture.md` § 6.3.1).
+/// Node-bound operator intent — `identity.json` at a platform-native
+/// user-data location: seed addresses and per-zone role intent.  Survives
+/// `<NEXUS_DATA_DIR>` wipes so cold-boot does not need operator
+/// re-specifying `--peers`.  Deliberately narrow: no replicated state and
+/// no `node_id` (raft's per-Progress heartbeat invariant requires wipe =
+/// id-rotation; see `docs/federation-architecture.md` § 6.3.1).
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod identity;
 

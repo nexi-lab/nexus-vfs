@@ -187,7 +187,7 @@ pub(super) async fn serve(
     .context("open user runtime zone task")?
     .context("open user runtime zone")?;
     let root = zones
-        .create_zone_async(contracts::ROOT_ZONE_ID, Vec::new())
+        .create_zone_async(contracts::ROOT_ZONE_ID)
         .await
         .context("open durable user root zone")?;
     let root_for_wait = Arc::clone(&root);

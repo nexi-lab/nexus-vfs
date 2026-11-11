@@ -381,6 +381,10 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// Per-peer send-failure tracking behind the quorum-at-risk WARN.
     /// Ephemeral diagnostic state — never persisted, never feeds raft.
     quorum_health: QuorumHealth,
+    /// Members whose last message had no route, warned about once. An id
+    /// leaves the set when it routes again, so losing a route warns once per
+    /// loss rather than once per message. Ephemeral diagnostic state.
+    unrouted: HashSet<u64>,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -414,6 +418,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             ec_completion_tx,
             ec_completion_rx,
             quorum_health: QuorumHealth::default(),
+            unrouted: HashSet::new(),
         }
     }
 
@@ -557,7 +562,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                         .peers
                         .read()
                         .unwrap()
-                        .get(&peer_id)
+                        .route(peer_id)
                         .map(|a| a.to_operator_str())
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let quorum = voters.len() / 2 + 1;
@@ -642,28 +647,15 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         }
     }
 
-    /// Take a point-in-time snapshot of the peer map (read lock, released immediately).
-    ///
-    /// Used by both `send_messages_fire_and_forget` and `replicate_ec_entries` to
-    /// get a consistent view of peers without holding the read lock across async work.
-    fn snapshot_peers(&self) -> HashMap<u64, NodeAddress> {
-        self.peers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(id, addr)| (*id, addr.clone()))
-            .collect()
-    }
-
     /// Select routes for this zone's current Raft members. Learned or retained
     /// addresses carry no authority to receive metadata, WAL or EC snapshots.
     fn snapshot_replication_peers(&self) -> Vec<(u64, NodeAddress)> {
         self.peers
             .read()
             .unwrap()
-            .iter()
-            .filter(|(id, _)| **id != self.node_id && self.driver.is_replication_member(**id))
-            .map(|(id, address)| (*id, address.clone()))
+            .routes()
+            .filter(|(id, _)| *id != self.node_id && self.driver.is_replication_member(*id))
+            .map(|(id, address)| (id, address.clone()))
             .collect()
     }
 
@@ -681,21 +673,40 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
     ///
     /// Failed sends log a warning and evict the client from the pool
     /// (reconnected on next attempt).
-    fn send_messages_fire_and_forget(&self, messages: Vec<raft::eraftpb::Message>) {
-        let peers_snapshot = self.snapshot_peers();
+    fn send_messages_fire_and_forget(&mut self, messages: Vec<raft::eraftpb::Message>) {
+        // One shared lock resolves the whole batch; only the routes the batch
+        // uses are cloned out.
+        let routed: Vec<(NodeAddress, raft::eraftpb::Message)> = {
+            let peers = Arc::clone(&self.peers);
+            let peers = peers.read().unwrap();
+            messages
+                .into_iter()
+                .filter_map(|msg| match peers.route(msg.to) {
+                    Some(address) => {
+                        if !self.unrouted.is_empty() {
+                            self.unrouted.remove(&msg.to);
+                        }
+                        Some((address.clone(), msg))
+                    }
+                    None => {
+                        if self.unrouted.insert(msg.to) {
+                            tracing::warn!(
+                                zone = %self.zone_id,
+                                peer_node_id = msg.to,
+                                msg_type = ?msg.get_msg_type(),
+                                "member has no registered or observed address — its \
+                                 messages are dropped until it registers its address \
+                                 or reaches this node",
+                            );
+                        }
+                        None
+                    }
+                })
+                .collect()
+        };
 
-        for msg in messages {
+        for (addr, msg) in routed {
             let target_id = msg.to;
-            let addr = match peers_snapshot.get(&target_id) {
-                Some(a) => a.clone(),
-                None => {
-                    tracing::warn!(
-                        peer_node_id = target_id,
-                        "No address for peer — dropping message (peer_map has no entry yet)",
-                    );
-                    continue;
-                }
-            };
 
             // Capture the message type *before* the move into the spawned
             // task so we can report a `MsgSnapshot` failure correctly.
@@ -1302,18 +1313,13 @@ mod tests {
             Some(Arc::new(ReplicationLog::new(&store, 1).unwrap())),
         )
         .unwrap();
-        let addresses = crate::transport::PeerMap::with_peers(
-            1,
-            (1..=5)
-                .map(|id| {
-                    (
-                        id,
-                        NodeAddress::parse(&format!("{id}@127.0.0.1:{}", 25000 + id), false)
-                            .unwrap(),
-                    )
-                })
-                .collect(),
-        );
+        let mut addresses = crate::transport::PeerMap::new(1);
+        for id in 1..=5 {
+            addresses.observe(
+                id,
+                NodeAddress::new(id, format!("http://127.0.0.1:{}", 25000 + id)),
+            );
+        }
         let transport = TransportLoop::new(
             driver,
             Arc::new(std::sync::RwLock::new(addresses)),
@@ -1342,7 +1348,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(recipients(&transport), vec![2, 3, 4]);
-        assert!(transport.peers.read().unwrap().contains_key(&5));
+        assert!(transport.peers.read().unwrap().route(5).is_some());
         assert_eq!(transport.driver.voter_ids(), vec![1, 2, 3]);
         for id in 1..=5 {
             assert_eq!(
@@ -1393,12 +1399,51 @@ mod tests {
             !handle.is_replication_member(2),
             "committed removal updates admission before returning"
         );
-        assert!(transport.peers.read().unwrap().contains_key(&2));
+        assert!(transport.peers.read().unwrap().route(2).is_some());
         assert!(recipients(&transport).is_empty());
         // A retired peer's progress cannot pin future compaction or count as
         // an acknowledgement when this zone subsequently changes membership.
         transport.spawn_ec_replications();
         assert!(!transport.ec_peer_state.contains_key(&2));
+    }
+
+    /// A member without a route is reported once per loss of its route,
+    /// not once per dropped message.
+    #[tokio::test]
+    async fn an_unrouted_member_is_reported_once_until_it_routes_again() {
+        let (_directory, _handle, mut transport) = membership_fixture(ConfState {
+            voters: vec![1],
+            learners: vec![9],
+            ..Default::default()
+        });
+        let to = |id: u64| {
+            let mut message = raft::eraftpb::Message::default();
+            message.set_msg_type(MessageType::MsgHeartbeat);
+            message.to = id;
+            message
+        };
+        transport.send_messages_fire_and_forget(vec![to(9), to(9)]);
+        transport.send_messages_fire_and_forget(vec![to(9)]);
+        assert_eq!(
+            transport.unrouted.iter().copied().collect::<Vec<_>>(),
+            vec![9]
+        );
+
+        transport
+            .peers
+            .write()
+            .unwrap()
+            .observe(9, NodeAddress::new(9, "http://127.0.0.1:1"));
+        transport.send_messages_fire_and_forget(vec![to(9)]);
+        assert!(
+            transport.unrouted.is_empty(),
+            "a routed send re-arms the warning for a later loss"
+        );
+        transport.send_messages_fire_and_forget(vec![to(7)]);
+        assert_eq!(
+            transport.unrouted.iter().copied().collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 
     #[test]
