@@ -84,6 +84,17 @@ driver enforces that exchange. Member qualification requires this explicit
 acknowledgement over the original Node channel and retains its original
 configuration view across the network call. An earlier empty reply describes
 local reader preparation alone.
+
+`ZoneConsensus::prepare_replica_control_members` takes the complete member set
+from the owning leader, resolves its existing zone routes, and requires the
+explicit transport acknowledgement from every remote member. The expected
+certificate identity comes from the configured member ID. The driver rechecks
+its incarnation, term and membership epoch after those network calls. The
+returned `PreparedReplicaControl` remains an in-process observation; activation
+consumes and revalidates that observation at its own submission boundary.
+Completed local preparations survive a failed group attempt. Retrying observes
+the current configuration and repeats the same idempotent local preparation.
+
 This durable local format upgrade and the replicated activation fact have
 separate purposes: the former defines which program can open the files, while
 the latter enables commands for the zone after authenticated member checks.

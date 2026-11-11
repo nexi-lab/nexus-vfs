@@ -74,6 +74,10 @@ mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
 mod storage_activation;
 pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
+#[cfg(all(feature = "grpc", has_protos))]
+mod replica_preparation;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use replica_preparation::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod storage_submission_tests;
 
@@ -350,6 +354,12 @@ pub enum RaftMsg {
     /// Capture the actual configuration before authenticated member probes.
     StorageActivationView {
         tx: oneshot::Sender<Result<StorageActivationView>>,
+    },
+    /// Recheck the original configuration after authenticated member preparation.
+    #[cfg(all(feature = "grpc", has_protos))]
+    CompleteReplicaControlPreparation {
+        observed: StorageActivationView,
+        tx: oneshot::Sender<Result<PreparedReplicaControl>>,
     },
     /// Durably prepare this driver's local reader before member qualification.
     PrepareReplicaControlReader { tx: oneshot::Sender<Result<()>> },
@@ -2162,6 +2172,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             }
             RaftMsg::StorageActivationView { tx } => {
                 let _ = tx.send(self.storage_activation_view());
+            }
+            #[cfg(all(feature = "grpc", has_protos))]
+            RaftMsg::CompleteReplicaControlPreparation { observed, tx } => {
+                let _ = tx.send(self.complete_replica_control_preparation(observed));
             }
             RaftMsg::PrepareReplicaControlReader { tx } => {
                 let _ = tx.send(self.prepare_replica_control_reader());

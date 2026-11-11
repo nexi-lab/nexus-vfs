@@ -176,16 +176,16 @@ async fn required_wire_prepares_witness_and_refuses_legacy_traffic() {
         .unwrap());
 }
 
-struct RunningNode {
-    directory: tempfile::TempDir,
-    registry: Arc<ZoneRaftRegistry>,
-    address: String,
+pub(super) struct RunningNode {
+    pub(super) directory: tempfile::TempDir,
+    pub(super) registry: Arc<ZoneRaftRegistry>,
+    pub(super) address: String,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl RunningNode {
-    async fn start(id: u64, tls: TlsConfig) -> Self {
+    pub(super) async fn start(id: u64, tls: TlsConfig) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let registry = Arc::new(ZoneRaftRegistry::with_tls(
             directory.path().to_path_buf(),
@@ -227,7 +227,7 @@ impl RunningNode {
         }
     }
 
-    async fn stop(self) -> tempfile::TempDir {
+    pub(super) async fn stop(self) -> tempfile::TempDir {
         self.stop.send(()).unwrap();
         self.task.await.unwrap();
         self.registry.shutdown_all();

@@ -147,3 +147,81 @@ async fn empty_durable_reader_reply_cannot_qualify_transport_on_the_same_node_ch
         .replica_control_reader_required()
         .unwrap());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_member_preparation_refuses_an_old_member_even_when_the_quorum_is_current() {
+    use super::replica_transport::RunningNode;
+    use nexus_raft::{raft::ReplicaPreparationError, transport::PeerMap};
+
+    let (ca, key) = generate_zone_ca("root").unwrap();
+    let first = RunningNode::start(1, node_tls(&ca, &key, 1)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
+    let old_node = registry
+        .create_zone("root", &tokio::runtime::Handle::current())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = ReaderOnly {
+        node: old_node.clone(),
+        calls: calls.clone(),
+    };
+    let address = common::node_bind_addr();
+    let incoming = lib::transport_primitives::federated_mtls_incoming(
+        address.parse().unwrap(),
+        &node_tls(&ca, &key, 7),
+        None,
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    listener_ready(&address).await;
+    let mut leader = first.registry.get_node("root").unwrap();
+    leader
+        .propose_conf_change(raft::eraftpb::ConfChangeType::AddLearnerNode, 7, Vec::new())
+        .await
+        .unwrap();
+    let mut routes = PeerMap::new(1);
+    routes.observe(7, NodeAddress::new(7, format!("http://{address}")));
+    let clients = pool(node_tls(&ca, &key, 1));
+    leader.set_forward_ctx(
+        clients.clone(),
+        Arc::new(std::sync::RwLock::new(routes)),
+        "root".into(),
+    );
+    let last = leader.last_index();
+    // The sole voter already provides a current majority. The old learner must
+    // still prevent a complete member observation from being returned.
+    let error = leader.prepare_replica_control_members().await.unwrap_err();
+    assert!(
+        matches!(error, ReplicaPreparationError::Member { member: 7, error }
+        if matches!(*error, TransportError::Rpc(ref reason)
+            if reason == "peer did not acknowledge replica-control transport v1"))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(leader.last_index(), last);
+    assert!(leader
+        .with_state_machine(
+            |state| nexus_raft::raft::StateMachine::replica_control_activation(state).unwrap()
+        )
+        .await
+        .is_none());
+    drop((leader, clients));
+    first.stop().await;
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    registry.shutdown_all();
+    drop((old_node, registry));
+    assert!(reopened(directory.path())
+        .await
+        .replica_control_reader_required()
+        .unwrap());
+}
