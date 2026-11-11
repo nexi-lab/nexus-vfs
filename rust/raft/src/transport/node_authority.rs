@@ -307,6 +307,7 @@ fn method_paths(service: &str, methods: &[&str]) -> Arc<[String]> {
 /// Each typed handler below this gate also checks the same zone membership.
 const REPLICA_DATA_METHODS: &[&str] = &[
     "StepMessage",
+    "StepStorageV1",
     "ReplicateEntries",
     "SnapshotEcState",
     "Propose",

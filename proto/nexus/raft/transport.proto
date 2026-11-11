@@ -22,6 +22,13 @@ service ZoneTransportService {
   // routing all raft-rs internal message types (~15 types) through a single RPC.
   rpc StepMessage(StepMessageRequest) returns (StepMessageResponse);
 
+  // Versioned reader boundary for the storage command dialect through
+  // replica-issuance-v1. Every required exchange uses this RPC, including
+  // after reconnect. An unavailable method is a refusal; clients retain the
+  // original request and never fall back to StepMessage. Zone membership and
+  // committed protocol activation are checked independently by the receiver.
+  rpc StepStorageV1(StepMessageRequest) returns (StepMessageResponse);
+
   // ReplicateEntries sends EC (eventually consistent) entries to a peer.
   // This is NOT Raft consensus — EC writes bypass Raft and use async replication.
   // Used by the background replication loop (Phase C) for peer data sync.
