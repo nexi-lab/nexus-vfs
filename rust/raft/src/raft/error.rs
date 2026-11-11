@@ -16,7 +16,7 @@ pub enum RaftError {
     /// Node is not the leader.
     ///
     /// `leader_hint` carries the operator-form address (`host:port`) of
-    /// the known leader when the local peer_map has an entry.  It is
+    /// the known leader when the local peer map routes to it.  It is
     /// intentionally NOT the raw u64 node_id: operators and peer AIs
     /// reading the resulting Display line commonly mistake a bare
     /// node_id (locally derived from `hostname_to_node_id(hostname)`)

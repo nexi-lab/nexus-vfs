@@ -2523,10 +2523,10 @@ impl WitnessZoneRegistry {
         &self.self_address
     }
 
-    /// Record a peer's advertise address learned from an inbound
-    /// `StepMessage`.  Mirrors `ZoneRaftRegistry::learn_peer_address`
-    /// so the witness peer-map converges via the network SSOT under
-    /// the opaque-ID contract.  Returns `true` if the map changed.
+    /// Record a peer's advertise address observed on an inbound
+    /// `StepMessage` — mirrors `ZoneRaftRegistry::learn_peer_address`.
+    /// A witness holds no member-address records, so these observations
+    /// are its routes.  Returns `true` if the route changed.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
         if endpoint.is_empty() || peer_id == 0 {
             return false;

@@ -770,12 +770,12 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
     }
 }
 
-/// Return the peer address book with any entry that resolves to
+/// Return the seed addresses with any entry that resolves to
 /// `self_address` removed, warning once per dropped entry.
 ///
-/// Contract under PR #3996+: the peer address book lists OTHER nodes only.
+/// Contract under PR #3996+: the seed addresses list OTHER nodes only.
 /// Self joins the ConfState via `create_zone(self)` on the founder or
-/// `AddNode(self)` on a joiner — never via the address book. A self-entry can
+/// `AddNode(self)` on a joiner — never via a seed. A self-entry can
 /// still appear two ways: an operator lists self in `NEXUS_PEERS`/`--peers`, or
 /// a stale learned entry survives in the persisted identity (e.g. a node that
 /// briefly learned its own advertise address round-trips it through
@@ -788,7 +788,7 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
 /// again without a manual identity edit) — a far worse failure than a filtered
 /// warning. Excluding self is always the correct interpretation: self is never
 /// a transport peer. Raft membership (self as a voter) lives in `ConfState` and
-/// is untouched here — this shapes only the transport peer address book.
+/// is untouched here — this shapes only the seed addresses.
 pub fn peers_excluding_self(peer_addrs: &[NodeAddress], self_address: &str) -> Vec<NodeAddress> {
     peer_addrs
         .iter()
@@ -800,8 +800,8 @@ pub fn peers_excluding_self(peer_addrs: &[NodeAddress], self_address: &str) -> V
             if peer_hostport == self_address {
                 tracing::warn!(
                     self_address,
-                    "peer address book contains self — excluding it; self joins \
-                     via bootstrap / AddNode-on-leader, not the address book \
+                    "seed addresses contain self — excluding it; self joins \
+                     via bootstrap / AddNode-on-leader, not a seed \
                      (PR #3996 opaque-ID contract). A stale self-entry is \
                      filtered, not fatal."
                 );
@@ -3282,9 +3282,8 @@ mod tests {
     #[test]
     fn parse_operator_addr_rejects_legacy_id_at_host_form() {
         // Operator-facing parse rejects `id@host:port` — operators
-        // never had a reason to sync peer node_ids
-        // (`learn_peer_address` populates the real id from the first
-        // inbound raft message).  Raft-internal `parse` still accepts
+        // never sync peer node_ids (a member's id and address are
+        // replicated member-address records).  Raft-internal `parse` accepts
         // the form for authoritative-id round-trips.  Pin at the raft
         // crate boundary so a regression on the operator-facing
         // rejection surfaces here.

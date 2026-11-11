@@ -634,11 +634,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             // that broke wipe-rejoin: with random IDs no two nodes can
             // independently agree on the same ConfState without a
             // round-trip, so we don't try.
-            //
-            // `config.peers` retains its meaning as the transport
-            // address book (raft messaging needs to know how to reach
-            // peers learned from snapshot's ConfState); it is NOT a
-            // ConfState seed.
             let voters = vec![config.id];
 
             let needs_bootstrap = if initial_state.conf_state.voters.is_empty() {
