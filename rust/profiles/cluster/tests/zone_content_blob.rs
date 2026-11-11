@@ -10,9 +10,11 @@ use std::time::Duration;
 use backends::storage::cas_local::CasLocalBackend;
 use backends::storage::zone_cas_local::ZoneCasLocalStores;
 use kernel::abc::object_store::ObjectStore;
+use kernel::core::stream::wal::wal_stream_prefix;
+use kernel::federation::ColdSegmentAddress;
 use kernel::kernel::convenience::{KernelConvenience, MountOptions};
 use kernel::kernel::{Kernel, OperationContext, WriteRequest};
-use kernel::meta_store::{FileMetadata, DT_LINK};
+use kernel::meta_store::{FileMetadata, DT_LINK, DT_STREAM};
 use nexus_cluster::zone_content::ZoneContentBlobFetcher;
 use nexus_raft::blob_fetcher_handler::KernelBlobFetcher;
 use nexus_raft::transport::proto::{
@@ -338,6 +340,67 @@ async fn assert_replica_membership_controls_content(
         .fetch_in_zone_async(address, "conversation-alice-bob", private_hash)
         .await
         .is_err());
+    // The locator resolves the existing committed segment index in the same
+    // physically isolated namespace; a forged index cannot cross that boundary.
+    let sealed_path = "/sealed-history";
+    let prefix = wal_stream_prefix(sealed_path);
+    let segment_bytes = b"actual specialized cold segment bytes";
+    let segment_hash = namespaces[0]
+        .backend()
+        .write_content(segment_bytes, "", &boot, 0)
+        .unwrap()
+        .content_id;
+    for source in [&metadata[0], &metadata[1]] {
+        source
+            .put(
+                sealed_path,
+                FileMetadata {
+                    path: sealed_path.into(),
+                    entry_type: DT_STREAM,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for record in [b"one", b"two"] {
+            source.append_stream_entry(&prefix, record).unwrap();
+        }
+        source
+            .seal_stream_segment(
+                &prefix,
+                0,
+                2,
+                &segment_hash,
+                address,
+                segment_bytes.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(source.stream_floor(&prefix).unwrap(), 2);
+    }
+    let sealed_locator = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .key("agent-alice");
+    assert_eq!(
+        alice_peer
+            .fetch_in_zone_async(address, "agent-alice", &sealed_locator)
+            .await
+            .unwrap(),
+        segment_bytes
+    );
+    let forged_locator = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .key("conversation-alice-bob");
+    assert!(alice_peer
+        .fetch_in_zone_async(address, "conversation-alice-bob", &forged_locator)
+        .await
+        .is_err());
+    assert!(alice_peer
+        .fetch_in_zone_async(address, "conversation-alice-bob", &sealed_locator)
+        .await
+        .is_err());
     let retained = alice
         .read_zone_blob(request("agent-alice", private_hash))
         .await
@@ -455,6 +518,10 @@ async fn assert_replica_membership_controls_content(
     assert!(receipt.success, "{:?}", receipt.error);
     assert!(alice_peer
         .fetch_in_zone_async(address, "agent-alice", private_hash)
+        .await
+        .is_err());
+    assert!(alice_peer
+        .fetch_in_zone_async(address, "agent-alice", &sealed_locator)
         .await
         .is_err());
     assert_eq!(
