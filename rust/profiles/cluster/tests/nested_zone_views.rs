@@ -29,7 +29,7 @@ fn stream_aliases_share_content_and_offsets() {
     rt.block_on(async {
         for zone in ["root", "contact-probe"] {
             manager
-                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .create_zone_async(zone)
                 .await
                 .unwrap()
                 .consensus_node()
@@ -180,7 +180,7 @@ fn stream_registry_separates_zones_and_uses_the_callers_namespace() {
     rt.block_on(async {
         for zone in ["root", "alice-data", "bob-data"] {
             manager
-                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .create_zone_async(zone)
                 .await
                 .unwrap()
                 .consensus_node()
@@ -253,13 +253,13 @@ fn replicated_stream_append_wakes_a_reader_under_a_different_mount() {
     let founder = node(41, founder_dir.path(), &founder_addr);
     let replica = node(42, replica_dir.path(), &replica_addr);
     rt.block_on(async {
-        for (manager, id, addr, zones) in [
-            (&founder, 41, &founder_addr, vec!["root", "messages"]),
-            (&replica, 42, &replica_addr, vec!["root"]),
+        for (manager, zones) in [
+            (&founder, vec!["root", "messages"]),
+            (&replica, vec!["root"]),
         ] {
             for zone in zones {
                 manager
-                    .create_zone_async(zone, vec![format!("{id}@{addr}")])
+                    .create_zone_async(zone)
                     .await
                     .unwrap()
                     .consensus_node()
@@ -337,7 +337,7 @@ fn legacy_alias_wal_is_reported_instead_of_opening_an_empty_stream() {
     rt.block_on(async {
         for zone in ["root", "legacy"] {
             manager
-                .create_zone_async(zone, vec![format!("41@{addr}")])
+                .create_zone_async(zone)
                 .await
                 .unwrap()
                 .consensus_node()
@@ -574,7 +574,7 @@ fn replicated_directory_zones_keep_separate_views_after_source_loss_and_restart(
             "data-team",
         ] {
             source
-                .create_zone_async(zone, vec![format!("41@{source_addr}")])
+                .create_zone_async(zone)
                 .await
                 .unwrap()
                 .consensus_node()
@@ -648,7 +648,7 @@ fn nested_view_device_worker() {
     let kernel = if !source.is_empty() {
         rt.block_on(async {
             manager
-                .create_zone_async("root", vec![format!("{id}@{addr}")])
+                .create_zone_async("root")
                 .await
                 .unwrap()
                 .consensus_node()
@@ -695,7 +695,7 @@ fn public_discovery_can_exclude_private_zones_but_subtree_mounts_cannot_filter_r
     rt.block_on(async {
         for zone in ["root", "discovery", "data-alice", "data-bob"] {
             source
-                .create_zone_async(zone, vec![format!("41@{source_addr}")])
+                .create_zone_async(zone)
                 .await
                 .unwrap()
                 .consensus_node()
@@ -779,7 +779,7 @@ fn public_discovery_can_exclude_private_zones_but_subtree_mounts_cannot_filter_r
         let target = node(id, dir.path(), &addr);
         rt.block_on(async {
             target
-                .create_zone_async("root", vec![format!("{id}@{addr}")])
+                .create_zone_async("root")
                 .await
                 .unwrap()
                 .consensus_node()

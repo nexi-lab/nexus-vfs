@@ -2904,7 +2904,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // matrix was derived from, so this is the same topology with the
             // part the matrix discarded still attached.
             mounts: _matrix_mounts,
-            peers_for_ha,
         } => {
             let mounts = federation_mounts.clone();
             // Matrix row 1 — see `plan_boot_action` docstring for the
@@ -2912,7 +2911,6 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             tracing::info!(
                 zones = ?zones,
                 mount_count = mounts.len(),
-                ha_seed_count = peers_for_ha.len(),
                 "Bootstrapping static topology from --cluster-init / --cluster-init-mount",
             );
             // S3 Phase D + F: the DiscoverZones RPC reads root's
@@ -2921,7 +2919,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // `mounts` map ends up in raft state via
             // `bootstrap_static_async` and gets served fresh on every
             // DiscoverZones call.
-            zm.bootstrap_static_async(zones, peers_for_ha, mounts)
+            zm.bootstrap_static_async(zones, mounts)
                 .await
                 .map_err(|e| anyhow::anyhow!("bootstrap_static: {}", e))?;
         }
@@ -3128,13 +3126,9 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             // SAME `bootstrap_static_async` as the `StaticFounder` arm (DRY: one
             // founding path, the two boot arms cannot diverge).
             if founder_declared && resume_peers.is_empty() {
-                zm.bootstrap_static_async(
-                    init_zones.clone(),
-                    Vec::new(),
-                    federation_mounts.clone(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("resume re-assert founder topology: {}", e))?;
+                zm.bootstrap_static_async(init_zones.clone(), federation_mounts.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resume re-assert founder topology: {}", e))?;
             }
 
             let reconciled = reconcile_federation_from_peers(
@@ -4067,12 +4061,7 @@ async fn run_share(
     mount_at: Option<&str>,
     allow_empty: bool,
 ) -> Result<()> {
-    let ZoneManagerBundle {
-        zm,
-        node_id,
-        cli_peer_addrs,
-        ..
-    } = open_zone_manager(
+    let ZoneManagerBundle { zm, node_id, .. } = open_zone_manager(
         &common,
         None,
         ZoneLoadPolicy::OnDemand,
@@ -4095,11 +4084,6 @@ async fn run_share(
     tokio::task::spawn_blocking(move || catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id))
         .await
         .ok();
-    let peers_str: Vec<String> = cli_peer_addrs
-        .iter()
-        .map(NodeAddress::to_raft_peer_str)
-        .collect();
-
     // `share` names a brand-new zone, so the id is being chosen here and the
     // format is refused rather than warned about: unlike a resumed node, there
     // is no existing data whose only migration path is a copy.
@@ -4163,7 +4147,7 @@ async fn run_share(
     }
 
     if zm.get_zone(new_zone_id).is_none() {
-        zm.create_zone_async(new_zone_id, peers_str)
+        zm.create_zone_async(new_zone_id)
             .await
             .map_err(|e| anyhow::anyhow!("create_zone({}): {}", new_zone_id, e))?;
     }
@@ -4579,7 +4563,7 @@ async fn run_join(
         .ok();
 
     // Pre-#3996 (and pre-this commit) ``run_join`` only invoked
-    // ``zm.join_zone(remote_zone_id, peers, false)`` — that registers
+    // ``zm.join_zone(remote_zone_id, false)`` — that registers
     // the zone locally with ``skip_bootstrap=true`` but never tells
     // the leader on ``peer_addr`` "I want in".  No JoinZone RPC fires,
     // no AddNode commits, the joiner waits forever after restart.
@@ -5601,7 +5585,7 @@ fn open_auth_store(
     // with a later daemon boot, which resumes the on-disk zone rather than
     // re-founding it.
     if zm.get_zone(auth_zone).is_none() {
-        zm.create_zone(auth_zone, Vec::new())
+        zm.create_zone(auth_zone)
             .map_err(|e| zone_manager_error(common, format!("open {auth_zone} zone"), e))?;
     }
     let cred_zone = zm
@@ -7716,9 +7700,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = nexus_raft::raft::ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
-        let node = registry
-            .create_zone("root", vec![], &runtime)
-            .expect("zone");
+        let node = registry.create_zone("root", &runtime).expect("zone");
         node.campaign().await.expect("campaign");
         let allow = Arc::new(RaftSessionMintAllowStore::new(node, runtime));
         *slot.write() = Some(Arc::clone(&allow));

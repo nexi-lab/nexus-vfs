@@ -28,8 +28,7 @@ use crate::transport::{
 use crate::zone_deletion_registry::DeletionEpochSource;
 use dashmap::DashMap;
 use lib::rt::block_on_via as bridge_block_on;
-use raft::eraftpb::ConfState;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -44,51 +43,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// Reconcile a static peer roster with persisted Raft membership.
-///
-/// Dynamic voter replacement can preserve a node's hostname/port while changing
-/// its Raft node ID. On restart, NEXUS_PEERS still contains the cold ID, but
-/// persisted ConfState is authoritative. If there is exactly one stale ID and
-/// one persisted ID missing from the transport map, carry the known address over
-/// to the persisted ID so membership checks and message routing agree.
-pub(crate) fn reconcile_peers_with_conf_state(
-    zone_id: &str,
-    peers: &mut [NodeAddress],
-    conf_state: &ConfState,
-) {
-    let conf_ids: HashSet<u64> = conf_state
-        .voters
-        .iter()
-        .chain(conf_state.voters_outgoing.iter())
-        .chain(conf_state.learners.iter())
-        .chain(conf_state.learners_next.iter())
-        .copied()
-        .collect();
-    if conf_ids.is_empty() {
-        return;
-    }
-
-    let peer_ids: HashSet<u64> = peers.iter().map(|peer| peer.id).collect();
-    let missing_conf_ids: Vec<u64> = conf_ids.difference(&peer_ids).copied().collect();
-    let stale_peer_ids: Vec<u64> = peer_ids.difference(&conf_ids).copied().collect();
-    if missing_conf_ids.len() != 1 || stale_peer_ids.len() != 1 {
-        return;
-    }
-
-    let old_id = stale_peer_ids[0];
-    let new_id = missing_conf_ids[0];
-    if let Some(peer) = peers.iter_mut().find(|peer| peer.id == old_id) {
-        tracing::warn!(
-            zone = %zone_id,
-            old_id,
-            new_id,
-            endpoint = %peer.endpoint,
-            "Reconciled peer ID from persisted Raft ConfState",
-        );
-        peer.id = new_id;
-    }
 }
 
 /// Per-zone concurrent-op guard. Prevents concurrent `setup_zone` and
@@ -208,13 +162,7 @@ impl ZoneLoadPolicy {
 }
 
 /// What a hosted zone needs to become resident, captured once at boot.
-///
-/// The peer address book is cluster-wide, not per-zone (every zone in a
-/// federation shares the same raft topology), which is why one snapshot taken
-/// at boot serves every later materialization — it is the same list the old
-/// open-everything boot passed to each zone.
 struct Materialization {
-    peers: Vec<NodeAddress>,
     runtime: tokio::runtime::Handle,
     policy: ZoneLoadPolicy,
 }
@@ -223,7 +171,9 @@ struct Materialization {
 struct ZoneEntry {
     /// ZoneConsensus handle (Clone + Send + Sync).
     node: ZoneConsensus<FullStateMachine>,
-    /// Known peers for this zone. Shared with TransportLoop for runtime ConfChange updates.
+    /// Route book for this zone, derived by its driver from the applied
+    /// member-address records plus inbound observations. Shared with its
+    /// TransportLoop and forwarding context.
     peers: SharedPeerMap,
     /// This node's ID within the zone.
     node_id: u64,
@@ -231,6 +181,9 @@ struct ZoneEntry {
     shutdown_tx: watch::Sender<bool>,
     /// Transport loop task handle (for join on removal).
     transport_handle: JoinHandle<()>,
+    /// Member-address self-registration task of a managed zone (for join on
+    /// removal; it ends by itself once the record matches).
+    registration_handle: Option<JoinHandle<()>>,
     /// On-disk lifecycle owner. Committed (not armed) post-insert —
     /// Drop on process shutdown is a no-op; explicit `destroy()` during
     /// `remove_zone` deletes the dir.
@@ -276,6 +229,9 @@ pub struct ZoneRaftRegistry {
     /// transport tasks read it when they spawn.  Empty disables
     /// advertisement.
     self_address: Arc<RwLock<String>>,
+    /// Operator seed addresses — plain configuration handed to each managed
+    /// zone's member-address self-registration as `Propose` targets.
+    seeds: RwLock<Vec<NodeAddress>>,
     /// Optional identity directory for the S3 Phase B ConfState apply
     /// mirror.  When set, every zone the registry creates or joins
     /// installs a [`crate::raft::ConfStateAppliedCb`] that mirrors the
@@ -399,6 +355,7 @@ impl ZoneRaftRegistry {
             node_id,
             tls: Arc::new(RwLock::new(tls)),
             self_address: Arc::new(RwLock::new(String::new())),
+            seeds: RwLock::new(Vec::new()),
             identity_dir: Arc::new(RwLock::new(None)),
             deletion_epoch_source: RwLock::new(None),
             creating: DashMap::new(),
@@ -431,6 +388,18 @@ impl ZoneRaftRegistry {
     /// updates the advertise address at runtime.
     pub fn set_self_address(&self, address: String) {
         *self.self_address.write().unwrap() = address;
+    }
+
+    /// Set the operator seed addresses — see [`Self::seeds`]. Zones set up
+    /// afterwards register against them.
+    pub fn set_seeds(&self, seeds: Vec<NodeAddress>) {
+        *self.seeds.write().unwrap() = seeds;
+    }
+
+    /// The operator seed addresses (`--peers` / `identity.peers`), parsed
+    /// with this node's TLS posture.
+    pub fn seeds(&self) -> Vec<NodeAddress> {
+        self.seeds.read().unwrap().clone()
     }
 
     /// Set the identity directory for the S3 Phase B ConfState apply
@@ -572,21 +541,12 @@ impl ZoneRaftRegistry {
 
     /// Allow this registry to materialize a hosted zone on first access.
     ///
-    /// Call once at boot, with the same peer address book and runtime the old
-    /// open-everything path handed to each zone, plus the policy that says
-    /// which zones this process may open at all. Until it is called (embedded
-    /// and test registries), a lookup only ever finds an already-resident zone.
-    pub fn arm_materialization(
-        &self,
-        peers: Vec<NodeAddress>,
-        runtime: tokio::runtime::Handle,
-        policy: ZoneLoadPolicy,
-    ) {
-        *self.materialization.write().unwrap() = Some(Materialization {
-            peers,
-            runtime,
-            policy,
-        });
+    /// Call once at boot, with the runtime zones run on and the policy that
+    /// says which zones this process may open at all. Until it is called
+    /// (embedded and test registries), a lookup only ever finds an
+    /// already-resident zone.
+    pub fn arm_materialization(&self, runtime: tokio::runtime::Handle, policy: ZoneLoadPolicy) {
+        *self.materialization.write().unwrap() = Some(Materialization { runtime, policy });
     }
 
     /// Subscribe to per-zone materialization — see [`ZoneMaterializedCb`].
@@ -627,38 +587,16 @@ impl ZoneRaftRegistry {
     ///
     /// # Arguments
     /// * `zone_id` — Unique zone identifier.
-    /// * `peers` — The full cluster roster for this zone (may include
-    ///   this node's own `NodeAddress`; self is filtered out before
-    ///   passing to raft-rs per the `RaftConfig.peers` contract).
     /// * `runtime_handle` — Tokio runtime handle for spawning the transport loop.
     #[allow(clippy::result_large_err)]
     pub fn create_zone(
         &self,
         zone_id: &str,
-        peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
         self.clear_auto_join_suppression(zone_id);
-        // Filter self out of the voter ID list. Callers (federation bootstrap,
-        // zone_manager) commonly pass the full cluster roster from NEXUS_PEERS
-        // which includes this node's own address; raft-rs expects
-        // `config.peers` to list OTHER peers only, so including self would
-        // produce a duplicate voter ID in ConfState.
-        let node_id = self.node_id_for_zone(zone_id);
-        let peer_ids: Vec<u64> = peers
-            .iter()
-            .map(|p| p.id)
-            .filter(|&id| id != node_id)
-            .collect();
         let config = RaftConfig {
-            id: node_id,
-            peers: peer_ids,
-            // Carry the registry's advertise address through to the
-            // bootstrap `AddNode(self)` entry's `context` field so
-            // joiners that later replay the log learn how to dial the
-            // founder (see `RaftConfig::bootstrap_self_address` for
-            // the rationale).
-            bootstrap_self_address: self.self_address(),
+            id: self.node_id_for_zone(zone_id),
             ..Default::default()
         };
 
@@ -666,7 +604,6 @@ impl ZoneRaftRegistry {
         self.setup_zone(
             zone_id,
             config,
-            peers,
             runtime_handle,
             crate::identity::IdentityZoneRole::Voter,
         )
@@ -686,7 +623,6 @@ impl ZoneRaftRegistry {
     pub fn join_zone(
         &self,
         zone_id: &str,
-        peers: Vec<NodeAddress>,
         learner: bool,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
@@ -715,7 +651,7 @@ impl ZoneRaftRegistry {
         } else {
             crate::identity::IdentityZoneRole::Voter
         };
-        self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)
+        self.setup_zone(zone_id, config, runtime_handle, intended_role)
     }
 
     /// Open a previously-persisted zone from disk WITHOUT bootstrapping.
@@ -733,14 +669,8 @@ impl ZoneRaftRegistry {
     pub fn open_persisted_zone(
         &self,
         zone_id: &str,
-        mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
-        // Network seed addresses belong to managed zones. The local root
-        // resumes its own ConfState and has no network routes.
-        if self.storage_policy.membership(zone_id)? == super::MembershipPolicy::FixedLocal {
-            peers.clear();
-        }
         self.clear_auto_join_suppression(zone_id);
         let config = RaftConfig {
             id: self.node_id_for_zone(zone_id),
@@ -750,7 +680,7 @@ impl ZoneRaftRegistry {
         };
         // Restart preserves the persisted role intent (SSOT) — don't re-guess.
         let intended_role = self.persisted_intent(zone_id);
-        let node = self.setup_zone(zone_id, config, peers, runtime_handle, intended_role)?;
+        let node = self.setup_zone(zone_id, config, runtime_handle, intended_role)?;
         // Deliberately not fatal here, and deliberately not re-logged: the wait
         // itself warns with the zone and both indices, and this path has no
         // error variant that could carry them (`TransportError` is tier-neutral,
@@ -903,7 +833,6 @@ impl ZoneRaftRegistry {
     pub fn materialize_now(
         &self,
         zone_ids: &[String],
-        peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<usize, TransportError> {
         let mut count: usize = 0;
@@ -912,7 +841,7 @@ impl ZoneRaftRegistry {
                 continue;
             }
             self.hosted.insert(zone_id.clone());
-            self.open_persisted_zone(zone_id, peers.clone(), runtime_handle)?;
+            self.open_persisted_zone(zone_id, runtime_handle)?;
             count += 1;
         }
         Ok(count)
@@ -935,7 +864,6 @@ impl ZoneRaftRegistry {
         &self,
         zone_id: &str,
         mut config: RaftConfig,
-        mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
         // This node's DURABLE role intent for the zone (voter/learner as
         // declared at join). Persisted once here as the SSOT for "what role
@@ -946,11 +874,6 @@ impl ZoneRaftRegistry {
         let node_id = config.id;
         let membership_policy = self.storage_policy.membership(zone_id)?;
         if membership_policy == super::MembershipPolicy::FixedLocal {
-            if !peers.is_empty() {
-                return Err(TransportError::Connection(
-                    "isolated root accepts its local root only".into(),
-                ));
-            }
             config.membership_policy = membership_policy;
         }
         // Fast path: zone already exists — no work needed.
@@ -1075,9 +998,6 @@ impl ZoneRaftRegistry {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
         use raft::Storage;
-        if let Ok(initial_state) = raft_storage.initial_state() {
-            reconcile_peers_with_conf_state(zone_id, &mut peers, &initial_state.conf_state);
-        }
         let mut state_machine = FullStateMachine::new(&store).map_err(|e| {
             TransportError::Connection(format!("Failed to create state machine: {}", e))
         })?;
@@ -1141,12 +1061,10 @@ impl ZoneRaftRegistry {
                 |e| TransportError::Connection(format!("Failed to create ZoneConsensus: {}", e)),
             )?;
 
-        // Peer map — shared between ZoneEntry, TransportLoop, and ZoneConsensusDriver.
-        // `PeerMap::with_peers` drops any self-entry in the seed (self is a ConfState
-        // member, not a transport peer — see `PeerMap` invariant).
-        let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
-        let shared_peers: SharedPeerMap =
-            Arc::new(RwLock::new(PeerMap::with_peers(node_id, peer_map)));
+        // Route book — shared between ZoneEntry, TransportLoop, the forwarding
+        // context and the ZoneConsensusDriver, which derives its registered
+        // layer from the applied member-address records.
+        let shared_peers: SharedPeerMap = Arc::new(RwLock::new(PeerMap::new(node_id)));
 
         driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
 
@@ -1206,7 +1124,7 @@ impl ZoneRaftRegistry {
                                     // fill in from the registry.
                                     (!self_addr_for_cb.is_empty()).then(|| self_addr_for_cb.clone())
                                 } else {
-                                    peers.get(id).map(NodeAddress::to_operator_str)
+                                    peers.route(*id).map(NodeAddress::to_operator_str)
                                 }
                             })
                             .collect()
@@ -1262,6 +1180,20 @@ impl ZoneRaftRegistry {
         .with_self_address(self.self_address());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // A managed zone keeps its member's address record current; the
+        // fixed local root has no network members.
+        let advertise = self.self_address();
+        let registration_handle = (membership_policy == super::MembershipPolicy::Managed
+            && !advertise.is_empty())
+        .then(|| {
+            runtime_handle.spawn(handle.clone().register_member_address(
+                crate::raft::MemberRegistration {
+                    advertise,
+                    seeds: self.seeds(),
+                },
+                shutdown_rx.clone(),
+            ))
+        });
         let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
 
         // Leader election is owned by raft-rs's tick loop inside the
@@ -1297,6 +1229,7 @@ impl ZoneRaftRegistry {
                 node_id,
                 shutdown_tx,
                 transport_handle,
+                registration_handle,
                 persistence,
             },
         );
@@ -1386,7 +1319,7 @@ impl ZoneRaftRegistry {
             );
             return None;
         }
-        let (peers, runtime) = {
+        let runtime = {
             let guard = self.materialization.read().unwrap();
             let m = guard.as_ref()?;
             if !m.policy.may_materialize(zone_id) {
@@ -1396,9 +1329,9 @@ impl ZoneRaftRegistry {
                 );
                 return None;
             }
-            (m.peers.clone(), m.runtime.clone())
+            m.runtime.clone()
         };
-        match self.open_persisted_zone(zone_id, peers, &runtime) {
+        match self.open_persisted_zone(zone_id, &runtime) {
             Ok(node) => {
                 tracing::info!(zone = %zone_id, "Zone materialized on first access");
                 Some(node)
@@ -1418,58 +1351,31 @@ impl ZoneRaftRegistry {
         }
     }
 
-    /// Get a snapshot of the peers map for a zone.
     /// Get the base path for zone storage directories.
     pub fn base_path(&self) -> &PathBuf {
         &self.base_path
     }
 
+    /// The current routes of a resident zone, as `id -> dial address`.
     pub fn get_peers(&self, zone_id: &str) -> Option<HashMap<u64, NodeAddress>> {
         self.zones
             .get(zone_id)
             .map(|e| e.peers.read().unwrap().snapshot())
     }
 
-    /// Get cluster peer addresses from any existing zone (all zones share the same peers).
-    /// Used by auto-join for new zones that don't have their own peer map yet.
-    pub fn get_all_peers(&self) -> Vec<NodeAddress> {
-        for entry in self.zones.iter() {
-            let peers = entry.peers.read().unwrap();
-            if !peers.is_empty() {
-                return peers.values().cloned().collect();
-            }
-        }
-        Vec::new()
-    }
-
-    /// Record a peer's advertise address learned from an inbound
-    /// `StepMessage`.  The transport peer-map's runtime SSOT under
-    /// the opaque-ID contract: every received raft message proves
-    /// the sender's reachable address, so we update on every
-    /// arrival rather than persist + hope.  Returns `true` if the
-    /// map changed (insert or address update), `false` otherwise.
+    /// Record a peer's advertise address observed on an authenticated
+    /// inbound `StepMessage` — the route book's observed layer, held in
+    /// memory only. Returns `true` if the route changed.
     ///
-    /// Empty `endpoint` is treated as "no advertise — keep existing
-    /// entry".  The caller is responsible for verifying `peer_id`
-    /// is a legitimate cluster member (zone authorization upstream
-    /// gates that).
+    /// Empty `endpoint` is "no advertise — keep the existing route". Zone
+    /// authorization upstream verifies the sender.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
         if endpoint.is_empty() || peer_id == 0 {
             return false;
         }
-        // Self-exclusion is enforced structurally by `PeerMap::insert` (self is a
-        // ConfState member, not a transport peer — PR #3996 opaque-ID contract);
-        // the insert below returns `false` for a self-entry, so this method
-        // reports "no change" without a scattered `== self.node_id` guard.
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        let mut peers = entry.peers.write().unwrap();
-        if let Some(existing) = peers.get(&peer_id) {
-            if existing.endpoint == endpoint {
-                return false;
-            }
-        }
         // The peer advertises a bare `host:port` authority; scheme it with
         // THIS node's transport posture (the cluster's SSOT — the registry
         // TLS config), not by sniffing the string. A scheme-less address
@@ -1483,9 +1389,8 @@ impl ZoneRaftRegistry {
             }
             Err(_) => return false,
         };
-        // `PeerMap::insert` returns `false` iff the entry was self — propagate
-        // that as "map unchanged".
-        peers.insert(peer_id, parsed)
+        let changed = entry.peers.write().unwrap().observe(peer_id, parsed);
+        changed
     }
 
     /// The network replica identity used by managed data zones.
@@ -1568,6 +1473,7 @@ impl ZoneRaftRegistry {
             node_id,
             shutdown_tx,
             transport_handle,
+            registration_handle,
             persistence,
         } = entry;
         self.recently_removed
@@ -1615,6 +1521,7 @@ impl ZoneRaftRegistry {
                     node_id,
                     shutdown_tx,
                     transport_handle,
+                    registration_handle,
                     persistence,
                 },
             );
@@ -1635,6 +1542,11 @@ impl ZoneRaftRegistry {
                 error = %e,
                 "Transport loop task failed during remove_zone; continuing with destroy",
             );
+        }
+        // The registration task holds a consensus handle; it observes the
+        // same shutdown and must be gone before the store is released.
+        if let Some(registration) = registration_handle {
+            let _ = registration.await;
         }
 
         // Explicitly drop the ZoneConsensus handle so the driver task's
@@ -1679,6 +1591,11 @@ impl ZoneRaftRegistry {
     /// shutdown and diagnostics only.
     pub fn resident_zones(&self) -> Vec<String> {
         self.zones.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Whether `zone_id`'s runtime is resident now. Never materializes.
+    pub fn is_resident(&self, zone_id: &str) -> bool {
+        self.zones.contains_key(zone_id)
     }
 
     /// Block until `zone_id` knows who its leader is.
@@ -1775,49 +1692,6 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    #[test]
-    fn test_reconcile_peers_with_conf_state_repairs_single_rotated_id() {
-        let mut peers = vec![
-            NodeAddress::parse("nexus-1:2126", false).unwrap(),
-            NodeAddress::parse("nexus-2:2126", false).unwrap(),
-            NodeAddress::parse("witness:2126", false).unwrap(),
-        ];
-        let stale_id = peers[1].id;
-        let rotated_id = 13569616949052319723;
-        let conf_state = ConfState {
-            voters: vec![peers[0].id, rotated_id, peers[2].id],
-            ..Default::default()
-        };
-
-        reconcile_peers_with_conf_state("root", &mut peers, &conf_state);
-
-        assert!(!peers.iter().any(|peer| peer.id == stale_id));
-        let repaired = peers
-            .iter()
-            .find(|peer| peer.id == rotated_id)
-            .expect("rotated peer id should be present");
-        assert_eq!(repaired.hostname, "nexus-2");
-        assert_eq!(repaired.endpoint, "http://nexus-2:2126");
-    }
-
-    #[test]
-    fn test_reconcile_peers_with_conf_state_ignores_ambiguous_mismatch() {
-        let mut peers = vec![
-            NodeAddress::parse("nexus-1:2126", false).unwrap(),
-            NodeAddress::parse("nexus-2:2126", false).unwrap(),
-            NodeAddress::parse("witness:2126", false).unwrap(),
-        ];
-        let original = peers.clone();
-        let conf_state = ConfState {
-            voters: vec![peers[0].id, 42],
-            ..Default::default()
-        };
-
-        reconcile_peers_with_conf_state("root", &mut peers, &conf_state);
-
-        assert_eq!(peers, original);
-    }
-
     #[tokio::test]
     async fn a_persisted_zone_is_hosted_at_boot_and_materializes_on_first_access() {
         // The restart contract, in the two halves the split makes distinct:
@@ -1829,7 +1703,7 @@ mod tests {
         let base = tmp.path().to_path_buf();
 
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("corp-eng", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("corp-eng", &tokio::runtime::Handle::current())
             .unwrap();
         assert_eq!(reg.list_zones(), vec!["corp-eng".to_string()]);
         // Simulate process restart: shutdown tasks, release file locks.
@@ -1846,11 +1720,7 @@ mod tests {
             "indexing must not open anything — that is the whole point",
         );
 
-        reg2.arm_materialization(
-            vec![],
-            tokio::runtime::Handle::current(),
-            ZoneLoadPolicy::OnDemand,
-        );
+        reg2.arm_materialization(tokio::runtime::Handle::current(), ZoneLoadPolicy::OnDemand);
         assert!(
             reg2.get_node("corp-eng").is_some(),
             "a hosted zone materializes on first access",
@@ -1866,7 +1736,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("zone-a", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("zone-a", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);
@@ -1942,9 +1812,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("victim", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.create_zone("healthy", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("healthy", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);
@@ -1989,7 +1859,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("victim", &tokio::runtime::Handle::current())
             .unwrap();
         assert_eq!(reg.resident_zones(), vec!["victim".to_string()]);
         assert!(base.join("victim").exists());
@@ -2017,7 +1887,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("victim", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("victim", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);
@@ -2025,11 +1895,7 @@ mod tests {
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
-        reg2.arm_materialization(
-            vec![],
-            tokio::runtime::Handle::current(),
-            ZoneLoadPolicy::OnDemand,
-        );
+        reg2.arm_materialization(tokio::runtime::Handle::current(), ZoneLoadPolicy::OnDemand);
         reg2.set_deletion_epoch_source(Arc::new(StubEpochSource(Some(u64::MAX))));
 
         assert!(
@@ -2052,9 +1918,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("root", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("root", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.create_zone("sharedzone", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("sharedzone", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);
@@ -2063,16 +1929,11 @@ mod tests {
         let reg2 = ZoneRaftRegistry::new(base, 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 2, "both are hosted");
         reg2.arm_materialization(
-            vec![],
             tokio::runtime::Handle::current(),
             ZoneLoadPolicy::Only(vec!["root".to_string()]),
         );
         let n = reg2
-            .materialize_now(
-                &["root".to_string()],
-                vec![],
-                &tokio::runtime::Handle::current(),
-            )
+            .materialize_now(&["root".to_string()], &tokio::runtime::Handle::current())
             .unwrap();
         assert_eq!(n, 1, "only root should open");
         assert_eq!(reg2.resident_zones(), vec!["root".to_string()]);
@@ -2101,7 +1962,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("temp-zone", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("temp-zone", &tokio::runtime::Handle::current())
             .unwrap();
         assert!(
             base.join("temp-zone").exists(),
@@ -2125,7 +1986,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base, 1);
-        reg.create_zone("temp-zone", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("temp-zone", &tokio::runtime::Handle::current())
             .unwrap();
 
         reg.remove_zone("temp-zone").await.unwrap();
@@ -2134,13 +1995,8 @@ mod tests {
             "stale raft messages must not resurrect a just-removed zone",
         );
 
-        reg.join_zone(
-            "temp-zone",
-            vec![],
-            false,
-            &tokio::runtime::Handle::current(),
-        )
-        .unwrap();
+        reg.join_zone("temp-zone", false, &tokio::runtime::Handle::current())
+            .unwrap();
         assert!(
             !reg.is_auto_join_suppressed("temp-zone"),
             "explicit recreate/join must clear the transport suppression marker",
@@ -2157,9 +2013,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("keep", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("keep", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.create_zone("gone", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("gone", &tokio::runtime::Handle::current())
             .unwrap();
         reg.remove_zone("gone").await.unwrap();
         reg.shutdown_all();
@@ -2184,7 +2040,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("crash-zone", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("crash-zone", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);
@@ -2214,7 +2070,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
-        reg.create_zone("persist", vec![], &tokio::runtime::Handle::current())
+        reg.create_zone("persist", &tokio::runtime::Handle::current())
             .unwrap();
         reg.shutdown_all();
         drop(reg);

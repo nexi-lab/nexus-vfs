@@ -132,7 +132,7 @@ async fn versioned_step_checks_current_replica_zone_membership_on_the_same_chann
     .await;
     let node = server
         .registry
-        .create_zone("shared", vec![], &tokio::runtime::Handle::current())
+        .create_zone("shared", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     node.propose_conf_change(raft::eraftpb::ConfChangeType::AddLearnerNode, 4, Vec::new())
@@ -242,7 +242,7 @@ async fn versioned_client_never_falls_back_on_legacy_peer_or_reconnect() {
     let directory = tempfile::tempdir().unwrap();
     let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
     let node = registry
-        .create_zone("root", vec![], &tokio::runtime::Handle::current())
+        .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     let server = RaftGrpcServer::new(

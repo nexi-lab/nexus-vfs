@@ -81,7 +81,7 @@ async fn zone_manager_create_and_apply_topology_under_tokio_main() {
 
     // Single-voter zone — raft-rs election timer (default ~150-300ms)
     // will self-elect once `tick()` runs in the spawned transport_loop.
-    zm.create_zone("root", vec![])
+    zm.create_zone("root")
         .expect("create_zone must not panic on tokio worker");
 
     // Wait briefly for the election timer to fire so subsequent
@@ -140,7 +140,7 @@ async fn one_voter_propose_converges_without_self_forward_loop() {
     )
     .expect("ZoneManager::new");
 
-    zm.create_zone("root", vec![]).expect("create_zone");
+    zm.create_zone("root").expect("create_zone");
 
     // Election timer ~150 ms; give the driver a small margin to settle
     // cached_leader_id post-self-vote.
@@ -199,7 +199,7 @@ async fn zone_manager_remove_zone_under_tokio_main() {
     )
     .expect("ZoneManager::new");
 
-    zm.create_zone("disposable", vec![]).expect("create_zone");
+    zm.create_zone("disposable").expect("create_zone");
 
     zm.remove_zone("disposable", true)
         .expect("remove_zone must not panic on tokio worker");

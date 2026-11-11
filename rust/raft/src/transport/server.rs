@@ -59,14 +59,13 @@ fn session_credential_response(
     })
 }
 use crate::raft::{
-    reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
-    WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
+    Command, CommandResult, FullStateMachine, RaftError, WitnessStateMachine, ZoneConsensus,
+    ZoneRaftRegistry,
 };
 use bincode::Options;
 use dashmap::DashMap;
 use prost::Message;
 use protobuf::Message as ProtobufV2Message;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -623,16 +622,16 @@ impl ZoneTransportServiceImpl {
                 "zone '{zone_id}' was recently removed on this node"
             )));
         }
-        let root_peers = self
-            .registry
-            .get_peers(contracts::ROOT_ZONE_ID)
-            .ok_or_else(|| Status::not_found(format!("zone '{zone_id}' not found on this node")))?;
-        // The transport authenticates the sender. The peer map supplies current
-        // addresses; the registry applies zone admission and membership rules.
-        let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
+        if !self.registry.is_resident(contracts::ROOT_ZONE_ID) {
+            return Err(Status::not_found(format!(
+                "zone '{zone_id}' not found on this node"
+            )));
+        }
+        // The transport authenticates the sender; the registry applies zone
+        // admission and membership rules.
         let handle = tokio::runtime::Handle::current();
         self.registry
-            .join_zone(zone_id, peers, false, &handle)
+            .join_zone(zone_id, false, &handle)
             .map_err(|e| Status::internal(format!("failed to auto-join zone '{zone_id}': {e}")))
     }
 
@@ -656,18 +655,11 @@ impl ZoneTransportServiceImpl {
             None => self.join_step_zone(&req.zone_id)?,
         };
 
-        // Learn the connected peer's address before stepping. Relayed requests
-        // retain their logical origin in `from`; that origin does not own the
-        // forwarder's advertised address.
-        //
-        // No separate membership check: the peer-map *is* the
-        // membership SSOT (populated via inbound StepMessage +
-        // ConfChange apply).  The OLD env-seeded `peer_map` was
-        // strict-fail under random data-plane ids — a legit
-        // post-JoinZone follower would have its leader's first
-        // heartbeat rejected before it could install ConfState.
-        // Authentication is the transport layer's job (mTLS when
-        // enabled).
+        // Observe the connected peer's address before stepping. Relayed
+        // requests retain their logical origin in `from`; that origin does not
+        // own the forwarder's advertised address. Authentication is the
+        // transport layer's job (mTLS when enabled); the observation is a
+        // route only, never membership.
         self.registry
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
@@ -937,6 +929,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             &self.registry,
             &request.get_ref().zone_id,
         )?;
+        let caller = super::node_authority::authenticated_node_id(request.extensions())?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -997,6 +990,19 @@ impl ZoneApiService for ZoneApiServiceImpl {
             return Err(Status::unimplemented(
                 "conditional metadata proposals are not activated",
             ));
+        }
+        crate::raft::member_address::admit_rpc(&cmd, req.forwarded, caller, |id| {
+            node.is_replication_member(id)
+        })
+        .map_err(Status::permission_denied)?;
+        // An admitted original registration is the caller's own statement of
+        // how to reach it: route to it now, so members that restarted without
+        // records can elect the leader that will commit them.
+        if !req.forwarded {
+            if let Some((node_id, address)) = crate::raft::member_address::registration(&cmd) {
+                self.registry
+                    .learn_peer_address(&req.zone_id, node_id, address);
+            }
         }
 
         // Use submit_to_channel (leader-only, no forwarding) for forwarded
@@ -2436,12 +2442,9 @@ pub async fn serve_node_enrollment(
 /// A single witness zone entry.
 struct WitnessZoneEntry {
     node: ZoneConsensus<WitnessStateMachine>,
-    /// Per-zone peer map — kept here so ``auto_join_zone`` can seed
-    /// new child zones from root's *current* peer map (which has
-    /// applied conf_change rotations) rather than the cold-start
-    /// ``self.peers`` snapshot.  Per-zone autonomy stays intact: a
-    /// child zone's later conf_change Removes only affect its own
-    /// peer_map, never another zone's.
+    /// Per-zone route book. A witness state machine holds no member-address
+    /// records, so its routes are the observed senders; ``auto_join_zone``
+    /// reads root's routes for a new zone's voter roster.
     peers: SharedPeerMap,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     _transport_handle: JoinHandle<()>,
@@ -2516,17 +2519,9 @@ impl WitnessZoneRegistry {
         if endpoint.is_empty() || peer_id == 0 {
             return false;
         }
-        // Self-exclusion is enforced structurally by `PeerMap::insert` (see
-        // `PeerMap`); the insert below returns `false` for a self-entry.
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        let mut peers = entry.peers.write().unwrap();
-        if let Some(existing) = peers.get(&peer_id) {
-            if existing.endpoint == endpoint {
-                return false;
-            }
-        }
         let use_tls = endpoint.starts_with("https://");
         let parsed = match NodeAddress::parse(endpoint, use_tls) {
             Ok(mut p) => {
@@ -2535,8 +2530,8 @@ impl WitnessZoneRegistry {
             }
             Err(_) => return false,
         };
-        // `PeerMap::insert` returns `false` iff the entry was self.
-        peers.insert(peer_id, parsed)
+        let changed = entry.peers.write().unwrap().observe(peer_id, parsed);
+        changed
     }
 
     /// Create a witness Raft group for a zone (static bootstrap).
@@ -2563,7 +2558,7 @@ impl WitnessZoneRegistry {
         let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
         let config = RaftConfig::witness(self.node_id, peer_ids);
 
-        self.setup_witness_zone(zone_id, config, peers, runtime_handle)
+        self.setup_witness_zone(zone_id, config, runtime_handle)
     }
 
     /// Bootstrap or join a zone at boot time under the opaque-ID
@@ -2720,14 +2715,14 @@ impl WitnessZoneRegistry {
             // but never learn that it may vote, so failover loses quorum.
             RaftConfig::witness(self.node_id, peer_ids)
         };
-        self.setup_witness_zone(zone_id, config, peers, runtime_handle)
+        self.setup_witness_zone(zone_id, config, runtime_handle)
     }
 
     fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
         if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
             let peers = root.peers.read().unwrap();
             if !peers.is_empty() {
-                return peers.values().cloned().collect();
+                return peers.routes().map(|(_, address)| address.clone()).collect();
             }
         }
         self.peers.clone()
@@ -2741,12 +2736,10 @@ impl WitnessZoneRegistry {
         &self,
         zone_id: &str,
         config: crate::raft::RaftConfig,
-        mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
         use crate::raft::RaftStorage;
         use crate::transport::{ClientConfig, RaftClientPool, TransportLoop};
-        use raft::Storage;
 
         // Zone-specific storage
         let zone_path = self.base_path.join(zone_id);
@@ -2754,9 +2747,6 @@ impl WitnessZoneRegistry {
         let raft_storage = RaftStorage::open(zone_path.join("raft")).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
-        if let Ok(initial_state) = raft_storage.initial_state() {
-            reconcile_peers_with_conf_state(zone_id, &mut peers, &initial_state.conf_state);
-        }
         let state_machine = WitnessStateMachine::new(&store).map_err(|e| {
             TransportError::Connection(format!("Failed to create witness state machine: {}", e))
         })?;
@@ -2766,13 +2756,8 @@ impl WitnessZoneRegistry {
                 TransportError::Connection(format!("Failed to create witness ZoneConsensus: {}", e))
             })?;
 
-        // Shared peer map — `PeerMap::with_peers` drops any self-entry in the
-        // seed (self is a ConfState member, not a transport peer).
-        let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
-        let shared_peers: super::SharedPeerMap = Arc::new(RwLock::new(super::PeerMap::with_peers(
-            self.node_id,
-            peer_map,
-        )));
+        let shared_peers: super::SharedPeerMap =
+            Arc::new(RwLock::new(super::PeerMap::new(self.node_id)));
         driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
 
         // Spawn transport loop with zone_id routing

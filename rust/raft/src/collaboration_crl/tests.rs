@@ -18,7 +18,7 @@ async fn old_crl_replay_and_restart_cannot_unrevoke_an_observed_serial() {
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
@@ -68,7 +68,7 @@ async fn old_crl_replay_and_restart_cannot_unrevoke_an_observed_serial() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
-        .open_persisted_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .open_persisted_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
@@ -87,7 +87,7 @@ async fn freshness_is_checked_on_every_admission_and_corrupt_state_refuses() {
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
@@ -135,7 +135,7 @@ async fn registered_admission_requires_exact_current_issuer_and_unambiguous_scop
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
@@ -209,7 +209,7 @@ async fn local_admission_also_requires_fresh_crl_and_rejects_foreign_alias() {
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;

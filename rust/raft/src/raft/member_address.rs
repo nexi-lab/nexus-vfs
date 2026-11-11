@@ -109,6 +109,63 @@ pub(crate) fn is_record_command(command: &Command) -> bool {
     )
 }
 
+/// The `(node_id, address)` a member-address put records, when its key and
+/// value are both canonical; `None` for any other command.
+#[cfg(feature = "grpc")]
+pub(crate) fn registration(command: &Command) -> Option<(u64, &str)> {
+    let Command::PutControlState {
+        namespace,
+        key,
+        value,
+        ..
+    } = command
+    else {
+        return None;
+    };
+    if namespace != NAMESPACE {
+        return None;
+    }
+    let address = std::str::from_utf8(value).ok()?;
+    let (node_id, _) = decode(key, value)?;
+    (canonical(address).as_deref() == Some(address)).then_some((node_id, address))
+}
+
+/// Admission of a member-address command arriving on the `Propose` RPC.
+///
+/// A delete is refused: RemoveNode is its only source. A put must carry a
+/// canonical record. An original (`forwarded=false`) request from an
+/// authenticated `caller` registers only that caller's own address, and only
+/// while the caller is a member of the zone; a forwarded request is a node
+/// relaying one it admitted.
+#[cfg(feature = "grpc")]
+pub(crate) fn admit_rpc(
+    command: &Command,
+    forwarded: bool,
+    caller: Option<u64>,
+    is_member: impl FnOnce(u64) -> bool,
+) -> Result<(), &'static str> {
+    if !is_record_command(command) {
+        return Ok(());
+    }
+    let Some((node_id, _)) = registration(command) else {
+        return Err(match command {
+            Command::DeleteControlState { .. } => {
+                "member-address records are removed only by a committed RemoveNode"
+            }
+            _ => "member-address put must carry a node id and a canonical host:port",
+        });
+    };
+    match caller {
+        Some(caller) if !forwarded && caller != node_id => {
+            Err("a node registers only its own member address")
+        }
+        Some(caller) if !forwarded && !is_member(caller) => {
+            Err("only a member of the zone registers a member address")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The dial endpoint for a recorded `address`, schemed by the reading node's
 /// TLS posture.
 #[cfg(feature = "grpc")]
@@ -209,6 +266,50 @@ mod tests {
             ),
             format!("{:?}", vec![delete(3), put(2, "nexus-2:2126").unwrap()])
         );
+    }
+
+    #[test]
+    fn the_propose_rpc_admits_only_a_members_own_registration() {
+        let own = put(7, "nexus-7:9000").unwrap();
+        let member = |id| id == 7 || id == 8;
+        assert_eq!(admit_rpc(&own, false, Some(7), member), Ok(()));
+        assert!(
+            admit_rpc(&own, false, Some(8), member).is_err(),
+            "a node cannot register another node's address"
+        );
+        assert!(
+            admit_rpc(&own, false, Some(7), |_| false).is_err(),
+            "a non-member cannot register"
+        );
+        assert_eq!(
+            admit_rpc(&own, true, Some(8), member),
+            Ok(()),
+            "a node relays a registration it admitted"
+        );
+        assert_eq!(
+            admit_rpc(&own, false, None, member),
+            Ok(()),
+            "a plaintext listener has no caller identity to compare"
+        );
+        for forwarded in [false, true] {
+            assert!(admit_rpc(&delete(7), forwarded, Some(7), member).is_err());
+            assert!(admit_rpc(&delete(7), forwarded, None, member).is_err());
+        }
+        let malformed = Command::PutControlState {
+            namespace: NAMESPACE.into(),
+            key: "7".into(),
+            value: b"https://nexus-7:9000".to_vec(),
+            if_absent: false,
+        };
+        assert!(admit_rpc(&malformed, true, Some(7), member).is_err());
+        let other_namespace = Command::DeleteControlState {
+            namespace: contracts::CONTROL_NS_AUTH.into(),
+            key: "7".into(),
+        };
+        assert_eq!(admit_rpc(&other_namespace, false, Some(8), member), Ok(()));
+        assert_eq!(admit_rpc(&Command::Noop, false, Some(8), member), Ok(()));
+        assert_eq!(registration(&own), Some((7, "nexus-7:9000")));
+        assert_eq!(registration(&malformed), None);
     }
 
     #[test]

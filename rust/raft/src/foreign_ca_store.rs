@@ -128,7 +128,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = RaftForeignCaStore::new(node, runtime);
@@ -205,7 +205,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 

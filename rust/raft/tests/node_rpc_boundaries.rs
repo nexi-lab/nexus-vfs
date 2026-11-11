@@ -67,7 +67,7 @@ impl PeerServer {
         let directory = tempfile::tempdir().unwrap();
         let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
         let root = registry
-            .create_zone("root", vec![], &tokio::runtime::Handle::current())
+            .create_zone("root", &tokio::runtime::Handle::current())
             .unwrap();
         root.campaign().await.unwrap();
         let address = common::node_bind_addr();
@@ -363,7 +363,7 @@ async fn raft_pool_rejects_an_in_flight_dial_after_credentials_change() {
 async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     let directory = tempfile::tempdir().unwrap();
     let manager = nexus_raft::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
-    let root = manager.create_zone_async("root", vec![]).await.unwrap();
+    let root = manager.create_zone_async("root").await.unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(5)));
     let node = root.consensus_node();
     node.propose(Command::SetMetadata {
@@ -456,7 +456,7 @@ async fn assert_owner_replica_data_scope(
     use raft::eraftpb::{ConfChangeType, Entry, EntryType, MessageType};
     const ZONE: &str = "owner-replica-data";
     let node = registry
-        .create_zone(ZONE, vec![], &tokio::runtime::Handle::current())
+        .create_zone(ZONE, &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     let membership = node
@@ -821,7 +821,7 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     let private = tempfile::tempdir().unwrap();
     let registry = Arc::new(ZoneRaftRegistry::new(private.path().to_path_buf(), 1));
     let node = registry
-        .create_zone("root", vec![], &tokio::runtime::Handle::current())
+        .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     let address = common::node_bind_addr();

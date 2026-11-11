@@ -81,19 +81,6 @@ pub enum RaftError {
     /// survives the hop into this vocabulary; see that variant for why it is typed.
     #[error("data dir already open by another process: {0}")]
     DataDirLocked(String),
-
-    /// `create_zone` was called for a zone that already exists with a
-    /// different peer-address-book.  Idempotency holds when the
-    /// requested address book matches the existing one (same set of
-    /// `(hostname, port)` tuples); a different set is operator error
-    /// — surface it loudly rather than silently mutating ConfState.
-    #[error(
-        "zone already exists with different membership: actual={actual:?} requested={requested:?}"
-    )]
-    ZoneAlreadyExistsWithDifferentMembership {
-        actual: Vec<String>,
-        requested: Vec<String>,
-    },
 }
 
 impl RaftError {

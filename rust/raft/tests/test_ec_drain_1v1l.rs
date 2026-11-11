@@ -83,7 +83,7 @@ async fn test_ec_drain_1v1l_learner_receives_propose_ec_local() {
 
     // Owner: create 1-voter sharedzone.  Self-elects (quorum=1).
     let zone_owner = zm_owner
-        .create_zone("sharedzone", vec![format!("{id_owner}@{bind_owner}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone on owner");
     for _ in 0..100 {
         if zone_owner.is_leader() {
@@ -101,11 +101,7 @@ async fn test_ec_drain_1v1l_learner_receives_propose_ec_local() {
 
     // Learner registers locally with `learner=true`, then JoinZone(learner).
     let _zone_learner = zm_learner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_owner}@{bind_owner}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join_zone(learner) on learner");
 
     let join_resp = call_join_zone_rpc(

@@ -119,21 +119,11 @@ pub struct BootConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootAction {
     /// Founder path — this node auto-creates each declared zone as a
-    /// SOLO 1-voter cluster and installs the DT_MOUNT entries.
-    /// Corresponds to the pre-refactor call to
-    /// `ZoneManager::bootstrap_static_async(zones, peers_for_ha,
-    /// mounts)`.
-    ///
-    /// `peers_for_ha` is the CLI `--peers` list projected into the
-    /// raft-internal `"id@host:port"` form (via
-    /// `NodeAddress::to_raft_peer_str`) — forwarded to
-    /// `bootstrap_static_async` verbatim so the founder's local
-    /// transport peer map is seeded with future HA members even though
-    /// the initial ConfState is `[self]` only.
+    /// SOLO 1-voter cluster and installs the DT_MOUNT entries
+    /// (`ZoneManager::bootstrap_static_async(zones, mounts)`).
     StaticFounder {
         zones: Vec<String>,
         mounts: BTreeMap<String, String>,
-        peers_for_ha: Vec<String>,
     },
 
     /// Joiner path — this node dispatches a per-zone
@@ -318,15 +308,9 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
 
     // Row 1: pure founder — no peers on either side, zones declared.
     if zones_set {
-        let peers_for_ha = cfg
-            .cli_peer_addrs
-            .iter()
-            .map(NodeAddress::to_raft_peer_str)
-            .collect();
         return BootAction::StaticFounder {
             zones: cfg.federation_zones.clone(),
             mounts: cfg.federation_mounts.clone(),
-            peers_for_ha,
         };
     }
 
@@ -388,7 +372,6 @@ pub fn plan_boot_action(cfg: &BootConfig) -> BootAction {
     BootAction::StaticFounder {
         zones: Vec::new(),
         mounts: BTreeMap::new(),
-        peers_for_ha: Vec::new(),
     }
 }
 
@@ -503,7 +486,6 @@ mod tests {
             BootAction::StaticFounder {
                 zones: Vec::new(),
                 mounts: BTreeMap::new(),
-                peers_for_ha: Vec::new(),
             }
         );
     }
@@ -518,17 +500,12 @@ mod tests {
             mount("/shared", "sharedzone"),
         );
         match plan_boot_action(&cfg) {
-            BootAction::StaticFounder {
-                zones,
-                mounts,
-                peers_for_ha,
-            } => {
+            BootAction::StaticFounder { zones, mounts } => {
                 assert_eq!(zones, vec!["sharedzone".to_string()]);
                 assert_eq!(
                     mounts.get("/shared").map(String::as_str),
                     Some("sharedzone")
                 );
-                assert!(peers_for_ha.is_empty(), "no CLI peers → empty HA seed");
             }
             other => panic!("expected StaticFounder, got {other:?}"),
         }
@@ -560,7 +537,6 @@ mod tests {
             BootAction::StaticFounder {
                 zones: Vec::new(),
                 mounts: BTreeMap::new(),
-                peers_for_ha: Vec::new(),
             }
         );
         assert!(plan_boot_action(&cfg).needs_root_zone());
@@ -712,14 +688,7 @@ mod tests {
     }
 
     // NOTE: no "row 1 with CLI peers" test — that shape (empty identity
-    // + non-empty CLI + zones set) is caught by row 6 as FailLoud.  The
-    // `peers_for_ha` field on `StaticFounder` is therefore unreachable
-    // as non-empty under the current matrix; it is retained for
-    // forward-compat with Phase B (identity.zones may seed HA members
-    // without triggering row 6) and to preserve the shape of the
-    // pre-refactor `bootstrap_static_async(zones, peers, mounts)` call.
-    // Row 1's empty-peers pass-through is pinned by
-    // `row1_pure_founder_returns_static_founder`.
+    // + non-empty CLI + zones set) is caught by row 6 as FailLoud.
 
     // ── Phase B: identity.zones seeds the joiner path ────────────────
     #[test]

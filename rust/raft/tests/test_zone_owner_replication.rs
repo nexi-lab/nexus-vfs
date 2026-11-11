@@ -34,7 +34,7 @@ async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
     let directory = tempfile::tempdir().unwrap();
     let address = common::node_bind_addr();
     let manager = node(31, directory.path(), &address).unwrap();
-    found(&manager, "root", 31, &address).await;
+    found(&manager, "root").await;
     let root_id = manager.cluster_status("root").node_id;
     let mut client = peer_client(&address).await;
     let mut heartbeat = raft::eraftpb::Message {
@@ -106,18 +106,8 @@ fn node_with_peers(
     )
 }
 
-async fn found(manager: &Arc<ZoneManager>, zone: &str, id: u64, addr: &str) {
-    let zone = manager
-        .create_zone_async(
-            zone,
-            if zone == "root" {
-                vec![]
-            } else {
-                vec![format!("{id}@{addr}")]
-            },
-        )
-        .await
-        .unwrap();
+async fn found(manager: &Arc<ZoneManager>, zone: &str) {
+    let zone = manager.create_zone_async(zone).await.unwrap();
     ready(zone.consensus_node()).await;
 }
 
@@ -232,9 +222,9 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
     let source = node(31, source_dir.path(), &source_addr).unwrap();
     let target = node(32, target_dir.path(), &target_addr).unwrap();
     for zone in ["root", AGENT_ZONE, OTHER_ZONE] {
-        found(&source, zone, 31, &source_addr).await;
+        found(&source, zone).await;
     }
-    found(&target, "root", 32, &target_addr).await;
+    found(&target, "root").await;
     let target_root_id = target.cluster_status("root").node_id;
     for (manager, owner) in [(&source, "user-source"), (&target, "user-target")] {
         let root = store(manager, "root", "/");
@@ -245,7 +235,7 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
                 .unwrap(),
             ConditionalMetadataResult::Committed { .. }
         ));
-        assert!(manager.join_zone("root", vec![], true).is_err());
+        assert!(manager.join_zone("root", true).is_err());
     }
     assert!(store(&source, AGENT_ZONE, HOME)
         .as_conditional_metadata()
@@ -360,7 +350,7 @@ async fn replica_adoption_preserves_local_root_identity_and_writes_across_restar
     let initial = ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
     let local_id = initial.node_id();
     let replica_id = if local_id == 41 { 42 } else { 41 };
-    found(&initial, "root", local_id, "127.0.0.1:0").await;
+    found(&initial, "root").await;
     let identity_path = directory.path().join(".node_id");
     let identity_bytes = std::fs::read(&identity_path).unwrap();
     let root = store(&initial, "root", "/");
@@ -420,7 +410,7 @@ async fn replica_adoption_preserves_local_root_identity_and_writes_across_restar
             ConditionalMetadataResult::Committed { .. }
         ));
         if round == 0 {
-            found(&manager, AGENT_ZONE, replica_id, &address).await;
+            found(&manager, AGENT_ZONE).await;
         }
         let data = manager.get_zone(AGENT_ZONE).unwrap().consensus_node();
         assert_eq!(data.id(), replica_id);
@@ -453,7 +443,7 @@ async fn failed_replica_removal_preserves_the_existing_route_map() {
     let directory = tempfile::tempdir().unwrap();
     let address = common::node_bind_addr();
     let manager = node(41, directory.path(), &address).unwrap();
-    found(&manager, AGENT_ZONE, 41, &address).await;
+    found(&manager, AGENT_ZONE).await;
     let registry = manager.registry();
     let endpoint = "http://127.0.0.1:2526";
     assert!(registry.learn_peer_address(AGENT_ZONE, 42, endpoint));

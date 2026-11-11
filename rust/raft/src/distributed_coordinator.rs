@@ -814,34 +814,6 @@ pub fn peers_excluding_self(peer_addrs: &[NodeAddress], self_address: &str) -> V
         .collect()
 }
 
-fn joiner_local_zone_peer_seeds(peer_addrs: &[NodeAddress]) -> Vec<String> {
-    let mut seeds: Vec<String> = peer_addrs
-        .iter()
-        .map(NodeAddress::to_raft_peer_str)
-        .collect();
-    seeds.sort();
-    seeds
-}
-
-/// Operator-facing projection of [`joiner_local_zone_peer_seeds`] — bare
-/// `host:port` strings, no local `hostname_to_node_id` hash prefix.  Used
-/// ONLY for tracing::info log fields at boot boundary; the actual peer
-/// list passed to `ZoneManager::join_zone` still uses the raft-internal
-/// `id@host:port` form because the address-book key derivation there
-/// needs the authoritative-id round-trip.  Keeping them separate prevents
-/// the leak class where operators / peer AIs read the log line and
-/// mistake local `hostname_to_node_id(peer_addr)` output for a
-/// "transport-auto-resolved remote node_id" — the two concepts share zero
-/// state.
-fn joiner_local_zone_peer_seeds_display(peer_addrs: &[NodeAddress]) -> Vec<String> {
-    let mut seeds: Vec<String> = peer_addrs
-        .iter()
-        .map(NodeAddress::to_operator_str)
-        .collect();
-    seeds.sort();
-    seeds
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyStorageBootstrapPlan {
     FoundImmediately,
@@ -910,14 +882,7 @@ fn create_founder_zone(
          what a peer discovers is what is MOUNTED in the root zone, reported at the \
          end of boot.",
     );
-    // Founder self-registration: encode `{node_id}@{self_address}` so
-    // `ZoneManager::create_zone`'s round-trip through
-    // `NodeAddress::parse` recovers `node_id` verbatim (raft-internal
-    // parse accepts the id-prefixed shape).  The operator-facing
-    // `parse_operator_addr` rejects `@` — but this is a raft-internal
-    // site with both authoritative inputs in hand.
-    let self_peer = format!("{node_id}@{self_address}");
-    zm.create_zone(zone_id, vec![self_peer])
+    zm.create_zone(zone_id)
         .map_err(|e| format!("create_zone({zone_id}): {e}"))
         .map(|_| ())
 }
@@ -1123,15 +1088,7 @@ fn attempt_join_zone_round(
             // FIRST so this node's gRPC server can serve append-
             // entries from the leader once AddNode commits.
             if zm.get_zone(zone_id).is_none() {
-                let zone_peers = joiner_local_zone_peer_seeds(peer_addrs);
-                let zone_peers_display = joiner_local_zone_peer_seeds_display(peer_addrs);
-                tracing::info!(
-                    zone = %zone_id,
-                    seed_count = zone_peers_display.len(),
-                    seed_peers = ?zone_peers_display,
-                    "local join_zone seed peers",
-                );
-                if let Err(e) = zm.join_zone(zone_id, zone_peers, /* learner */ as_learner) {
+                if let Err(e) = zm.join_zone(zone_id, as_learner) {
                     last_err = format!("local join_zone setup failed: {e}");
                     tracing::warn!(
                         endpoint = %endpoint,
@@ -1780,10 +1737,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         // Root-leader path: founder creates 1-voter cluster locally.
         let am_root_leader = zm.get_zone("root").map(|h| h.is_leader()).unwrap_or(false);
         if am_root_leader {
-            // Founder self-registration string — see `create_founder_zone`
-            // for the encoding rationale.
-            let self_peer = format!("{self_id}@{self_address}");
-            zm.create_zone(zone_id, vec![self_peer])
+            zm.create_zone(zone_id)
                 .map_err(|e| format!("create_zone({zone_id}): {e}"))?;
             self.install_apply_cb_for_zone(kernel, zone_id);
 
@@ -1804,7 +1758,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             };
             campaign_result.map_err(|e| format!("create_zone({zone_id}) campaign: {e}"))?;
 
-            // Auto-invite witness voters present in NEXUS_PEERS.  The
+            // Auto-invite witness voters among the seed addresses.  The
             // witness's id is hostname-derived (well-known per F3) so
             // the leader can address it directly without waiting for
             // JoinZone.  Without this, witness never receives raft
@@ -1818,8 +1772,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             // 2/2 until witness comes up — same exposure as the OLD
             // hostname-deterministic ConfState bootstrap, operationally
             // equivalent.
-            let root_peers = registry.get_peers("root").unwrap_or_default();
-            for peer in root_peers.values() {
+            for peer in zm.seed_peers() {
                 if !peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
@@ -1854,10 +1807,9 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
             return Ok(());
         }
 
-        // Follower path: JoinZone via peers.  Address book comes from
-        // root zone's peer map (populated via inbound StepMessage).
-        let peer_addrs = registry.get_peers("root").unwrap_or_default();
-        if peer_addrs.is_empty() {
+        // Follower path: JoinZone against the seed addresses.
+        let candidates = zm.seed_peers();
+        if candidates.is_empty() {
             return Err(format!(
                 "create_zone({zone_id}): not root-leader and no peers known",
             ));
@@ -1866,43 +1818,22 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut last_err = String::new();
         while Instant::now() < deadline {
-            // Re-resolve root leader on each iteration — it may emerge
-            // (election) or change (failover) during retry.
-            let leader_id = zm.get_zone("root").and_then(|h| h.leader_id()).unwrap_or(0);
-            let candidates: Vec<NodeAddress> = if leader_id != 0 {
-                peer_addrs.get(&leader_id).into_iter().cloned().collect()
-            } else {
-                peer_addrs.values().cloned().collect()
-            };
-
             // Register the zone locally with skip_bootstrap=true so
             // the leader's snapshot can install the authoritative
             // ConfState the moment AddNode commits.  Idempotent.
             if zm.get_zone(zone_id).is_none() {
-                let peer_seed_addrs: Vec<NodeAddress> = peer_addrs.values().cloned().collect();
-                let local_peer_seeds = joiner_local_zone_peer_seeds(&peer_seed_addrs);
-                if !local_peer_seeds.is_empty() {
-                    let local_peer_seeds_display =
-                        joiner_local_zone_peer_seeds_display(&peer_seed_addrs);
-                    tracing::info!(
+                if let Err(e) = zm.join_zone(zone_id, false) {
+                    // Not fatal — the JoinZone RPCs below still run and the
+                    // outer loop retries until the deadline — but it MUST
+                    // be visible: without the local registration the
+                    // leader's snapshot has nowhere to install the
+                    // authoritative ConfState, so the join "succeeds"
+                    // remotely while this node holds no zone.
+                    tracing::warn!(
                         zone = %zone_id,
-                        seed_count = local_peer_seeds_display.len(),
-                        seed_peers = ?local_peer_seeds_display,
-                        "local federation zone seed peers",
+                        error = %e,
+                        "local zone pre-registration failed; join will retry",
                     );
-                    if let Err(e) = zm.join_zone(zone_id, local_peer_seeds, false) {
-                        // Not fatal — the JoinZone RPCs below still run and the
-                        // outer loop retries until the deadline — but it MUST
-                        // be visible: without the local registration the
-                        // leader's snapshot has nowhere to install the
-                        // authoritative ConfState, so the join "succeeds"
-                        // remotely while this node holds no zone.
-                        tracing::warn!(
-                            zone = %zone_id,
-                            error = %e,
-                            "local zone pre-registration failed; join will retry",
-                        );
-                    }
                 }
             }
 
@@ -1989,8 +1920,7 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
 
     fn join_zone(&self, kernel: &Kernel, zone_id: &str, as_learner: bool) -> CoordinatorResult<()> {
         let zm = self.zm().ok_or("federation not active")?;
-        let peers = zm.current_peer_strings();
-        zm.join_zone(zone_id, peers, as_learner)
+        zm.join_zone(zone_id, as_learner)
             .map_err(|e| e.to_string())?;
         // install_apply_cb_for_zone now atomically pairs the cb
         // install with a DT_MOUNT replay scan (see its docstring),
@@ -2017,13 +1947,10 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         }
 
         // Step 1: set up local raft replica with skip_bootstrap=true so the
-        // leader's snapshot is the authoritative ConfState source.  We seed
-        // the address book with the leader so outgoing AppendEntries acks
-        // and vote responses can reach it from the moment the snapshot
-        // installs.
-        let leader_peer = vec![leader_addr.to_string()];
+        // leader's snapshot is the authoritative ConfState source. Replies
+        // route to the leader through the address its messages carry.
         if zm.get_zone(zone_id).is_none() {
-            zm.join_zone(zone_id, leader_peer, as_learner)
+            zm.join_zone(zone_id, as_learner)
                 .map_err(|e| format!("join_cluster local setup: {e}"))?;
         }
 
@@ -2857,33 +2784,27 @@ fn wire_mount_impl(
     // Quorum-replication contract: a DT_MOUNT entry committed on the
     // parent zone is observed by every voter via raft replication, so
     // every peer's apply-cb fires here.  If the target zone's raft
-    // replica isn't loaded locally yet, create it now using the same
-    // peer roster as root — every peer derives the identical
-    // ConfState seed and the new zone's raft group converges on a
-    // leader once a quorum of peers have run through this path.
+    // replica isn't loaded locally yet and this node federates (it has
+    // seed addresses), create it now.
     //
     // Without this auto-create, only the originating peer's local
     // sys_setattr ever instantiates the target zone; followers stay
     // empty, the new zone's voter set has no quorum, and `cluster_info`
     // never reports a leader_id — the symptom that broke
     // `_wait_zone_ready` in the federation E2E suite.
-    if registry.get_node(target_zone_id).is_none() {
-        let zone_peers = zm.current_peer_strings();
-        if !zone_peers.is_empty() {
-            tracing::info!(
+    if registry.get_node(target_zone_id).is_none() && !zm.seed_peers().is_empty() {
+        tracing::info!(
+            target_zone_id = %target_zone_id,
+            "wire_mount: target zone not loaded locally — auto-creating raft replica"
+        );
+        if let Err(e) = zm.create_zone(target_zone_id) {
+            tracing::warn!(
                 target_zone_id = %target_zone_id,
-                peers = ?zone_peers,
-                "wire_mount: target zone not loaded locally — auto-creating raft replica"
+                error = %e,
+                "wire_mount: target zone auto-create failed; wire_mount_core will defer"
             );
-            if let Err(e) = zm.create_zone(target_zone_id, zone_peers) {
-                tracing::warn!(
-                    target_zone_id = %target_zone_id,
-                    error = %e,
-                    "wire_mount: target zone auto-create failed; wire_mount_core will defer"
-                );
-            } else {
-                provider.install_apply_cb_for_zone(kernel, target_zone_id);
-            }
+        } else {
+            provider.install_apply_cb_for_zone(kernel, target_zone_id);
         }
     }
 
@@ -3381,29 +3302,6 @@ mod tests {
     fn peers_excluding_self_empty_is_empty() {
         // Founder mode with no other peers yet.
         assert!(peers_excluding_self(&[], "100.64.0.26:2126").is_empty());
-    }
-
-    #[test]
-    fn bootstrap_joiner_local_seed_includes_all_configured_peers() {
-        let peers = vec![
-            parse_peer("nexus-1:2126"),
-            parse_peer("witness:2126"),
-            parse_peer("nexus-3:2126"),
-        ];
-
-        let seeds = joiner_local_zone_peer_seeds(&peers);
-
-        let mut expected = vec![
-            parse_peer("nexus-1:2126").to_raft_peer_str(),
-            parse_peer("nexus-3:2126").to_raft_peer_str(),
-            parse_peer("witness:2126").to_raft_peer_str(),
-        ];
-        expected.sort();
-
-        assert_eq!(
-            seeds, expected,
-            "joiner local root registration must seed the full address book, not just the dialed peer",
-        );
     }
 
     #[test]

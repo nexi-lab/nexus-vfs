@@ -93,9 +93,7 @@ async fn test_async_bootstrap_1voter_then_join() {
 
     // Node A: create 1-voter root zone.  Self-elects as leader by
     // construction (quorum=1).
-    let zone_a = zm_a
-        .create_zone("root", vec![format!("{id_a}@{bind_a}")])
-        .expect("create root on A");
+    let zone_a = zm_a.create_zone("root").expect("create root on A");
     // Wait for self-campaign to land.
     for _ in 0..100 {
         if zone_a.is_leader() {
@@ -112,9 +110,7 @@ async fn test_async_bootstrap_1voter_then_join() {
     // on B's quorum ack.
     let endpoint_a = format!("http://{bind_a}");
     let endpoint_b = format!("http://{bind_b}");
-    let _zone_b = zm_b
-        .join_zone("root", vec![format!("{id_a}@{bind_a}")], false)
-        .expect("local join_zone on B");
+    let _zone_b = zm_b.join_zone("root", false).expect("local join_zone on B");
 
     // Step 2: JoinZone RPC against A's leader. Learner-then-promote is
     // retry-driven (the raft-canonical membership change): the first call
@@ -204,7 +200,7 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
     // Owner: create the 1-voter sharedzone.  Self-elects on
     // construction (quorum=1).
     let zone_owner = zm_owner
-        .create_zone("sharedzone", vec![format!("{id_owner}@{bind_owner}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone on owner");
     for _ in 0..100 {
         if zone_owner.is_leader() {
@@ -223,11 +219,7 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
     // Learner.
     let endpoint_b1 = format!("http://{bind_b1}");
     let _zone_b1 = zm_b1
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_owner}@{bind_owner}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join_zone(learner) on b1");
     let r1 = call_join_zone_rpc(
         &endpoint_owner,
@@ -276,11 +268,7 @@ async fn test_share_join_learner_survives_joiner_wipe_rejoin() {
     // Joiner v2 — fresh id, brand-new dir.  Repeat JoinZone(learner).
     let endpoint_b2 = format!("http://{bind_b2}");
     let _zone_b2 = zm_b2
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_owner}@{bind_owner}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join_zone(learner) on b2");
     let r2 = call_join_zone_rpc(
         &endpoint_owner,

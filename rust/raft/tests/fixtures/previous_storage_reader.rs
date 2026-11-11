@@ -79,7 +79,7 @@ fn previous_reader_refuses_applied_compacted_and_snapshot_replica_formats() {
     // An ordinary root still opens with this exact previous binary.
     let directory = tempfile::tempdir().unwrap();
     let runtime = ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
-    let root = runtime.create_zone("root", vec![]).unwrap();
+    let root = runtime.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(5)));
     runtime.shutdown();
 }

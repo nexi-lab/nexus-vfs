@@ -73,6 +73,8 @@ pub use state_machine::{
 };
 
 pub use membership_policy::MembershipPolicy;
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use node::MemberRegistration;
 #[cfg(feature = "consensus")]
 pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
 #[cfg(feature = "consensus")]
@@ -81,8 +83,6 @@ pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use zone_persistence::{DeletionRecord, ZonePersistence};
-#[cfg(all(feature = "grpc", has_protos))]
-pub(crate) use zone_registry::reconcile_peers_with_conf_state;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use zone_registry::wait_until_caught_up;
 #[cfg(all(feature = "grpc", has_protos))]

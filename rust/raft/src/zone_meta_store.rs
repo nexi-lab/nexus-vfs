@@ -1171,7 +1171,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("corp", vec![], &runtime)
+            .create_zone("corp", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = ZoneMetaStore::new(node, runtime, "/corp".to_string());
