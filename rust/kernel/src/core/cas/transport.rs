@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ahash::AHashSet;
-use lib::file_durability::{sync_directory, sync_directory_ancestors, PublishedButNotDurable};
+use lib::file_durability::{
+    replace_file, sync_directory, sync_directory_ancestors, PublishedButNotDurable,
+};
 use tempfile::TempPath;
 
 /// Map content hash to CAS blob key: `cas/{h[0..2]}/{h[2..4]}/{hash}`.
@@ -343,9 +345,7 @@ impl LocalCASTransport {
         let key = blob_key(content_id)?;
         let path = self.resolve(&format!("{}.meta", key));
         let mut staged = self.stage_file(&path, meta)?;
-        // Rust's native replacement handles open readers on Windows through
-        // FileRenameInfoEx as well as the normal rename path on Unix.
-        std::fs::rename(&staged, &path)?;
+        replace_file(&staged, &path)?;
         staged.disable_cleanup(true);
         self.sync_published(&path)?;
         Ok(())

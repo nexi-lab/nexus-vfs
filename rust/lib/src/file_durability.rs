@@ -1,4 +1,4 @@
-//! Filesystem namespace barriers for storage with an application-controlled root.
+//! File replacement and namespace barriers for application-controlled storage.
 //!
 //! These functions report OS synchronization errors. Storage qualification must
 //! separately establish persistent backing and the platform's device-cache
@@ -6,6 +6,9 @@
 
 use std::io;
 use std::path::Path;
+
+mod replacement;
+pub use replacement::replace_file;
 
 /// Synchronize a directory's entries using the native filesystem barrier.
 pub fn sync_directory(path: &Path) -> io::Result<()> {
