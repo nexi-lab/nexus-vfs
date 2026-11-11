@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "cold_lifetime/owner_control.rs"]
+mod owner_control;
+
 enum Cut {
     Write,
     Read(String),

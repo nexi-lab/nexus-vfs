@@ -134,6 +134,23 @@ impl ZoneMetaStore {
         Ok(Box::new(NativeRecordIoGuard { _file: file }))
     }
 
+    pub(super) fn check_record_owner_binding(
+        &self,
+        path: &str,
+        owner_path: &str,
+        owner_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        let key = self.to_zone_key(path);
+        let owner_key = self.to_zone_key(owner_path);
+        let (_, actual_owner) = self.live_io_domain(path, owner_version)?;
+        if key == owner_key || actual_owner != owner_key {
+            return Err(refused(
+                "record binding does not match its control owner".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_exclude_retired_record_io(
         &self,
         path: &str,

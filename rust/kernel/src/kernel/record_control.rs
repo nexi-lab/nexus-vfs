@@ -6,17 +6,59 @@
 use std::sync::Arc;
 
 use crate::extensions::guarded_records::{RecordIoGuard, RecordOwnerState};
-use crate::meta_store::{ConditionalMetadataError, ConditionalMetadataResult, MetaStoreError};
+use crate::meta_store::{
+    ConditionalMetadataError, ConditionalMetadataResult, MetaStore, MetaStoreError,
+};
 use crate::vfs_router::RouteResult;
 
 use super::conditional_content::{ConditionalContentError, ConditionalContentResult};
 use super::{Kernel, KernelError, OperationContext};
 
+mod captured;
+pub use captured::{RecordContentExclusion, RecordContentOwner};
+
 fn storage_error(error: MetaStoreError) -> ConditionalContentError {
     ConditionalMetadataError::Failed(error).into()
 }
 
+fn retire_in_store(
+    store: &dyn MetaStore,
+    path: &str,
+    expected_version: &[u8],
+) -> Result<ConditionalContentResult, ConditionalContentError> {
+    let snapshot = store
+        .as_conditional_metadata()
+        .ok_or(ConditionalContentError::Unsupported)?
+        .read_versioned(path)?
+        .ok_or_else(|| storage_error(MetaStoreError::IOError("record owner is absent".into())))?;
+    let result = store
+        .as_guarded_records()
+        .ok_or(ConditionalContentError::Unsupported)?
+        .retire_record_guard(path, snapshot.metadata, expected_version)?;
+    Ok(match result {
+        ConditionalMetadataResult::Committed { version } => {
+            ConditionalContentResult::Committed { version }
+        }
+        ConditionalMetadataResult::Conflict { current_version } => {
+            ConditionalContentResult::Conflict { current_version }
+        }
+    })
+}
+
 impl Kernel {
+    /// Capture an enrolled owner's actual store/key for lifecycle readback.
+    /// On restart, the service must first restore its authoritative storage
+    /// binding; a visible path alone does not identify a previous store.
+    /// Active WAL consumers use the control returned with their original WAL.
+    pub fn capture_record_content_owner(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<RecordContentOwner, ConditionalContentError> {
+        let (path, route) = self.record_control_route(path, ctx)?;
+        RecordContentOwner::from_route(&route, &path)
+    }
+
     /// Inspect the original owner decision through the trusted control plane.
     /// This supports unknown-outcome/restart readback while generic content
     /// reads stay refused. A retired result requires separate I/O exclusion
@@ -140,26 +182,8 @@ impl Kernel {
         expected_version: &[u8],
     ) -> Result<ConditionalContentResult, ConditionalContentError> {
         let (path, route) = self.record_control_route(path, ctx)?;
-        self.with_metastore_route(&route, |store| -> Result<_, ConditionalContentError> {
-            let snapshot = store
-                .as_conditional_metadata()
-                .ok_or(ConditionalContentError::Unsupported)?
-                .read_versioned(&path)?
-                .ok_or_else(|| {
-                    storage_error(MetaStoreError::IOError("record owner is absent".into()))
-                })?;
-            let result = store
-                .as_guarded_records()
-                .ok_or(ConditionalContentError::Unsupported)?
-                .retire_record_guard(&path, snapshot.metadata, expected_version)?;
-            Ok(match result {
-                ConditionalMetadataResult::Committed { version } => {
-                    ConditionalContentResult::Committed { version }
-                }
-                ConditionalMetadataResult::Conflict { current_version } => {
-                    ConditionalContentResult::Conflict { current_version }
-                }
-            })
+        self.with_metastore_route(&route, |store| {
+            retire_in_store(store, &path, expected_version)
         })
         .ok_or(ConditionalContentError::Unsupported)?
     }

@@ -172,6 +172,15 @@ impl kernel::meta_store::GuardedRecords for ZoneMetaStore {
         Self::begin_record_io(self, path, guard_version)
     }
 
+    fn check_record_owner_binding(
+        &self,
+        path: &str,
+        owner_path: &str,
+        owner_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Self::check_record_owner_binding(self, path, owner_path, owner_version)
+    }
+
     fn try_exclude_retired_record_io(
         &self,
         path: &str,

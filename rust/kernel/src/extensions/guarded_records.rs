@@ -58,6 +58,18 @@ pub trait GuardedRecords: Send + Sync {
         guard_version: &[u8],
     ) -> Result<Box<dyn RecordIoGuard>, ConditionalMetadataError>;
 
+    /// Verify an existing child's permanent binding to this exact live owner.
+    /// Matching opaque revisions alone cannot pair a data handle with control.
+    /// This reads existing authority; it never enrolls or reassigns a record.
+    fn check_record_owner_binding(
+        &self,
+        _path: &str,
+        _owner_path: &str,
+        _owner_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported)
+    }
+
     /// Return exclusive retirement coverage after every admitted I/O has ended.
     /// None means an actual operation still holds its lifetime guard.
     fn try_exclude_retired_record_io(
