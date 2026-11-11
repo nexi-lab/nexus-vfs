@@ -16,7 +16,7 @@ impl Command {
     /// Fixed on every replica, including one that has not applied a first SC
     /// create. EC must never publish either managed metadata or its allocator.
     pub(crate) fn requires_conditional_sc(&self) -> bool {
-        if self.requires_fixed_local_storage() {
+        if self.storage_protocol().is_some() {
             return true;
         }
         if let Some(key) = self.ordinary_metadata_key() {

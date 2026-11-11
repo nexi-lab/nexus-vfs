@@ -61,11 +61,15 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use super::replication_log::ReplicationLog;
 use super::state_machine::StateMachine;
 use super::storage::RaftStorage;
+#[cfg(all(feature = "grpc", has_protos))]
+use super::storage_protocol::StorageProtocol;
 use super::PROPOSAL_TIMEOUT_SECS;
 use super::{Command, CommandResult, RaftError, Result};
 
 mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod storage_submission_tests;
 
 /// Capacity of the bounded channel between [`ZoneConsensus`] handles and the
 /// [`ZoneConsensusDriver`] actor. Provides backpressure under sustained
@@ -1323,7 +1327,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // protocol. Refuse before serialization/forwarding: mixed members may
         // not even decode the new enum variant. A future activation gate must
         // replace this refusal only after membership and storage are enforced.
-        if command.requires_fixed_local_storage() {
+        if command.storage_protocol().is_some() {
             return Err(RaftError::Config(
                 "conditional metadata proposals are not activated".into(),
             ));
@@ -1378,7 +1382,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             expected,
             incarnation,
         };
-        self.submit_conditional_storage(command).await
+        self.submit_storage_command(command, StorageProtocol::ConditionalMetadata)
+            .await
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
@@ -1388,20 +1393,40 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         expected_image: Option<Vec<u8>>,
         incarnation: [u8; 16],
     ) -> Result<CommandResult> {
-        self.submit_conditional_storage(Command::AdoptProtectedMetadata {
-            key,
-            expected_image,
-            incarnation,
-        })
+        self.submit_storage_command(
+            Command::AdoptProtectedMetadata {
+                key,
+                expected_image,
+                incarnation,
+            },
+            StorageProtocol::ConditionalMetadata,
+        )
         .await
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
-    async fn submit_conditional_storage(&self, command: Command) -> Result<CommandResult> {
-        if !self.supports_conditional_metadata() {
-            return Err(RaftError::UnsupportedOperation(
-                "conditional metadata requires fixed local membership",
+    async fn submit_storage_command(
+        &self,
+        command: Command,
+        protocol: StorageProtocol,
+    ) -> Result<CommandResult> {
+        if command.storage_protocol() != Some(protocol) {
+            return Err(RaftError::InvalidState(
+                "command belongs to a different storage protocol".into(),
             ));
+        }
+        let (supported, refusal) = match protocol {
+            StorageProtocol::ReplicaControl => (
+                self.supports_replica_binding(),
+                "replica binding protocol is not activated",
+            ),
+            StorageProtocol::ConditionalMetadata | StorageProtocol::RecordLifetime => (
+                self.supports_conditional_metadata(),
+                "conditional metadata requires fixed local membership",
+            ),
+        };
+        if !supported {
+            return Err(RaftError::UnsupportedOperation(refusal));
         }
         let receiver = self.enqueue_proposal(&command)?;
         // Once enqueued, any failure without a proven refusal is ambiguous.
@@ -1418,45 +1443,20 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
-    /// The storage owner uses the same qualified SC door as conditional files.
-    /// Generic, forwarded and EC proposal doors cannot submit these controls.
+    /// The record owner submits through its own admission domain and the
+    /// common SC completion path.
     #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) async fn commit_record_storage(&self, command: Command) -> Result<CommandResult> {
-        if !matches!(
-            command,
-            Command::BindRecordGuard { .. }
-                | Command::GuardedRecord { .. }
-                | Command::RetireRecordGuard { .. }
-                | Command::AdmitRecordIoOwner { .. }
-        ) {
-            return Err(RaftError::InvalidState(
-                "not a record storage command".into(),
-            ));
-        }
-        self.submit_conditional_storage(command).await
+        self.submit_storage_command(command, StorageProtocol::RecordLifetime)
+            .await
     }
 
-    /// A typed control mutation shares the existing enforced-local SC door.
-    /// Managed membership needs protocol activation before this command can
-    /// enter its log or be forwarded to another binary.
+    /// Replica authority has a distinct admission domain. SC completion and
+    /// original-operation uncertainty use the common storage submission path.
     #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) async fn commit_replica_control(&self, command: Command) -> Result<CommandResult> {
-        if !self.supports_replica_binding() {
-            return Err(RaftError::UnsupportedOperation(
-                "replica binding protocol is not activated",
-            ));
-        }
-        if !matches!(
-            command,
-            Command::ApplyReplicaBinding(_)
-                | Command::ReserveNodeIdentity(_)
-                | Command::ApplyReplicaIssuance(_)
-        ) {
-            return Err(RaftError::InvalidState(
-                "not a replica control command".into(),
-            ));
-        }
-        self.submit_conditional_storage(command).await
+        self.submit_storage_command(command, StorageProtocol::ReplicaControl)
+            .await
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
@@ -1471,11 +1471,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         new_key: String,
         is_pas: bool,
     ) -> Result<CommandResult> {
-        self.submit_conditional_storage(Command::RenameMetadata {
-            old_key,
-            new_key,
-            is_pas,
-        })
+        self.submit_storage_command(
+            Command::RenameMetadata {
+                old_key,
+                new_key,
+                is_pas,
+            },
+            StorageProtocol::ConditionalMetadata,
+        )
         .await
     }
 
