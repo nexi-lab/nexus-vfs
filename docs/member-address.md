@@ -93,6 +93,11 @@ The `Propose` handler admits member-address commands as follows:
 | Put, `forwarded=false`, authenticated caller | Key equals the caller's node id, and the caller is a member of the zone |
 | Put, `forwarded=true` | A node relaying a request it admitted |
 
+An admitted original put is also the caller's own statement of where it
+listens, so the receiving node adds it to its observed routes before
+proposing. Members of a zone that all restarted without records reach each
+other this way and elect the leader that commits their records.
+
 ## Peer map
 
 The transport peer map is a cache derived from the record and from inbound
@@ -101,7 +106,7 @@ traffic. It has two layers:
 | Layer | Source | Lifetime |
 |---|---|---|
 | Registered | The state machine's member-address records | Rebuilt at driver start, after a snapshot install, and after an applied batch that contains a member-address command or a ConfChange |
-| Observed | `sender_address` of authenticated inbound Raft messages | Memory only; an entry for an id is cleared when that id's registered record changes |
+| Observed | `sender_address` of authenticated inbound Raft messages, and the address of an admitted original registration | Memory only; an entry for an id is cleared when that id's registered record changes |
 
 `route(id)` returns the observed address, else the registered address. The
 local node is never a peer. Ordinary applied batches do not touch the map, and
@@ -133,13 +138,17 @@ resumes once that put commits on the leader.
 
 `identity.json` keeps the operator's seed addresses (`peers`) and the node's
 per-zone role intent (`zones[].zone_id`, `zones[].as_role`). Fields that older
-versions wrote under `zones[]` load and are ignored.
+versions wrote under `zones[]` load and are ignored. A node whose data
+directory was wiped rejoins its remembered zones through a seed; with zones
+remembered and no seed known, boot refuses rather than founding those zones
+again.
 
 ## Visibility
 
-- `GetClusterInfo` lists voters and learners with the addresses the local state
-  machine records for them, including the local node. A member without a record
-  appears with an empty address.
+- `GetClusterInfo` lists voters and learners, and the leader address, with the
+  addresses the local state machine records for them, including the local
+  node. A member without a record appears with an empty address. JoinZone's
+  returned configuration uses the same records.
 - The transport warns once when a member has no registered or observed route,
   and again only after its route has existed and gone.
 - `ZoneStatus` cluster facts carry `leader_contact_age_ms`: the time since this
