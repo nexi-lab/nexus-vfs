@@ -361,6 +361,13 @@ pub enum RaftMsg {
         observed: StorageActivationView,
         tx: oneshot::Sender<Result<PreparedReplicaControl>>,
     },
+    /// Consume an authenticated complete-member observation at the owning actor.
+    #[cfg(all(feature = "grpc", has_protos))]
+    ActivateReplicaControl {
+        prepared: PreparedReplicaControl,
+        operation_id: String,
+        tx: oneshot::Sender<Result<CommandResult>>,
+    },
     /// Durably prepare this driver's local reader before member qualification.
     PrepareReplicaControlReader { tx: oneshot::Sender<Result<()>> },
     /// Propose a configuration change (add/remove node).
@@ -543,6 +550,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     membership_epoch: Option<u64>,
     /// Derived from the mandatory Raft reader floor; updated after its commit.
     replica_control_reader_prepared: bool,
+    /// Derived from committed state at boot, apply and snapshot installation.
+    replica_control_active: bool,
     /// Shared state machine (shared with handle for reads).
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
@@ -853,6 +862,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // durable past bootstrap milestone" invariant against the
         // legitimate just-loaded case.  One call to the SSOT mapping
         // helper pins all four atoms to truth from t=0.
+        let replica_control_active = state_machine.replica_control_activation()?.is_some();
         let state_machine = Arc::new(RwLock::new(state_machine));
         let proposal_id = Arc::new(AtomicU64::new(0));
         let cached_leader_id = Arc::new(AtomicU64::new(0));
@@ -906,6 +916,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             incarnation: Arc::new(()),
             membership_epoch: Some(0),
             replica_control_reader_prepared,
+            replica_control_active,
             state_machine,
             config,
             pending: HashMap::new(),
@@ -1434,7 +1445,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
         let (supported, refusal) = match protocol {
             StorageProtocol::ReplicaControl => (
-                self.supports_replica_binding(),
+                self.supports_replica_binding().await?,
                 "replica binding protocol is not activated",
             ),
             StorageProtocol::ConditionalMetadata | StorageProtocol::RecordLifetime => (
@@ -1461,20 +1472,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 tx,
             })
             .map_err(channel_try_send_err)?;
-        // Once enqueued, any failure without a proven refusal is ambiguous.
-        // The state machine may have committed before its answer was lost.
-        match super::proposal::wait_for_commit(
-            receiver,
-            tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS),
-        )
-        .await
-        {
-            Err(error @ (RaftError::NotLeader { .. } | RaftError::ProposalRejected(_))) => {
-                Err(error)
-            }
-            Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
-            result => result,
-        }
+        storage_activation::await_storage_commit(receiver).await
     }
 
     /// The record owner submits through its own admission domain and the
@@ -1494,8 +1492,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
-    pub(crate) fn supports_replica_binding(&self) -> bool {
-        self.config.membership_policy == super::MembershipPolicy::FixedLocal
+    pub(crate) async fn supports_replica_binding(&self) -> Result<bool> {
+        if self.config.membership_policy == super::MembershipPolicy::FixedLocal {
+            return Ok(true);
+        }
+        Ok(self
+            .state_machine
+            .read()
+            .await
+            .replica_control_activation()?
+            .is_some())
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
@@ -1892,7 +1898,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// correct behavior: the peer's gRPC call blocks until the driver
     /// can accept the message.
     pub async fn step(&self, msg: Message) -> Result<()> {
-        self.validate_step_message(&msg).await?;
+        self.validate_step_message(&msg, RaftMessageProtocol::Legacy)
+            .await?;
         self.msg_tx
             .send(RaftMsg::Step { msg })
             .await
@@ -1908,7 +1915,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         msg: Message,
         protocol: RaftMessageProtocol,
     ) -> Result<()> {
-        self.validate_step_message(&msg).await?;
+        self.validate_step_message(&msg, protocol).await?;
         let (tx, rx) = oneshot::channel();
         self.msg_tx
             .send(RaftMsg::StepTransport { msg, protocol, tx })
@@ -1917,8 +1924,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
-    async fn validate_step_message(&self, msg: &Message) -> Result<()> {
+    async fn validate_step_message(
+        &self,
+        msg: &Message,
+        protocol: RaftMessageProtocol,
+    ) -> Result<()> {
         self.config.membership_policy.require_managed()?;
+        let replica_reader = protocol == RaftMessageProtocol::ReplicaControlV1;
         // ReadIndex also carries entries, whose data is an opaque request
         // context. Only proposal/append entries contain serialized commands.
         if matches!(
@@ -1926,17 +1938,18 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgPropose
         ) {
             for entry in &msg.entries {
-                self.config.membership_policy.validate_entry(entry)?;
+                self.config.membership_policy.validate_entry_for_reader(
+                    entry,
+                    replica_reader && msg.get_msg_type() == raft::eraftpb::MessageType::MsgAppend,
+                )?;
             }
         }
         if msg.has_snapshot() && !msg.get_snapshot().data.is_empty() {
-            self.state_machine
-                .read()
-                .await
-                .validate_snapshot_membership(
-                    &msg.get_snapshot().data,
-                    self.config.membership_policy,
-                )?;
+            self.state_machine.read().await.validate_snapshot_reader(
+                &msg.get_snapshot().data,
+                self.config.membership_policy,
+                replica_reader,
+            )?;
         }
         Ok(())
     }
@@ -2176,6 +2189,14 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             #[cfg(all(feature = "grpc", has_protos))]
             RaftMsg::CompleteReplicaControlPreparation { observed, tx } => {
                 let _ = tx.send(self.complete_replica_control_preparation(observed));
+            }
+            #[cfg(all(feature = "grpc", has_protos))]
+            RaftMsg::ActivateReplicaControl {
+                prepared,
+                operation_id,
+                tx,
+            } => {
+                self.submit_replica_activation(prepared, operation_id, tx);
             }
             RaftMsg::PrepareReplicaControlReader { tx } => {
                 let _ = tx.send(self.prepare_replica_control_reader());
@@ -2424,6 +2445,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 let mut sm = self.state_machine.write().await;
                 sm.restore_snapshot(&snapshot.data)
                     .map_err(|e| RaftError::Storage(format!("restore snapshot: {e}")))?;
+                self.replica_control_active = sm.replica_control_activation()?.is_some();
             }
             // Reset the cheap compaction gate: the log now starts at the
             // snapshot index, so a freshly-installed follower does not re-open
@@ -2654,6 +2676,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 EntryType::EntryNormal => {
                     let (proposal_id, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
+                    if command.requires_activation_qualification() {
+                        self.replica_control_active = sm.replica_control_activation()?.is_some();
+                    }
                     #[cfg(all(feature = "grpc", has_protos))]
                     if super::member_address::is_record_command(&command) {
                         self.routes_stale = true;

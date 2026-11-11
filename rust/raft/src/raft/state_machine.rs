@@ -32,6 +32,8 @@ mod replica_issuance;
 mod storage_admission;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use replica_activation::validate_operation as validate_replica_activation_operation;
 pub use replica_activation::ReplicaControlActivation;
 
 const OWNED_CONTROL_NAMESPACES: &[&str] = &[
@@ -438,6 +440,26 @@ pub trait StateMachine: Send + Sync {
         Ok(())
     }
 
+    /// Validate retained state against the original local Raft reader floor.
+    /// Implementations keep their existing refusal unless they own this format.
+    fn validate_storage_reader(
+        &self,
+        policy: super::MembershipPolicy,
+        _replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_membership_policy(policy)
+    }
+
+    /// Validate a snapshot against the admitted transport or retained reader.
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        _replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_snapshot_membership(data, policy)
+    }
+
     /// Admission shared by EC origin, ingress and state-machine apply.
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
         Ok(command.requires_conditional_sc()
@@ -700,6 +722,19 @@ impl WitnessStateMachineInMemory {
 }
 
 impl StateMachine for WitnessStateMachineInMemory {
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        storage_admission::validate_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
     fn apply(&mut self, index: u64, _command: &Command) -> Result<CommandResult> {
         self.last_applied = index;
         Ok(CommandResult::Success)
@@ -795,6 +830,19 @@ impl WitnessStateMachine {
 }
 
 impl StateMachine for WitnessStateMachine {
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        storage_admission::validate_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
     fn apply(&mut self, index: u64, _command: &Command) -> Result<CommandResult> {
         // Witness nodes don't apply commands - they just track the index
         self.last_index = index;
@@ -1875,6 +1923,17 @@ struct Snapshot {
     last_applied: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn assert_snapshots_equal(left: &[u8], right: &[u8]) {
+    let left: Snapshot = bincode::deserialize(left).unwrap();
+    let right: Snapshot = bincode::deserialize(right).unwrap();
+    assert_eq!(left.metadata, right.metadata);
+    assert_eq!(left.stream_entries, right.stream_entries);
+    assert_eq!(left.control_state, right.control_state);
+    assert_eq!(left.advisory.locks, right.advisory.locks);
+    assert_eq!(left.last_applied, right.last_applied);
+}
+
 impl FullStateMachine {
     /// Shared command dispatch — the actual redb operations.
     ///
@@ -2498,6 +2557,24 @@ impl FullStateMachine {
 }
 
 impl StateMachine for FullStateMachine {
+    fn validate_storage_reader(
+        &self,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_owned_storage_reader(policy, replica_reader)
+    }
+
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        self.validate_owned_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
     fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
         self.read_replica_control_activation()
     }

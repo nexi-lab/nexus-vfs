@@ -17,7 +17,7 @@ pub struct ReplicaControlActivation {
     pub operation_id: String,
 }
 
-fn validate_operation(operation: &str) -> Result<()> {
+pub(crate) fn validate_operation(operation: &str) -> Result<()> {
     if operation.is_empty() || operation.len() > 256 || operation.chars().any(char::is_control) {
         return Err(storage_error("invalid activation operation ID"));
     }

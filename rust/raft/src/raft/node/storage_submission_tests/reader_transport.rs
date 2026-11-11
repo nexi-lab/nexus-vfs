@@ -158,13 +158,16 @@ async fn versioned_ingress_preserves_fixed_local_and_storage_domain_refusal() {
         .unwrap());
 
     let (handle, driver, _directory) = node(MembershipPolicy::Managed);
-    for command in [
-        replica(),
-        conditional(),
-        record(),
-        Command::ActivateReplicaControl {
-            operation_id: "wire-is-not-activation".into(),
-        },
+    for (command, protocol) in [
+        (replica(), RaftMessageProtocol::Legacy),
+        (conditional(), RaftMessageProtocol::ReplicaControlV1),
+        (record(), RaftMessageProtocol::ReplicaControlV1),
+        (
+            Command::ActivateReplicaControl {
+                operation_id: "wire-is-not-activation".into(),
+            },
+            RaftMessageProtocol::Legacy,
+        ),
     ] {
         let mut message = heartbeat(8);
         message.set_msg_type(raft::eraftpb::MessageType::MsgAppend);
@@ -175,7 +178,7 @@ async fn versioned_ingress_preserves_fixed_local_and_storage_domain_refusal() {
             ..Default::default()
         });
         assert!(handle
-            .step_transport(message, RaftMessageProtocol::ReplicaControlV1)
+            .step_transport(message, protocol)
             .await
             .unwrap_err()
             .to_string()

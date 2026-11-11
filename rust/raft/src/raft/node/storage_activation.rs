@@ -157,6 +157,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
         match (self.config.membership_policy, submission.protocol) {
             (MembershipPolicy::FixedLocal, _) if submission.configuration.is_none() => Ok(()),
+            (MembershipPolicy::Managed, StorageProtocol::ReplicaControl)
+                if self.replica_control_reader_prepared && self.replica_control_active =>
+            {
+                Ok(())
+            }
             (MembershipPolicy::Managed, StorageProtocol::ReplicaControl) => Err(
                 RaftError::UnsupportedOperation("replica binding protocol is not activated"),
             ),
@@ -164,5 +169,23 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 "conditional metadata requires fixed local membership",
             )),
         }
+    }
+}
+
+/// Shared SC completion semantics for storage proposals and activation.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(super) async fn await_storage_commit(
+    receiver: super::oneshot::Receiver<Result<super::CommandResult>>,
+) -> Result<super::CommandResult> {
+    // Once enqueued, only a proven pre-submission refusal resolves uncertainty.
+    match crate::raft::proposal::wait_for_commit(
+        receiver,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(super::PROPOSAL_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Err(error @ (RaftError::NotLeader { .. } | RaftError::ProposalRejected(_))) => Err(error),
+        Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
+        result => result,
     }
 }

@@ -30,10 +30,17 @@ impl MembershipPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_entry(self, entry: &Entry) -> Result<()> {
+    pub(crate) fn validate_entry_for_reader(
+        self,
+        entry: &Entry,
+        replica_reader: bool,
+    ) -> Result<()> {
         if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
             let (_, command) = Command::from_log_data(&entry.data)?;
-            if self == Self::Managed && command.storage_protocol().is_some() {
+            let protocol = command.storage_protocol();
+            let qualified_replica = replica_reader
+                && protocol == Some(super::storage_protocol::StorageProtocol::ReplicaControl);
+            if self == Self::Managed && protocol.is_some() && !qualified_replica {
                 return Err(RaftError::Config(
                     "conditional metadata log requires qualified fixed-local storage".into(),
                 ));
@@ -48,7 +55,8 @@ impl MembershipPolicy {
         storage: &RaftStorage,
         state_machine: &dyn StateMachine,
     ) -> Result<()> {
-        state_machine.validate_membership_policy(self)?;
+        let replica_reader = storage.replica_control_reader_required()?;
+        state_machine.validate_storage_reader(self, replica_reader)?;
         if self == Self::Managed {
             let first = storage.first_index_impl()?;
             let last = storage.last_index_impl()?;
@@ -92,6 +100,7 @@ impl MembershipPolicy {
         last: u64,
         local_id: Option<u64>,
     ) -> Result<()> {
+        let replica_reader = storage.replica_control_reader_required()?;
         let end = last
             .checked_add(1)
             .ok_or_else(|| invalid("stored log index is exhausted"))?;
@@ -108,7 +117,7 @@ impl MembershipPolicy {
                 return Err(invalid("stored log is incomplete"));
             }
             for entry in entries {
-                self.validate_entry(&entry)?;
+                self.validate_entry_for_reader(&entry, replica_reader)?;
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {}
                     EntryType::EntryConfChange if local_id.is_some() => {

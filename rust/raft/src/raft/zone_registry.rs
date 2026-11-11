@@ -1000,8 +1000,11 @@ impl ZoneRaftRegistry {
         })?;
         // Admission precedes rehydration, which writes the restored image back
         // to disk. A rejected mode change must preserve the existing store.
+        let replica_reader = raft_storage
+            .replica_control_reader_required()
+            .map_err(|e| TransportError::Connection(format!("Reader admission: {e}")))?;
         state_machine
-            .validate_membership_policy(config.membership_policy)
+            .validate_storage_reader(config.membership_policy, replica_reader)
             .map_err(|e| TransportError::Connection(format!("Storage admission: {e}")))?;
 
         // R14 raft-rs contract fix: rehydrate advisory lock state from
@@ -1025,7 +1028,7 @@ impl ZoneRaftRegistry {
             let meta = snap.get_metadata();
             if meta.index > 0 && !snap.data.is_empty() {
                 state_machine
-                    .validate_snapshot_membership(&snap.data, config.membership_policy)
+                    .validate_snapshot_reader(&snap.data, config.membership_policy, replica_reader)
                     .map_err(|e| TransportError::Connection(format!("Snapshot admission: {e}")))?;
                 state_machine.restore_snapshot(&snap.data).map_err(|e| {
                     TransportError::Connection(format!(

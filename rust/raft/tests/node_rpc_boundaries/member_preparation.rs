@@ -155,3 +155,79 @@ async fn configured_identity_controls_dial_even_when_route_carries_another_node_
     second.stop().await;
     third.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualified_members_activate_and_replicate_native_identity_before_voter_promotion() {
+    use contracts::node_identity::{NodeIdentity, NodeIdentityRequest};
+    use nexus_raft::replica_binding_store::RaftReplicaBindingStore;
+
+    let (ca, key) = generate_zone_ca("root").unwrap();
+    let first = RunningNode::start(1, node_tls(&ca, &key, 1)).await;
+    let second = RunningNode::start(2, node_tls(&ca, &key, 2)).await;
+    let zone = "activated-members";
+    let runtime = tokio::runtime::Handle::current();
+    let peer = second.registry.join_zone(zone, false, &runtime).unwrap();
+    let mut node = leader(&first, zone, &[2]).await;
+    assert!(first.registry.learn_peer_address(zone, 2, &second.address));
+    node.set_forward_ctx(
+        pool(node_tls(&ca, &key, 1)),
+        routes(1, &[(2, 2, &second.address)]),
+        zone.into(),
+    );
+    let prepared = node.prepare_replica_control_members().await.unwrap();
+    assert_eq!(prepared.member_ids(), vec![1, 2]);
+    let active = node
+        .activate_replica_control(prepared, "native-original".into())
+        .await
+        .unwrap();
+    assert_eq!(active.operation_id, "native-original");
+
+    let store = RaftReplicaBindingStore::new(node.clone(), runtime);
+    tokio::task::spawn_blocking(move || {
+        store
+            .reserve_node(&NodeIdentityRequest {
+                operation_id: "native-node".into(),
+                identity: NodeIdentity {
+                    node_id: 42,
+                    subject_public_key_sha256: [7; 32],
+                },
+            })
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if node.membership().await.unwrap().is_caught_up_learner(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.propose_conf_change(raft::eraftpb::ConfChangeType::AddNode, 2, Vec::new())
+        .await
+        .unwrap();
+    assert!(node.membership().await.unwrap().is_voter(2));
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        peer.read_linearizable(|state| state.replica_control_activation().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(observed, Some(active));
+    let store = RaftReplicaBindingStore::new(peer.clone(), tokio::runtime::Handle::current());
+    let identity = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || store.node_identity(42).unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(identity.unwrap().subject_public_key_sha256, [7; 32]);
+    drop((node, peer));
+    first.stop().await;
+    second.stop().await;
+}

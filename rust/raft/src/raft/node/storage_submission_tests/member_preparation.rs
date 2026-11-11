@@ -2,7 +2,7 @@
 
 use super::*;
 
-async fn drive<F: Future>(
+pub(super) async fn drive<F: Future>(
     driver: &mut ZoneConsensusDriver<FullStateMachine>,
     future: F,
 ) -> F::Output {
@@ -12,6 +12,9 @@ async fn drive<F: Future>(
             Poll::Ready(result) => return result,
             Poll::Pending => {
                 driver.process_messages();
+                // ReadIndex admission runs in advance even before raw Raft has
+                // a Ready. This is the same ordering as the transport driver.
+                let _ = driver.advance().await.unwrap();
                 while driver.has_ready() {
                     let _ = driver.advance().await.unwrap();
                 }
