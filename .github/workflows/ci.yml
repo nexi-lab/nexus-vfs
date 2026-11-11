@@ -30,7 +30,7 @@ jobs:
           shared-key: ci-database-bootstrap-${{ matrix.os }}
       - run: cargo test -p lib --features redb-storage redb_storage --lib
       - run: cargo test -p lib --features redb-storage file_durability::tests --lib
-      - run: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests raft::zone_persistence::tests
+      - run: 'cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests raft::zone_persistence::tests'
       - name: Record I/O lifetime on the native filesystem
         run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
       - name: Committed record notifications on the native filesystem
