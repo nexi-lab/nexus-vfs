@@ -128,7 +128,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let registry = Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1));
     let runtime = tokio::runtime::Handle::current();
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -126,6 +126,10 @@ message ClusterFacts {
   uint64 leader_id = 5;
   uint32 voter_count = 6;
   uint32 witness_count = 7;
+  // Milliseconds since this node last received a message from its current
+  // leader, measured in memory: 0 on the leader, absent before the first
+  // contact since the zone became resident.
+  optional uint64 leader_contact_age_ms = 8;
 }
 
 // Mount facts re-read from the parent zone's state machine post-mount.

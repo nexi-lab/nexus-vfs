@@ -29,7 +29,7 @@ struct Runtime(Arc<ZoneManager>);
 impl Runtime {
     fn open(directory: &std::path::Path) -> Self {
         let manager = ZoneManager::isolated(directory.to_str().unwrap()).unwrap();
-        let zone = manager.create_zone("root", vec![]).unwrap();
+        let zone = manager.create_zone("root").unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         Self(manager)
     }

@@ -140,7 +140,7 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
     let runtime = tokio::runtime::Handle::current();
     let zones = Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1));
     let node = zones
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {

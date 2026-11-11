@@ -86,6 +86,7 @@ pub const USER_RUNTIME_MAX_VALIDITY_SECS: u64 = 300;
 /// `zone-ops`           — zone-mutation operation journal (`raft::zone_op_journal`).
 /// `zone-registry`      — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
 /// `boot-sync`          — per-node boot catch-up markers (`profiles/cluster` boot).
+/// `member-address`     — zone member id → dial address (`raft::raft::member_address`).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
@@ -105,6 +106,10 @@ pub const CONTROL_NS_ZONE_REGISTRY: &str = "zone-registry";
 /// crates" guideline at the top of this file — same trade-off as
 /// `CONTROL_NS_ZONE_OPS`/`CONTROL_NS_ZONE_REGISTRY`.
 pub const CONTROL_NS_BOOT_SYNC: &str = "boot-sync";
+/// Every zone member's advertise address, keyed by its decimal Raft node id.
+/// Single-crate owner (`raft`), registered here for the same collision-
+/// prevention reason as [`CONTROL_NS_BOOT_SYNC`].
+pub const CONTROL_NS_MEMBER_ADDRESS: &str = "member-address";
 
 /// Zone IDs that can never be deleted — the replicated-control substrate
 /// itself. Deletion guards (`ZoneManager::remove_zone`, the registry's

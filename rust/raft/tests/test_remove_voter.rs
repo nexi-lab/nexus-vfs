@@ -111,18 +111,14 @@ async fn remove_voter_prunes_learner_from_conf_state() {
     let (zm_joiner, bind_joiner) = make_node(id_joiner, dir_joiner.path()).await;
 
     zm_owner
-        .create_zone("sharedzone", vec![format!("{id_owner}@{bind_owner}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone");
     wait_leader(&zm_owner, "sharedzone").await;
 
     let endpoint_owner = format!("http://{bind_owner}");
     let endpoint_joiner = format!("http://{bind_joiner}");
     zm_joiner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_owner}@{bind_owner}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join");
     let r = call_join_zone_rpc(
         &endpoint_owner,
@@ -212,9 +208,7 @@ async fn remove_voter_is_idempotent_on_unknown_id() {
     let id_owner = mint_random_id();
     write_node_id(dir_owner.path(), id_owner);
     let (zm_owner, bind_owner) = make_node(id_owner, dir_owner.path()).await;
-    zm_owner
-        .create_zone("sharedzone", vec![format!("{id_owner}@{bind_owner}")])
-        .expect("create");
+    zm_owner.create_zone("sharedzone").expect("create");
     wait_leader(&zm_owner, "sharedzone").await;
 
     let endpoint = format!("http://{bind_owner}");
@@ -244,19 +238,13 @@ async fn remove_voter_on_follower_returns_leader_address() {
     let (zm_owner, bind_owner) = make_node(id_owner, dir_owner.path()).await;
     let (zm_joiner, bind_joiner) = make_node(id_joiner, dir_joiner.path()).await;
 
-    zm_owner
-        .create_zone("sharedzone", vec![format!("{id_owner}@{bind_owner}")])
-        .expect("create");
+    zm_owner.create_zone("sharedzone").expect("create");
     wait_leader(&zm_owner, "sharedzone").await;
 
     let endpoint_owner = format!("http://{bind_owner}");
     let endpoint_joiner = format!("http://{bind_joiner}");
     zm_joiner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_owner}@{bind_owner}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join");
     let r = call_join_zone_rpc(
         &endpoint_owner,

@@ -23,7 +23,7 @@ impl Runtime {
     }
 
     fn store(&self, mount: &str, subtree: &str) -> Arc<dyn MetaStore> {
-        let root = self.0.create_zone("root", vec![]).unwrap();
+        let root = self.0.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(10)));
         Arc::new(ZoneMetaStore::new_with_subtree(
             root.consensus_node().clone(),
@@ -302,7 +302,7 @@ fn managed_membership_keeps_the_optional_operations_closed() {
         )
         .unwrap(),
     );
-    let root = runtime.0.create_zone("root", vec![]).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     let store = ZoneMetaStore::new_with_subtree(
         root.consensus_node().clone(),
         runtime.0.runtime_handle(),
@@ -348,7 +348,7 @@ fn managed_membership_keeps_the_optional_operations_closed() {
 fn isolated_metadata_adapter_keeps_generic_conditional_proposals_closed() {
     let dir = TempDir::new().unwrap();
     let runtime = Runtime::open(&dir);
-    let root = runtime.0.create_zone("root", vec![]).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(10)));
     let node = root.consensus_node();
     runtime

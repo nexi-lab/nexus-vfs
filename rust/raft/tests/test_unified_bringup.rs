@@ -138,7 +138,7 @@ async fn scenario1_split_roles_fresh_bringup_no_split_brain() {
     let (zm_a, bind_a) = make_node(id_a, dir_a.path()).await;
     for z in &zones {
         let zone_a = zm_a
-            .create_zone(z, vec![format!("{id_a}@{bind_a}")])
+            .create_zone(z)
             .expect("create_zone(founder) admits BootAction value");
         // Wait for self-election on 1-voter.
         for _ in 0..100 {

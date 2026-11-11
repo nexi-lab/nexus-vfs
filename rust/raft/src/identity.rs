@@ -1,22 +1,22 @@
-//! Node-bound peer address book persistence.
+//! Node-bound operator intent: seed addresses and per-zone role intent.
 //!
 //! `identity.json` at a platform-native user-data location persists
-//! the raft transport peer address book so `<NEXUS_DATA_DIR>` cleanup
-//! (Windows Storage Sense, antivirus, ops scripts scanning
-//! `.nexus-vfs/`) does not force the operator to re-specify `--peers`
-//! on the next boot.
+//! the operator's seed addresses and the role this node asked for in each
+//! zone, so `<NEXUS_DATA_DIR>` cleanup (Windows Storage Sense, antivirus,
+//! ops scripts scanning `.nexus-vfs/`) does not force the operator to
+//! re-specify `--peers` or re-join on the next boot.
 //!
 //! ### Scope
 //!
-//! Identity persists ONLY the peer list, not `node_id`.  Raft's
+//! Identity persists local intent only — never replicated state (member
+//! addresses live in each zone's state machine) and not `node_id`.  Raft's
 //! per-`Progress` heartbeat commit invariant
 //! ([`test_handle_heartbeat_on_empty_follower_with_stale_commit_panics`](../raft/storage.rs))
 //! requires wipe-rejoin to rotate `node_id` — reusing the old id
 //! against a leader that still remembers `Progress[old_id].matched > 0`
 //! trips `RaftLog::commit_to` on the fresh follower (`last_index=0`).
 //! Node identity therefore stays at `<data_dir>/.node_id` with its
-//! rotate-on-wipe lifecycle, and identity's role is narrowly the
-//! *transport address book*.
+//! rotate-on-wipe lifecycle.
 //!
 //! ### File layout and boot flow
 //!
@@ -38,41 +38,37 @@ pub const IDENTITY_FILE: &str = "identity.json";
 ///
 /// Version history:
 ///   * v1 (PR #106): peers only.
-///   * v2 (S3 完全体 Phase B): adds `zones` — per-zone membership snapshot
-///     for auto-reconnect after `data_dir` wipe.
+///   * v2 (S3 完全体 Phase B): adds `zones` — per-zone role intent for
+///     auto-reconnect after `data_dir` wipe.
 ///
 /// Load rule: any version `<= SCHEMA_VERSION` is accepted; missing
-/// fields default (e.g. v1 files load with `zones = []`).  Persist
-/// always writes the current version, upgrading files in place on the
-/// next write.  Files with `schema_version > SCHEMA_VERSION` refuse
-/// to load — forward-incompatible schemas are never silently
-/// downgraded.
+/// fields default (e.g. v1 files load with `zones = []`) and fields this
+/// build does not know are ignored.  Persist always writes the current
+/// version, upgrading files in place on the next write.  Files with
+/// `schema_version > SCHEMA_VERSION` refuse to load — forward-incompatible
+/// schemas are never silently downgraded.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// On-disk shape of `identity.json`.  Narrow by design: peer address
-/// book + per-zone membership snapshot.  Anything derivable from raft
-/// state (ConfState, log, snapshots) still belongs in the replicated
-/// SSOT — `zones` here is a *durable snapshot* driven by the ConfChange
-/// apply callback (Phase B, commit 7), not authoritative membership.
+/// On-disk shape of `identity.json`.  Narrow by design: seed addresses +
+/// per-zone role intent.  Anything derivable from raft state (ConfState,
+/// member addresses, log, snapshots) belongs in the replicated SSOT.
 /// `node_id` is deliberately NOT here — see module docs; Phase C
 /// reconsiders after the raft-rs Progress reset work.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
     pub schema_version: u32,
-    /// Raft peer address book — `"host:port"` strings, same schema
-    /// as CLI `--peers` / `NEXUS_PEERS`.  Transport seed only, NOT a
-    /// `ConfState` shadow.  Persisted so cold-boot after
+    /// Operator seed addresses — `"host:port"` strings, same schema as
+    /// CLI `--peers` / `NEXUS_PEERS`.  RPC targets (JoinZone,
+    /// DiscoverZones, member-address registration), NOT a `ConfState`
+    /// shadow and never zone routes.  Persisted so cold-boot after
     /// `<NEXUS_DATA_DIR>` loss can still contact known nodes without
-    /// operator re-specifying.  Peer node_ids are not encoded — they
-    /// are opaque, learned from the first inbound raft message via
-    /// `learn_peer_address` (transport/server.rs).
+    /// operator re-specifying.  Peer node_ids are not encoded.
     #[serde(default)]
     pub peers: Vec<String>,
-    /// Per-zone membership snapshot.  Written by the ConfChange apply
-    /// callback (Phase B, commit 7) on every voter+learner change so
-    /// that a subsequent boot with a wiped `data_dir` still knows
-    /// which zones this node participated in — and therefore which
-    /// zones' JoinZone to dispatch at boot.  See [`IdentityZone`].
+    /// Zones this node participates in, with the role it asked for —
+    /// written when a zone is set up here, so a boot with a wiped
+    /// `data_dir` still knows which zones' JoinZone to dispatch.  See
+    /// [`IdentityZone`].
     ///
     /// v1 files load with an empty `zones` vec via `#[serde(default)]`;
     /// the next persist upgrades the file to v2 on disk.
@@ -80,10 +76,7 @@ pub struct Identity {
     pub zones: Vec<IdentityZone>,
 }
 
-/// Per-zone entry in [`Identity::zones`].  Populated by the ConfChange
-/// apply callback with the *current* voter+learner list (both count —
-/// wipe-and-rejoin needs to reach the leader regardless of the
-/// rejoiner's own role, and any live member serves that role).
+/// Per-zone entry in [`Identity::zones`].
 ///
 /// `as_role` is this node's DURABLE role INTENT for the zone — the role
 /// it *wants* (voter/learner), as declared at join and written once by
@@ -96,28 +89,15 @@ pub struct Identity {
 /// prevented at the source by the learner-then-promote JoinZone (the
 /// leader adds a learner and promotes only once caught up), so recording
 /// intent here is safe.
-///
-/// `last_confirmed_unix_secs` is a coarse mtime (Unix seconds) —
-/// diagnostic only.  Never load-bearing for the ConfState decision.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdentityZone {
     pub zone_id: String,
-    /// Voter + learner list in operator-facing bare `"host:port"` form.
-    /// Order is the emit order from the ConfChange apply callback so
-    /// two boots at the same ConfState converge on the same identity
-    /// file — makes `persist_zones_if_changed` a real no-op most of
-    /// the time.
-    pub members: Vec<String>,
-    /// This node's role in the zone at last ConfChange apply.
+    /// The role this node asked for in the zone.
     #[serde(default)]
     pub as_role: IdentityZoneRole,
-    /// Unix seconds of the last apply that touched this zone entry.
-    /// `None` on v1 upgrade path.
-    #[serde(default)]
-    pub last_confirmed_unix_secs: Option<u64>,
 }
 
-/// This node's role in a given zone at the last ConfChange apply.
+/// The role this node asks for in a zone.
 /// Wire form is lowercase JSON — `"voter"` / `"learner"`.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -204,7 +184,7 @@ pub fn load(identity_dir: &Path) -> Result<Identity, String> {
             }
             if ident.schema_version < SCHEMA_VERSION {
                 // Leave the returned struct at the on-disk version so
-                // `persist_peers` / `persist_zone_members` see the gap
+                // `persist_peers` / `persist_zone_intent` see the gap
                 // and force a rewrite even if the peer set is unchanged.
                 // A boot that only reads (`share`/`join` audit paths)
                 // never rewrites the file; a boot that touches identity
@@ -281,89 +261,13 @@ pub fn persist_peers(
     Ok(updated)
 }
 
-/// Rewrite `identity.json` with the zone's current member list.
-///
-/// Called from the ConfChange apply callback with the new voter+learner
-/// membership.  Persists ONLY the members address book — the durable
-/// "how do I reach this zone's cluster on rejoin" fact.  It deliberately
-/// does NOT touch `as_role`: the node's role in a zone is the ephemeral,
-/// ConfState-derived achieved state (a would-be-voter is transiently a
-/// learner mid-promote), and persisting that here is what stranded a
-/// mid-promote node as a permanent learner.  The durable INTENT
-/// (voter/learner) is written once at join by [`persist_zone_intent`] and
-/// preserved across every members update here.
-///
-/// Idempotent: when the persisted members already match (same order),
-/// the file is not rewritten — apply runs on every ConfChange, so a naive
-/// rewrite would trigger disk I/O on every committed entry.
-///
-/// Members MUST be operator-facing bare `"host:port"` strings.  The
-/// caller (raft apply cb) has NodeAddress in hand; project via
-/// `NodeAddress::to_operator_str` before calling.
-pub fn persist_zone_members(
-    identity_dir: &Path,
-    existing: &Identity,
-    zone_id: &str,
-    members: Vec<String>,
-) -> Result<Identity, String> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs());
-    let mut zones = existing.zones.clone();
-    let changed_material = match zones.iter_mut().find(|z| z.zone_id == zone_id) {
-        Some(slot) => {
-            // Load-bearing field is members only; `as_role` (intent) is
-            // preserved (owned by `persist_zone_intent`), and
-            // `last_confirmed_unix_secs` alone is not a reason to rewrite.
-            let materially_same = slot.members == members;
-            if materially_same && existing.schema_version == SCHEMA_VERSION {
-                return Ok(existing.clone());
-            }
-            slot.members = members;
-            slot.last_confirmed_unix_secs = now_secs;
-            !materially_same
-        }
-        None => {
-            // No intent recorded yet (members arrived before the join-time
-            // intent write) — default to Voter, the common case; a later
-            // `persist_zone_intent` corrects an explicit learner.
-            zones.push(IdentityZone {
-                zone_id: zone_id.to_string(),
-                members,
-                as_role: IdentityZoneRole::default(),
-                last_confirmed_unix_secs: now_secs,
-            });
-            true
-        }
-    };
-
-    let updated = Identity {
-        schema_version: SCHEMA_VERSION,
-        peers: existing.peers.clone(),
-        zones,
-    };
-    let path = identity_dir.join(IDENTITY_FILE);
-    atomic_write(&path, &updated)?;
-    tracing::info!(
-        identity_path = %path.display(),
-        zone = %zone_id,
-        member_count = updated.zones.iter().find(|z| z.zone_id == zone_id)
-            .map(|z| z.members.len()).unwrap_or(0),
-        material_change = changed_material,
-        "identity zone membership persisted",
-    );
-    Ok(updated)
-}
-
 /// Record this node's DURABLE role INTENT for a zone (voter/learner as the
 /// operator declared at join) into `identity.json`.  This is the SSOT for
 /// "what role do I want to be", read at boot to reissue JoinZone with the
 /// right role; the ACHIEVED role is derived at runtime from ConfState and
 /// is never persisted (persisting it strands a mid-promote would-be-voter
-/// as a permanent learner).  Called once at join wiring
-/// ([`crate::raft::ZoneRegistry`] `setup_zone`); the members list is owned
-/// by [`persist_zone_members`] and preserved here.  Idempotent: a no-op
+/// as a permanent learner).  Called once at zone setup
+/// ([`crate::raft::ZoneRaftRegistry`] `setup_zone`).  Idempotent: a no-op
 /// when the recorded intent already matches.
 pub fn persist_zone_intent(
     identity_dir: &Path,
@@ -381,9 +285,7 @@ pub fn persist_zone_intent(
         }
         None => zones.push(IdentityZone {
             zone_id: zone_id.to_string(),
-            members: Vec::new(),
             as_role: desired_role,
-            last_confirmed_unix_secs: None,
         }),
     }
     let updated = Identity {
@@ -517,103 +419,70 @@ mod tests {
     }
 
     #[test]
-    fn persist_zone_members_writes_and_dedupes() {
-        let dir = tempdir().unwrap();
-        let ident = load(dir.path()).unwrap();
-        let members = vec![
-            "100.64.0.21:2126".to_string(),
-            "100.64.0.27:2126".to_string(),
-        ];
-
-        let after =
-            persist_zone_members(dir.path(), &ident, "sharedzone", members.clone()).unwrap();
-        assert_eq!(after.zones.len(), 1);
-        assert_eq!(after.zones[0].zone_id, "sharedzone");
-        assert_eq!(after.zones[0].members, members);
-        // No prior intent recorded ⇒ defaults to Voter (the common case).
-        assert_eq!(after.zones[0].as_role, IdentityZoneRole::Voter);
-        assert!(after.zones[0].last_confirmed_unix_secs.is_some());
-
-        // Second call with the same members is a no-op (does not rewrite
-        // the file mtime).
-        let path = dir.path().join(IDENTITY_FILE);
-        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let noop = persist_zone_members(dir.path(), &after, "sharedzone", members.clone()).unwrap();
-        assert_eq!(noop, after);
-        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(mtime_before, mtime_after, "no-op MUST NOT rewrite file");
-    }
-
-    #[test]
-    fn persist_zone_members_updates_existing_entry_in_place() {
-        // Adding a peer to an already-tracked zone rewrites the entry
-        // and keeps zone ordering stable.  Order matters for the
-        // no-op detection above.
-        let dir = tempdir().unwrap();
-        let ident = load(dir.path()).unwrap();
-        let one = vec!["100.64.0.21:2126".to_string()];
-        let two = vec![
-            "100.64.0.21:2126".to_string(),
-            "100.64.0.27:2126".to_string(),
-        ];
-        let after1 = persist_zone_members(dir.path(), &ident, "sharedzone", one).unwrap();
-        let after2 = persist_zone_members(dir.path(), &after1, "sharedzone", two.clone()).unwrap();
-        assert_eq!(after2.zones.len(), 1, "same zone_id must not duplicate");
-        assert_eq!(after2.zones[0].members, two);
-    }
-
-    #[test]
-    fn persist_zone_members_tracks_multiple_zones() {
-        let dir = tempdir().unwrap();
-        let ident = load(dir.path()).unwrap();
-        let a = persist_zone_members(dir.path(), &ident, "sharedzone", vec!["a:2126".to_string()])
-            .unwrap();
-        let b =
-            persist_zone_members(dir.path(), &a, "corp-eng", vec!["b:2126".to_string()]).unwrap();
-        assert_eq!(b.zones.len(), 2);
-        let ids: Vec<&str> = b.zones.iter().map(|z| z.zone_id.as_str()).collect();
-        assert!(ids.contains(&"sharedzone") && ids.contains(&"corp-eng"));
-
-        let reloaded = load(dir.path()).unwrap();
-        assert_eq!(reloaded.zones.len(), 2);
-    }
-
-    #[test]
-    fn persist_zone_intent_sets_role_and_members_preserve_it() {
-        // The durable role INTENT is owned by `persist_zone_intent`; a
-        // subsequent members update MUST preserve it (the achieved role is
-        // never persisted — that's what stranded a mid-promote voter as a
-        // learner).
+    fn persist_zone_intent_records_each_zone_once_and_flips_material_changes() {
         let dir = tempdir().unwrap();
         let ident = load(dir.path()).unwrap();
 
-        // Declare voter intent.
         let a =
             persist_zone_intent(dir.path(), &ident, "sharedzone", IdentityZoneRole::Voter).unwrap();
-        assert_eq!(a.zones[0].as_role, IdentityZoneRole::Voter);
-
-        // A members update (apply cb) preserves the voter intent — even
-        // though it carries no role at all.
-        let b =
-            persist_zone_members(dir.path(), &a, "sharedzone", vec!["x:2126".to_string()]).unwrap();
         assert_eq!(
-            b.zones[0].as_role,
-            IdentityZoneRole::Voter,
-            "members update must not clobber the role intent"
+            a.zones,
+            vec![IdentityZone {
+                zone_id: "sharedzone".into(),
+                as_role: IdentityZoneRole::Voter,
+            }]
         );
-        assert_eq!(b.zones[0].members, vec!["x:2126".to_string()]);
+        let b = persist_zone_intent(dir.path(), &a, "corp-eng", IdentityZoneRole::Learner).unwrap();
+        assert_eq!(b.zones.len(), 2);
 
         // Flipping the intent (voter -> learner) is a material change.
         let c =
             persist_zone_intent(dir.path(), &b, "sharedzone", IdentityZoneRole::Learner).unwrap();
+        assert_eq!(c.zones.len(), 2, "same zone_id must not duplicate");
         assert_eq!(c.zones[0].as_role, IdentityZoneRole::Learner);
-        // Members are preserved across an intent change.
-        assert_eq!(c.zones[0].members, vec!["x:2126".to_string()]);
-        // Idempotent: same intent again is a no-op.
+
+        // Idempotent: same intent again is a no-op and leaves the file alone.
+        let path = dir.path().join(IDENTITY_FILE);
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let d =
             persist_zone_intent(dir.path(), &c, "sharedzone", IdentityZoneRole::Learner).unwrap();
         assert_eq!(d, c);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+        assert_eq!(load(dir.path()).unwrap().zones, c.zones);
+    }
+
+    #[test]
+    fn fields_older_versions_wrote_under_zones_load_and_are_ignored() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(IDENTITY_FILE),
+            br#"{"schema_version":2,"peers":["a:2126"],"zones":[{"zone_id":"sharedzone",
+                "members":["a:2126","b:2126"],"as_role":"learner",
+                "last_confirmed_unix_secs":1700000000}]}"#,
+        )
+        .unwrap();
+        let ident = load(dir.path()).unwrap();
+        assert_eq!(ident.peers, vec!["a:2126"]);
+        assert_eq!(
+            ident.zones,
+            vec![IdentityZone {
+                zone_id: "sharedzone".into(),
+                as_role: IdentityZoneRole::Learner,
+            }]
+        );
+        // The next write carries only the current fields.
+        let rewritten =
+            persist_zone_intent(dir.path(), &ident, "corp-eng", IdentityZoneRole::Voter).unwrap();
+        let raw = fs::read_to_string(dir.path().join(IDENTITY_FILE)).unwrap();
+        assert!(
+            !raw.contains("members") && !raw.contains("last_confirmed"),
+            "{raw}"
+        );
+        assert_eq!(load(dir.path()).unwrap(), rewritten);
     }
 
     #[test]

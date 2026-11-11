@@ -50,7 +50,9 @@ fn authenticated_peer(extensions: &http::Extensions) -> Result<Option<Authentica
     Ok(None)
 }
 
-fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+/// The Node or replica id the TLS connection authenticated, `None` on a
+/// plaintext listener.
+pub(super) fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
     Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
 }
 

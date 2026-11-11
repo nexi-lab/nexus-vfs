@@ -369,11 +369,10 @@ impl RaftClient {
     /// The message bytes are an opaque serialized `eraftpb::Message` (protobuf v2).
     ///
     /// `sender_address` is this node's own advertise address; the
-    /// receiver records `(message.from -> sender_address)` in its
-    /// transport peer map so the network is the SSOT for routing.
-    /// Pass `""` from contexts that don't have an advertise address
-    /// (the receiver falls back to whatever peer-map entry already
-    /// exists from prior ConfChange or env seed).
+    /// receiver records `(message.from -> sender_address)` in its peer
+    /// map's observed layer. Pass `""` from contexts that don't have an
+    /// advertise address (the receiver keeps routing by the sender's
+    /// member-address record).
     pub async fn step_message(
         &mut self,
         message_bytes: Vec<u8>,

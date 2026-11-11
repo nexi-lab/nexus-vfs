@@ -169,9 +169,9 @@ Standard OS DNS + bootstrap + Raft membership exchange covers all scenarios.
 | Layer | Mechanism | When |
 |-------|-----------|------|
 | Bootstrap | `NEXUS_BOOTSTRAP_NEW=1` (founder) or JoinZone RPC against `NEXUS_PEERS` (joiner) | First cluster formation |
-| First contact | OS DNS (hostname → IP) | `join_zone(peers=["bob:2126"])` |
-| After join | Leader snapshot installs authoritative `ConfState` | After AddNode commits |
-| Ongoing | Raft `ConfChange` | Automatic membership propagation |
+| First contact | OS DNS (hostname → IP) | JoinZone against a seed `host:port` |
+| After join | Leader snapshot installs authoritative `ConfState` and member addresses | After AddNode commits |
+| Ongoing | Raft `ConfChange` and member-address records | Automatic membership and address propagation |
 
 Path resolution across zones is **all local** (~5us per hop) because mounting = Voter = full local replica. No network hops on the read path.
 
@@ -189,7 +189,8 @@ For a rolling upgrade, renew mismatched certificates on the sending nodes before
 updating receivers that enforce the certificate-to-sender binding.
 
 - **Identity** — `node_id` is an opaque random `u64` minted at first daemon boot, persisted as 8 bytes BE u64 to `<NEXUS_DATA_DIR>/.node_id`.  Decoupling identity from hostname lets a wiped follower rejoin under a fresh ID; the leader's `Progress[new_id]` is created with `matched=0` by `AddNode`, so the first heartbeat carries `m.commit=0` — within `RaftLog::commit_to`'s safe range on a fresh follower (`last_index=0`).  Pinned by [`test_handle_heartbeat_on_empty_follower_with_stale_commit_panics`](../../rust/raft/src/raft/storage.rs).  `<NEXUS_DATA_DIR>` wipe MUST rotate `node_id` — reusing the old id against a leader that still remembers `Progress[old_id].matched > 0` trips exactly this panic (heartbeat commit lands above the fresh follower's `last_index=0`).
-- **Address book** — `NEXUS_PEERS` (or `--peers`) is a hostname → endpoint mapping for OTHER nodes only that seeds the transport peer map.  Entries are `"host:port"` strings — peer `node_id` is opaque, random per boot, and never carried in the address book (`learn_peer_address` in `rust/raft/src/transport/server.rs` populates the real id from the first inbound raft message).  Persisted separately at node-bound `identity.json` (Windows `%LOCALAPPDATA%\Nexus\identity.json`, macOS `~/Library/Application Support/Nexus/identity.json`, Linux `$XDG_DATA_HOME/nexus/identity.json`) so a cache-cleaner removing `<NEXUS_DATA_DIR>` does not force the operator to re-specify `--peers` on next boot.  Boot merges CLI/env peers with identity's persisted `peers[]` and rewrites identity monotonically when the CLI set widens.  Self joins the cluster through `create_zone(self)` (founder) or `AddNode(self)` on the leader (joiner) — never through the address book.  Boot fails loud (`peer list contains self ...`) when the merged peer list includes the local node so the joiner-loop self-RPC stall surfaces at parse time, not after `Zone 'root' registered`.  `ConfState` lives in raft storage and is mutated only by `ConfChange` (AddNode / RemoveNode) driven by JoinZone; `identity.json`'s `peers[]` is a *transport seed*, not a `ConfState` shadow.
+- **Seed addresses** — `NEXUS_PEERS` (or `--peers`) lists `"host:port"` addresses of OTHER nodes.  Seeds are RPC targets: JoinZone, DiscoverZones and member-address self-registration dial them.  Peer `node_id` is opaque, random per boot, and never carried in a seed.  Seeds persist at node-bound `identity.json` (Windows `%LOCALAPPDATA%\Nexus\identity.json`, macOS `~/Library/Application Support/Nexus/identity.json`, Linux `$XDG_DATA_HOME/nexus/identity.json`) so a cache-cleaner removing `<NEXUS_DATA_DIR>` does not force the operator to re-specify `--peers` on next boot.  Boot merges CLI/env peers with identity's persisted `peers[]` and rewrites identity monotonically when the CLI set widens.  Self joins the cluster through `create_zone(self)` (founder) or `AddNode(self)` on the leader (joiner).  A self-entry in the merged list is excluded with a warning.  `ConfState` lives in raft storage and is mutated only by `ConfChange` (AddNode / RemoveNode) driven by JoinZone.
+- **Member addresses** — every zone member's dial address is a record in that zone's replicated state machine, written by the committed membership change that adds the member and by the member's own self-registration, and deleted by RemoveNode.  The transport peer map is derived from those records plus the `sender_address` of authenticated inbound messages; a restarted node therefore reaches every member its ConfState names.  See [Member addresses](member-address.md).
 
 - **Advertise address — `--advertise-addr` decoupled from `--hostname`** — `--hostname` / `NEXUS_HOSTNAME` is the display label only (ZoneManager registry + TLS cert SANs).  The reachable network endpoint this node broadcasts to peers as `StepMessage.sender_address` comes from `--advertise-addr` / `NEXUS_ADVERTISE_ADDR` instead, defaulting to `<hostname>:<bind_port>` for backward compatibility.  Cross-machine federation over overlay networks (Tailscale, WireGuard, VPN) MUST pin `--advertise-addr` to the overlay IP — the OS hostname does not resolve through the overlay, so the joiner's initial `JoinZone` RPC succeeds (the caller passed the peer addr directly) but subsequent raft heartbeats / log replication target `http://<peer-hostname>:2126` and fail at the DNS layer, surfacing minutes later as silent "ConfState install timeout". Boot logs a warning when the resolved advertise address looks unreachable (`0.0.0.0:*`, loopback with peers, or bare hostname with peers configured on a remote machine) so the misconfiguration surfaces immediately rather than after long timeouts.
 - **Boot action** — the operator declares *role*, not *mode*: `--cluster-init` (+ `--accept-enrollments`) to found, `--peers` (+ `--token`) to join, and the two are mutually exclusive at boot. The daemon derives the action from `(data_dir state, identity, --peers, --cluster-init)` and dispatches through [`plan_boot_action`](../../rust/raft/src/bootstrap.rs); misconfiguration surfaces before the gRPC server starts rather than as a silent stall later. There is no mode flag to set — `--bootstrap-mode` / `NEXUS_BOOTSTRAP_MODE` were deleted in S3 Phase G, and `nexusd-cluster` now refuses to boot if the retired env var is still set rather than ignoring it.
@@ -204,9 +205,9 @@ updating receivers that enforce the certificate-to-sender binding.
 
 - **`nexusd-cluster join` auto-bootstraps the parent zone** — the join sidecar writes a DT_MOUNT entry into `<parent_zone>` (defaults to root) to stitch the remote zone into local namespace at `<local_path>`.  That DT_MOUNT propose lands in the parent zone's raft log, so the parent zone MUST be loaded locally before the mount step.  Pre-this-contract behaviour assumed the operator had bootstrapped the parent zone via a prior step (a prior `nexusd-cluster` boot that founded the parent zone, then `join`); the sidecar would silently no-op on the mount propose when called against a fresh data dir, producing an empty `<local_path>` namespace and the "wire_mount: root zone not loaded — distributed locks NOT installed" warn that wedged the Mac↔Win cc-tasks-share L1 smoke.  The sidecar now SOLO-bootstraps the parent zone (empty peers, matching the per-node SOLO contract above) when `<data_dir>/<parent_zone>/raft/` is missing — idempotent (no-op when the zone already exists), so the join CLI runs end-to-end against a brand-new data dir without an operator pre-step.
 
-- **`join <peer_addr>` — `host:port` is the ONLY accepted form** — operators DO NOT sync opaque `node_id` between peers.  `nexusd-cluster join 100.64.0.27:2126 sharedzone /shared` is the shape; the peer's real `node_id` (random per boot under PR #3996) is learned from the first inbound `MsgSnapshot.sender_address` via [`learn_peer_address`](../../rust/raft/src/transport/server.rs) and populates the peer_map entry outbound raft replies route through.  The legacy `<id>@host:port` form is hard-rejected at parse time with a migration message pointing at the bare form (see `PeerAddress::parse`) — carrying an explicit id in the address book had no protocol purpose and misled operators into thinking a peer rebuild required an id lookup ceremony.  Operational implication: cross-peer coordination for `join` reduces to sharing the leader's TCP endpoint plus the zone name, matching the Docker Swarm `docker swarm join <addr>` / Consul `consul join <addr>` UX curve.
+- **`join <peer_addr>` — `host:port` is the ONLY accepted form** — operators DO NOT sync opaque `node_id` between peers.  `nexusd-cluster join 100.64.0.27:2126 sharedzone /shared` is the shape; the joiner's JoinZone carries its advertise address, which the leader's `AddLearnerNode` / `AddNode` records as the joiner's member address, and the joiner replicates every member's record with the zone.  The `<id>@host:port` form is rejected at parse time with a message pointing at the bare form (see `PeerAddress::parse_operator_addr`).  Operational implication: cross-peer coordination for `join` reduces to sharing the leader's TCP endpoint plus the zone name, matching the Docker Swarm `docker swarm join <addr>` / Consul `consul join <addr>` UX curve.
 
-- **Wipe-rejoin** — wiping `<NEXUS_DATA_DIR>` mints a fresh `node_id` on the next boot; the daemon JoinZones, the leader commits `AddNode(new_id)`.  The persisted peer address book at `identity.json` survives — so `--peers` does not need re-specifying at wipe-rejoin, only `NEXUS_BOOTSTRAP_MODE=static` (or `dynamic`) with the same env otherwise.  Identity-and-data-dir both wiped is equivalent to a first-time install; identity survives and data_dir wiped is the routine cache-loss recovery.
+- **Wipe-rejoin** — wiping `<NEXUS_DATA_DIR>` mints a fresh `node_id` on the next boot; the daemon JoinZones, the leader commits `AddNode(new_id)`.  The seed addresses in `identity.json` survive, so `--peers` does not need re-specifying at wipe-rejoin.  Identity-and-data-dir both wiped is equivalent to a first-time install; identity survives and data_dir wiped is the routine cache-loss recovery.
 
 ##### S3 完全体 — Unified bring-up decision layer
 
@@ -230,16 +231,14 @@ registry, WAL streams and pipes, credential records. It costs a local redb and
 a tick loop; it does NOT put file syscalls through consensus (`/` keeps its
 local metastore), so the hot path is unaffected.
 
-##### S3 Phase B — Identity carries per-zone membership
+##### S3 Phase B — Identity carries per-zone role intent
 
-Every successful ConfChange apply on this node fires an in-driver callback that mirrors the fresh `ConfState` into `identity.json`'s `zones` array (schema v2 — see [`Identity`](../../rust/raft/src/identity.rs)).  Payload per entry:
+`identity.json`'s `zones` array (see [`Identity`](../../rust/raft/src/identity.rs)) records each zone this node participates in, written when the zone is set up here:
 
 - `zone_id` — the zone this node participates in
-- `members` — `voters ∪ learners` projected through the peer map to bare `host:port`
-- `as_role` — `voter` if `self_id ∈ voters`, else `learner`
-- `last_confirmed_unix_secs` — coarse mtime, diagnostic only
+- `as_role` — the role this node asked for at join (`voter` / `learner`)
 
-Boot dispatch consumes this: matrix row 4 (returning joiner) becomes `JoinFederationZones { zones: identity.zones[*].zone_id }` instead of the empty Phase-A no-op.  When neither `--peers` nor `identity.peers` are populated, the JoinZone probe list falls back to `identity.zones[i].members` — so a wipe that took `data_dir` + `--peers` but preserved `identity.json` still has enough seed information to reach a live peer.
+Boot dispatch consumes this: matrix row 4 (returning joiner) becomes `JoinFederationZones { zones: identity.zones[*].zone_id }` with each zone's `as_role`, dialing CLI `--peers`, else `identity.peers`.  Member addresses live in each zone's replicated state, not in `identity.json`.
 
 Coverage today (S3 Phase A + B + C-lite + D + F + G):
 - **Learner wipe-rejoin — auto-heals** under the existing rotate-on-wipe rule.  Wiped learner boots with fresh `node_id`, `plan_boot_action` returns `JoinFederationZones{zones=[…]}` from identity, `bootstrap_or_join_zone` sends JoinZone as learner.  The AddLearnerNode ConfChange on the leader does NOT require the wiped node's ack (learners never count toward quorum), so it commits with just the live voter side.  Old learner id lingers in ConfState as a ghost (harmless — no quorum contribution).
@@ -582,9 +581,9 @@ tolerate + retry.
 Same-machine clients (FUSE mount, `sudocode`, `moss`) already respect
 this by waiting on daemon-side log tails or on named-pipe readiness
 handshakes before issuing writes. Cross-machine clients cannot reach
-us in the (1)→(3) window because their peer address book learns our
-endpoint via post-`install_with_kernel` peer-map propagation, so they
-inherit the invariant for free. `grpcurl` and other ad-hoc clients
+us in the (1)→(3) window because their routes to us come from this
+zone's member-address records and our own outbound messages, which start
+after `install_with_kernel`, so they inherit the invariant for free. `grpcurl` and other ad-hoc clients
 issuing writes during boot are responsible for waiting on the log
 signal themselves — this is the client-side half of the boot-serving
 contract, deliberately kept out of the handler layer to avoid a
@@ -649,6 +648,8 @@ no table: it is the first thing a newcomer (or an agent) uses to orient.
 |-----------|------|
 | Boot dispatch (`BootAction`, `plan_boot_action`) | `rust/raft/src/bootstrap.rs` |
 | Raft node | `rust/raft/src/raft/node.rs` |
+| Member-address record + self-registration | `rust/raft/src/raft/member_address.rs`, `rust/raft/src/raft/node/member_registration.rs` |
+| Transport route book (`PeerMap`) | `rust/raft/src/transport/mod.rs` |
 | Raft storage (redb) | `rust/raft/src/raft/storage.rs` |
 | State machine | `rust/raft/src/raft/state_machine.rs` |
 | Zone lifecycle + topology apply | `rust/raft/src/zone_manager.rs` |
