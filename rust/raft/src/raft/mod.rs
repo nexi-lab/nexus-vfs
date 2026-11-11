@@ -42,6 +42,7 @@
 #[cfg(feature = "consensus")]
 mod apply_observer;
 mod error;
+pub(crate) mod member_address;
 pub mod replication_log;
 mod state_machine;
 mod storage_protocol;
