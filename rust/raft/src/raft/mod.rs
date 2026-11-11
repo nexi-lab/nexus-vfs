@@ -67,13 +67,16 @@ pub use state_machine::MountApplyEvent;
 pub use state_machine::MountDecl;
 pub use state_machine::{
     AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, GuardedRecordMutation,
-    HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine,
-    WitnessStateMachine, WitnessStateMachineInMemory,
+    HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, ReplicaControlActivation,
+    StateMachine, WitnessStateMachine, WitnessStateMachineInMemory,
 };
 
 pub use membership_policy::MembershipPolicy;
 #[cfg(feature = "consensus")]
-pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
+pub use node::{
+    ConfStateAppliedCb, RaftConfig, RaftMsg, StorageActivationView, StorageSubmission,
+    ZoneConsensus, ZoneConsensusDriver,
+};
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 #[cfg(feature = "consensus")]

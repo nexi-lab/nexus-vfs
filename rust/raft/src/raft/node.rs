@@ -68,6 +68,8 @@ use super::{Command, CommandResult, RaftError, Result};
 
 mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
+mod storage_activation;
+pub use storage_activation::{StorageActivationView, StorageSubmission};
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod storage_submission_tests;
 
@@ -351,6 +353,15 @@ pub enum RaftMsg {
         proposal_id: u64,
         tx: oneshot::Sender<Result<CommandResult>>,
     },
+    /// Submit through a native storage authority; the actor checks its domain.
+    ProposeStorage {
+        submission: StorageSubmission,
+        tx: oneshot::Sender<Result<CommandResult>>,
+    },
+    /// Capture the actual configuration before authenticated member probes.
+    StorageActivationView {
+        tx: oneshot::Sender<Result<StorageActivationView>>,
+    },
     /// Propose a configuration change (add/remove node).
     /// The tx resolves after the ConfChange is **committed and applied** (not just enqueued).
     ProposeConfChange {
@@ -523,6 +534,9 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// All access must go through the channel ([`RaftMsg`]). Exposing this
     /// field will cause `"not leader but has new msg after advance"` panics.
     raw_node: RawNode<RaftStorage>,
+    /// Process-local identity and configuration generation for probe results.
+    incarnation: Arc<()>,
+    membership_epoch: Option<u64>,
     /// Shared state machine (shared with handle for reads).
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
@@ -907,6 +921,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let read_request_ids = ReadRequestIds::new(config.id);
         let driver = ZoneConsensusDriver {
             raw_node,
+            incarnation: Arc::new(()),
+            membership_epoch: Some(0),
             state_machine,
             config,
             pending: HashMap::new(),
@@ -1410,6 +1426,11 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         protocol: StorageProtocol,
     ) -> Result<CommandResult> {
+        if command.requires_activation_qualification() {
+            return Err(RaftError::UnsupportedOperation(
+                "protocol activation requires qualified member observation",
+            ));
+        }
         if command.storage_protocol() != Some(protocol) {
             return Err(RaftError::InvalidState(
                 "command belongs to a different storage protocol".into(),
@@ -1428,7 +1449,22 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         if !supported {
             return Err(RaftError::UnsupportedOperation(refusal));
         }
-        let receiver = self.enqueue_proposal(&command)?;
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self.leader_hint_addr(),
+            });
+        }
+        let (tx, receiver) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::ProposeStorage {
+                submission: StorageSubmission {
+                    command,
+                    protocol,
+                    configuration: None,
+                },
+                tx,
+            })
+            .map_err(channel_try_send_err)?;
         // Once enqueued, any failure without a proven refusal is ambiguous.
         // The state machine may have committed before its answer was lost.
         match super::proposal::wait_for_commit(
@@ -1437,7 +1473,9 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         )
         .await
         {
-            Err(error @ RaftError::NotLeader { .. }) => Err(error),
+            Err(error @ (RaftError::NotLeader { .. } | RaftError::ProposalRejected(_))) => {
+                Err(error)
+            }
             Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
             result => result,
         }
@@ -1824,6 +1862,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         rx.await.map_err(|_| RaftError::ProposalDropped)
     }
 
+    /// Observe the owning leader's configuration for authenticated probes.
+    /// The actor rechecks this ephemeral view at storage submission.
+    pub async fn storage_activation_view(&self) -> Result<StorageActivationView> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::StorageActivationView { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
     /// Process a message from another node (sends through channel to driver).
     ///
     /// Uses `send().await` (blocking until space is available) instead of
@@ -2087,51 +2135,21 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     tracing::warn!("raft step error: {}", e);
                 }
             }
-            RaftMsg::Propose { data, tx, .. } => {
-                // The handle's leader check precedes this queue boundary. Check
-                // again against the actor's actual role before allocating an ID
-                // or calling RawNode::propose, which can otherwise reject a
-                // queued write with the unhelpful generic "proposal dropped".
-                if !self.is_leader() {
-                    self.update_cached_status();
-                    #[cfg(all(feature = "grpc", has_protos))]
-                    let leader_hint = self.peer_map.as_ref().and_then(|peers| {
-                        peers
-                            .read()
-                            .ok()?
-                            .get(&self.raw_node.raft.leader_id)
-                            .map(|address| address.to_operator_str())
-                    });
-                    #[cfg(not(all(feature = "grpc", has_protos)))]
-                    let leader_hint = None;
-                    tracing::debug!(
-                        local_node_id = self.config.id,
-                        leader_node_id = self.raw_node.raft.leader_id,
-                        leader_addr = leader_hint.as_deref().unwrap_or("unknown"),
-                        term = self.raw_node.raft.term,
-                        "leadership changed before local proposal; nothing submitted"
-                    );
-                    let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+            RaftMsg::Propose { data, tx, .. } => self.propose_data(data, tx),
+            RaftMsg::ProposeStorage { submission, tx } => {
+                if let Err(error) = self.validate_storage_submission(&submission) {
+                    let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
                     return;
                 }
-                // Generate the real proposal ID here in the driver
-                let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
-
-                // Prepend proposal ID to the data
-                let mut proposal_data = Vec::with_capacity(8 + data.len());
-                proposal_data.extend_from_slice(&id.to_be_bytes());
-                proposal_data.extend_from_slice(&data);
-
-                tracing::debug!(proposal_id = id, "raft.driver.propose");
-                match self.raw_node.propose(vec![], proposal_data) {
-                    Ok(()) => {
-                        // Store pending — tx will be resolved in apply_entries
-                        self.pending.insert(id, PendingProposal { tx });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(RaftError::Raft(e.to_string())));
+                match bincode::serialize(&submission.command) {
+                    Ok(data) => self.propose_data(data, tx),
+                    Err(error) => {
+                        let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
                     }
                 }
+            }
+            RaftMsg::StorageActivationView { tx } => {
+                let _ = tx.send(self.storage_activation_view());
             }
             RaftMsg::ProposeConfChange { change, tx } => {
                 if let Err(error) = self.config.membership_policy.require_managed() {
@@ -2178,6 +2196,53 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             }
             RaftMsg::Membership { tx } => {
                 let _ = tx.send(read_membership(&self.raw_node));
+            }
+        }
+    }
+
+    fn propose_data(&mut self, data: Vec<u8>, tx: oneshot::Sender<Result<CommandResult>>) {
+        // The handle's leader check precedes this queue boundary. Check
+        // again against the actor's actual role before allocating an ID
+        // or calling RawNode::propose, which can otherwise reject a
+        // queued write with the unhelpful generic "proposal dropped".
+        if !self.is_leader() {
+            self.update_cached_status();
+            #[cfg(all(feature = "grpc", has_protos))]
+            let leader_hint = self.peer_map.as_ref().and_then(|peers| {
+                peers
+                    .read()
+                    .ok()?
+                    .get(&self.raw_node.raft.leader_id)
+                    .map(|address| address.to_operator_str())
+            });
+            #[cfg(not(all(feature = "grpc", has_protos)))]
+            let leader_hint = None;
+            tracing::debug!(
+                local_node_id = self.config.id,
+                leader_node_id = self.raw_node.raft.leader_id,
+                leader_addr = leader_hint.as_deref().unwrap_or("unknown"),
+                term = self.raw_node.raft.term,
+                "leadership changed before local proposal; nothing submitted"
+            );
+            let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+            return;
+        }
+        // Generate the real proposal ID here in the driver
+        let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
+
+        // Prepend proposal ID to the data
+        let mut proposal_data = Vec::with_capacity(8 + data.len());
+        proposal_data.extend_from_slice(&id.to_be_bytes());
+        proposal_data.extend_from_slice(&data);
+
+        tracing::debug!(proposal_id = id, "raft.driver.propose");
+        match self.raw_node.propose(vec![], proposal_data) {
+            Ok(()) => {
+                // Store pending — tx will be resolved in apply_entries
+                self.pending.insert(id, PendingProposal { tx });
+            }
+            Err(e) => {
+                let _ = tx.send(Err(RaftError::Raft(e.to_string())));
             }
         }
     }
@@ -2257,6 +2322,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
         // 1. Handle snapshot (received from leader during catch-up / join)
         if !ready.snapshot().is_empty() {
+            self.membership_epoch = self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
             let snapshot = ready.snapshot();
             // A snapshot puts a ConfState in force on this node exactly as applying a
             // ConfChange entry does, so it reports membership in the SAME shape —
@@ -2551,6 +2617,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     // to include the new/removed member before it is used to
                     // catch anyone up (see the field docstring).
                     self.membership_changed_since_snapshot = true;
+                    self.membership_epoch =
+                        self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
 
                     // Update peer map from ConfChange context (etcd pattern)
                     #[cfg(all(feature = "grpc", has_protos))]
@@ -2648,6 +2716,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     );
                     // Membership changed → refresh the stored snapshot (see V1 arm).
                     self.membership_changed_since_snapshot = true;
+                    self.membership_epoch =
+                        self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
 
                     #[cfg(all(feature = "grpc", has_protos))]
                     if let Some(ref peer_map) = self.peer_map {

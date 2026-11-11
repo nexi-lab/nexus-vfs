@@ -9,6 +9,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use tempfile::TempDir;
 
+mod activation;
+
 fn node(
     policy: MembershipPolicy,
 ) -> (
@@ -79,6 +81,14 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
     let (handle, mut driver, _dir) = node(MembershipPolicy::FixedLocal);
     finish(&mut driver, handle.campaign()).await.unwrap();
     assert!(handle.is_leader());
+    assert!(matches!(
+        handle
+            .commit_replica_control(Command::ActivateReplicaControl {
+                operation_id: "ordinary-door".into(),
+            })
+            .await,
+        Err(RaftError::UnsupportedOperation(_))
+    ));
     let before = handle.state_machine.read().await.snapshot().unwrap();
     for (command, owner) in [
         (conditional(), StorageProtocol::ConditionalMetadata),

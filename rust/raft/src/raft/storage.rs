@@ -138,19 +138,9 @@ impl RaftStorage {
         Ok(last_key)
     }
 
-    /// Append entries to the log.
+    /// Replace the uncommitted suffix and append its new entries atomically.
     pub fn append(&self, entries: &[Entry]) -> Result<()> {
-        let mut batch = self.entries.batch();
-
-        for entry in entries {
-            let key = entry.index.to_be_bytes();
-            let value = protobuf::Message::write_to_bytes(entry)
-                .map_err(|e| RaftError::Serialization(e.to_string()))?;
-            batch.insert(&key, &value);
-        }
-
-        batch.apply()?;
-        Ok(())
+        self.replace_suffix(entries)
     }
 
     /// Set the hard state.
@@ -396,6 +386,8 @@ impl RaftStorage {
         }
     }
 }
+
+mod append;
 
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
