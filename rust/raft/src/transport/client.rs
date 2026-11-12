@@ -1425,23 +1425,52 @@ pub async fn call_mint_agent_rpc(
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<MintAgentResult> {
-    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "MintAgent").await?;
-    let response = client
-        .mint_agent(MintAgentRequest {
-            subject_id: subject_id.to_string(),
-            display_name: display_name.to_string(),
-            allow_existing,
-        })
+    MintAgentChannel::connect(peer_addr, tls, timeout_secs)
+        .await?
+        .mint(subject_id, display_name, allow_existing)
         .await
-        .map_err(|e| TransportError::Rpc(format!("MintAgent RPC failed: {e}")))?
-        .into_inner();
-    Ok(MintAgentResult {
-        success: response.success,
-        error: response.error,
-        agent_cert_pem: response.agent_cert_pem,
-        agent_key_pem: response.agent_key_pem,
-        ca_pem: response.ca_pem,
-    })
+}
+
+/// An established channel for exactly one MintAgent request. Connecting sends
+/// no request, so a [`Self::connect`] failure proves the issuer received
+/// nothing; once [`Self::mint`] starts, the request may have been delivered.
+pub struct MintAgentChannel(ZoneApiServiceClient<Channel>);
+
+impl MintAgentChannel {
+    pub async fn connect(
+        peer_addr: &str,
+        tls: Option<super::TlsConfig>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        connect_zone_api(peer_addr, tls, timeout_secs, "MintAgent")
+            .await
+            .map(Self)
+    }
+
+    pub async fn mint(
+        mut self,
+        subject_id: &str,
+        display_name: &str,
+        allow_existing: bool,
+    ) -> Result<MintAgentResult> {
+        let response = self
+            .0
+            .mint_agent(MintAgentRequest {
+                subject_id: subject_id.to_string(),
+                display_name: display_name.to_string(),
+                allow_existing,
+            })
+            .await
+            .map_err(|e| TransportError::Rpc(format!("MintAgent RPC failed: {e}")))?
+            .into_inner();
+        Ok(MintAgentResult {
+            success: response.success,
+            error: response.error,
+            agent_cert_pem: response.agent_cert_pem,
+            agent_key_pem: response.agent_key_pem,
+            ca_pem: response.ca_pem,
+        })
+    }
 }
 
 /// Params for [`call_mint_key_rpc`] — mirrors the CLI's `auth mint` sk- flags.

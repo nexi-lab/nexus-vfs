@@ -715,58 +715,63 @@ pub fn read_or_mint_node_id(zones_dir: &str) -> Result<u64, String> {
     use std::io::Write;
 
     let dir = Path::new(zones_dir);
+    if let Some(id) = read_node_id(dir)? {
+        tracing::info!(local_node_id = id, "local_node_id loaded from disk");
+        return Ok(id);
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("create zones dir for node id '{}': {e}", dir.display(),))?;
+    // raft-rs reserves 0 as "no node" — retry once on the
+    // astronomically rare 1/2^64 collision.
+    let mut id = rand::random::<u64>();
+    if id == 0 {
+        id = rand::random::<u64>();
+        if id == 0 {
+            return Err("rand::random() returned 0 twice".to_string());
+        }
+    }
     let final_path = dir.join(NODE_ID_FILE);
+    let tmp_path = dir.join(format!("{NODE_ID_FILE}.tmp"));
+    {
+        let mut tmp = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("create tmp node id file '{}': {e}", tmp_path.display()))?;
+        tmp.write_all(&id.to_be_bytes())
+            .map_err(|e| format!("write tmp node id file '{}': {e}", tmp_path.display()))?;
+        tmp.sync_all()
+            .map_err(|e| format!("sync tmp node id file '{}': {e}", tmp_path.display()))?;
+    }
+    lib::file_durability::replace_file(&tmp_path, &final_path).map_err(|e| {
+        format!(
+            "rename '{}' -> '{}': {e}",
+            tmp_path.display(),
+            final_path.display(),
+        )
+    })?;
+    tracing::info!(local_node_id = id, "local_node_id minted and persisted");
+    Ok(id)
+}
 
-    match std::fs::read(&final_path) {
-        Ok(bytes) => {
-            let arr: [u8; 8] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| format!("node id file '{}' is not 8 bytes", final_path.display()))?;
-            let id = u64::from_be_bytes(arr);
-            if id == 0 {
-                return Err(format!(
-                    "node id file '{}' contains 0 (reserved by raft-rs); \
-                     wipe `<NEXUS_DATA_DIR>` and retry",
-                    final_path.display(),
-                ));
-            }
-            tracing::info!(local_node_id = id, "local_node_id loaded from disk");
-            Ok(id)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("create zones dir for node id '{}': {e}", dir.display(),))?;
-            // raft-rs reserves 0 as "no node" — retry once on the
-            // astronomically rare 1/2^64 collision.
-            let mut id = rand::random::<u64>();
-            if id == 0 {
-                id = rand::random::<u64>();
-                if id == 0 {
-                    return Err("rand::random() returned 0 twice".to_string());
-                }
-            }
-            let tmp_path = dir.join(format!("{NODE_ID_FILE}.tmp"));
-            {
-                let mut tmp = std::fs::File::create(&tmp_path).map_err(|e| {
-                    format!("create tmp node id file '{}': {e}", tmp_path.display())
-                })?;
-                tmp.write_all(&id.to_be_bytes())
-                    .map_err(|e| format!("write tmp node id file '{}': {e}", tmp_path.display()))?;
-                tmp.sync_all()
-                    .map_err(|e| format!("sync tmp node id file '{}': {e}", tmp_path.display()))?;
-            }
-            lib::file_durability::replace_file(&tmp_path, &final_path).map_err(|e| {
-                format!(
-                    "rename '{}' -> '{}': {e}",
-                    tmp_path.display(),
-                    final_path.display(),
-                )
-            })?;
-            tracing::info!(local_node_id = id, "local_node_id minted and persisted");
-            Ok(id)
-        }
-        Err(e) => Err(format!("read node id '{}': {e}", final_path.display())),
+/// Read the persisted node ID without minting one: `None` for a data
+/// directory that has never booted. Read-only callers (`doctor`) use this;
+/// boot uses [`read_or_mint_node_id`], which shares it.
+pub fn read_node_id(zones_dir: &Path) -> Result<Option<u64>, String> {
+    let path = zones_dir.join(NODE_ID_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read node id '{}': {e}", path.display())),
+    };
+    let arr: [u8; 8] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("node id file '{}' is not 8 bytes", path.display()))?;
+    match u64::from_be_bytes(arr) {
+        0 => Err(format!(
+            "node id file '{}' contains 0 (reserved by raft-rs); \
+             wipe `<NEXUS_DATA_DIR>` and retry",
+            path.display(),
+        )),
+        id => Ok(Some(id)),
     }
 }
 
