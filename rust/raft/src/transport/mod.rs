@@ -40,6 +40,7 @@
 //! ```
 
 mod node_authority;
+pub(crate) use node_authority::current_local_replication_id;
 pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
 
 #[cfg(all(feature = "grpc", has_protos))]

@@ -151,6 +151,23 @@ pub fn current_local_node_certificate(
     node_certificate_identity(&leaf)
 }
 
+/// Read the signed peer identity for a local-root replication runtime. This
+/// verifies the current local issuer and profile; TLS proves key possession.
+pub(crate) fn current_local_replication_id(der: &[u8], local_ca_der: &[u8]) -> Result<u64, String> {
+    current_local_peer_certificate(der, local_ca_der).map(AuthenticatedPeer::node_id)
+}
+
+fn current_local_peer_certificate(
+    der: &[u8],
+    local_ca_der: &[u8],
+) -> Result<AuthenticatedPeer, String> {
+    let certificate = current_local_leaf(der, local_ca_der)?;
+    if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
+        return Ok(AuthenticatedPeer::Replica(id));
+    }
+    node_certificate_identity(&certificate).map(|node| AuthenticatedPeer::Node(node.node_id))
+}
+
 fn current_local_leaf<'a>(
     der: &'a [u8],
     local_ca_der: &[u8],
@@ -209,19 +226,13 @@ impl NodeControlPolicy {
         let leaf = certs
             .first()
             .ok_or_else(|| Status::permission_denied("missing Node mTLS leaf"))?;
-        let classify = || -> Result<AuthenticatedPeer, String> {
-            let certificate = current_local_leaf(leaf.as_ref(), ca)?;
-            if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
-                return Ok(AuthenticatedPeer::Replica(id));
-            }
-            node_certificate_identity(&certificate)
-                .map(|node| AuthenticatedPeer::Node(node.node_id))
-        };
-        classify().map(Some).map_err(|_| {
-            Status::permission_denied(
-                "Raft control requires a current local Node or owner replica certificate",
-            )
-        })
+        current_local_peer_certificate(leaf.as_ref(), ca)
+            .map(Some)
+            .map_err(|_| {
+                Status::permission_denied(
+                    "Raft control requires a current local Node or owner replica certificate",
+                )
+            })
     }
 }
 

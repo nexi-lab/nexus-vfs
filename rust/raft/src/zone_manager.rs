@@ -519,17 +519,23 @@ impl ZoneManager {
                     e
                 ))
             })?;
-            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "Node")
+            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "peer")
                 .map_err(RaftError::Config)?;
             let ca_der = lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
                 .map_err(RaftError::Config)?;
-            let identity = crate::transport::current_local_node_certificate(&cert_der, &ca_der)
-                .map_err(RaftError::Config)?;
-            if identity.node_id != node_id {
+            let certificate_id = match profile {
+                RuntimeProfile::NetworkedLocalRoot => {
+                    crate::transport::current_local_replication_id(&cert_der, &ca_der)
+                }
+                RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => {
+                    crate::transport::current_local_node_certificate(&cert_der, &ca_der)
+                        .map(|identity| identity.node_id)
+                }
+            }
+            .map_err(RaftError::Config)?;
+            if certificate_id != node_id {
                 return Err(RaftError::Config(format!(
-                    "Node certificate identifies {}, but the configured Raft Node ID is {node_id}; \
-                     renew the certificate with `enroll` against the founder using this data directory",
-                    identity.node_id
+                    "peer certificate identifies {certificate_id}, but the configured Raft Node ID is {node_id}"
                 )));
             }
             Some(TlsConfig {
@@ -2036,12 +2042,12 @@ impl ZoneManager {
 
     /// Gracefully shut down all zones and the gRPC server.
     pub fn shutdown(&self) {
-        self.registry.shutdown_all();
-        if let Some(tx) = bridge_block_on(self.rt().handle(), async {
-            self.shutdown_tx.lock().await.take()
-        }) {
-            let _ = tx.send(true);
-        }
+        bridge_block_on(self.rt().handle(), async {
+            if let Some(tx) = self.shutdown_tx.lock().await.take() {
+                let _ = tx.send(true);
+            }
+            self.registry.shutdown_all_and_wait().await;
+        });
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }

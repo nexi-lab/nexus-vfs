@@ -1,7 +1,7 @@
 //! Ownership survives a zone's native replication and restart, including when
 //! its home and linked session are exposed through separate subtree mounts.
-//! This does not test user authorization, cold blob retention, runtime handoff,
-//! or the daemon's automatic discovery.
+//! Local-root boot also exercises signed replica identity and Node-only control.
+//! Cold blob retention, runtime handoff and daemon discovery have separate tests.
 #![cfg(all(feature = "grpc", has_protos))]
 
 mod common;
@@ -26,6 +26,236 @@ const SESSION: &str = "/sessions/sid-a";
 const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
 const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
+
+fn tls_files(
+    directory: &std::path::Path,
+    ca: &[u8],
+    cert: &[u8],
+    key: &[u8],
+) -> nexus_raft::zone_manager::TlsFiles {
+    let files = nexus_raft::zone_manager::TlsFiles {
+        cert_path: directory.join("peer.pem"),
+        key_path: directory.join("peer-key.pem"),
+        ca_path: directory.join("ca.pem"),
+        ca_key_path: None,
+        join_token_hash: None,
+    };
+    std::fs::write(&files.cert_path, cert).unwrap();
+    lib::transport_primitives::write_secret(&files.key_path, key).unwrap();
+    std::fs::write(&files.ca_path, ca).unwrap();
+    files
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_root_replica_tls_boot_and_restart_preserve_root_and_control_authority() {
+    use lib::transport_primitives::{create_peer_channel, ClientConfig, TlsConfig};
+    use nexus_raft::transport::{
+        generate_node_cert, generate_user_replica_cert, generate_zone_ca,
+        proto::PrepareReplicaControlReaderRequest,
+    };
+    use protobuf::Message as _;
+
+    lib::transport_primitives::ensure_crypto_provider();
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data");
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let files = tls_files(directory.path(), &ca, &cert, &key);
+    let (node_cert, node_key) = generate_node_cert(19, "root", &ca, &ca_key, &[], None).unwrap();
+    let node_client = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem: node_cert,
+            key_pem: node_key,
+        }),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let replica_client = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca,
+            cert_pem: cert,
+            key_pem: key,
+        }),
+        ..node_client.clone()
+    };
+    let mut original_root = None;
+    let mut stopped_manager = None;
+    for round in 0..2 {
+        let address = common::node_bind_addr();
+        let manager = ZoneManager::with_local_root(
+            "owner-runtime",
+            31,
+            data.to_str().unwrap(),
+            Vec::new(),
+            &address,
+            Some(files.clone()),
+            Some(format!("https://{address}")),
+            None,
+        )
+        .expect("current matching replica must boot the local-root profile");
+        drop(stopped_manager.take());
+        found(&manager, "root").await;
+        let root_id = manager.cluster_status("root").node_id;
+        match original_root {
+            None => original_root = Some(root_id),
+            Some(original) => assert_eq!(root_id, original),
+        }
+        assert_eq!(
+            manager.get_zone("root").unwrap().consensus_node().voters(),
+            vec![root_id]
+        );
+        let retained = Arc::clone(&manager);
+        tokio::task::spawn_blocking(move || {
+            let root = store(&retained, "root", "/");
+            if round == 0 {
+                root.put("/private", metadata("/private", 0, "root", "alice"))
+                    .unwrap();
+            }
+            assert_eq!(
+                root.get("/private").unwrap().unwrap().owner_id.as_deref(),
+                Some("alice")
+            );
+        })
+        .await
+        .unwrap();
+
+        let endpoint = format!("https://{address}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&address).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local-root TLS listener must bind");
+        let channel = create_peer_channel(&endpoint, &node_client, 31.try_into().unwrap())
+            .await
+            .expect("actual TLS must authenticate the replica server");
+        let mut node_api = ZoneApiServiceClient::new(channel.clone());
+        let mut node_transport = ZoneTransportServiceClient::new(channel);
+        let info = node_api
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.node_id, root_id);
+        let mut heartbeat = raft::eraftpb::Message {
+            from: 19,
+            to: 31,
+            term: 1,
+            ..Default::default()
+        };
+        heartbeat.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeat);
+        let unadmitted = node_transport
+            .step_message(StepMessageRequest {
+                zone_id: AGENT_ZONE.into(),
+                sender_address: "https://127.0.0.1:2126".into(),
+                message: heartbeat.write_to_bytes().unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unadmitted.code(), tonic::Code::NotFound);
+        let channel = create_peer_channel(&endpoint, &replica_client, 31.try_into().unwrap())
+            .await
+            .expect("replica mTLS must connect before control refusal");
+        let mut replica_api = ZoneApiServiceClient::new(channel.clone());
+        let mut replica_transport = ZoneTransportServiceClient::new(channel);
+        let refusal = replica_api
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        let control = replica_transport
+            .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(control.code(), tonic::Code::PermissionDenied);
+        assert!(!manager.hosts_zone(AGENT_ZONE));
+        assert!(!data.join(AGENT_ZONE).exists());
+        let stopped = Arc::clone(&manager);
+        tokio::task::spawn_blocking(move || manager.shutdown())
+            .await
+            .unwrap();
+        assert!(stopped.get_zone("root").is_none());
+        assert!(stopped
+            .registry()
+            .create_zone("after-shutdown", &tokio::runtime::Handle::current())
+            .is_err());
+        assert!(!data.join("after-shutdown").exists());
+        // Retain the old runtime owner through the next actual constructor.
+        // The completed shutdown itself must release the database handles.
+        stopped_manager = Some(stopped);
+    }
+}
+
+#[test]
+fn local_root_tls_refuses_invalid_peer_before_storage_and_preserves_node_only_boot() {
+    use nexus_raft::transport::{
+        generate_user_replica_cert, generate_user_runtime_cert, generate_zone_ca,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
+    for (name, (cert, key), local_root) in [
+        (
+            "wrong-id",
+            generate_user_replica_cert("runtime", "alice", 32, 300, &ca, &ca_key).unwrap(),
+            true,
+        ),
+        (
+            "ordinary-owner",
+            generate_user_runtime_cert("runtime", "alice", 300, &ca, &ca_key).unwrap(),
+            true,
+        ),
+        (
+            "foreign-issuer",
+            generate_user_replica_cert("runtime", "alice", 31, 300, &foreign, &foreign_key)
+                .unwrap(),
+            true,
+        ),
+        (
+            "node-only",
+            generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap(),
+            false,
+        ),
+    ] {
+        let tls_dir = directory.path().join(name);
+        std::fs::create_dir(&tls_dir).unwrap();
+        let files = tls_files(&tls_dir, &ca, &cert, &key);
+        let data = tls_dir.join("data");
+        let constructor = if local_root {
+            ZoneManager::with_local_root
+        } else {
+            ZoneManager::with_node_id
+        };
+        let result = constructor(
+            "owner-runtime",
+            31,
+            data.to_str().unwrap(),
+            Vec::new(),
+            "127.0.0.1:0",
+            Some(files),
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Err(nexus_raft::raft::RaftError::Config(_))),
+            "{name} must refuse before runtime or storage"
+        );
+        assert!(!data.exists(), "{name} created storage before refusing");
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_traffic_cannot_admit_an_unknown_zone_on_a_local_root_runtime() {
