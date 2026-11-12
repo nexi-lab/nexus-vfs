@@ -144,7 +144,7 @@ pub(crate) async fn forward_propose(
         let mut guard = cached_client.lock().await;
         match guard.take() {
             Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
-            _ => connect_proposer(client_pool.config(), &leader_addr.endpoint).await?,
+            _ => connect_api_client(client_pool.config(), &leader_addr.endpoint).await?,
         }
     };
 
@@ -183,7 +183,7 @@ pub(crate) async fn propose_to(
     deadline: tokio::time::Instant,
 ) -> crate::raft::Result<crate::raft::CommandResult> {
     let request = propose_request(command, zone_id, false, deadline)?;
-    let mut client = connect_proposer(config, endpoint).await?;
+    let mut client = connect_api_client(config, endpoint).await?;
     let response = client
         .inner_mut()
         .propose(request)
@@ -213,10 +213,41 @@ fn propose_request(
     Ok(request)
 }
 
-/// Connect a proposal client with short timeouts — fail fast on an
-/// unreachable node.
+/// The member-address records the node at `endpoint` has applied for
+/// `zone_id`, as its `GetClusterInfo` reports them: `(node id, bare
+/// host:port)` for each voter and learner with a record. One connection per
+/// call — for a member whose own state machine keeps no records (a witness)
+/// checking its registration.
 #[cfg(all(feature = "grpc", has_protos))]
-async fn connect_proposer(
+pub(crate) async fn member_addresses_at(
+    config: &ClientConfig,
+    endpoint: &str,
+    zone_id: &str,
+) -> crate::raft::Result<Vec<(u64, String)>> {
+    let info = connect_api_client(config, endpoint)
+        .await?
+        .with_zone_id(zone_id.to_string())
+        .get_cluster_info()
+        .await
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
+    let Some(members) = info.config else {
+        return Ok(Vec::new());
+    };
+    Ok(members
+        .voters
+        .iter()
+        .chain(&members.learners)
+        .filter_map(|member| {
+            crate::raft::member_address::canonical(&member.address)
+                .map(|address| (member.id, address))
+        })
+        .collect())
+}
+
+/// Connect an API client with short timeouts — fail fast on an unreachable
+/// node.
+#[cfg(all(feature = "grpc", has_protos))]
+async fn connect_api_client(
     config: &ClientConfig,
     endpoint: &str,
 ) -> crate::raft::Result<RaftApiClient> {
@@ -337,6 +368,96 @@ pub(crate) fn open_zone_store(sm_path: std::path::PathBuf) -> Result<crate::stor
             TransportError::Connection(format!("Failed to open store: {e}"))
         }
     })
+}
+
+/// A started zone's running parts: its route book, the shutdown signal its
+/// tasks observe, its transport loop and, when it registers, its
+/// member-address registration.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) struct StartedZone {
+    pub(crate) peers: SharedPeerMap,
+    pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub(crate) transport_handle: tokio::task::JoinHandle<()>,
+    pub(crate) registration_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Run a zone's consensus on this node. Every zone start — data node and
+/// witness alike — goes through here, so every member gets the same parts: a
+/// route book shared by `driver`, the transport loop and the leader
+/// forwarding of `handle`; a transport loop that advertises `advertise`; and,
+/// in a managed zone whose member advertises an address, the member-address
+/// registration (`docs/member-address.md`) with `seeds` as its fallback
+/// `Propose` targets.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
+    handle: &mut crate::raft::ZoneConsensus<S>,
+    mut driver: crate::raft::ZoneConsensusDriver<S>,
+    zone_id: &str,
+    tls: &std::sync::Arc<std::sync::RwLock<Option<TlsConfig>>>,
+    advertise: String,
+    seeds: Vec<NodeAddress>,
+    runtime_handle: &tokio::runtime::Handle,
+) -> StartedZone {
+    let peers: SharedPeerMap =
+        std::sync::Arc::new(std::sync::RwLock::new(PeerMap::new(handle.id())));
+    driver.set_peer_map(peers.clone(), tls.read().unwrap().is_some());
+    let client_config = ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    };
+    handle.set_forward_ctx(
+        RaftClientPool::with_config(client_config.clone()),
+        peers.clone(),
+        zone_id.to_string(),
+    );
+    let transport_loop = TransportLoop::new(
+        driver,
+        peers.clone(),
+        RaftClientPool::with_config(client_config),
+    )
+    .with_zone_id(zone_id.to_string())
+    .with_self_address(advertise.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // The fixed local root has no network members.
+    let registration_handle = (handle.config().membership_policy
+        == crate::raft::MembershipPolicy::Managed
+        && !advertise.is_empty())
+    .then(|| {
+        runtime_handle.spawn(handle.clone().register_member_address(
+            crate::raft::MemberRegistration { advertise, seeds },
+            shutdown_rx.clone(),
+        ))
+    });
+    let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+    StartedZone {
+        peers,
+        shutdown_tx,
+        transport_handle,
+        registration_handle,
+    }
+}
+
+/// Record `address`, the advertise address `peer_id` stated on an
+/// authenticated inbound message or registration, in `peers`' observed
+/// layer. A bare `host:port` is schemed by this node's own TLS posture
+/// (`use_tls`): under mTLS a plaintext dial cannot complete the handshake.
+/// Returns `true` if the route changed; an empty address or id changes
+/// nothing.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) fn observe_sender(
+    peers: &SharedPeerMap,
+    peer_id: u64,
+    address: &str,
+    use_tls: bool,
+) -> bool {
+    if address.is_empty() || peer_id == 0 {
+        return false;
+    }
+    let Ok(mut route) = NodeAddress::parse(address, use_tls) else {
+        return false;
+    };
+    route.id = peer_id;
+    peers.write().unwrap().observe(peer_id, route)
 }
 
 /// The transport route book for one zone — how this node dials each OTHER
@@ -550,6 +671,37 @@ mod peer_map_tests {
         m.set_registered(records(&[(5005, 9000)]));
         assert!(!m.observe(5005, addr(5005, 9000)));
         assert_eq!(m.len(), 2);
+    }
+
+    /// Data nodes and witnesses observe senders through one function, which
+    /// schemes a bare advertise address by the local TLS posture.
+    #[cfg(all(feature = "grpc", has_protos))]
+    #[test]
+    fn an_observed_sender_is_schemed_by_the_local_tls_posture() {
+        let peers: super::SharedPeerMap =
+            std::sync::Arc::new(std::sync::RwLock::new(PeerMap::new(SELF_ID)));
+        assert!(super::observe_sender(&peers, 7, "nexus-7:2126", true));
+        assert_eq!(
+            peers
+                .read()
+                .unwrap()
+                .route(7)
+                .map(|route| route.endpoint.clone()),
+            Some("https://nexus-7:2126".to_string())
+        );
+        assert!(
+            !super::observe_sender(&peers, 7, "https://nexus-7:2126", true),
+            "the route it already has changes nothing"
+        );
+        assert!(!super::observe_sender(&peers, 0, "nexus-0:2126", true));
+        assert!(!super::observe_sender(&peers, 8, "", true));
+        assert!(!super::observe_sender(
+            &peers,
+            SELF_ID,
+            "nexus-1:2126",
+            true
+        ));
+        assert_eq!(peers.read().unwrap().len(), 1);
     }
 }
 

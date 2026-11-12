@@ -20,7 +20,7 @@ package nexus.grpc.vfs;
 
 service ZoneRuntimeService {
   // Create a new tenant/data zone. Idempotent per operation_id; the same
-  // address book replays the original receipt, a different one is refused.
+  // request replays the original receipt, a different one is refused.
   rpc ZoneCreate(ZoneCreateRequest) returns (ZoneReceipt);
 
   // Join an existing zone. NEVER bootstraps a founder — a join that cannot
@@ -67,14 +67,16 @@ message ZoneCreateRequest {
   string auth_token = 1;
   ZoneMutationHeader mutation = 2;
   string zone_id = 3;
-  repeated string peers = 4;
+  reserved 4;
+  reserved "peers";
 }
 
 message ZoneJoinRequest {
   string auth_token = 1;
   ZoneMutationHeader mutation = 2;
   string zone_id = 3;
-  repeated string peers = 4;
+  reserved 4;
+  reserved "peers";
   bool learner = 5;
 }
 
