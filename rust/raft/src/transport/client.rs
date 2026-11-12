@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 /// Default TTL for cached gRPC clients. Connections older than this are
 /// evicted on next access and a fresh connection is established.
@@ -935,28 +935,14 @@ pub struct JoinClusterResult {
     pub api_key_secret: Option<String>,
 }
 
-/// Dial a one-shot `ZoneApiService` client, honoring mTLS when `tls` is set.
-///
-/// Routes through the shared [`lib::transport_primitives::create_channel`]
-/// primitive — the same Endpoint builder the pooled raft channels use — so
-/// the join / discover / remove / delete RPCs present the node's client
-/// identity + CA under mTLS. The pre-refactor helpers each hand-rolled a
-/// plaintext `Endpoint::from_shared(..).connect()`, which cannot complete a
-/// handshake against an mTLS leader (an `https://` endpoint with no
-/// `ClientTlsConfig` is rejected at connect): the federation dynamic-join
-/// path silently broke the moment TLS was turned on.
-///
-/// `what` labels the RPC in the connect error so a handshake failure names
-/// the operation. SNI note: `apply_tls` sets no `domain_name`, so the
-/// server cert must carry the endpoint host in a SAN — node certs already
-/// include `localhost` / `127.0.0.1` / `::1`, and cross-host reachability
-/// SANs come from `generate_node_cert`'s `extra_hostnames`.
-async fn connect_zone_api(
+/// Dial a one-shot RPC through the shared channel builder and timeout policy.
+/// The supplied credentials select mTLS; `what` identifies connection errors.
+async fn connect_rpc_channel(
     peer_addr: &str,
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
     what: &str,
-) -> Result<ZoneApiServiceClient<Channel>> {
+) -> Result<Channel> {
     let config = lib::transport_primitives::ClientConfig {
         connect_timeout: Duration::from_secs(timeout_secs),
         request_timeout: Duration::from_secs(timeout_secs),
@@ -965,12 +951,23 @@ async fn connect_zone_api(
         http2_keepalive_timeout: None,
         tls,
     };
-    let channel = lib::transport_primitives::create_channel(peer_addr, &config)
+    lib::transport_primitives::create_channel(peer_addr, &config)
         .await
         .map_err(|e| {
             TransportError::Connection(format!("{what} connect to {peer_addr} failed: {e}"))
-        })?;
-    Ok(ZoneApiServiceClient::new(channel))
+        })
+}
+
+/// Dial a one-shot `ZoneApiService` client using the supplied credentials.
+async fn connect_zone_api(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+    what: &str,
+) -> Result<ZoneApiServiceClient<Channel>> {
+    Ok(ZoneApiServiceClient::new(
+        connect_rpc_channel(peer_addr, tls, timeout_secs, what).await?,
+    ))
 }
 
 /// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
@@ -993,15 +990,7 @@ pub async fn call_join_cluster(
     csr_pem: &[u8],
     timeout_secs: u64,
 ) -> Result<JoinClusterResult> {
-    let ep = Endpoint::from_shared(leader_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep
-        .connect()
-        .await
-        .map_err(|e| TransportError::Connection(format!("JoinCluster connect failed: {}", e)))?;
+    let channel = connect_rpc_channel(leader_addr, None, timeout_secs, "JoinCluster").await?;
 
     let mut client = NodeEnrollmentServiceClient::new(channel);
     let request = JoinClusterRequest {
@@ -1046,15 +1035,7 @@ pub async fn call_get_crl(enroll_addr: &str, timeout_secs: u64) -> Result<Vec<u8
     } else {
         format!("http://{enroll_addr}")
     };
-    let ep = Endpoint::from_shared(uri)
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
-
-    let channel = ep
-        .connect()
-        .await
-        .map_err(|e| TransportError::Connection(format!("GetCrl connect failed: {e}")))?;
+    let channel = connect_rpc_channel(&uri, None, timeout_secs, "GetCrl").await?;
 
     let response = NodeEnrollmentServiceClient::new(channel)
         .get_crl(GetCrlRequest {})
