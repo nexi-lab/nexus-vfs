@@ -826,7 +826,7 @@ impl ZoneManager {
     }
 
     /// This Node's current TLS identity (`None` under `--no-tls`).
-    pub fn node_tls(&self) -> std::result::Result<Option<TlsConfig>, &'static str> {
+    pub fn node_tls(&self) -> std::result::Result<Option<TlsConfig>, String> {
         self.registry.tls_config()
     }
 
@@ -2430,9 +2430,9 @@ mod tests {
         assert_eq!(manager.node_tls().unwrap(), Some(next.clone()));
         assert_eq!(credentials.snapshot().config().unwrap(), Some(&next));
         credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
-        assert_eq!(manager.node_tls(), Err("revoked"));
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
         assert!(manager.install_node_identity(next).is_err());
-        assert_eq!(manager.node_tls(), Err("revoked"));
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
     }
 
     #[test]
