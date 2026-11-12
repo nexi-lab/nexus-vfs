@@ -145,7 +145,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let verifier = lib::transport_primitives::FederatedClientCertVerifier::new(&ca).unwrap();
     let peer_slot = Arc::new(std::sync::OnceLock::new());
     peer_slot.set(verifier.clone()).unwrap();
-    let minter = Arc::new(FounderAgentMinter {
+    let minter = Arc::new(FounderCaIssuer {
         store: store.clone(),
         tls_dir: tls.clone(),
         data_dir: private.path().to_path_buf(),
@@ -153,7 +153,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
         replica_store: crate::replica_rpc::new_store_slot(),
         peer_verifier: peer_slot,
     });
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
     *slot.write() = Some(minter);
     let (server_cert, server_key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -178,7 +178,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
             ..Default::default()
         },
     )
-    .with_agent_minter_slot(slot)
+    .with_ca_issuer_slot(slot)
     .with_foreign_ca_verifier(Some(verifier.clone()));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let running = tokio::spawn(async move {

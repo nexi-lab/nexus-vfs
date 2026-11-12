@@ -141,7 +141,9 @@ pub enum DialError {
 pub struct PeerChannelCache {
     channels: DashMap<Arc<str>, Channel>,
     config: PeerChannelConfig,
-    tls: Option<ClientTlsConfig>,
+    /// The client identity and its generation; a dial that began under an
+    /// older generation is used once but never cached.
+    tls: std::sync::RwLock<(u64, Option<ClientTlsConfig>)>,
 }
 
 impl PeerChannelCache {
@@ -151,7 +153,7 @@ impl PeerChannelCache {
         Self {
             channels: DashMap::new(),
             config,
-            tls: None,
+            tls: std::sync::RwLock::new((0, None)),
         }
     }
 
@@ -162,8 +164,16 @@ impl PeerChannelCache {
         Self {
             channels: DashMap::new(),
             config,
-            tls: Some(tls),
+            tls: std::sync::RwLock::new((0, Some(tls))),
         }
+    }
+
+    /// Present a renewed client identity from now on: cached channels are
+    /// dropped, so the next RPC to each target dials with `tls`.
+    pub fn install_tls(&self, tls: ClientTlsConfig) {
+        let mut current = self.tls.write().unwrap_or_else(|e| e.into_inner());
+        *current = (current.0.wrapping_add(1), Some(tls));
+        self.channels.clear();
     }
 
     /// The config this cache was built under.  Useful for a caller
@@ -188,7 +198,12 @@ impl PeerChannelCache {
         }
         // Slow-path: dial, then publish.  See the struct docstring's
         // race posture note.
-        let channel = self.dial(target).await?;
+        let (generation, tls) = self.tls.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let channel = self.dial(target, tls).await?;
+        let current = self.tls.read().unwrap_or_else(|e| e.into_inner());
+        if current.0 != generation {
+            return Ok(channel);
+        }
         Ok(self.channels.entry(key).or_insert(channel).clone())
     }
 
@@ -198,7 +213,7 @@ impl PeerChannelCache {
     /// invalidation surface on this abstraction on purpose — tonic
     /// handles reconnection internally, so a cached dead Channel
     /// heals without a caller-visible signal).
-    async fn dial(&self, target: &str) -> Result<Channel, DialError> {
+    async fn dial(&self, target: &str, tls: Option<ClientTlsConfig>) -> Result<Channel, DialError> {
         if self.config.require_tls && !target.starts_with("https://") {
             return Err(DialError::TlsRequired {
                 target: target.into(),
@@ -228,10 +243,7 @@ impl PeerChannelCache {
             // roots enabled at build time (webpki-roots on
             // tls-ring) — matches the outbound-client posture the
             // wider tonic 0.14 tree uses.
-            let tls_config = self
-                .tls
-                .clone()
-                .unwrap_or_else(|| ClientTlsConfig::new().with_enabled_roots());
+            let tls_config = tls.unwrap_or_else(|| ClientTlsConfig::new().with_enabled_roots());
             endpoint = endpoint
                 .tls_config(tls_config)
                 .map_err(|e| DialError::BadEndpoint {

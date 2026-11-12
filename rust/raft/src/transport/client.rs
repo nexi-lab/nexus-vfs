@@ -13,7 +13,8 @@ use super::proto::nexus::raft::{
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
     MintSessionAgentRequest, PrepareReplicaControlReaderRequest,
     PrepareReplicaControlReaderResponse, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
-    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
+    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest,
+    RenewLocalNodeCertificateRequest, RenewNodeCertificateRequest, RenewSessionAgentRequest,
     ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
@@ -923,11 +924,10 @@ pub struct ClusterInfoResult {
 // JoinCluster client — shared by cluster nodes and witness binary
 // =============================================================================
 
-/// Result of a successful JoinCluster call.
+/// Result of a successful JoinCluster call: the certificate for the CSR's key.
 pub struct JoinClusterResult {
     pub ca_pem: Vec<u8>,
     pub node_cert_pem: Vec<u8>,
-    pub node_key_pem: Vec<u8>,
     /// Cluster API-key HMAC secret the founder served (over the same
     /// token-gated channel as the CA). `None` when the founder is auth-off.
     /// The caller persists it to `tls/api-key-secret` (the single SSOT) so the
@@ -973,10 +973,12 @@ async fn connect_zone_api(
     Ok(ZoneApiServiceClient::new(channel))
 }
 
-/// Call JoinCluster on a leader to get a signed node certificate.
+/// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
+/// [`super::generate_node_key_request`]).
 ///
 /// K3s-style: authenticates with join token password. The leader signs
-/// the cert server-side — CA key never leaves node-1.
+/// the cert server-side — the CA key never leaves it, and the joiner's key
+/// never leaves the joiner.
 ///
 /// Intentionally plaintext: this is the pre-identity bootstrap RPC a
 /// certless joiner uses to *obtain* its node cert, so it cannot present a
@@ -988,6 +990,7 @@ pub async fn call_join_cluster(
     node_address: &str,
     zone_id: &str,
     password: &str,
+    csr_pem: &[u8],
     timeout_secs: u64,
 ) -> Result<JoinClusterResult> {
     let ep = Endpoint::from_shared(leader_addr.to_string())
@@ -1006,6 +1009,7 @@ pub async fn call_join_cluster(
         node_id,
         node_address: node_address.to_string(),
         zone_id: zone_id.to_string(),
+        csr_pem: csr_pem.to_vec(),
     };
 
     let response = client
@@ -1024,7 +1028,6 @@ pub async fn call_join_cluster(
     Ok(JoinClusterResult {
         ca_pem: response.ca_pem,
         node_cert_pem: response.node_cert_pem,
-        node_key_pem: response.node_key_pem,
         api_key_secret: response.api_key_secret,
     })
 }
@@ -1299,7 +1302,7 @@ pub struct MintAgentResult {
 /// uniqueness + audit live there) and returns the bundle. A peer that does not
 /// hold the CA returns `success=false` with "does not hold the cluster CA", so
 /// the caller tries the next peer. mTLS-only — the caller presents its NODE
-/// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
+/// cert, which the founder's `CaIssuer` gate requires (an agent cert is a
 /// pure identity and must not be able to mint further agents).
 /// Permit `agent_id` to mint session credentials, against a live daemon.
 ///
@@ -1418,7 +1421,7 @@ pub async fn call_mint_session_agent_rpc(
 /// Renew the same actor using a session-key proof bound to the minter's TLS leaf.
 pub async fn call_renew_session_agent_rpc(
     peer_addr: &str,
-    renewal: crate::agent_minter::SessionRenewal<'_>,
+    renewal: crate::ca_issuer::SessionRenewal<'_>,
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<MintSessionAgentResult> {
@@ -1517,6 +1520,62 @@ impl MintAgentChannel {
             ca_pem: response.ca_pem,
         })
     }
+}
+
+/// Ask `peer_addr` to re-issue this Node's certificate for the key in
+/// `csr_pem`, authenticating with the current Node identity in `tls`. A
+/// refusal (`Ok(Err(..))`) carries the server's reason — a node that is not the
+/// CA holder says so, and the caller asks the next candidate.
+pub async fn call_renew_node_certificate_rpc(
+    peer_addr: &str,
+    csr_pem: &[u8],
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    let mut client =
+        connect_zone_api(peer_addr, Some(tls), timeout_secs, "RenewNodeCertificate").await?;
+    let response = client
+        .renew_node_certificate(RenewNodeCertificateRequest {
+            csr_pem: csr_pem.to_vec(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewNodeCertificate RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.node_cert_pem)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
+    })
+}
+
+/// Ask this Node's own daemon at `peer_addr` to renew its certificate now.
+/// Returns the notAfter (Unix seconds) of the certificate it then serves.
+pub async fn call_renew_local_node_certificate_rpc(
+    peer_addr: &str,
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<i64, String>> {
+    let mut client = connect_zone_api(
+        peer_addr,
+        Some(tls),
+        timeout_secs,
+        "RenewLocalNodeCertificate",
+    )
+    .await?;
+    let response = client
+        .renew_local_node_certificate(RenewLocalNodeCertificateRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewLocalNodeCertificate RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.not_after_unix_s)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
+    })
 }
 
 /// Params for [`call_mint_key_rpc`] — mirrors the CLI's `auth mint` sk- flags.

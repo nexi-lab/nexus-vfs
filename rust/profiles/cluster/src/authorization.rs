@@ -73,7 +73,7 @@ pub(super) fn validate(common: &CommonArgs) -> Result<()> {
 pub(super) fn service_decls(
     common: &CommonArgs,
     _ctx: &ServiceBootCtx,
-    _tls: Option<&nexus_raft::transport::TlsConfig>,
+    _zm: &nexus_raft::ZoneManager,
     _ready: Arc<DataPlaneReady>,
 ) -> Result<Vec<ServiceDecl>> {
     #[cfg(feature = "rebac")]
@@ -130,22 +130,32 @@ pub(super) fn service_decls(
                         std::net::Ipv6Addr::LOCALHOST.into()
                     });
                 }
-                let (scheme, channels) = match _tls {
-                    Some(tls) => (
-                        "https",
-                        PeerChannelCache::with_tls(
+                let client_tls = |tls: &nexus_raft::transport::TlsConfig| {
+                    ClientTlsConfig::new()
+                        .domain_name(nexus_raft::transport::TlsConfig::CLUSTER_SERVER_NAME)
+                        .ca_certificate(Certificate::from_pem(&tls.ca_pem))
+                        .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem))
+                };
+                let (scheme, channels) = match _zm.node_tls().map_err(anyhow::Error::msg)? {
+                    Some(tls) => {
+                        let channels = Arc::new(PeerChannelCache::with_tls(
                             PeerChannelConfig::default(),
-                            ClientTlsConfig::new()
-                                .domain_name(nexus_raft::transport::TlsConfig::CLUSTER_SERVER_NAME)
-                                .ca_certificate(Certificate::from_pem(&tls.ca_pem))
-                                .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem)),
-                        ),
+                            client_tls(&tls),
+                        ));
+                        let renewed = Arc::clone(&channels);
+                        _zm.on_node_identity(Box::new(move |tls| {
+                            renewed.install_tls(client_tls(tls))
+                        }));
+                        ("https", channels)
+                    }
+                    None => (
+                        "http",
+                        Arc::new(PeerChannelCache::new(PeerChannelConfig::default())),
                     ),
-                    None => ("http", PeerChannelCache::new(PeerChannelConfig::default())),
                 };
                 let search = nexus_http_api::SearchBackend::with_channels(
                     format!("{scheme}://{grpc}"),
-                    Arc::new(channels),
+                    channels,
                 );
                 services.push(nexus_http_api::service_decl(
                     addr,

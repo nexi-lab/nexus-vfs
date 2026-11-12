@@ -17,7 +17,7 @@ use nexus_raft::{
 };
 
 use crate::replica_issuer::{ReplicaIssue, ReplicaIssuer, ReplicaIssuerError};
-use crate::FounderAgentMinter;
+use crate::FounderCaIssuer;
 
 #[cfg(test)]
 mod tests;
@@ -38,7 +38,7 @@ pub(super) struct ReplyAuthority {
 
 impl ReplyAuthority {
     pub(super) fn capture(
-        founder: &FounderAgentMinter,
+        founder: &FounderCaIssuer,
         caller: Option<&[u8]>,
     ) -> Result<Self, String> {
         let caller = caller.ok_or("replica issuer requires an mTLS Node")?;
@@ -85,7 +85,7 @@ impl ReplyAuthority {
 }
 
 pub(super) async fn respond(
-    founder: FounderAgentMinter,
+    founder: FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: ReplicaCsrRequest,
     query_only: bool,
@@ -142,7 +142,7 @@ fn parse(request: &ReplicaCsrRequest) -> Result<ReplicaIssuanceRequest, String> 
 }
 
 pub(super) fn execute(
-    founder: &FounderAgentMinter,
+    founder: &FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: ReplicaCsrRequest,
     query_only: bool,
@@ -158,7 +158,7 @@ pub(super) fn execute(
 }
 
 fn execute_inner(
-    founder: &FounderAgentMinter,
+    founder: &FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: &ReplicaCsrRequest,
     query_only: bool,

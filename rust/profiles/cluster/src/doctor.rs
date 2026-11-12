@@ -24,7 +24,8 @@ const CERTIFICATE_EXPIRY_WARNING_DAYS: i64 = 14;
 ///   * `CERT_NOT_YET_VALID` / `CERT_EXPIRED` — outside its validity window.
 ///   * `CERT_UNTRUSTED` — not a current Node leaf of the bundled cluster CA.
 ///   * `CERT_EXPIRING` (warning) — expires within
-///     [`CERTIFICATE_EXPIRY_WARNING_DAYS`].
+///     [`CERTIFICATE_EXPIRY_WARNING_DAYS`], so the daemon's own renewal (due
+///     once a third of the lifetime remains) has not succeeded.
 ///
 /// Each zone section reads the persisted ConfState + HardState +
 /// last_log_index directly from redb (no driver, no async runtime, no kernel
@@ -209,7 +210,17 @@ impl Findings {
                 "  RECOVERY: synchronize this host's clock with its issuer's (NTP)"
             )?;
         }
-        if !self.warnings.is_empty() || self.alarms.len() > usize::from(self.clock_skew) {
+        if !self.warnings.is_empty() {
+            writeln!(
+                out,
+                "  RECOVERY: the daemon renews this certificate itself once a third of its \
+                 lifetime remains; check that it reaches the CA holder, then force a renewal \
+                 with the daemon running:\n  \
+                 nexusd-cluster renew-certificate --data-dir {}",
+                data_dir.display()
+            )?;
+        }
+        if self.alarms.len() > usize::from(self.clock_skew) {
             writeln!(
                 out,
                 "  RECOVERY: re-enroll so the CA holder re-issues this Node's certificate for \
@@ -522,7 +533,11 @@ mod tests {
             report.contains("WARN   CERT_EXPIRING: expires in 3 day(s)"),
             "{report}"
         );
-        assert!(report.contains("nexusd-cluster enroll"), "{report}");
+        assert!(
+            report.contains("nexusd-cluster renew-certificate --data-dir")
+                && !report.contains("nexusd-cluster enroll"),
+            "{report}"
+        );
 
         let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
         let (outsider, _) =

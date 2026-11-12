@@ -1,16 +1,17 @@
 //! Native host-to-issuer composition. The public request contains neither a
 //! caller certificate nor an issuer URL: only the boot composition supplies
-//! this daemon's selected TLS identity and the existing minter slot.
+//! this daemon's selected TLS identity and the existing CA issuer slot.
 
 use super::*;
 use nexus_raft::{
-    agent_minter::{AgentMinter, AgentMinterSlot},
+    ca_issuer::{CaIssuer, CaIssuerSlot},
     transport::{current_local_node_certificate, proto::AgentCsrState, TlsConfig},
 };
 
 pub(crate) struct NativeIssuer {
-    slot: AgentMinterSlot,
-    node_der: Vec<u8>,
+    slot: CaIssuerSlot,
+    /// This daemon's current Node leaf, replaced on each renewal.
+    node_der: Arc<std::sync::RwLock<Vec<u8>>>,
     issuer_der: Vec<u8>,
     runtime: tokio::runtime::Handle,
 }
@@ -20,7 +21,7 @@ impl NativeIssuer {
     /// preparation service usable with issuance capability zero; never promote
     /// its TLS identity or turn this optional capability into a boot failure.
     pub(crate) fn for_host(
-        slot: AgentMinterSlot,
+        slot: CaIssuerSlot,
         tls: &TlsConfig,
         runtime: tokio::runtime::Handle,
     ) -> Option<Self> {
@@ -31,7 +32,7 @@ impl NativeIssuer {
     /// used by the daemon. This is an in-process native call, not a claim that
     /// a public DER supplied over Call proves possession or Node authority.
     pub(crate) fn from_tls(
-        slot: AgentMinterSlot,
+        slot: CaIssuerSlot,
         tls: &TlsConfig,
         runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
@@ -42,17 +43,35 @@ impl NativeIssuer {
         current_local_node_certificate(&node_der, &issuer_der).map_err(anyhow::Error::msg)?;
         Ok(Self {
             slot,
-            node_der,
+            node_der: Arc::new(std::sync::RwLock::new(node_der)),
             issuer_der,
             runtime,
         })
     }
 
-    pub(super) fn minter(&self, ca: &[u8]) -> Result<Arc<dyn AgentMinter>, String> {
+    /// Follow this daemon's renewed Node identity.
+    pub(crate) fn node_identity_holder(&self) -> nexus_raft::zone_manager::NodeIdentityHolder {
+        let node_der = Arc::clone(&self.node_der);
+        Box::new(
+            move |tls| match first_certificate_der(&tls.cert_pem, "native Node") {
+                Ok(der) => *node_der.write().unwrap_or_else(|e| e.into_inner()) = der,
+                Err(error) => tracing::warn!(%error, "native issuer kept its Node identity"),
+            },
+        )
+    }
+
+    fn node_der(&self) -> Vec<u8> {
+        self.node_der
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(super) fn minter(&self, ca: &[u8]) -> Result<Arc<dyn CaIssuer>, String> {
         if first_certificate_der(ca, "prepared issuer")? != self.issuer_der {
             return Err("prepared issuer differs from the daemon's native TLS authority".into());
         }
-        current_local_node_certificate(&self.node_der, &self.issuer_der)?;
+        current_local_node_certificate(&self.node_der(), &self.issuer_der)?;
         let minter = self
             .slot
             .read()
@@ -109,7 +128,7 @@ impl PreparationService {
             let observed = lib::rt::block_on_via(
                 &issuer.runtime,
                 minter.agent_csr_v1(
-                    Some(issuer.node_der.clone()),
+                    Some(issuer.node_der()),
                     pending.request().clone(),
                     verb != "issue_v1",
                 ),

@@ -241,6 +241,7 @@ fn replica_params(intent: &ReplicaCertificateIntent) -> Result<CertificateParams
 
 /// Verify holder possession and the exact public certificate profile before
 /// committing an externally retained intent. This operation uses no CA key.
+#[inline(never)]
 pub fn verify_replica_csr_intent(
     intent: &ReplicaCertificateIntent,
     csr_pem: &[u8],
