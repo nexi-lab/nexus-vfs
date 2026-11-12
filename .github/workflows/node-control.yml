@@ -26,6 +26,9 @@ on:
       - 'rust/transport/src/federation/**'
       - 'rust/transport/src/test_peer.rs'
       - 'rust/profiles/cluster/**'
+      - 'rust/search-common/**'
+      - 'rust/search-plugin/**'
+      - 'rust/http-api/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
       - 'rust/lib/src/rt.rs'
@@ -91,6 +94,8 @@ jobs:
       - name: Content peer TLS configuration and connection rotation
         run: |
           cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::credential_channel::tests
+          cargo test --locked -p nexus-search-common --features transport --lib transport::tests
           cargo test --locked -p transport --lib peer_blob::
           cargo test --locked -p transport --lib federation::
       - name: Forwarded proposal credentials and pending TLS dials
@@ -128,6 +133,10 @@ jobs:
       - run: cargo test --locked -p nexus-cluster --lib
       - name: Enroll, replicate credentials and restore the same Node identity
         run: cargo test --locked -p nexus-cluster --test node_enrollment --test node_certificate_renewal --test cross_node_sk_replication -- --test-threads=1
+      - name: HTTP clients consume the live node identity
+        run: |
+          cargo test --locked -p nexus-http-api --features rebac --tests
+          cargo test --locked -p nexus-cluster --features http-api --test http_identity --test production_http_files -- --test-threads=1
 
   managed-credentials:
     runs-on: ${{ matrix.os }}

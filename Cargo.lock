@@ -2283,6 +2283,7 @@ dependencies = [
  "dashmap",
  "getrandom 0.4.2",
  "globset",
+ "http-body",
  "memchr",
  "parking_lot",
  "pem",
@@ -2788,6 +2789,7 @@ name = "nexus-search-common"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "lib",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
