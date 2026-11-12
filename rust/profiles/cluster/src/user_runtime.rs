@@ -22,6 +22,13 @@ const OWNER_FILE: &str = ".user-runtime-owner";
 
 struct ValidatedCredential {
     bundle: LoadedCredential,
+    identity: RuntimeIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeIdentity {
+    agent: String,
+    replica_id: Option<u64>,
 }
 
 impl ValidatedCredential {
@@ -34,16 +41,16 @@ impl ValidatedCredential {
     }
 }
 
-enum CredentialUse {
+enum CredentialUse<'a> {
     Bootstrap,
-    Rotation,
+    Rotation(&'a RuntimeIdentity),
 }
 
 fn validate_credential(
     bundle: LoadedCredential,
     owner: &str,
     verifier: &FederatedClientCertVerifier,
-    usage: CredentialUse,
+    usage: CredentialUse<'_>,
 ) -> Result<ValidatedCredential> {
     let ca = ::pem::parse(&bundle.ca_pem).context("runtime CA PEM")?;
     if ca.contents() != verifier.cluster_ca_der() {
@@ -66,7 +73,7 @@ fn validate_credential(
     // replacement. TLS and RuntimeScope still refuse expired authority. This
     // avoids a container restart backoff outlasting every renewed credential.
     let is_expired_bootstrap =
-        matches!(usage, CredentialUse::Bootstrap) && cert.validity().not_after < ASN1Time::now();
+        matches!(&usage, CredentialUse::Bootstrap) && cert.validity().not_after < ASN1Time::now();
     if !cert.validity().is_valid() && !is_expired_bootstrap {
         bail!("runtime certificate is outside its validity window");
     }
@@ -93,7 +100,19 @@ fn validate_credential(
         bail!("runtime credential must be an ordinary agent of its fixed owner");
     }
     u64::try_from(cert.validity().not_after.timestamp()).context("invalid runtime expiry")?;
-    Ok(ValidatedCredential { bundle })
+    let identity = RuntimeIdentity {
+        agent: peer
+            .agent_name
+            .context("runtime certificate lacks an agent subject")?,
+        replica_id: lib::transport_primitives::replica_node_id_from_x509(&cert)
+            .map_err(anyhow::Error::msg)?,
+    };
+    if let CredentialUse::Rotation(expected) = usage {
+        if &identity != expected {
+            bail!("runtime renewal must preserve its agent subject and replica identity");
+        }
+    }
+    Ok(ValidatedCredential { bundle, identity })
 }
 
 fn bind_owner(dir: &Path, owner: &str) -> Result<()> {
@@ -261,6 +280,7 @@ pub(super) async fn serve(
     tracing::info!(owner = %owner, bind = %listener.local_addr()?, "confined user runtime ready");
     let incoming = tls_listener.incoming(listener);
     let reload = tokio::spawn(async move {
+        let expected_identity = initial.identity;
         let mut previous = initial.bundle;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -285,14 +305,18 @@ pub(super) async fn serve(
             {
                 continue;
             }
-            let candidate =
-                match validate_credential(candidate, &owner, &verifier, CredentialUse::Rotation) {
-                    Ok(candidate) => candidate,
-                    Err(error) => {
-                        tracing::warn!(%error, "runtime credential replacement refused");
-                        continue;
-                    }
-                };
+            let candidate = match validate_credential(
+                candidate,
+                &owner,
+                &verifier,
+                CredentialUse::Rotation(&expected_identity),
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    tracing::warn!(%error, "runtime credential replacement refused");
+                    continue;
+                }
+            };
             match server_config(
                 Arc::clone(&verifier),
                 &candidate.bundle.cert_pem,
@@ -315,4 +339,71 @@ pub(super) async fn serve(
             .await;
     reload.abort();
     result.context("user runtime server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_raft::transport::{
+        generate_user_replica_cert, generate_user_runtime_cert, generate_zone_ca,
+    };
+
+    #[test]
+    fn renewal_preserves_the_signed_subject_and_replica_profile() {
+        let (ca, ca_key) = generate_zone_ca("root").unwrap();
+        let verifier = FederatedClientCertVerifier::new(&ca).unwrap();
+        let bundle = |agent: &str, replica| {
+            let (cert_pem, key_pem) = match replica {
+                Some(id) => generate_user_replica_cert(agent, "alice", id, 300, &ca, &ca_key),
+                None => generate_user_runtime_cert(agent, "alice", 300, &ca, &ca_key),
+            }
+            .unwrap();
+            LoadedCredential {
+                agent: "manifest-is-not-identity-authority".into(),
+                server_name: user_runtime_server_name("alice").unwrap(),
+                ca_pem: ca.clone(),
+                cert_pem,
+                key_pem,
+            }
+        };
+        for replica in [None, Some(31)] {
+            let initial = validate_credential(
+                bundle("runtime", replica),
+                "alice",
+                &verifier,
+                CredentialUse::Bootstrap,
+            )
+            .unwrap();
+            assert_eq!(initial.identity.agent, "runtime");
+            assert_eq!(initial.identity.replica_id, replica);
+            let expected = &initial.identity;
+            let renewal = validate_credential(
+                bundle("runtime", replica),
+                "alice",
+                &verifier,
+                CredentialUse::Rotation(expected),
+            )
+            .unwrap();
+            assert_eq!(&renewal.identity, expected);
+            assert_ne!(renewal.bundle.key_pem, initial.bundle.key_pem);
+            for (agent, replacement) in [
+                ("other-runtime", replica),
+                ("runtime", Some(32)),
+                ("runtime", if replica.is_some() { None } else { Some(31) }),
+            ] {
+                let refused = validate_credential(
+                    bundle(agent, replacement),
+                    "alice",
+                    &verifier,
+                    CredentialUse::Rotation(expected),
+                );
+                let error = refused
+                    .err()
+                    .expect("renewal changed the signed runtime identity");
+                assert!(error
+                    .to_string()
+                    .contains("preserve its agent subject and replica identity"));
+            }
+        }
+    }
 }
