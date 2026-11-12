@@ -103,6 +103,8 @@ impl<'a> ReplicaIssuer<'a> {
         )
     }
 
+    // Keep blocking lifecycle stages out of the generic revocation callback.
+    #[inline(never)]
     fn issue_guarded(
         &self,
         controller: &CurrentController<'_>,
@@ -142,6 +144,7 @@ impl<'a> ReplicaIssuer<'a> {
             .map_err(after_preparation)
     }
 
+    #[inline(never)]
     fn publish_guarded(
         &self,
         controller: &CurrentController<'_>,
