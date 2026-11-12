@@ -43,6 +43,10 @@ mod managed_csr_binding;
 #[cfg(feature = "operator-agent-enrollment")]
 pub mod operator_enrollment;
 mod plugin_loading;
+pub mod replica_control;
+mod replica_control_rpc;
+pub mod replica_issuer;
+mod replica_rpc;
 mod runtime_backends;
 mod search_capabilities;
 pub mod stream_observers;
@@ -2581,6 +2585,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // an unbound slot denies.
     let session_mint_allow_slot =
         nexus_raft::session_mint_allow_store::new_session_mint_allow_slot();
+    let replica_store_slot = replica_rpc::new_store_slot();
 
     // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
     // into the raft gRPC server's slot, so `auth mint --subject-type agent` on
@@ -2601,6 +2606,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                     // session minting is closed, which is the safe default for
                     // a gate that cannot read its policy.
                     session_allow: Arc::clone(&session_mint_allow_slot),
+                    replica_store: Arc::clone(&replica_store_slot),
                     peer_verifier: Arc::clone(&fca_verifier_slot),
                 });
             *zm.agent_minter_slot().write() = Some(minter);
@@ -3277,6 +3283,17 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             )
         })?;
         let consensus = cred_zone.consensus_node();
+        if !common.no_tls {
+            let replica_store = Arc::new(
+                nexus_raft::replica_binding_store::RaftReplicaBindingStore::new(
+                    consensus.clone(),
+                    cred_zone.runtime_handle(),
+                ),
+            );
+            replica_store_slot
+                .set(replica_store)
+                .map_err(|_| anyhow::anyhow!("replica control store was already bound"))?;
+        }
         let store = nexus_raft::auth_key_store::RaftAuthKeyStore::new_arc(
             consensus.clone(),
             cred_zone.runtime_handle(),
@@ -5500,6 +5517,8 @@ struct FounderAgentMinter {
     /// Unbound means session minting is CLOSED, not open: a gate that cannot
     /// read its policy denies.
     session_allow: nexus_raft::session_mint_allow_store::SessionMintAllowSlot,
+    /// One boot binding to the original control-zone consensus.
+    replica_store: replica_rpc::StoreSlot,
     /// The live verifier also used by handshake admission and VFS attribution.
     peer_verifier: transport::grpc::ForeignCaVerifierSlot,
 }
@@ -5567,6 +5586,23 @@ impl FounderAgentMinter {
 
 #[tonic::async_trait]
 impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
+    async fn replica_control_v1(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        request: nexus_raft::transport::proto::ReplicaControlRequest,
+    ) -> nexus_raft::transport::proto::ReplicaControlResponse {
+        replica_control_rpc::respond(self.clone(), caller_cert_der, request).await
+    }
+
+    async fn replica_csr_v1(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        request: nexus_raft::transport::proto::ReplicaCsrRequest,
+        query_only: bool,
+    ) -> nexus_raft::transport::proto::ReplicaCsrResponse {
+        replica_rpc::respond(self.clone(), caller_cert_der, request, query_only).await
+    }
+
     #[cfg(feature = "experimental-managed-agent-csr")]
     fn csr_capabilities(&self) -> nexus_raft::transport::proto::AgentCsrCapabilitiesResponse {
         managed_csr::capabilities(self)
@@ -7334,6 +7370,7 @@ mod tests {
             // This test exercises the node gate on `mint`; session minting is
             // unbound, which is exactly the closed default.
             session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+            replica_store: crate::replica_rpc::new_store_slot(),
             peer_verifier: test_peer_verifier(&ca_pem),
         };
 
@@ -7413,6 +7450,7 @@ mod tests {
             tls_dir: tls,
             data_dir: directory.path().to_path_buf(),
             session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+            replica_store: crate::replica_rpc::new_store_slot(),
             peer_verifier: verifier,
         };
         assert!(
@@ -7508,6 +7546,7 @@ mod tests {
             tls_dir,
             data_dir: dir.path().to_path_buf(),
             session_allow: Arc::clone(&slot),
+            replica_store: crate::replica_rpc::new_store_slot(),
             peer_verifier: test_peer_verifier(&ca_pem),
         };
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
@@ -7796,6 +7835,7 @@ mod tests {
             tls_dir,
             data_dir: dir.path().to_path_buf(),
             session_allow: new_session_mint_allow_slot(),
+            replica_store: crate::replica_rpc::new_store_slot(),
             peer_verifier: test_peer_verifier(&ca_pem),
         };
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();

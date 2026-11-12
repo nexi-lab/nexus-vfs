@@ -55,7 +55,7 @@ pub use certgen::{
     generate_user_runtime_cert, generate_zone_ca, join_token_hash_path, node_identity_uri,
     parse_node_identity_uri, prepare_agent_csr_intent, prepare_replica_csr_intent,
     read_join_token_hashes, sign_agent_csr, sign_committed_agent_intent,
-    sign_committed_replica_intent, sign_node_csr, BootstrapTls,
+    sign_committed_replica_intent, sign_node_csr, verify_replica_csr_intent, BootstrapTls,
 };
 /// Re-exported so a caller that already depends on this crate can name a
 /// session subject without taking a direct dependency on `lib` — the cluster
