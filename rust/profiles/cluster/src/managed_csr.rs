@@ -1,11 +1,11 @@
 //! Versioned frontend for the existing I/F coordinator and CA holder. No key
 //! generation, second issuer/store, legacy name adoption or automatic retry.
-use super::FounderAgentMinter;
+use super::FounderCaIssuer;
 use auth::agent_issuance::{
     agent_intent_digest, commit_agent_intent, finalize_agent_issuance, query_agent_issuance,
     AgentIssuanceIntent, AgentIssuanceState, IssuanceAuthorizer, IssuanceBinding,
 };
-use nexus_raft::agent_minter::agent_csr_request_digest;
+use nexus_raft::ca_issuer::agent_csr_request_digest;
 use nexus_raft::transport::proto::{
     AgentCsrCapabilitiesResponse, AgentCsrRequest, AgentCsrResponse, AgentCsrState,
 };
@@ -23,7 +23,7 @@ pub(super) fn failure(state: AgentCsrState, reason: impl ToString) -> AgentCsrRe
     }
 }
 
-fn issuer_bytes(issuer: &FounderAgentMinter) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn issuer_bytes(issuer: &FounderCaIssuer) -> Result<(Vec<u8>, Vec<u8>), String> {
     let pem =
         std::fs::read(issuer.tls_dir.join("ca.pem")).map_err(|e| format!("read local CA: {e}"))?;
     let der = lib::transport_primitives::first_certificate_der(&pem, "local issuer CA")?;
@@ -37,7 +37,7 @@ fn issuer_bytes(issuer: &FounderAgentMinter) -> Result<(Vec<u8>, Vec<u8>), Strin
     Ok((pem, der))
 }
 
-pub(super) fn capabilities(issuer: &FounderAgentMinter) -> AgentCsrCapabilitiesResponse {
+pub(super) fn capabilities(issuer: &FounderCaIssuer) -> AgentCsrCapabilitiesResponse {
     match issuer_bytes(issuer) {
         Ok((_, der)) => AgentCsrCapabilitiesResponse {
             version: 1,
@@ -48,7 +48,7 @@ pub(super) fn capabilities(issuer: &FounderAgentMinter) -> AgentCsrCapabilitiesR
 }
 
 struct CurrentNode<'a> {
-    issuer: &'a FounderAgentMinter,
+    issuer: &'a FounderCaIssuer,
     caller: &'a [u8],
     expected: &'a IssuanceBinding,
 }
@@ -115,7 +115,7 @@ fn observed_reply(
 }
 
 pub(super) fn execute(
-    issuer: &FounderAgentMinter,
+    issuer: &FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: AgentCsrRequest,
     query_only: bool,

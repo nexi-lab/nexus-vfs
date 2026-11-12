@@ -33,8 +33,8 @@ use super::proto::nexus::raft::{
     UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
-use crate::agent_minter::{AgentBundle, AgentMinterSlot, LocalNodeRenewerSlot, NOT_CA_HOLDER};
 use crate::blob_fetcher::BlobFetcherSlot;
+use crate::ca_issuer::{AgentBundle, CaIssuerSlot, LocalNodeRenewerSlot, NOT_CA_HOLDER};
 use crate::foreign_ca_registrar::ForeignCaRegistrarSlot;
 use crate::key_minter::{KeyMinterSlot, MintKeyParams};
 
@@ -115,10 +115,10 @@ pub struct RaftGrpcServer {
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Slot the cluster profile binds an `AgentMinter` into on the founder
+    /// Slot the cluster profile binds an `CaIssuer` into on the founder
     /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
     /// success=false there ("not the CA holder").
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Slot the cluster profile binds a `KeyMinter` into on every auth-on
     /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
     /// success=false there (auth-off has no sk- plane).
@@ -165,7 +165,7 @@ impl RaftGrpcServer {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             search_capabilities_slot: self.search_capabilities_slot.clone(),
-            agent_minter_slot: self.agent_minter_slot.clone(),
+            ca_issuer_slot: self.ca_issuer_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
@@ -188,7 +188,7 @@ impl RaftGrpcServer {
             registry,
             blob_fetcher_slot: None,
             search_capabilities_slot: None,
-            agent_minter_slot: None,
+            ca_issuer_slot: None,
             key_minter_slot: None,
             foreign_ca_registrar_slot: None,
             session_mint_admin_slot: None,
@@ -216,11 +216,11 @@ impl RaftGrpcServer {
         self
     }
 
-    /// Attach the late-bindable `AgentMinter` slot so `ZoneApiService::mint_agent`
+    /// Attach the late-bindable `CaIssuer` slot so `ZoneApiService::mint_agent`
     /// can sign agent certs once the founder installs an impl. Installed only on
     /// the CA holder; a joiner leaves it empty and rejects `MintAgent`.
-    pub fn with_agent_minter_slot(mut self, slot: AgentMinterSlot) -> Self {
-        self.agent_minter_slot = Some(slot);
+    pub fn with_ca_issuer_slot(mut self, slot: CaIssuerSlot) -> Self {
+        self.ca_issuer_slot = Some(slot);
         self
     }
 
@@ -946,9 +946,9 @@ struct ZoneApiServiceImpl {
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
+    /// Optional late-bound `CaIssuer` for `MintAgent`. Present only on the
     /// CA holder (founder); `None` → `mint_agent` returns success=false.
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Optional late-bound `KeyMinter` for `MintKey`/`RevokeKey`. Present on
     /// every auth-on daemon; `None` (auth-off) → both return success=false.
     key_minter_slot: Option<KeyMinterSlot>,
@@ -1000,10 +1000,7 @@ impl ZoneApiServiceImpl {
         query_only: bool,
     ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
         let caller = peer_cert_der(&request);
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         let Some(minter) = minter else {
             return Ok(Response::new(super::proto::AgentCsrResponse {
                 state: super::proto::AgentCsrState::NotSubmitted as i32,
@@ -1025,10 +1022,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         _request: Request<super::proto::AgentCsrCapabilitiesRequest>,
     ) -> std::result::Result<Response<super::proto::AgentCsrCapabilitiesResponse>, Status> {
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         Ok(Response::new(
             minter.map_or_else(Default::default, |m| m.csr_capabilities()),
         ))
@@ -1849,7 +1843,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
     /// Sign an agent identity cert on the CA holder (founder) for a remote
     /// caller — the server half of a joiner's `auth mint --subject-type agent`
     /// routing to the founder. The verified mTLS client leaf cert is forwarded
-    /// to the injected `AgentMinter`, which gates it to a NODE peer (an agent
+    /// to the injected `CaIssuer`, which gates it to a NODE peer (an agent
     /// may not mint agents) before signing; raft applies no auth logic. A node
     /// with no minter installed (a joiner — not the CA holder) returns
     /// success=false so the caller can try the founder.
@@ -1869,7 +1863,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
@@ -1911,7 +1905,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
@@ -1934,7 +1928,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1956,7 +1950,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1964,7 +1958,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 minter
                     .renew_session(
                         caller_cert_der,
-                        crate::agent_minter::SessionRenewal {
+                        crate::ca_issuer::SessionRenewal {
                             cert_pem: &req.agent_cert_pem,
                             validity_secs: req.validity_secs,
                             issued_at_unix_ms: req.issued_at_unix_ms,
@@ -1992,7 +1986,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
@@ -2020,7 +2014,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {

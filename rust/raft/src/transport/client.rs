@@ -1256,7 +1256,7 @@ pub struct MintAgentResult {
 /// uniqueness + audit live there) and returns the bundle. A peer that does not
 /// hold the CA returns `success=false` with "does not hold the cluster CA", so
 /// the caller tries the next peer. mTLS-only — the caller presents its NODE
-/// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
+/// cert, which the founder's `CaIssuer` gate requires (an agent cert is a
 /// pure identity and must not be able to mint further agents).
 /// Permit `agent_id` to mint session credentials, against a live daemon.
 ///
@@ -1375,7 +1375,7 @@ pub async fn call_mint_session_agent_rpc(
 /// Renew the same actor using a session-key proof bound to the minter's TLS leaf.
 pub async fn call_renew_session_agent_rpc(
     peer_addr: &str,
-    renewal: crate::agent_minter::SessionRenewal<'_>,
+    renewal: crate::ca_issuer::SessionRenewal<'_>,
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<MintSessionAgentResult> {

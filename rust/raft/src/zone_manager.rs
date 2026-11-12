@@ -294,9 +294,9 @@ pub struct ZoneManager {
     blob_fetcher_slot: crate::blob_fetcher::BlobFetcherSlot,
     search_capabilities_slot: crate::search_capabilities::SearchCapabilitiesSlot,
     /// Shared with the gRPC server so `ZoneApiService::mint_agent` can sign
-    /// agent certs once the founder installs an `AgentMinter`. Empty on a
+    /// agent certs once the founder installs an `CaIssuer`. Empty on a
     /// joiner (not the CA holder) — the RPC returns success=false there.
-    agent_minter_slot: crate::agent_minter::AgentMinterSlot,
+    ca_issuer_slot: crate::ca_issuer::CaIssuerSlot,
     /// Shared with the gRPC server so `ZoneApiService::mint_key`/`revoke_key`
     /// can mint/revoke sk- credentials once the daemon installs a `KeyMinter`.
     /// Empty under `--no-tls` (no sk- plane).
@@ -318,7 +318,7 @@ pub struct ZoneManager {
     /// Holders outside this manager that present the Node identity, told of
     /// every installed replacement.
     node_identity_holders: parking_lot::Mutex<Vec<NodeIdentityHolder>>,
-    local_node_renewer_slot: crate::agent_minter::LocalNodeRenewerSlot,
+    local_node_renewer_slot: crate::ca_issuer::LocalNodeRenewerSlot,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
@@ -651,7 +651,7 @@ impl ZoneManager {
 
         let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
         let search_capabilities_slot = crate::search_capabilities::new_search_capabilities_slot();
-        let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
+        let ca_issuer_slot = crate::ca_issuer::new_ca_issuer_slot();
         let key_minter_slot = crate::key_minter::new_key_minter_slot();
         let foreign_ca_registrar_slot =
             crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
@@ -679,11 +679,11 @@ impl ZoneManager {
             ),
             _ => None,
         };
-        let local_node_renewer_slot = crate::agent_minter::new_local_node_renewer_slot();
+        let local_node_renewer_slot = crate::ca_issuer::new_local_node_renewer_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
             .with_search_capabilities_slot(search_capabilities_slot.clone())
-            .with_agent_minter_slot(agent_minter_slot.clone())
+            .with_ca_issuer_slot(ca_issuer_slot.clone())
             .with_key_minter_slot(key_minter_slot.clone())
             .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
             .with_session_mint_admin_slot(session_mint_admin_slot.clone())
@@ -771,7 +771,7 @@ impl ZoneManager {
             node_id,
             blob_fetcher_slot,
             search_capabilities_slot,
-            agent_minter_slot,
+            ca_issuer_slot,
             key_minter_slot,
             foreign_ca_registrar_slot,
             session_mint_admin_slot,
@@ -794,10 +794,10 @@ impl ZoneManager {
         self.search_capabilities_slot.clone()
     }
 
-    /// Hand the shared `AgentMinter` slot back so the cluster profile can
+    /// Hand the shared `CaIssuer` slot back so the cluster profile can
     /// install a concrete minter on the founder (CA holder). Clone-cheap.
-    pub fn agent_minter_slot(&self) -> crate::agent_minter::AgentMinterSlot {
-        self.agent_minter_slot.clone()
+    pub fn ca_issuer_slot(&self) -> crate::ca_issuer::CaIssuerSlot {
+        self.ca_issuer_slot.clone()
     }
 
     /// Hand the shared `KeyMinter` slot back so the cluster profile can install a
@@ -887,7 +887,7 @@ impl ZoneManager {
     }
 
     /// Hand back the slot the daemon binds its own Node certificate renewer into.
-    pub fn local_node_renewer_slot(&self) -> crate::agent_minter::LocalNodeRenewerSlot {
+    pub fn local_node_renewer_slot(&self) -> crate::ca_issuer::LocalNodeRenewerSlot {
         self.local_node_renewer_slot.clone()
     }
 

@@ -153,7 +153,7 @@ impl NodeRenewal {
 }
 
 #[tonic::async_trait]
-impl nexus_raft::agent_minter::LocalNodeRenewer for NodeRenewal {
+impl nexus_raft::ca_issuer::LocalNodeRenewer for NodeRenewal {
     async fn renew_now(&self) -> Result<i64, String> {
         self.renew().await
     }

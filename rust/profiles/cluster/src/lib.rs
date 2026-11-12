@@ -2592,7 +2592,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     let session_mint_allow_slot =
         nexus_raft::session_mint_allow_store::new_session_mint_allow_slot();
 
-    // Remote agent-cert mint (task #40): the CA holder installs an `AgentMinter`
+    // Remote agent-cert mint (task #40): the CA holder installs an `CaIssuer`
     // into the raft gRPC server's slot, so `auth mint --subject-type agent` on
     // ANY node just-works — a node without the CA key forwards to the founder
     // over mTLS (`mint_agent_via_founder`) and the founder signs + records the
@@ -2602,18 +2602,17 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     if !common.no_tls {
         let tls_dir = common.data_dir.join("tls");
         if tls_dir.join("ca-key.pem").exists() {
-            let minter: Arc<dyn nexus_raft::agent_minter::AgentMinter> =
-                Arc::new(FounderAgentMinter {
-                    store: auth::KernelSlotStore::new_arc(Arc::clone(&kernel)),
-                    tls_dir,
-                    data_dir: common.data_dir.clone(),
-                    // Bound once the control zone is up (below); until then
-                    // session minting is closed, which is the safe default for
-                    // a gate that cannot read its policy.
-                    session_allow: Arc::clone(&session_mint_allow_slot),
-                    peer_verifier: Arc::clone(&fca_verifier_slot),
-                });
-            *zm.agent_minter_slot().write() = Some(minter);
+            let minter: Arc<dyn nexus_raft::ca_issuer::CaIssuer> = Arc::new(FounderCaIssuer {
+                store: auth::KernelSlotStore::new_arc(Arc::clone(&kernel)),
+                tls_dir,
+                data_dir: common.data_dir.clone(),
+                // Bound once the control zone is up (below); until then
+                // session minting is closed, which is the safe default for
+                // a gate that cannot read its policy.
+                session_allow: Arc::clone(&session_mint_allow_slot),
+                peer_verifier: Arc::clone(&fca_verifier_slot),
+            });
+            *zm.ca_issuer_slot().write() = Some(minter);
             tracing::info!("CA holder armed MintAgent RPC (remote agent-cert mint)");
         }
     }
@@ -3552,7 +3551,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     #[cfg(feature = "experimental-managed-agent-csr")]
     if identity_armed && !common.no_tls {
         let native_issuer = managed_csr_binding::NativeIssuer::for_host(
-            zm.agent_minter_slot(),
+            zm.ca_issuer_slot(),
             cluster_tls.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("managed credentials require the selected native TLS identity")
             })?,
@@ -5522,10 +5521,11 @@ fn write_agent_bundle(
     Ok(out_dir)
 }
 
-/// Founder-side [`nexus_raft::agent_minter::AgentMinter`]: signs an agent
-/// identity cert with the cluster CA and records it in the replicated auth
-/// store, serving a remote `MintAgent` call from another node. Installed ONLY
-/// on the CA holder (see the founder-install block in `run_daemon`).
+/// Founder-side [`nexus_raft::ca_issuer::CaIssuer`]: signs agent identity
+/// certs with the cluster CA and records them in the replicated auth store,
+/// serving a remote `MintAgent` call from another node, and re-issues Node
+/// certificates for `RenewNodeCertificate`. Installed ONLY on the CA holder
+/// (see the founder-install block in `run_daemon`).
 ///
 /// This is the SAME two reusable units the local CLI agent-mint path calls
 /// (`generate_agent_cert` + `mint_agent_authz`), so the remote and local paths
@@ -5535,7 +5535,7 @@ fn write_agent_bundle(
 /// role; the listener may also admit foreign CA leaves for VFS. An agent can never
 /// be leveraged into minting further agents (privilege confinement).
 #[derive(Clone)]
-struct FounderAgentMinter {
+struct FounderCaIssuer {
     store: Arc<dyn kernel::hal::auth_key_store::AuthKeyStore>,
     tls_dir: PathBuf,
     /// Where the CA-plane revocation list lives. `tls_dir`'s parent in
@@ -5547,7 +5547,7 @@ struct FounderAgentMinter {
     /// Late-bound because the CA key — which is what decides whether this node
     /// mints at all — is known at boot, while the control-zone consensus the
     /// list is replicated through is not ready until later. Same late-binding
-    /// idiom as the minter slot this struct is installed into.
+    /// idiom as the CA issuer slot this struct is installed into.
     ///
     /// Unbound means session minting is CLOSED, not open: a gate that cannot
     /// read its policy denies.
@@ -5561,7 +5561,7 @@ enum OwnerCredentialKind {
     UserRuntime,
 }
 
-impl FounderAgentMinter {
+impl FounderCaIssuer {
     fn session_minter_caller(
         &self,
         caller_cert_der: Option<Vec<u8>>,
@@ -5593,7 +5593,7 @@ impl FounderAgentMinter {
         owner_id: &str,
         validity_secs: u64,
         kind: OwnerCredentialKind,
-    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+    ) -> std::result::Result<nexus_raft::ca_issuer::AgentBundle, String> {
         let caller = self.session_minter_caller(caller_cert_der)?;
         let subject_id = nexus_raft::transport::session_agent_name(&uuid_v4());
         let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
@@ -5608,7 +5608,7 @@ impl FounderAgentMinter {
             signer(&subject_id, owner_id, validity_secs, &ca_pem, &ca_key_pem)?;
         tracing::info!(caller = %caller, owner = %owner_id, subject = %subject_id, validity_secs, "minted owner credential");
         // Owner and lifetime are signed facts; issuing a credential creates no record.
-        Ok(nexus_raft::agent_minter::AgentBundle {
+        Ok(nexus_raft::ca_issuer::AgentBundle {
             cert_pem,
             key_pem,
             ca_pem,
@@ -5618,7 +5618,7 @@ impl FounderAgentMinter {
 }
 
 #[tonic::async_trait]
-impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
+impl nexus_raft::ca_issuer::CaIssuer for FounderCaIssuer {
     #[cfg(feature = "experimental-managed-agent-csr")]
     fn csr_capabilities(&self) -> nexus_raft::transport::proto::AgentCsrCapabilitiesResponse {
         managed_csr::capabilities(self)
@@ -5651,7 +5651,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         subject_id: &str,
         display_name: &str,
         allow_existing: bool,
-    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+    ) -> std::result::Result<nexus_raft::ca_issuer::AgentBundle, String> {
         // Gate: node-only. An agent cert carries no authorization, so a valid
         // agent cert must never be leverageable into minting more agents.
         gate_node_caller(caller_cert_der, &self.peer_verifier, "MintAgent")?;
@@ -5681,7 +5681,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         auth::mint_agent_authz(&self.store, record, allow_existing)
             .map_err(|e| format!("record agent: {e}"))?;
 
-        Ok(nexus_raft::agent_minter::AgentBundle {
+        Ok(nexus_raft::ca_issuer::AgentBundle {
             cert_pem,
             key_pem,
             ca_pem,
@@ -5694,7 +5694,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         caller_cert_der: Option<Vec<u8>>,
         owner_id: &str,
         validity_secs: u64,
-    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+    ) -> std::result::Result<nexus_raft::ca_issuer::AgentBundle, String> {
         self.mint_owner_credential(
             caller_cert_der,
             owner_id,
@@ -5708,7 +5708,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
         caller_cert_der: Option<Vec<u8>>,
         owner_id: &str,
         validity_secs: u64,
-    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+    ) -> std::result::Result<nexus_raft::ca_issuer::AgentBundle, String> {
         self.mint_owner_credential(
             caller_cert_der,
             owner_id,
@@ -5720,8 +5720,8 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
     async fn renew_session(
         &self,
         caller_cert_der: Option<Vec<u8>>,
-        renewal: nexus_raft::agent_minter::SessionRenewal<'_>,
-    ) -> std::result::Result<nexus_raft::agent_minter::AgentBundle, String> {
+        renewal: nexus_raft::ca_issuer::SessionRenewal<'_>,
+    ) -> std::result::Result<nexus_raft::ca_issuer::AgentBundle, String> {
         let caller = self.session_minter_caller(caller_cert_der.clone())?;
         let caller_der = caller_cert_der.ok_or("session renewal requires mTLS")?;
         let ca_pem = std::fs::read(self.tls_dir.join("ca.pem"))
@@ -5762,7 +5762,7 @@ impl nexus_raft::agent_minter::AgentMinter for FounderAgentMinter {
             },
         )?;
         tracing::info!(caller = %caller, subject = %subject_id, "renewed session credential");
-        Ok(nexus_raft::agent_minter::AgentBundle {
+        Ok(nexus_raft::ca_issuer::AgentBundle {
             cert_pem,
             key_pem,
             ca_pem,
@@ -5961,7 +5961,7 @@ impl nexus_raft::session_mint_admin::SessionMintAdmin for DaemonSessionMintAdmin
 /// Gate a control-plane mint RPC to a cluster NODE caller: the mTLS client leaf
 /// must parse to a node identity. Minting a credential (agent cert or sk- key)
 /// is a node/admin operation, so a bare agent cert — a pure identity — must
-/// never be leverageable into it. Shared by `FounderAgentMinter` and
+/// never be leverageable into it. Shared by `FounderCaIssuer` and
 /// `DaemonKeyMinter` so both gates read identically. Returns the Node the
 /// caller's leaf names.
 fn gate_node_caller(
@@ -5981,7 +5981,7 @@ fn gate_node_caller(
 /// params. The ONE place the subject-type parse, zone-grant parse, and the
 /// "no grants ⇒ refused" rule live — shared by the offline path
 /// (`run_auth_action`) and the live-daemon [`DaemonKeyMinter`], so they cannot
-/// drift. Rejects `agent` (cert-only, minted via [`FounderAgentMinter`]).
+/// drift. Rejects `agent` (cert-only, minted via [`FounderCaIssuer`]).
 fn build_sk_record(
     subject_type: &str,
     subject_id: String,
@@ -6259,7 +6259,7 @@ fn ca_holder_candidates(common: &CommonArgs) -> Result<Vec<String>> {
 }
 
 /// Ask `candidates` in order until the CA holder answers. A candidate that is
-/// unreachable or replies [`nexus_raft::agent_minter::NOT_CA_HOLDER`] passes to
+/// unreachable or replies [`nexus_raft::ca_issuer::NOT_CA_HOLDER`] passes to
 /// the next; any other refusal is authoritative. Returns the answering
 /// endpoint and its reply.
 async fn ask_ca_holder<T, E, F, Fut>(
@@ -6280,7 +6280,7 @@ where
     for endpoint in candidates {
         match ask(endpoint.clone()).await {
             Ok(Ok(reply)) => return Ok((endpoint.clone(), reply)),
-            Ok(Err(msg)) if msg.contains(nexus_raft::agent_minter::NOT_CA_HOLDER) => {
+            Ok(Err(msg)) if msg.contains(nexus_raft::ca_issuer::NOT_CA_HOLDER) => {
                 last_err = format!("{endpoint}: {msg}");
             }
             Ok(Err(msg)) => {
@@ -7448,15 +7448,15 @@ mod tests {
         );
     }
 
-    /// The founder-side agent minter: the node-only gate refuses a caller that
+    /// The founder-side CA issuer: the node-only gate refuses a caller that
     /// is not a cluster node (no cert, or an agent cert — an agent is a pure
     /// identity and must never mint agents), and the happy path signs a real
     /// cluster-CA agent cert and records the agent with cluster-wide uniqueness.
     /// Exercises the SAME units the offline CLI and the remote MintAgent RPC
     /// drive, without a live daemon.
     #[tokio::test]
-    async fn founder_agent_minter_gates_to_nodes_and_signs() {
-        use nexus_raft::agent_minter::AgentMinter;
+    async fn founder_ca_issuer_gates_to_nodes_and_signs() {
+        use nexus_raft::ca_issuer::CaIssuer;
         use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
 
         // A real cluster CA on disk — the minter reads ca.pem + ca-key.pem.
@@ -7468,7 +7468,7 @@ mod tests {
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
 
         let store: Arc<dyn AuthKeyStore> = Arc::new(MemStore::default());
-        let minter = FounderAgentMinter {
+        let minter = FounderCaIssuer {
             store,
             tls_dir,
             data_dir: dir.path().to_path_buf(),
@@ -7521,7 +7521,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_mint_rejects_a_registered_foreign_node() {
-        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::ca_issuer::CaIssuer;
         use nexus_raft::transport::{generate_node_cert, generate_zone_ca};
         let (ca, key) = generate_zone_ca("root").unwrap();
         // Same issuer DN, different key: names cannot establish locality.
@@ -7549,7 +7549,7 @@ mod tests {
         std::fs::create_dir(&tls).unwrap();
         std::fs::write(tls.join("ca.pem"), &ca).unwrap();
         std::fs::write(tls.join("ca-key.pem"), &key).unwrap();
-        let minter = FounderAgentMinter {
+        let minter = FounderCaIssuer {
             store: Arc::new(MemStore::default()),
             tls_dir: tls,
             data_dir: directory.path().to_path_buf(),
@@ -7577,7 +7577,7 @@ mod tests {
     /// and a caller that is not a current, unrevoked Node of this CA is refused.
     #[tokio::test]
     async fn founder_renews_only_the_calling_node_for_its_own_key() {
-        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::ca_issuer::CaIssuer;
         use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
         use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -7587,7 +7587,7 @@ mod tests {
         std::fs::create_dir_all(&tls_dir).unwrap();
         std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
-        let minter = FounderAgentMinter {
+        let minter = FounderCaIssuer {
             store: Arc::new(MemStore::default()),
             tls_dir,
             data_dir: dir.path().to_path_buf(),
@@ -7734,7 +7734,7 @@ mod tests {
     /// closed for a foreign namesake of an allow-listed local agent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_mint_is_gated_to_the_allow_list_and_fails_closed() {
-        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::ca_issuer::CaIssuer;
         use nexus_raft::session_mint_allow_store::{
             new_session_mint_allow_slot, RaftSessionMintAllowStore,
         };
@@ -7748,7 +7748,7 @@ mod tests {
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
 
         let slot = new_session_mint_allow_slot();
-        let minter = FounderAgentMinter {
+        let minter = FounderCaIssuer {
             store: Arc::new(MemStore::default()) as Arc<dyn AuthKeyStore>,
             tls_dir,
             data_dir: dir.path().to_path_buf(),
@@ -7852,7 +7852,7 @@ mod tests {
             issued_at,
         );
         let proof = lib::transport_primitives::authorship::sign(&message, &bundle.key_pem).unwrap();
-        let renewal = || nexus_raft::agent_minter::SessionRenewal {
+        let renewal = || nexus_raft::ca_issuer::SessionRenewal {
             cert_pem: &bundle.cert_pem,
             validity_secs: 300,
             issued_at_unix_ms: issued_at,
@@ -7904,7 +7904,7 @@ mod tests {
             minter
                 .renew_session(
                     Some(der(&moss_cert)),
-                    nexus_raft::agent_minter::SessionRenewal {
+                    nexus_raft::ca_issuer::SessionRenewal {
                         cert_pem: &renewed.cert_pem,
                         validity_secs: 300,
                         issued_at_unix_ms: issued_at,
@@ -7939,13 +7939,13 @@ mod tests {
     }
 
     async fn assert_owner_runtime_renewal(
-        minter: &FounderAgentMinter,
+        minter: &FounderCaIssuer,
         caller: &[u8],
         ca: &[u8],
         ca_key: &[u8],
     ) {
         use lib::transport_primitives::{authorship, replica_node_id_from_x509};
-        use nexus_raft::agent_minter::{AgentMinter, SessionRenewal};
+        use nexus_raft::ca_issuer::{CaIssuer, SessionRenewal};
         use x509_parser::prelude::*;
         for node_id in [None, Some(19)] {
             let (cert, key) = if let Some(node) = node_id {
@@ -8025,7 +8025,7 @@ mod tests {
     /// denial of service against every credential checked against it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn revoking_records_serial_and_expiry_but_only_for_our_own_ca() {
-        use nexus_raft::agent_minter::AgentMinter;
+        use nexus_raft::ca_issuer::CaIssuer;
         use nexus_raft::session_mint_allow_store::new_session_mint_allow_slot;
         use nexus_raft::transport::{generate_agent_cert, generate_node_cert, generate_zone_ca};
 
@@ -8036,7 +8036,7 @@ mod tests {
         std::fs::write(tls_dir.join("ca.pem"), &ca_pem).unwrap();
         std::fs::write(tls_dir.join("ca-key.pem"), &ca_key_pem).unwrap();
 
-        let minter = FounderAgentMinter {
+        let minter = FounderCaIssuer {
             store: Arc::new(MemStore::default()) as Arc<dyn AuthKeyStore>,
             tls_dir,
             data_dir: dir.path().to_path_buf(),
