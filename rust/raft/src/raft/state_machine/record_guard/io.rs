@@ -3,6 +3,62 @@
 use super::*;
 
 impl FullStateMachine {
+    /// Read the original committed decision after an ambiguous retire or restart.
+    /// The control plane never infers retirement from a payload or lease expiry.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn record_io_owner_state(
+        &self,
+        owner: &str,
+    ) -> Result<kernel::extensions::guarded_records::RecordOwnerState> {
+        let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
+        if self
+            .record_io_control_in_read(&txn, BINDING_PREFIX, owner)?
+            .is_some()
+            || !self.is_record_io_owner_in_read(&txn, owner)?
+        {
+            return Err(super::super::super::RaftError::UnsupportedOperation(
+                "path is not an enrolled record owner",
+            ));
+        }
+        let image = self.versioned_metadata_in_read(&txn, owner)?;
+        let version = image.version.ok_or_else(|| {
+            super::super::super::RaftError::InvalidState(
+                "enrolled record owner has no committed revision".into(),
+            )
+        })?;
+        let is_retired = match self.record_io_control_in_read(&txn, RETIRED_PREFIX, owner)? {
+            None => false,
+            Some(terminal) if terminal == version => true,
+            Some(_) => {
+                return Err(super::super::super::RaftError::InvalidState(
+                    "record owner retirement marker disagrees with its revision".into(),
+                ));
+            }
+        };
+        Ok(kernel::extensions::guarded_records::RecordOwnerState {
+            version,
+            is_retired,
+        })
+    }
+
+    /// Generic readers must not bypass the enrolled owner's I/O lifetime.
+    /// Enrollment requires fresh/quiescent storage, so an ordinary handle
+    /// cannot remain an admission authority after this durable policy exists.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn check_unscoped_record_io(&self, record: &str) -> Result<()> {
+        let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
+        let owner = match self.record_io_control_in_read(&txn, BINDING_PREFIX, record)? {
+            Some(binding) => String::from_utf8(binding).map_err(storage_error)?,
+            None => record.to_owned(),
+        };
+        if self.is_record_io_owner_in_read(&txn, &owner)? {
+            return Err(super::super::super::RaftError::InvalidState(
+                "record I/O requires the scoped owner handle".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn admit_record_io_in_txn(
         &self,
         txn: &redb::WriteTransaction,

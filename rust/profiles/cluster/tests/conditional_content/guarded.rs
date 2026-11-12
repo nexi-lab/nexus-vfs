@@ -14,7 +14,9 @@ fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
         MANAGED,
         false,
     );
-    let handle = admit(&fixture);
+    // This legacy guarded stream has no I/O enrollment or reclamation grant.
+    // Enrolled owners require the scoped path, exercised separately over RPC.
+    let handle = protected_owner(&fixture);
     let path = "/state/history";
     fixture
         .store
@@ -39,19 +41,7 @@ fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
         .unwrap();
     // Use the actual production coordinator and its apply observer / cold
     // materializer. The mounted spelling differs from the owning WAL path.
-    let ops = Arc::new(transport::federation::FederationClient::new(
-        fixture.kernel.runtime().handle().clone(),
-        None,
-    ));
-    Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
-        .install_with_kernel(
-            fixture.manager.clone(),
-            fixture.manager.runtime_handle(),
-            "127.0.0.1:0",
-            &fixture.kernel,
-            ops,
-        );
-    nexus_cluster::stream_observers::install_wakeup(&fixture.kernel, &fixture.manager);
+    install_stream_coordinator(&fixture);
     let (result, received) = std::sync::mpsc::channel();
     let reader = {
         let kernel = fixture.kernel.clone();
@@ -88,7 +78,23 @@ fn guarded_wal_append_wakes_a_parked_kernel_tail_through_its_mount() {
 pub(super) const OWNER: &str = "/state/lifetime";
 pub(super) const RECORD: &str = "/state/register";
 
-pub(super) fn admit(fixture: &Fixture) -> Vec<u8> {
+pub(super) fn install_stream_coordinator(fixture: &Fixture) {
+    let ops = Arc::new(transport::federation::FederationClient::new(
+        fixture.kernel.runtime().handle().clone(),
+        None,
+    ));
+    Arc::new(nexus_raft::distributed_coordinator::RaftDistributedCoordinator::new())
+        .install_with_kernel(
+            fixture.manager.clone(),
+            fixture.manager.runtime_handle(),
+            "127.0.0.1:0",
+            &fixture.kernel,
+            ops,
+        );
+    nexus_cluster::stream_observers::install_wakeup(&fixture.kernel, &fixture.manager);
+}
+
+fn protected_owner(fixture: &Fixture) -> Vec<u8> {
     fixture.replace(OWNER, b"live storage incarnation", None);
     let service = OperationContext::new("alice", "root", true, None, false);
     fixture
@@ -106,10 +112,18 @@ pub(super) fn admit(fixture: &Fixture) -> Vec<u8> {
     records
         .bind_record_guard(RECORD, None, OWNER, &owner.version)
         .unwrap();
-    records
-        .admit_record_io_owner(OWNER, &owner.version)
-        .unwrap();
     owner.version
+}
+
+pub(super) fn admit(fixture: &Fixture) -> Vec<u8> {
+    let owner = protected_owner(fixture);
+    fixture
+        .store
+        .as_guarded_records()
+        .unwrap()
+        .admit_record_io_owner(OWNER, &owner)
+        .unwrap();
+    owner
 }
 
 pub(super) fn retire(store: &dyn MetaStore, handle: &[u8]) -> Vec<u8> {

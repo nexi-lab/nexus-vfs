@@ -226,6 +226,7 @@ impl Kernel {
         owner_version: Option<&[u8]>,
     ) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalContentError> {
         let Some(owner_version) = owner_version else {
+            self.check_unscoped_content_io(path, route)?;
             return Ok(None);
         };
         self.with_metastore_route(route, |store| {
