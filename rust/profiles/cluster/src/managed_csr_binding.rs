@@ -223,7 +223,7 @@ impl RustService for PreparationService {
                 let issuance = self
                     .issuer
                     .as_ref()
-                    .is_some_and(|issuer| issuer.minter(&self.ca).is_ok());
+                    .is_some_and(|issuer| issuer.admit(&self.ca).is_ok());
                 json!({"prepareVersion":1,"issuanceVersion":u32::from(issuance),"activationVersion":0,
                     "issuerSha256": <[u8;32]>::from(Sha256::digest(first_certificate_der(&self.ca,"native Agent issuer").map_err(RustCallError::Internal)?))})
             }

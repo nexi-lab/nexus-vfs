@@ -3542,16 +3542,14 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     let service_tls = zm.registry().tls_config().map_err(anyhow::Error::msg)?;
     #[cfg(feature = "experimental-managed-agent-csr")]
     if identity_armed && !common.no_tls {
+        service_tls.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("managed credentials require the selected native TLS identity")
+        })?;
         let native_issuer = managed_csr_binding::NativeIssuer::for_host(
             zm.ca_issuer_slot(),
-            service_tls.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("managed credentials require the selected native TLS identity")
-            })?,
+            zm.registry().shared_tls(),
             svc_ctx.runtime.clone(),
         );
-        if let Some(issuer) = &native_issuer {
-            zm.on_node_identity(issuer.node_identity_holder());
-        }
         service_decls.push(managed_csr_binding::service_decl(
             common.data_dir.join("tls"),
             identity_armed,
