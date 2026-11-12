@@ -198,6 +198,16 @@ fn prepare_certificate_intent(
         tbs_certificate_der: vec![0],
     };
     params = with_committed_fields(params, intent.as_ref())?;
+    intent.tbs_certificate_der = capture_certificate_tbs(params, &key, ca_pem, public_key)?;
+    Ok(intent)
+}
+
+fn capture_certificate_tbs(
+    params: CertificateParams,
+    subject: &impl PublicKeyData,
+    ca_pem: &[u8],
+    public_key: SubjectPublicKeyInfo,
+) -> Result<Vec<u8>, String> {
     let capture = CaptureTbs {
         public_key,
         captured: RefCell::new(None),
@@ -205,15 +215,50 @@ fn prepare_certificate_intent(
     let ca_str = std::str::from_utf8(ca_pem).map_err(|_| "invalid issuer PEM encoding")?;
     let issuer =
         Issuer::from_ca_cert_pem(ca_str, &capture).map_err(|_| "invalid issuer metadata")?;
-    if params.signed_by(&key, &issuer).is_ok() {
+    if params.signed_by(subject, &issuer).is_ok() {
         return Err("unsigned serializer unexpectedly signed".into());
     }
     drop(issuer);
-    intent.tbs_certificate_der = capture
+    capture
         .captured
         .into_inner()
-        .ok_or("failed to serialize unsigned certificate")?;
-    Ok(intent)
+        .ok_or_else(|| "failed to serialize unsigned certificate".into())
+}
+
+fn replica_params(intent: &ReplicaCertificateIntent) -> Result<CertificateParams, String> {
+    intent.validate_shape()?;
+    let fields = intent.certificate.as_ref();
+    let params = user_replica_certificate_params(
+        &intent.subject_name,
+        &intent.binding.allocation.owner_id,
+        intent.binding.replica_id,
+        (fields.not_after_unix_s - fields.not_before_unix_s) as u64,
+    )?;
+    with_committed_fields(params, fields)
+}
+
+/// Verify holder possession and the exact public certificate profile before
+/// committing an externally retained intent. This operation uses no CA key.
+pub fn verify_replica_csr_intent(
+    intent: &ReplicaCertificateIntent,
+    csr_pem: &[u8],
+    ca_pem: &[u8],
+) -> Result<(), String> {
+    let params = replica_params(intent)?;
+    let key = verified_csr_key(csr_pem)?;
+    let (ca_der, public_key, expiry) = public_issuer(ca_pem)?;
+    let fields = &intent.certificate;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if key.subject_public_key_info() != fields.subject_public_key_info_der
+        || Sha256::digest(ca_der).as_slice() != fields.issuer_sha256
+        || fields.not_after_unix_s > expiry
+        || now < fields.not_before_unix_s
+        || now >= fields.not_after_unix_s
+        || capture_certificate_tbs(params, &key, ca_pem, public_key)? != fields.tbs_certificate_der
+    {
+        return Err("replica CSR differs from its retained certificate intent".into());
+    }
+    Ok(())
 }
 
 /// The caller must have selected this exact intent through committed storage.
@@ -234,17 +279,9 @@ pub fn sign_committed_replica_intent(
     ca_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<SignedAgentCertificate, String> {
-    intent.validate_shape()?;
-    let fields = intent.certificate.as_ref();
-    let params = user_replica_certificate_params(
-        &intent.subject_name,
-        &intent.binding.allocation.owner_id,
-        intent.binding.replica_id,
-        (fields.not_after_unix_s - fields.not_before_unix_s) as u64,
-    )?;
     sign_committed_certificate(
-        with_committed_fields(params, fields)?,
-        fields,
+        replica_params(intent)?,
+        intent.certificate.as_ref(),
         ca_pem,
         ca_key_pem,
     )

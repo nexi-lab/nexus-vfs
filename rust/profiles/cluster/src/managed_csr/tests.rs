@@ -150,6 +150,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
         tls_dir: tls.clone(),
         data_dir: private.path().to_path_buf(),
         session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        replica_store: crate::replica_rpc::new_store_slot(),
         peer_verifier: peer_slot,
     });
     let slot = nexus_raft::agent_minter::new_agent_minter_slot();
