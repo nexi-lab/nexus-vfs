@@ -40,6 +40,7 @@
 //! ```
 
 mod node_authority;
+pub(crate) use node_authority::current_local_replication_id;
 pub use node_authority::{
     current_local_node_certificate, local_node_identity, LocalNodeCertificate,
 };
@@ -140,26 +141,34 @@ pub(crate) async fn forward_propose(
 
     let request = propose_request(command, zone_id, true, deadline)?;
 
-    // Get or create a cached API client. Evict if the leader endpoint changed.
+    // Reuse only the current route and credential snapshot.
     let mut api_client = {
         let mut guard = cached_client.lock().await;
         match guard.take() {
-            Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
+            Some((endpoint, client))
+                if endpoint == leader_addr.endpoint
+                    && client.uses_current_credentials(client_pool.config()) =>
+            {
+                client
+            }
             _ => connect_proposer(client_pool.config(), &leader_addr.endpoint).await?,
         }
     };
 
     let result = api_client
         .inner_mut()
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?
         .propose(request)
         .await
         .map_err(|e| RaftError::Transport(e.to_string()));
 
     match result {
         Ok(response) => {
-            // Success — cache the client for reuse.
+            // Return the original write outcome even if credentials rotated during the RPC.
             let mut guard = cached_client.lock().await;
-            *guard = Some((leader_addr.endpoint.clone(), api_client));
+            if api_client.uses_current_credentials(client_pool.config()) {
+                *guard = Some((leader_addr.endpoint.clone(), api_client));
+            }
 
             decode_propose_response(response.into_inner())
         }
@@ -187,6 +196,7 @@ pub(crate) async fn propose_to(
     let mut client = connect_proposer(config, endpoint).await?;
     let response = client
         .inner_mut()
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?
         .propose(request)
         .await
         .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
@@ -553,6 +563,9 @@ mod peer_map_tests {
         assert_eq!(m.len(), 2);
     }
 }
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod proposal_client_tests;
 
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod decode_tests {

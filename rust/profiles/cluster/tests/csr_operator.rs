@@ -140,15 +140,20 @@ async fn unsupported_native_issuer_never_creates_a_pending_key_or_falls_back_off
         write_secret(&tls.join(name), bytes).unwrap();
     }
     let address = format!("127.0.0.1:{}", free_port_pair());
+    let server_tls = TlsConfig {
+        ca_pem: ca,
+        cert_pem: server_cert,
+        key_pem: server_key,
+    };
     let server = RaftGrpcServer::new(
-        Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1)),
+        Arc::new(ZoneRaftRegistry::with_tls(
+            private.path().join("raft"),
+            1,
+            Some(server_tls.clone()),
+        )),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                ca_pem: ca,
-                cert_pem: server_cert,
-                key_pem: server_key,
-            }),
+            tls: Some(server_tls),
             ..Default::default()
         },
     );

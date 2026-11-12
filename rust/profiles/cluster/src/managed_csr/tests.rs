@@ -159,15 +159,22 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = port.local_addr().unwrap().to_string();
     drop(port);
+    let server_tls = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    };
+    registry
+        .clone()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
     let server = RaftGrpcServer::new(
         registry.clone(),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                ca_pem: ca.clone(),
-                cert_pem: server_cert,
-                key_pem: server_key,
-            }),
+            tls: Some(server_tls),
             ..Default::default()
         },
     )

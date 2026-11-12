@@ -4,6 +4,8 @@
 mod common;
 #[path = "node_rpc_boundaries/enrollment.rs"]
 mod enrollment;
+#[path = "node_rpc_boundaries/listener_start.rs"]
+mod listener_start;
 #[path = "node_rpc_boundaries/member_preparation.rs"]
 mod member_preparation;
 #[path = "node_rpc_boundaries/reader_capability.rs"]
@@ -77,7 +79,11 @@ impl PeerServer {
     async fn start(tls: TlsConfig) -> Self {
         lib::transport_primitives::ensure_crypto_provider();
         let directory = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
+        let registry = Arc::new(ZoneRaftRegistry::with_tls(
+            directory.path().to_path_buf(),
+            7,
+            Some(tls.clone()),
+        ));
         let root = registry
             .create_zone("root", &tokio::runtime::Handle::current())
             .unwrap();
@@ -266,11 +272,11 @@ async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
     })
     .await;
     let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
-    let tls = Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+    let tls = lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
         ca_pem: ca,
         cert_pem,
         key_pem,
-    })));
+    }));
     let pool = RaftClientPool::with_config(ClientConfig {
         tls: tls.clone(),
         ..Default::default()
@@ -295,7 +301,11 @@ async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
             PeerRefusal::Identity("server certificate does not name the expected replication peer"),
         );
     }
-    tls.write().unwrap().as_mut().unwrap().ca_pem = generate_zone_ca("root").unwrap().0;
+    let mut replacement = tls.snapshot().config().unwrap().unwrap().clone();
+    replacement.ca_pem = generate_zone_ca("root").unwrap().0;
+    tls.replace(lib::transport_primitives::TlsPolicy::Configured(
+        replacement,
+    ));
     let error = pool
         .get(&address)
         .await
@@ -332,11 +342,11 @@ async fn raft_pool_rejects_an_in_flight_dial_after_credentials_change() {
         let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
     });
     let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
-    let tls = Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+    let tls = lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
         ca_pem: ca.clone(),
         cert_pem,
         key_pem,
-    })));
+    }));
     let pool = RaftClientPool::with_config(ClientConfig {
         tls: tls.clone(),
         ..Default::default()
@@ -352,11 +362,13 @@ async fn raft_pool_rejects_an_in_flight_dial_after_credentials_change() {
         "the old TLS handshake must still be pending"
     );
     let (cert_pem, key_pem) = generate_node_cert(3, "root", &ca, &ca_key, &[], None).unwrap();
-    *tls.write().unwrap() = Some(TlsConfig {
-        ca_pem: ca,
-        cert_pem,
-        key_pem,
-    });
+    tls.replace(lib::transport_primitives::TlsPolicy::Configured(
+        TlsConfig {
+            ca_pem: ca,
+            cert_pem,
+            key_pem,
+        },
+    ));
     release.send(()).unwrap();
     let error = tokio::time::timeout(Duration::from_secs(5), dial)
         .await
@@ -397,15 +409,22 @@ async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
     let (cert, key) =
         generate_node_cert(manager.node_id(), "root", &ca, &ca_key, &[], None).unwrap();
+    let server_tls = TlsConfig {
+        cert_pem: cert,
+        key_pem: key,
+        ca_pem: ca.clone(),
+    };
+    manager
+        .registry()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
     let server = RaftGrpcServer::new(
         manager.registry(),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                cert_pem: cert,
-                key_pem: key,
-                ca_pem: ca.clone(),
-            }),
+            tls: Some(server_tls),
             ..Default::default()
         },
     );
@@ -722,11 +741,11 @@ async fn ec_decode_failures_preserve_replication_positions_until_complete_retry(
     let mut sender = RaftClient::connect(
         &server.endpoint,
         ClientConfig {
-            tls: Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+            tls: lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
                 ca_pem: ca,
                 cert_pem: cert,
                 key_pem: key,
-            }))),
+            })),
             ..Default::default()
         },
     )
@@ -843,15 +862,22 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
         .unwrap();
     node.campaign().await.unwrap();
     let address = common::node_bind_addr();
+    let server_tls = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    };
+    registry
+        .clone()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
     let server = RaftGrpcServer::new(
         registry.clone(),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                ca_pem: ca.clone(),
-                cert_pem: server_cert,
-                key_pem: server_key,
-            }),
+            tls: Some(server_tls),
             ..ServerConfig::default()
         },
     )

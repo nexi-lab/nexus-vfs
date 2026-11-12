@@ -80,7 +80,7 @@ impl NodeRenewal {
         let _one = self.running.lock().await;
         let current = self
             .zm
-            .node_tls()
+            .node_tls()?
             .ok_or("a plaintext node has no certificate to renew")?;
         let (csr_pem, key_pem) = nexus_raft::transport::generate_node_key_request()?;
         let candidates = super::ca_holder_candidates(&self.common).map_err(|e| e.to_string())?;
@@ -125,8 +125,13 @@ impl NodeRenewal {
     }
 
     async fn check(&self, now: i64) {
-        let Some(current) = self.zm.node_tls() else {
-            return;
+        let current = match self.zm.node_tls() {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(%error, "Node credential installation is unavailable; re-enrollment is required");
+                return;
+            }
         };
         let (not_before, not_after) = match validity(&current) {
             Ok(window) => window,

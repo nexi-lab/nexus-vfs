@@ -312,9 +312,6 @@ pub struct ZoneManager {
     /// cross-org apply-observer calls `set_foreign_cas`); the SAME `Arc` is
     /// shared with the gRPC serve path and that observer. `None` under `--no-tls`.
     foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
-    /// The Node identity the gRPC server presents to new connections; replaced
-    /// by [`Self::install_node_identity`]. `None` under `--no-tls`.
-    server_identity: Option<Arc<lib::transport_primitives::ReloadableServerIdentity>>,
     /// Holders outside this manager that present the Node identity, told of
     /// every installed replacement.
     node_identity_holders: parking_lot::Mutex<Vec<NodeIdentityHolder>>,
@@ -530,13 +527,25 @@ impl ZoneManager {
                     e
                 ))
             })?;
-            let identity = crate::transport::local_node_identity(&cert_pem, &ca_pem)
-                .map_err(RaftError::Config)?;
-            if identity.node_id != node_id {
+            let certificate_id = match profile {
+                RuntimeProfile::NetworkedLocalRoot => {
+                    let cert_der =
+                        lib::transport_primitives::first_certificate_der(&cert_pem, "peer")
+                            .map_err(RaftError::Config)?;
+                    let ca_der =
+                        lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
+                            .map_err(RaftError::Config)?;
+                    crate::transport::current_local_replication_id(&cert_der, &ca_der)
+                }
+                RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => {
+                    crate::transport::local_node_identity(&cert_pem, &ca_pem)
+                        .map(|identity| identity.node_id)
+                }
+            }
+            .map_err(RaftError::Config)?;
+            if certificate_id != node_id {
                 return Err(RaftError::Config(format!(
-                    "Node certificate identifies {}, but the configured Raft Node ID is {node_id}; \
-                     renew the certificate with `enroll` against the founder using this data directory",
-                    identity.node_id
+                    "peer certificate identifies {certificate_id}, but the configured Raft Node ID is {node_id}"
                 )));
             }
             Some(TlsConfig {
@@ -669,16 +678,6 @@ impl ZoneManager {
             ),
             None => None,
         };
-        let server_identity = match (&tls_config, &foreign_ca_verifier) {
-            (Some(tls), Some(verifier)) => Some(
-                lib::transport_primitives::ReloadableServerIdentity::from_tls(
-                    Arc::clone(verifier),
-                    tls,
-                )
-                .map_err(|e| RaftError::Config(format!("Node server identity: {e}")))?,
-            ),
-            _ => None,
-        };
         let local_node_renewer_slot = crate::ca_issuer::new_local_node_renewer_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
@@ -689,9 +688,6 @@ impl ZoneManager {
             .with_session_mint_admin_slot(session_mint_admin_slot.clone())
             .with_local_node_renewer_slot(local_node_renewer_slot.clone())
             .with_foreign_ca_verifier(foreign_ca_verifier.clone());
-        if let Some(identity) = &server_identity {
-            server = server.with_server_identity(Arc::clone(identity));
-        }
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
         // cluster daemon runs it on a separate plaintext listener via
@@ -704,12 +700,16 @@ impl ZoneManager {
         // this borrow.
         let bind_for_error = bind_addr.to_string();
         if !matches!(profile, RuntimeProfile::IsolatedRoot) {
+            let shutdown = async move {
+                let mut rx = shutdown_rx_server;
+                let _ = rx.changed().await;
+            };
+            // Prepare trust before the manager exposes its credential owner.
+            // A withdrawal before the first poll then denies handshakes while
+            // preserving the listener for a later authorized replacement.
+            let serving = server.serve_with_shutdown(shutdown);
             runtime.spawn(async move {
-                let shutdown = async move {
-                    let mut rx = shutdown_rx_server;
-                    let _ = rx.changed().await;
-                };
-                if let Err(e) = server.serve_with_shutdown(shutdown).await {
+                if let Err(e) = serving.await {
                     // gRPC bind failure (port in use, IP not assigned to any
                     // interface — e.g. Tailscale in NoState — TLS cert
                     // mismatch, etc.) leaves the daemon half-alive: raft
@@ -776,7 +776,6 @@ impl ZoneManager {
             foreign_ca_registrar_slot,
             session_mint_admin_slot,
             foreign_ca_verifier,
-            server_identity,
             node_identity_holders: parking_lot::Mutex::new(Vec::new()),
             local_node_renewer_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
@@ -831,7 +830,7 @@ impl ZoneManager {
     }
 
     /// This Node's current TLS identity (`None` under `--no-tls`).
-    pub fn node_tls(&self) -> Option<TlsConfig> {
+    pub fn node_tls(&self) -> std::result::Result<Option<TlsConfig>, String> {
         self.registry.tls_config()
     }
 
@@ -840,15 +839,32 @@ impl ZoneManager {
     /// registered [`NodeIdentityHolder`]. The bundle must name this Node and
     /// chain to the cluster CA it already uses, whose verifier is unchanged.
     pub fn install_node_identity(&self, tls: TlsConfig) -> std::result::Result<(), String> {
-        self.check_node_identity(&tls)?;
-        let (Some(identity), Some(verifier)) = (
-            self.server_identity.as_ref(),
-            self.foreign_ca_verifier.as_ref(),
-        ) else {
-            return Err("a plaintext node has no TLS identity to replace".into());
-        };
-        identity.replace_tls(Arc::clone(verifier), &tls)?;
-        self.registry.install_tls(tls.clone());
+        let original = self.registry.shared_tls().snapshot();
+        self.install_node_identity_from(&original, tls)
+    }
+
+    fn install_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: TlsConfig,
+    ) -> std::result::Result<(), String> {
+        self.check_node_identity_from(original, &tls)?;
+        let verifier = self
+            .foreign_ca_verifier
+            .as_ref()
+            .ok_or("a plaintext node has no TLS identity to replace")?;
+        // Validate the key/certificate pair before publishing the shared installation.
+        lib::transport_primitives::server_config(
+            Arc::clone(verifier),
+            &tls.cert_pem,
+            &tls.key_pem,
+        )?;
+        if !self.registry.shared_tls().replace_if_current(
+            original,
+            lib::transport_primitives::TlsPolicy::Configured(tls.clone()),
+        ) {
+            return Err("Node credential installation changed during renewal validation".into());
+        }
         for holder in self.node_identity_holders.lock().iter() {
             holder(&tls);
         }
@@ -862,9 +878,16 @@ impl ZoneManager {
     /// Whether `tls` may replace this Node's identity: a current leaf naming
     /// this Node, chained to the cluster CA it already uses.
     pub fn check_node_identity(&self, tls: &TlsConfig) -> std::result::Result<(), String> {
-        let current = self
-            .registry
-            .tls_config()
+        self.check_node_identity_from(&self.registry.shared_tls().snapshot(), tls)
+    }
+
+    fn check_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: &TlsConfig,
+    ) -> std::result::Result<(), String> {
+        let current = original
+            .config()?
             .ok_or("a plaintext node has no TLS identity to replace")?;
         if tls.ca_pem != current.ca_pem {
             return Err("a renewed Node identity must chain to the same cluster CA".into());
@@ -1535,13 +1558,13 @@ impl ZoneManager {
 
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
         bridge_block_on(self.rt().handle(), async {
             for (peer_id, peer) in peers {
                 if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
-                call_delete_zone(&peer.endpoint, zone_id, force, tls.clone(), 10)
+                let tls = self.registry.tls_config().map_err(RaftError::Config)?;
+                call_delete_zone(&peer.endpoint, zone_id, force, tls, 10)
                     .await
                     .map_err(|e| {
                         RaftError::Raft(format!(
@@ -1565,7 +1588,6 @@ impl ZoneManager {
     pub(crate) fn fan_out_delete_best_effort(&self, zone_id: &str, force: bool) {
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
         let zid = zone_id.to_string();
         let handle = self.rt().handle().clone();
         bridge_block_on(&handle, async move {
@@ -1573,8 +1595,14 @@ impl ZoneManager {
                 if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
-                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls.clone(), 10).await
-                {
+                let tls = match self.registry.tls_config() {
+                    Ok(tls) => tls,
+                    Err(error) => {
+                        tracing::warn!(zone = %zid, error = %error, "deprovision credentials unavailable");
+                        return;
+                    }
+                };
+                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls, 10).await {
                     tracing::warn!(
                         zone = %zid,
                         peer = %peer.endpoint,
@@ -2122,12 +2150,12 @@ impl ZoneManager {
 
     /// Gracefully shut down all zones and the gRPC server.
     pub fn shutdown(&self) {
-        self.registry.shutdown_all();
-        if let Some(tx) = bridge_block_on(self.rt().handle(), async {
-            self.shutdown_tx.lock().await.take()
-        }) {
-            let _ = tx.send(true);
-        }
+        bridge_block_on(self.rt().handle(), async {
+            if let Some(tx) = self.shutdown_tx.lock().await.take() {
+                let _ = tx.send(true);
+            }
+            self.registry.shutdown_all_and_wait().await;
+        });
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
@@ -2378,6 +2406,99 @@ pub fn join_cluster_and_provision_tls(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn renewal_fixture() -> (TempDir, Arc<ZoneManager>, TlsConfig, TlsConfig) {
+        let directory = TempDir::new().unwrap();
+        let (ca, ca_key) = crate::transport::generate_zone_ca("root").unwrap();
+        let identity = || {
+            let (cert_pem, key_pem) =
+                crate::transport::generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+            TlsConfig {
+                cert_pem,
+                key_pem,
+                ca_pem: ca.clone(),
+            }
+        };
+        let initial = identity();
+        let files = TlsFiles {
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node-key.pem"),
+            ca_path: directory.path().join("ca.pem"),
+            ca_key_path: None,
+            join_token_hash: None,
+        };
+        std::fs::write(&files.cert_path, &initial.cert_pem).unwrap();
+        lib::transport_primitives::write_secret(&files.key_path, &initial.key_pem).unwrap();
+        std::fs::write(&files.ca_path, &initial.ca_pem).unwrap();
+        let manager = ZoneManager::with_node_id(
+            "test-host",
+            7,
+            directory.path().join("data").to_str().unwrap(),
+            Vec::new(),
+            "127.0.0.1:0",
+            Some(files),
+            None,
+            None,
+        )
+        .unwrap();
+        (directory, manager, initial, identity())
+    }
+
+    #[test]
+    fn renewal_publishes_one_shared_installation_after_key_validation() {
+        let (_directory, manager, initial, next) = renewal_fixture();
+        let credentials = manager.registry().shared_tls();
+        let original = credentials.snapshot();
+        let mut wrong_key = next.clone();
+        wrong_key.key_pem = initial.key_pem;
+        assert!(manager.install_node_identity(wrong_key).is_err());
+        assert!(credentials.is_current(&original));
+
+        manager.install_node_identity(next.clone()).unwrap();
+        assert!(!credentials.is_current(&original));
+        assert_eq!(manager.node_tls().unwrap(), Some(next.clone()));
+        assert_eq!(credentials.snapshot().config().unwrap(), Some(&next));
+        credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+        assert!(manager.install_node_identity(next).is_err());
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+    }
+
+    #[test]
+    fn renewal_preserves_rejection_or_replacement_during_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_directory, manager, initial, next) = renewal_fixture();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        manager.on_node_identity(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let credentials = manager.registry().shared_tls();
+        let original = credentials.snapshot();
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(
+            initial.clone(),
+        ));
+        let reinstalled = credentials.snapshot();
+        assert_eq!(
+            manager.install_node_identity_from(&original, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert!(credentials.is_current(&reinstalled));
+        assert_eq!(manager.node_tls().unwrap(), Some(initial.clone()));
+        credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
+        assert_eq!(
+            manager.install_node_identity_from(&reinstalled, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(initial));
+        manager.install_node_identity(next.clone()).unwrap();
+        assert_eq!(manager.node_tls().unwrap(), Some(next));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn mismatched_node_certificate_is_refused_before_opening_zone_storage() {

@@ -136,7 +136,7 @@ pub(super) fn service_decls(
                         .ca_certificate(Certificate::from_pem(&tls.ca_pem))
                         .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem))
                 };
-                let (scheme, channels) = match _zm.node_tls() {
+                let (scheme, channels) = match _zm.node_tls().map_err(anyhow::Error::msg)? {
                     Some(tls) => {
                         let channels = Arc::new(PeerChannelCache::with_tls(
                             PeerChannelConfig::default(),

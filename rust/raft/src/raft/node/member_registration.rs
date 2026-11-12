@@ -116,7 +116,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 }
             }
         }
-        let use_tls = ctx.client_pool.config().tls.read().unwrap().is_some();
+        let use_tls = ctx.client_pool.config().tls.snapshot().uses_tls();
         let mut targets: Vec<String> = records
             .iter()
             .filter(|(id, _)| *id != self.id())

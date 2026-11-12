@@ -19,7 +19,7 @@ pub(super) fn node_tls(ca: &[u8], key: &[u8], id: u64) -> TlsConfig {
 
 pub(super) fn pool(tls: TlsConfig) -> RaftClientPool {
     RaftClientPool::with_config(ClientConfig {
-        tls: Arc::new(std::sync::RwLock::new(Some(tls))),
+        tls: lib::transport_primitives::SharedTlsConfig::new(Some(tls)),
         ..Default::default()
     })
 }

@@ -31,11 +31,11 @@ async fn versioned_step_retains_sender_identity_and_storage_activation_gates() {
     .await;
     let (cert, client_key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
     let pool = RaftClientPool::with_config(ClientConfig {
-        tls: Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+        tls: lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
             ca_pem: ca.clone(),
             cert_pem: cert.clone(),
             key_pem: client_key.clone(),
-        }))),
+        })),
         ..Default::default()
     });
     let peer = NodeAddress::new(7, server.endpoint.clone());
@@ -336,11 +336,11 @@ async fn reader_preparation_never_falls_back_after_authenticated_legacy_reconnec
     let address = endpoint.strip_prefix("http://").unwrap().to_owned();
     let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
     let pool = RaftClientPool::with_config(ClientConfig {
-        tls: Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+        tls: lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
             ca_pem: ca,
             cert_pem,
             key_pem,
-        }))),
+        })),
         ..Default::default()
     });
     let peer = NodeAddress::new(7, endpoint);

@@ -159,6 +159,23 @@ pub fn current_local_node_certificate(
     node_certificate_identity(&leaf)
 }
 
+/// Read the signed peer identity for a local-root replication runtime. This
+/// verifies the current local issuer and profile; TLS proves key possession.
+pub(crate) fn current_local_replication_id(der: &[u8], local_ca_der: &[u8]) -> Result<u64, String> {
+    current_local_peer_certificate(der, local_ca_der).map(AuthenticatedPeer::node_id)
+}
+
+fn current_local_peer_certificate(
+    der: &[u8],
+    local_ca_der: &[u8],
+) -> Result<AuthenticatedPeer, String> {
+    let certificate = current_local_leaf(der, local_ca_der)?;
+    if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
+        return Ok(AuthenticatedPeer::Replica(id));
+    }
+    node_certificate_identity(&certificate).map(|node| AuthenticatedPeer::Node(node.node_id))
+}
+
 /// The Node a data directory's PEM TLS bundle names, under exactly the checks
 /// above: its first certificate is current, signed by the bundle's own CA and
 /// carries one canonical Node identity. Boot, operator grants and `doctor`
@@ -200,10 +217,12 @@ fn node_certificate_identity(leaf: &X509Certificate<'_>) -> Result<LocalNodeCert
 #[derive(Clone)]
 pub(super) struct NodeControlPolicy {
     local_ca: Option<Arc<[u8]>>,
+    local_credentials: Option<(lib::transport_primitives::SharedTlsConfig, Option<Vec<u8>>)>,
 }
 impl NodeControlPolicy {
     pub(super) fn from_tls(tls: Option<&super::TlsConfig>) -> Result<Self, String> {
         Ok(Self {
+            local_credentials: None,
             local_ca: tls
                 .map(|t| {
                     lib::transport_primitives::first_certificate_der(&t.ca_pem, "local cluster CA")
@@ -211,6 +230,29 @@ impl NodeControlPolicy {
                 })
                 .transpose()?,
         })
+    }
+
+    pub(super) fn from_shared_tls(
+        source: lib::transport_primitives::SharedTlsConfig,
+    ) -> Result<Self, String> {
+        let initial = source.snapshot();
+        let tls = initial.config()?;
+        let mut policy = Self::from_tls(tls)?;
+        policy.local_credentials = Some((source, tls.map(|tls| tls.ca_pem.clone())));
+        Ok(policy)
+    }
+
+    fn check_local_credentials(&self) -> Result<(), Status> {
+        if let Some((source, ca)) = &self.local_credentials {
+            source.read(|snapshot| -> Result<(), Status> {
+                let tls = snapshot.config().map_err(Status::unavailable)?;
+                if tls.map(|tls| tls.ca_pem.as_slice()) != ca.as_deref() {
+                    return Err(Status::unavailable("local listener trust anchor changed"));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
     fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
         // Explicit plaintext/development listeners retain their old contract.
@@ -227,19 +269,13 @@ impl NodeControlPolicy {
         let leaf = certs
             .first()
             .ok_or_else(|| Status::permission_denied("missing Node mTLS leaf"))?;
-        let classify = || -> Result<AuthenticatedPeer, String> {
-            let certificate = current_local_leaf(leaf.as_ref(), ca)?;
-            if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
-                return Ok(AuthenticatedPeer::Replica(id));
-            }
-            node_certificate_identity(&certificate)
-                .map(|node| AuthenticatedPeer::Node(node.node_id))
-        };
-        classify().map(Some).map_err(|_| {
-            Status::permission_denied(
-                "Raft control requires a current local Node or owner replica certificate",
-            )
-        })
+        current_local_peer_certificate(leaf.as_ref(), ca)
+            .map(Some)
+            .map_err(|_| {
+                Status::permission_denied(
+                    "Raft control requires a current local Node or owner replica certificate",
+                )
+            })
     }
 }
 
@@ -306,6 +342,7 @@ impl RequestAdmission {
     // Keep one implementation across all generated tonic service wrappers.
     #[inline(never)]
     fn check(&self, request: &mut http::Request<Body>) -> Result<(), Status> {
+        self.policy.check_local_credentials()?;
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
                 Ok(Some(AuthenticatedPeer::Replica(_)))
