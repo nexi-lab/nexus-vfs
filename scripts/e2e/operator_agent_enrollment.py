@@ -63,7 +63,7 @@ class Node:
             NEXUS_ADVERTISE_ADDR=self.address,
             NEXUS_CLUSTER_INIT=cluster,
             NEXUS_CLUSTER_INIT_MOUNTS=f"/agents={cluster}",
-            NEXUS_ACCEPT_ENROLLMENTS="1",
+            NEXUS_ACCEPT_ENROLLMENTS="true",
             RUST_LOG="info,h2=warn,hyper=warn,tower=warn,tonic=warn",
             NO_COLOR="1",
         )
