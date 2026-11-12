@@ -5,6 +5,8 @@
 #![cfg(all(feature = "grpc", has_protos))]
 
 mod common;
+#[path = "test_zone_owner_replication/replica_join_flow.rs"]
+mod replica_join_flow;
 
 use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
@@ -855,42 +857,7 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
         .as_conditional_metadata()
         .is_none());
 
-    {
-        let home = store(&source, AGENT_ZONE, HOME);
-        let sessions = store(&source, AGENT_ZONE, SESSION);
-        home.put(HOME, metadata(HOME, 1, AGENT_ZONE, "user-alice"))
-            .unwrap();
-        let mut link = metadata(LINK, 6, AGENT_ZONE, "user-alice");
-        link.link_target = Some(SESSION.into());
-        home.put(LINK, link).unwrap();
-        sessions
-            .put(SESSION, metadata(SESSION, 1, AGENT_ZONE, "user-alice"))
-            .unwrap();
-        for frame in [b"first-frame".as_slice(), b"second-frame", b"third-frame"] {
-            sessions.append_stream_entry(STREAM, frame).unwrap();
-        }
-        // This models only the persisted cold-segment index, never a retained blob.
-        sessions
-            .seal_stream_segment(STREAM, 0, 2, "synthetic-cold-blob", &source_addr, 23)
-            .unwrap();
-        let other = store(&source, OTHER_ZONE, "/agents/bob");
-        other
-            .put(
-                "/agents/bob",
-                metadata("/agents/bob", 1, OTHER_ZONE, "user-bob"),
-            )
-            .unwrap();
-    }
-    for path in [HOME, SESSION] {
-        source
-            .mount_subtree_async("root", path, AGENT_ZONE, path, true)
-            .await
-            .unwrap();
-    }
-    source
-        .mount_subtree_async("root", "/agents/bob", OTHER_ZONE, "/agents/bob", true)
-        .await
-        .unwrap();
+    seed_selected_zone(&source, &source_addr).await;
 
     let joining = Arc::clone(&target);
     let target_endpoint = target_addr.clone();
@@ -933,6 +900,45 @@ async fn selected_zone_join_preserves_disjoint_paths_owner_link_and_wal_tables()
     let restarted = restart_node(32, target_dir.path(), &restart_addr, Vec::new()).await;
     check_agent_state(&restarted, target_root_id);
     tokio::task::spawn_blocking(move || restarted.shutdown())
+        .await
+        .unwrap();
+}
+
+async fn seed_selected_zone(source: &Arc<ZoneManager>, source_addr: &str) {
+    {
+        let home = store(source, AGENT_ZONE, HOME);
+        let sessions = store(source, AGENT_ZONE, SESSION);
+        home.put(HOME, metadata(HOME, 1, AGENT_ZONE, "user-alice"))
+            .unwrap();
+        let mut link = metadata(LINK, 6, AGENT_ZONE, "user-alice");
+        link.link_target = Some(SESSION.into());
+        home.put(LINK, link).unwrap();
+        sessions
+            .put(SESSION, metadata(SESSION, 1, AGENT_ZONE, "user-alice"))
+            .unwrap();
+        for frame in [b"first-frame".as_slice(), b"second-frame", b"third-frame"] {
+            sessions.append_stream_entry(STREAM, frame).unwrap();
+        }
+        // This models only the persisted cold-segment index, never a retained blob.
+        sessions
+            .seal_stream_segment(STREAM, 0, 2, "synthetic-cold-blob", source_addr, 23)
+            .unwrap();
+        let other = store(source, OTHER_ZONE, "/agents/bob");
+        other
+            .put(
+                "/agents/bob",
+                metadata("/agents/bob", 1, OTHER_ZONE, "user-bob"),
+            )
+            .unwrap();
+    }
+    for path in [HOME, SESSION] {
+        source
+            .mount_subtree_async("root", path, AGENT_ZONE, path, true)
+            .await
+            .unwrap();
+    }
+    source
+        .mount_subtree_async("root", "/agents/bob", OTHER_ZONE, "/agents/bob", true)
         .await
         .unwrap();
 }
