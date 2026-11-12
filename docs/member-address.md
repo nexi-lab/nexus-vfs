@@ -27,15 +27,15 @@ the other control namespaces, and travels in every snapshot with the rest of
 | Part | Content |
 |---|---|
 | Key | The member's Raft node id in decimal |
-| Value | The member's bare advertise authority, `host:port`, canonicalised by the operator-address parser |
+| Value | The member's bare advertise authority, `host:port`, canonicalised by the operator-address parser; a wildcard host (`0.0.0.0`, `[::]`) is no dial address and never forms a record |
 | Dial endpoint | `http://` or `https://` plus the value, chosen by the reading node's own TLS posture |
 
 `rust/raft/src/raft/member_address.rs` is the only code that builds, decodes
 and interprets these records: the put and delete commands, the decoder, the
 dial endpoint and the predicate that tells whether an applied batch touched
 member addresses. `StateMachine::member_addresses` lists the records a state
-machine holds; a state machine that keeps no control store (the witness) holds
-none.
+machine holds, and answers `None` for a state machine that keeps no control
+store and so cannot hold them (the witness).
 
 The namespace is strongly consistent. The state machine's consistency
 classifier refuses it on the EC and local write paths, so a record changes only
@@ -65,23 +65,36 @@ holds the joiner's record from the moment the change applies.
 ### Self-registration
 
 Each resident managed zone keeps its own member's record equal to the local
-advertise address. Once the zone's consensus is running, it reads its own record
-from the local state machine. A missing or different record is proposed as a
-member-address put:
+advertise address, on a data node and on a witness alike:
+`transport::start_zone` starts every zone with the same route book, transport
+loop and registration task (`rust/raft/src/raft/node/member_registration.rs`).
+Each round reads the zone's records:
+
+- from the local state machine;
+- for a state machine without records (a witness), from the `GetClusterInfo`
+  of its leader, else of its seed addresses, whichever answers first. The
+  reported voters and learners carry the answering node's applied records.
+
+A missing or different record is proposed as a member-address put:
 
 1. A node that knows its leader proposes through the normal path (local commit
-   on the leader, forwarding on a follower).
+   on the leader, forwarding on a follower or a witness).
 2. When no leader is known or that proposal fails, the node sends a `Propose`
-   RPC with `forwarded=false` to every registered member address except its own
-   and to the configured seed addresses (`--peers` / `identity.peers`).
-3. It repeats with exponential backoff until its own record is visible in its
-   local state machine, then stops.
+   RPC with `forwarded=false` to every recorded member address and to the
+   configured seed addresses (`--peers` / `identity.peers`, a witness's
+   `NEXUS_PEERS`), its own address excluded.
+3. It repeats with exponential backoff until the records it reads hold its own,
+   then stops.
 
 This path registers a founder (its bootstrap entry carries no address), a member
 whose address changed, and every member of a zone that predates the record. A
 zone with fixed local membership (the isolated local root) has no network
-members and does not register. A zone that is not resident runs no Raft and
-registers when it next becomes resident.
+members and does not register; neither does a member without an advertise
+address. A zone that is not resident runs no Raft and registers when it next
+becomes resident. A witness makes the zones it joins at boot (root and
+`NEXUS_FEDERATION_ZONES`) resident when it starts, resuming one it holds on disk
+from its own storage before re-sending JoinZone; any other zone becomes resident
+when a member's message reaches it.
 
 ### RPC admission
 
@@ -105,7 +118,7 @@ traffic. It has two layers:
 
 | Layer | Source | Lifetime |
 |---|---|---|
-| Registered | The state machine's member-address records | Rebuilt at driver start, after a snapshot install, and after an applied batch that contains a member-address command or a ConfChange |
+| Registered | The state machine's member-address records; empty on a witness | Rebuilt at driver start, after a snapshot install, and after an applied batch that contains a member-address command or a ConfChange |
 | Observed | `sender_address` of authenticated inbound Raft messages, and the address of an admitted original registration | Memory only; an entry for an id is cleared when that id's registered record changes |
 
 `route(id)` returns the observed address, else the registered address. The
@@ -124,17 +137,24 @@ the send path reads it under one shared lock per batch of outgoing messages.
   from the restored state.
 - Routing reads applied state plus transport observations. Nothing outside apply
   writes the state machine.
+- Registration only proposes. A witness reads another member's applied records
+  and changes nothing locally; a stale read costs at most a repeated put of the
+  same value, which applies idempotently.
 - The founder's bootstrap entry is pre-applied and carries no context; the
   founder's first self-registration commits its record like any other put.
 
 ## Migration
 
 A zone created before the record exists has members in its ConfState without
-records. Each member registers itself the next time the zone becomes resident
-on it, using the registered addresses it holds and its seed addresses. A
-learner that its leader can no longer reach therefore restores the leader's
-route by sending its own registration to a seed address, and replication
-resumes once that put commits on the leader.
+records. Each member, a witness included, registers itself the next time the
+zone becomes resident on it, using the recorded addresses it reads and its seed
+addresses. A learner that its leader can no longer reach therefore restores the
+leader's route by sending its own registration to a seed address, and
+replication resumes once that put commits on the leader. A witness and a leader
+that restart together without the witness's record meet the same way: the
+witness resumes the zone at boot and sends its registration to a seed, the seed
+routes to it, and the witness's vote counts in electing the leader that commits
+the record.
 
 `identity.json` keeps the operator's seed addresses (`peers`) and the node's
 per-zone role intent (`zones[].zone_id`, `zones[].as_role`). Fields that older
