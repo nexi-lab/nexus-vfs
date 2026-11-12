@@ -10,6 +10,8 @@ mod reader_capability;
 mod reader_preparation;
 #[path = "node_rpc_boundaries/replica_transport.rs"]
 mod replica_transport;
+#[path = "node_rpc_boundaries/revocation.rs"]
+mod revocation;
 #[path = "node_rpc_boundaries/storage_transport.rs"]
 mod storage_transport;
 
