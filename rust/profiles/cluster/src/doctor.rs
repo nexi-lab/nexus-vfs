@@ -52,7 +52,10 @@ pub(super) fn run(data_dir: &Path, zone_filter: Option<&str>) -> Result<()> {
     let total = zones.len();
     println!("# Doctor — {} zone(s) under {}", total, data_dir.display());
     println!();
-    let certificate_alarms = audit_node_certificate(data_dir, &mut std::io::stdout().lock())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let certificate_alarms = audit_node_certificate(data_dir, now, &mut std::io::stdout().lock())?;
     let zone_alarms = audit_zones(data_dir, zone_filter, zones)?;
     println!(
         "Summary: {certificate_alarms} node-certificate alarm(s); \
@@ -72,9 +75,9 @@ pub(super) fn run(data_dir: &Path, zone_filter: Option<&str>) -> Result<()> {
 
 /// Audit the Node certificate against the persisted Node ID. The verdict is the
 /// boot check itself ([`nexus_raft::transport::local_node_identity`]); the
-/// validity window and CA facts around it explain a refusal. Returns the
-/// number of alarms written.
-fn audit_node_certificate(data_dir: &Path, out: &mut impl Write) -> Result<usize> {
+/// validity window and CA facts around it explain a refusal, judged at `now`
+/// (Unix seconds). Returns the number of alarms written.
+fn audit_node_certificate(data_dir: &Path, now: i64, out: &mut impl Write) -> Result<usize> {
     let tls_dir = data_dir.join("tls");
     let (cert_path, ca_path) = (tls_dir.join("node.pem"), tls_dir.join("ca.pem"));
     writeln!(out, "## node certificate")?;
@@ -129,9 +132,6 @@ fn audit_node_certificate(data_dir: &Path, out: &mut impl Write) -> Result<usize
         "  validity    = {} .. {}",
         validity.not_before, validity.not_after
     )?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64);
     if now < start {
         findings.clock_skew = true;
         findings.alarms.push(format!(
@@ -396,9 +396,17 @@ mod tests {
         directory
     }
 
-    fn audit(directory: &tempfile::TempDir) -> (usize, String) {
+    /// The current instant on a whole second, the precision of X.509 validity,
+    /// so windows built from it and the audit judge the same instant.
+    fn now() -> SystemTime {
+        let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        SystemTime::UNIX_EPOCH + Duration::from_secs(elapsed.as_secs())
+    }
+
+    fn audit(directory: &tempfile::TempDir, at: SystemTime) -> (usize, String) {
         let mut out = Vec::new();
-        let alarms = audit_node_certificate(directory.path(), &mut out).unwrap();
+        let at = at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let alarms = audit_node_certificate(directory.path(), at, &mut out).unwrap();
         (alarms, String::from_utf8(out).unwrap())
     }
 
@@ -430,13 +438,13 @@ mod tests {
     fn a_current_certificate_for_the_persisted_node_is_healthy_in_either_cn_form() {
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
         let (numeric, _) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
-        let (alarms, report) = audit(&data_dir(7, &numeric, &ca));
+        let (alarms, report) = audit(&data_dir(7, &numeric, &ca), now());
         assert_eq!(alarms, 0, "{report}");
         assert!(report.contains("CN=nexus-zone-root-node-7\n"), "{report}");
         // A founder's bootstrap certificate names its host in the CN.
         let host = Some("DESKTOP-K2PHFNR");
         let (cert, _) = generate_node_cert(7, "root", &ca, &ca_key, &[], host).unwrap();
-        let (alarms, report) = audit(&data_dir(7, &cert, &ca));
+        let (alarms, report) = audit(&data_dir(7, &cert, &ca), now());
         assert_eq!(alarms, 0, "{report}");
         assert!(
             report.contains("CN=nexus-zone-root-node-DESKTOP-K2PHFNR\n"),
@@ -464,7 +472,7 @@ mod tests {
         let (cert, _) =
             generate_node_cert(6272818444033277711, "root", &ca, &ca_key, &[], None).unwrap();
         let directory = data_dir(6536933648025587040, &cert, &ca);
-        let (alarms, report) = audit(&directory);
+        let (alarms, report) = audit(&directory, now());
         assert_eq!(alarms, 1, "{report}");
         assert!(
             report.contains(
@@ -483,17 +491,17 @@ mod tests {
     #[test]
     fn the_validity_window_and_the_issuing_ca_are_diagnosed() {
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
-        let now = SystemTime::now();
+        let now = now();
 
         let expired = windowed(7, &ca, &ca_key, now - 100 * DAY, now - DAY);
-        let (alarms, report) = audit(&data_dir(7, &expired, &ca));
+        let (alarms, report) = audit(&data_dir(7, &expired, &ca), now);
         assert_eq!(alarms, 1, "{report}");
         assert!(report.contains("ALARM  CERT_EXPIRED: expired "), "{report}");
         assert!(report.contains("nexusd-cluster enroll"), "{report}");
 
         // Issued by a CA host whose clock runs two minutes ahead of this one.
         let ahead = windowed(7, &ca, &ca_key, now + Duration::from_secs(120), now + DAY);
-        let (alarms, report) = audit(&data_dir(7, &ahead, &ca));
+        let (alarms, report) = audit(&data_dir(7, &ahead, &ca), now);
         assert_eq!(alarms, 1, "{report}");
         assert!(
             report.contains("ALARM  CERT_NOT_YET_VALID: valid only from "),
@@ -506,10 +514,10 @@ mod tests {
         assert!(!report.contains("nexusd-cluster enroll"), "{report}");
 
         let expiring = windowed(7, &ca, &ca_key, now - DAY, now + 3 * DAY);
-        let (alarms, report) = audit(&data_dir(7, &expiring, &ca));
+        let (alarms, report) = audit(&data_dir(7, &expiring, &ca), now);
         assert_eq!(alarms, 0, "{report}");
         assert!(
-            report.contains("WARN   CERT_EXPIRING: expires in 2 day(s)"),
+            report.contains("WARN   CERT_EXPIRING: expires in 3 day(s)"),
             "{report}"
         );
         assert!(report.contains("nexusd-cluster enroll"), "{report}");
@@ -517,7 +525,7 @@ mod tests {
         let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
         let (outsider, _) =
             generate_node_cert(7, "root", &foreign, &foreign_key, &[], None).unwrap();
-        let (alarms, report) = audit(&data_dir(7, &outsider, &ca));
+        let (alarms, report) = audit(&data_dir(7, &outsider, &ca), now);
         assert_eq!(alarms, 1, "{report}");
         assert!(
             report.contains("ALARM  CERT_UNTRUSTED: the CA at ")
@@ -533,7 +541,7 @@ mod tests {
     #[test]
     fn a_node_without_a_certificate_has_nothing_to_audit() {
         let directory = tempfile::tempdir().unwrap();
-        let (alarms, report) = audit(&directory);
+        let (alarms, report) = audit(&directory, now());
         assert_eq!(alarms, 0);
         assert!(report.contains("  none at "), "{report}");
     }
