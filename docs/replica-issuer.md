@@ -51,6 +51,86 @@ and minimum storage-reader format. The format requirement increases monotonicall
 at the existing storage-admission key and survives compaction and snapshots.
 Boot and snapshot admission check that the reader supports the retained format
 and that its membership policy qualifies the stored records.
+
+Every participating node also prepares its local Raft reader format before
+qualifying for replica-control activation. The mandatory `first_index` record
+holds the log boundary and its reader dialect together. This covers witnesses,
+whose business state machine stores no control records. Compaction and snapshot
+installation preserve that local format; earlier readers refuse it at Raft
+startup. Ordinary stores retain the original eight-byte index representation.
+The owning Raft driver serializes local preparation with its message handling
+and acknowledges it after the storage transaction commits. Followers, learners
+and witnesses prepare the same local reader format without becoming leaders.
+Retries preserve that format after a lost response. A stopped driver refuses
+preparation through its closed request channel.
+`PrepareReplicaControlReaderV1` carries this operation between authenticated
+cluster Nodes for an already hosted zone. The client pins the destination's
+Node role and ID throughout TLS reconnects; the server authenticates the caller
+before resolving the zone. The connection pool includes that role in its cache
+key. Ordinary Agent credentials, owner replicas and plaintext listeners carry
+their existing data-plane roles rather than storage-format control authority.
+The response acknowledges the original local preparation; member-set validation
+and the versioned replication exchange remain part of activation qualification.
+The prepared driver uses `StepReplicaControlV1` for every subsequent Raft
+exchange. The same driver serializes inbound dialect checks with preparation,
+including messages already waiting in its queue. Full nodes and witnesses
+persist the reader floor before admitting this method; their replies acknowledge
+protocol admission. Raft acknowledgements continue to follow log persistence
+in the original Ready/advance loop. A cold driver derives the required dialect
+from its retained reader floor. Each outbound connection pins the destination's
+Node identity, and every reconnect uses the required method.
+Reader preparation reports `replica_control_transport_v1` only after the
+driver enforces that exchange. Member qualification requires this explicit
+acknowledgement over the original Node channel and retains its original
+configuration view across the network call. An earlier empty reply describes
+local reader preparation alone.
+
+`ZoneConsensus::prepare_replica_control_members` takes the complete member set
+from the owning leader, resolves its existing zone routes, and requires the
+explicit transport acknowledgement from every remote member. The expected
+certificate identity comes from the configured member ID. The driver rechecks
+its incarnation, term and membership epoch after those network calls. The
+returned `PreparedReplicaControl` remains an in-process observation; activation
+consumes and revalidates that observation at its own submission boundary.
+Completed local preparations survive a failed group attempt. Retrying observes
+the current configuration and repeats the same idempotent local preparation.
+
+`ZoneConsensus::activate_replica_control` consumes that observation and the
+original operation ID. Its owning actor rechecks the incarnation, term,
+membership epoch and local reader floor immediately before proposing the
+existing activation command. The first operation and the state machine's
+last-applied marker commit atomically. An uncertain response is reconciled by reading that
+fact through the same zone's ReadIndex; the caller preserves its original
+request.
+
+```mermaid
+sequenceDiagram
+    participant Controller
+    participant Leader as Owning Raft driver
+    participant Members as All configured members
+    Controller->>Leader: prepare_replica_control_members
+    Leader->>Members: Prepare original reader and required transport
+    Members-->>Leader: Durable preparation acknowledgements
+    Leader-->>Controller: PreparedReplicaControl for original configuration
+    Controller->>Leader: activate_replica_control(observation, operation)
+    Leader->>Leader: Recheck original view and propose activation
+    Leader->>Members: Existing Raft replication and commit
+    Leader-->>Controller: Original committed activation fact
+```
+
+Managed replica-control submissions use their typed storage door after that
+fact commits. Startup and incoming snapshots combine the retained local reader
+floor with the replicated format and activation record. The format marker
+qualifies its exact domain; conditional metadata and record-lifetime records
+retain their own admission requirements. Witnesses check the incoming format
+and retain their local reader floor while the full replicas own business state.
+New members receive the required transport before acknowledging replicated
+storage commands. Generic proposal forwarding retains its ordinary command
+boundary.
+
+This durable local format upgrade and the replicated activation fact have
+separate purposes: the former defines which program can open the files, while
+the latter enables commands for the zone after authenticated member checks.
 Generic control writes are refused for this owned namespace. EC admission
 requires these mutations to use the consensus path.
 
@@ -196,3 +276,10 @@ certificate recovery, and races publication against allocation retirement and
 CA rotation through Raft. The shared CSR tests verify exact TBS commitment,
 owner/replica scope, lifetime limits and the existing ordinary-Agent record
 format. Revocation and renewal ordering also have state-machine coverage.
+
+The managed activation suites exercise configuration and incarnation changes,
+lost responses, compaction, original-store restart, snapshot admission and
+cross-domain refusal. The Node RPC suite prepares actual authenticated members,
+commits a Node identity, catches up a learner and promotes it through the
+existing membership path. These cases use the same three-platform Node-control
+CI job.

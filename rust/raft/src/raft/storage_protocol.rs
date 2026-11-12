@@ -12,6 +12,11 @@ pub(crate) enum StorageProtocol {
 }
 
 impl Command {
+    #[cfg(feature = "consensus")]
+    pub(crate) fn requires_activation_qualification(&self) -> bool {
+        matches!(self, Self::ActivateReplicaControl { .. })
+    }
+
     pub(crate) fn storage_protocol(&self) -> Option<StorageProtocol> {
         match self {
             Self::WriteVersionedMetadata { .. }
@@ -23,7 +28,8 @@ impl Command {
             | Self::AdmitRecordIoOwner { .. } => Some(StorageProtocol::RecordLifetime),
             Self::ApplyReplicaBinding(_)
             | Self::ReserveNodeIdentity(_)
-            | Self::ApplyReplicaIssuance(_) => Some(StorageProtocol::ReplicaControl),
+            | Self::ApplyReplicaIssuance(_)
+            | Self::ActivateReplicaControl { .. } => Some(StorageProtocol::ReplicaControl),
             _ => None,
         }
     }

@@ -223,6 +223,9 @@ pub struct ClusterStatus {
     pub applied_index: u64,
     pub voter_count: usize,
     pub witness_count: usize,
+    /// Milliseconds since this node last heard from its current leader —
+    /// 0 on the leader, `None` before the first contact. Memory only.
+    pub leader_contact_age_ms: Option<u64>,
 }
 
 /// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
@@ -283,13 +286,6 @@ pub struct ZoneManager {
     runtime: OwnedRuntime,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     node_id: u64,
-    use_tls: bool,
-    /// Remembered peer list (the `peers` arg from construction), in
-    /// `host:port` form. Used when `get_or_create_zone` auto-creates
-    /// a zone during `sys_setattr(DT_MOUNT)` — every zone in a
-    /// federation shares the same raft peer topology, so the peer
-    /// list is cluster-wide, not per-zone.
-    default_peers: Vec<String>,
     /// Late-bindable slot the kernel populates with a `BlobFetcher`
     /// once its root mount backend is ready. Shared with the gRPC
     /// server so `ZoneApiService::read_blob` serves once the kernel
@@ -360,11 +356,11 @@ impl ZoneManager {
     ///
     /// Used by `RaftDistributedCoordinator::init_from_env` to bind the
     /// node ID returned by `read_or_mint_node_id` (opaque random u64
-    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` is the
-    /// hostname → endpoint **address book** parsed from `NEXUS_PEERS`;
-    /// it seeds the transport peer map for raft messaging but is **not**
-    /// the source of truth for ConfState — ConfState is mutated only
-    /// by ConfChange (AddNode / RemoveNode) driven by JoinZone.  The
+    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` are the
+    /// operator seed addresses (`NEXUS_PEERS` / `--peers`): RPC targets for
+    /// JoinZone and for self-registration, never zone routes and never
+    /// ConfState — ConfState is mutated only by ConfChange driven by
+    /// JoinZone.
     /// Callers that supply an explicit ID also supply its matching TLS identity.
     /// `self_address` is this node's advertise address (e.g.,
     /// `"http://10.0.0.3:2126"` or `"10.0.0.3:2126"`).  Carried in every
@@ -372,8 +368,7 @@ impl ZoneManager {
     /// `(self.node_id -> self_address)` from inbound messages — the
     /// runtime SSOT for transport routing under the opaque-ID contract.
     /// `None` disables sender-address advertisement; use only for
-    /// tests / sync-only deployments where peers already have the
-    /// address via env seeding.
+    /// tests / sync-only deployments.
     #[allow(clippy::too_many_arguments)]
     pub fn with_node_id(
         hostname: &str,
@@ -596,6 +591,17 @@ impl ZoneManager {
         if let Some(ref addr) = self_address {
             registry.set_self_address(addr.clone());
         }
+        // Seeds are RPC targets (JoinZone, member-address registration),
+        // never zone routes: those derive from member-address records.
+        registry.set_seeds(
+            peers
+                .iter()
+                .map(|s| {
+                    NodeAddress::parse(s.trim(), tls_config.is_some())
+                        .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -606,16 +612,6 @@ impl ZoneManager {
         };
         let use_tls = tls_config.is_some();
 
-        // Enumerate + reopen local zone storage BEFORE gRPC accepts
-        // traffic. Otherwise a vote/heartbeat arriving during restart
-        // could silently drop messages or re-bootstrap with peers=0.
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Index what this node hosts BEFORE the gRPC server accepts traffic,
         // so an arriving vote / append / VFS call can never be told "no such
         // zone" about a zone that is sitting right there on disk. Opening it
@@ -632,11 +628,7 @@ impl ZoneManager {
         registry
             .index_persisted_zones()
             .map_err(|e| RaftError::Raft(format!("Failed to enumerate zones on startup: {}", e)))?;
-        registry.arm_materialization(
-            peer_addrs.clone(),
-            runtime.handle().clone(),
-            load_policy.clone(),
-        );
+        registry.arm_materialization(runtime.handle().clone(), load_policy.clone());
         // The zones that must be resident before anything can be served at
         // all: `root`, whose DT_MOUNT entries define the namespace, and — for
         // offline tooling — exactly the zone it was told to touch.
@@ -645,7 +637,7 @@ impl ZoneManager {
             ZoneLoadPolicy::Only(zone_ids) => zone_ids.clone(),
         };
         registry
-            .materialize_now(&eager, peer_addrs.clone(), runtime.handle())
+            .materialize_now(&eager, runtime.handle())
             .map_err(|e| {
                 zone_open_error(e, format!("Failed to open zones {eager:?} on startup"))
             })?;
@@ -755,8 +747,6 @@ impl ZoneManager {
             runtime,
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
             node_id,
-            use_tls,
-            default_peers: peers,
             blob_fetcher_slot,
             search_capabilities_slot,
             agent_minter_slot,
@@ -815,43 +805,22 @@ impl ZoneManager {
         self.foreign_ca_verifier.clone()
     }
 
-    /// Cluster-wide peer list remembered from construction, in
-    /// `host:port` form. Used by `sys_setattr(DT_MOUNT)`'s
-    /// leader-side create-on-mount path so zone auto-creation picks
-    /// up the federation's peer topology without re-parsing env vars.
-    pub fn default_peers(&self) -> &[String] {
-        &self.default_peers
+    /// The operator seed addresses this node was started with, parsed with
+    /// this node's TLS posture. A seed's `id` is derived from its hostname,
+    /// which identifies only a witness.
+    pub fn seed_peers(&self) -> Vec<NodeAddress> {
+        self.registry.seeds()
     }
 
-    /// Current cluster-wide peer roster in `host:port` form.
-    ///
-    /// The env-derived `default_peers` are only the cold-start seed. Once
-    /// root membership changes through wipe-rejoin rotation, root's live
-    /// peer map is the authoritative address roster for newly-created
-    /// zones.
-    pub fn current_peer_strings(&self) -> Vec<String> {
-        if let Some(peers) = self.registry.get_peers("root") {
-            if !peers.is_empty() {
-                let mut out: Vec<String> =
-                    peers.values().map(NodeAddress::to_raft_peer_str).collect();
-                out.sort();
-                return out;
-            }
-        }
-        self.default_peers.clone()
-    }
-
-    /// Get an existing zone handle, or create one with the current
-    /// root-zone peer roster and return a handle to it. Called from
-    /// `Kernel::sys_setattr(DT_MOUNT)` leader path so the caller
-    /// doesn't have to specify peers (same federation = same peers).
-    /// Idempotent: subsequent calls for an existing zone skip the
-    /// raft ConfState bootstrap and return the cached node.
+    /// Get an existing zone handle, or create the zone and return a handle to
+    /// it. Called from `Kernel::sys_setattr(DT_MOUNT)` leader path.
+    /// Idempotent: subsequent calls for an existing zone skip the raft
+    /// ConfState bootstrap and return the cached node.
     pub fn get_or_create_zone(&self, zone_id: &str) -> Result<Arc<ZoneHandle>> {
         if let Some(h) = self.get_zone(zone_id) {
             return Ok(h);
         }
-        self.create_zone(zone_id, self.current_peer_strings())
+        self.create_zone(zone_id)
     }
 
     /// The network replica ID. Per-zone status reports the root's local ID.
@@ -970,75 +939,22 @@ impl ZoneManager {
         if !self.registry.hosts(zone_id) {
             return ZonePresence::LocalNotFound;
         }
-        if self
-            .registry
-            .resident_zones()
-            .contains(&zone_id.to_string())
-        {
+        if self.registry.is_resident(zone_id) {
             ZonePresence::Resident
         } else {
             ZonePresence::HostedNotResident
         }
     }
 
-    /// Create a new zone (raft group) on this node.
-    ///
-    /// Idempotent — calling `create_zone` for an existing zone with
-    /// the **same** address book (same set of `(hostname, port)`
-    /// tuples) returns the existing handle.  A **different** address
-    /// book returns
-    /// [`RaftError::ZoneAlreadyExistsWithDifferentMembership`] so
-    /// operator config drift surfaces loudly instead of silently
-    /// re-bootstrapping the local replica.  The address book carries
-    /// no role in ConfState (which is mutated only by ConfChange via
-    /// JoinZone) so two callers passing equivalent peer lists are
-    /// genuinely equivalent.
-    pub fn create_zone(&self, zone_id: &str, peers: Vec<String>) -> Result<Arc<ZoneHandle>> {
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), self.use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Idempotency: zone already loaded.  Compare existing
-        // address-book entries by `(hostname, port)` ignoring the
-        // raft-id prefix — under the opaque-ID contract two parses of
-        // the same NEXUS_PEERS entry can carry different witness-derived
-        // ids but represent the same physical peer.
-        if self.get_zone(zone_id).is_some() {
-            let existing = self
-                .registry
-                .get_peers(zone_id)
-                .map(|map| {
-                    let mut set: std::collections::BTreeSet<(String, u16)> = map
-                        .values()
-                        .map(|addr| (addr.hostname.clone(), addr.port))
-                        .collect();
-                    set.remove(&(String::new(), 0));
-                    set
-                })
-                .unwrap_or_default();
-            let requested: std::collections::BTreeSet<(String, u16)> = peer_addrs
-                .iter()
-                .map(|a| (a.hostname.clone(), a.port))
-                .collect();
-            if existing == requested {
-                return Ok(self.get_zone(zone_id).expect("re-checked above"));
-            }
-            let to_strs = |set: &std::collections::BTreeSet<(String, u16)>| -> Vec<String> {
-                set.iter().map(|(h, p)| format!("{h}:{p}")).collect()
-            };
-            return Err(RaftError::ZoneAlreadyExistsWithDifferentMembership {
-                actual: to_strs(&existing),
-                requested: to_strs(&requested),
-            });
+    /// Create a new zone (raft group) on this node, founded with this node
+    /// as its sole voter. Idempotent — an existing zone returns its handle.
+    pub fn create_zone(&self, zone_id: &str) -> Result<Arc<ZoneHandle>> {
+        if let Some(existing) = self.get_zone(zone_id) {
+            return Ok(existing);
         }
-
         let node = self
             .registry
-            .create_zone(zone_id, peer_addrs, self.rt().handle())
+            .create_zone(zone_id, self.rt().handle())
             .map_err(|e| zone_open_error(e, "Failed to create zone"))?;
 
         Ok(ZoneHandle::new(
@@ -1055,12 +971,7 @@ impl ZoneManager {
     /// responsible for sending a JoinZone RPC to the leader (via
     /// PyFederationClient::request_join_zone) with the same learner flag so
     /// the leader proposes AddNode vs AddLearnerNode accordingly.
-    pub fn join_zone(
-        &self,
-        zone_id: &str,
-        peers: Vec<String>,
-        learner: bool,
-    ) -> Result<Arc<ZoneHandle>> {
+    pub fn join_zone(&self, zone_id: &str, learner: bool) -> Result<Arc<ZoneHandle>> {
         // R12: the join path can never resurrect a deprovisioned zone —
         // a deletion epoch that outranks this replica's creation epoch
         // refuses the join outright (auto-rejoin against a stale identity
@@ -1076,17 +987,9 @@ impl ZoneManager {
                  override."
             )));
         }
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), self.use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let node = self
             .registry
-            .join_zone(zone_id, peer_addrs, learner, self.rt().handle())
+            .join_zone(zone_id, learner, self.rt().handle())
             .map_err(|e| zone_open_error(e, "Failed to join zone"))?;
 
         Ok(ZoneHandle::new(
@@ -1122,7 +1025,6 @@ impl ZoneManager {
     pub fn bootstrap_static(
         &self,
         zones: &[String],
-        peers: Vec<String>,
         mounts: &BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         // Zones skipped by the D9 guard below — mounts pointing at them are
@@ -1159,7 +1061,7 @@ impl ZoneManager {
                 deprovisioned.insert(zone_id.clone());
                 continue;
             }
-            self.create_zone(zone_id, peers.clone())?;
+            self.create_zone(zone_id)?;
         }
         let mut pending = self.pending_mounts.lock();
         pending.clear();
@@ -1643,6 +1545,7 @@ impl ZoneManager {
                 applied_index: 0,
                 voter_count: 0,
                 witness_count: 0,
+                leader_contact_age_ms: None,
             };
         };
         // Membership SSOT is raft's ConfState (the authoritative voter set),
@@ -1677,6 +1580,7 @@ impl ZoneManager {
             applied_index: node.applied_index(),
             voter_count,
             witness_count,
+            leader_contact_age_ms: node.leader_contact_age().map(|age| age.as_millis() as u64),
         }
     }
 
@@ -2214,14 +2118,10 @@ impl ZoneManager {
     }
 
     /// Async wrapper for [`Self::create_zone`].
-    pub async fn create_zone_async(
-        self: &Arc<Self>,
-        zone_id: &str,
-        peers: Vec<String>,
-    ) -> Result<Arc<ZoneHandle>> {
+    pub async fn create_zone_async(self: &Arc<Self>, zone_id: &str) -> Result<Arc<ZoneHandle>> {
         let this = Arc::clone(self);
         let zone_id = zone_id.to_string();
-        tokio::task::spawn_blocking(move || this.create_zone(&zone_id, peers))
+        tokio::task::spawn_blocking(move || this.create_zone(&zone_id))
             .await
             .map_err(|e| RaftError::InvalidState(format!("create_zone_async task panicked: {e}")))?
     }
@@ -2248,11 +2148,10 @@ impl ZoneManager {
     pub async fn bootstrap_static_async(
         self: &Arc<Self>,
         zones: Vec<String>,
-        peers: Vec<String>,
         mounts: BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, peers, &mounts))
+        tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, &mounts))
             .await
             .map_err(|e| {
                 RaftError::InvalidState(format!("bootstrap_static_async task panicked: {e}"))
@@ -2453,38 +2352,17 @@ mod tests {
     }
 
     #[test]
-    fn test_create_zone_repeated_same_peers_is_noop() {
-        // Calling create_zone twice with the same address book must be
-        // idempotent — second call returns the existing handle, does
-        // NOT re-bootstrap or shadow the original raft group.
+    fn test_create_zone_repeated_is_noop() {
+        // A second create_zone returns the existing handle; it never
+        // re-bootstraps or shadows the original raft group.
         let (zm, _dir) = make_zm(1);
-        let peers = vec!["nexus-2:2126".to_string(), "nexus-3:2126".to_string()];
-        let h1 = zm.create_zone("z1", peers.clone()).expect("first create");
-        let h2 = zm
-            .create_zone("z1", peers)
-            .expect("second create idempotent");
+        let h1 = zm.create_zone("z1").expect("first create");
+        let h2 = zm.create_zone("z1").expect("second create idempotent");
         assert_eq!(h1.zone_id(), h2.zone_id());
-    }
-
-    #[test]
-    fn test_create_zone_with_different_peers_errors() {
-        // Calling create_zone twice with a different address book is
-        // an operator-config error — surface it explicitly so config
-        // drift doesn't silently mutate ConfState.
-        let (zm, _dir) = make_zm(1);
-        zm.create_zone("z1", vec!["nexus-2:2126".to_string()])
-            .expect("first create");
-        let result = zm.create_zone(
-            "z1",
-            vec!["nexus-2:2126".to_string(), "nexus-3:2126".to_string()],
+        assert_eq!(
+            h1.consensus_node().coherence_id(),
+            h2.consensus_node().coherence_id()
         );
-        match result {
-            Err(RaftError::ZoneAlreadyExistsWithDifferentMembership { .. }) => {}
-            Err(other) => {
-                panic!("expected ZoneAlreadyExistsWithDifferentMembership, got {other:?}")
-            }
-            Ok(_) => panic!("expected ZoneAlreadyExistsWithDifferentMembership, got Ok"),
-        }
     }
 
     #[test]
@@ -2505,7 +2383,7 @@ mod tests {
         // share copies something non-trivial — the propose path against
         // ``new_zone`` is what we're really exercising.
         let parent = zm
-            .create_zone(contracts::ROOT_ZONE_ID, vec![])
+            .create_zone(contracts::ROOT_ZONE_ID)
             .expect("root create");
         assert!(
             parent.wait_for_leader(std::time::Duration::from_secs(5)),
@@ -2522,8 +2400,7 @@ mod tests {
         // Fresh shared zone — created immediately before the share call
         // so the raft tick driver has had no time to elect.  Under the
         // old contract this raced and returned NotLeader.
-        zm.create_zone("sharedzone", vec![])
-            .expect("shared zone create");
+        zm.create_zone("sharedzone").expect("shared zone create");
         let copied = zm
             .share_subtree_core(contracts::ROOT_ZONE_ID, "/shared", "sharedzone")
             .expect("share_subtree_core must wait for new_zone leader internally");
@@ -2543,7 +2420,7 @@ mod tests {
             let zm =
                 ZoneManager::with_node_id("h1", 1, &path, vec![], "127.0.0.1:0", None, None, None)
                     .expect("zm-1");
-            zm.create_zone("z1", vec![]).expect("create");
+            zm.create_zone("z1").expect("create");
             // Drop zm — runtime + gRPC server shut down, redb files
             // remain on disk.
         }
@@ -2553,9 +2430,7 @@ mod tests {
         // with the persisted ConfState; create_zone with identical
         // (empty) peer list must hit the idempotency branch.
         assert!(zm.get_zone("z1").is_some(), "zone reloaded from disk");
-        let _ = zm
-            .create_zone("z1", vec![])
-            .expect("create idempotent on restart");
+        let _ = zm.create_zone("z1").expect("create idempotent on restart");
     }
 }
 

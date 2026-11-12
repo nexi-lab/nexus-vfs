@@ -69,9 +69,12 @@ impl RaftStorage {
             state,
         };
 
-        // Initialize first_index if not set
-        if storage.state.get(KEY_FIRST_INDEX)?.is_none() {
-            storage.state.set(KEY_FIRST_INDEX, &1u64.to_be_bytes())?;
+        // Existing stores need only a read. Initialization checks the current
+        // value again inside its transaction so it preserves a concurrent upgrade.
+        if let Some(bytes) = storage.state.get(KEY_FIRST_INDEX)? {
+            reader_format::LogBoundary::decode(Some(&bytes))?;
+        } else {
+            storage.update_log_boundary(None, false)?;
         }
 
         Ok(storage)
@@ -99,16 +102,7 @@ impl RaftStorage {
 
     /// Get the first index in the log.
     pub fn first_index_impl(&self) -> Result<u64> {
-        match self.state.get(KEY_FIRST_INDEX)? {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| RaftError::Storage("invalid first_index".into()))?;
-                Ok(u64::from_be_bytes(arr))
-            }
-            None => Ok(1),
-        }
+        Ok(reader_format::LogBoundary::decode(self.state.get(KEY_FIRST_INDEX)?.as_deref())?.index)
     }
 
     /// Get the last index in the log.
@@ -138,19 +132,9 @@ impl RaftStorage {
         Ok(last_key)
     }
 
-    /// Append entries to the log.
+    /// Replace the uncommitted suffix and append its new entries atomically.
     pub fn append(&self, entries: &[Entry]) -> Result<()> {
-        let mut batch = self.entries.batch();
-
-        for entry in entries {
-            let key = entry.index.to_be_bytes();
-            let value = protobuf::Message::write_to_bytes(entry)
-                .map_err(|e| RaftError::Serialization(e.to_string()))?;
-            batch.insert(&key, &value);
-        }
-
-        batch.apply()?;
-        Ok(())
+        self.replace_suffix(entries)
     }
 
     /// Set the hard state.
@@ -305,8 +289,16 @@ impl RaftStorage {
             let mut state_table = write_txn
                 .open_table(state_def)
                 .map_err(|e| RaftError::Storage(e.to_string()))?;
+            let first_bytes = self.first_index_bytes(
+                state_table
+                    .get(KEY_FIRST_INDEX)
+                    .map_err(|e| RaftError::Storage(e.to_string()))?
+                    .as_ref()
+                    .map(|value| value.value()),
+                new_first,
+            )?;
             state_table
-                .insert(KEY_FIRST_INDEX, new_first.to_be_bytes().as_slice())
+                .insert(KEY_FIRST_INDEX, first_bytes.as_slice())
                 .map_err(|e| RaftError::Storage(e.to_string()))?;
             state_table
                 .insert(KEY_SNAPSHOT, snapshot_bytes.as_slice())
@@ -372,8 +364,7 @@ impl RaftStorage {
         batch.apply()?;
 
         // Update first_index
-        self.state
-            .set(KEY_FIRST_INDEX, &compact_index.to_be_bytes())?;
+        self.set_first_index(compact_index)?;
 
         Ok(())
     }
@@ -396,6 +387,9 @@ impl RaftStorage {
         }
     }
 }
+
+mod append;
+mod reader_format;
 
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {

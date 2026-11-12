@@ -165,7 +165,7 @@ async fn federation_joins_and_replicates_over_mtls_and_refuses_untrusted_certs()
 
     // ── Founder self-elects on a 1-voter zone ────────────────────────────
     let zone_founder = zm_founder
-        .create_zone("sharedzone", vec![format!("{id_founder}@{bind_founder}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone on founder");
     for _ in 0..100 {
         if zone_founder.is_leader() {
@@ -182,11 +182,7 @@ async fn federation_joins_and_replicates_over_mtls_and_refuses_untrusted_certs()
     let endpoint_joiner = format!("https://{bind_joiner}");
 
     let _zone_joiner_local = zm_joiner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_founder}@{bind_founder}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join_zone(learner) on joiner");
 
     // ── 1. JoinZone over mTLS — the fixed path ───────────────────────────

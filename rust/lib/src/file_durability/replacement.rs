@@ -35,7 +35,7 @@ fn replace_windows(staged: &Path, destination: &Path) -> io::Result<()> {
     };
 
     let destination = std::path::absolute(destination)?;
-    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let mut name: Vec<u16> = destination.as_os_str().encode_wide().collect();
     if name.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -49,10 +49,14 @@ fn replace_windows(staged: &Path, destination: &Path) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replacement path too long"))?;
     let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes as usize)
+        .and_then(|bytes| bytes.checked_add(size_of::<u16>()))
         .and_then(|bytes| u32::try_from(bytes).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replacement path too long"))?;
+    // Win32 consumes a NUL-terminated FileName, even though FileNameLength
+    // excludes that terminator. Struct-alignment padding is not guaranteed.
+    name.push(0);
     // Whole struct elements provide the native alignment and enough trailing
-    // storage for FileName's counted UTF-16 sequence. No terminator is required.
+    // storage for both FileName's counted UTF-16 sequence and its terminator.
     let elements = (buffer_bytes as usize).div_ceil(size_of::<FILE_RENAME_INFO>());
     let mut storage = vec![MaybeUninit::<FILE_RENAME_INFO>::zeroed(); elements];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -61,7 +65,7 @@ fn replace_windows(staged: &Path, destination: &Path) -> io::Result<()> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(staged)?;
     // SAFETY: storage is aligned for FILE_RENAME_INFO and includes every byte
-    // in the counted name. The source handle remains owned through the call;
+    // in the counted name and its terminator. The source handle remains owned through the call;
     // Windows reads this initialized buffer synchronously and retains no pointer.
     let result = unsafe {
         (&raw mut (*info).Anonymous).write(FILE_RENAME_INFO_0 {

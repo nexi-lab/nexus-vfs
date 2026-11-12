@@ -28,15 +28,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-database-bootstrap-${{ matrix.os }}
-      - run: cargo test -p lib --features redb-storage redb_storage --lib
-      - run: cargo test -p lib --features redb-storage file_durability::tests --lib
-      - run: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage::tests raft::replication_log::tests raft::zone_persistence::tests
+      - run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage redb_storage --lib
+      - run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage file_durability::tests --lib
+      - run: 'cargo --config .github/ci/functional-tests.toml test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests raft::zone_persistence::tests'
       - name: Record I/O lifetime on the native filesystem
-        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
       - name: Committed record notifications on the native filesystem
-        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
       - name: Owned WAL I/O and background retirement on the native filesystem
-        run: 'cargo test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
 
   # CAS has a different kernel feature/build graph. On Windows, compiling it
   # after both completed bootstrap suites exhausted the 25-minute job budget
@@ -62,21 +62,21 @@ jobs:
         with:
           shared-key: ci-cas-publication-${{ matrix.os }}
       - name: Kernel boot and CAS publication on the native filesystem
-        run: cargo test -p kernel --test cas_publication --test boot_metastore
+        run: cargo --config .github/ci/functional-tests.toml test -p kernel --test cas_publication --test boot_metastore
       - name: Reject malformed content identifiers before filesystem access
-        run: cargo test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
       - name: Cold peer reads retain their owning zone
-        run: cargo test --locked -p kernel --lib federation::cold_segment::tests
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib federation::cold_segment::tests
       - name: Concurrent mounts retain complete storage pairs
-        run: cargo test --locked -p kernel --lib kernel::mount::tests
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib kernel::mount::tests
       - name: Batch write results and commit notifications on the native filesystem
-        run: cargo test --locked -p kernel --test batch_write_outcomes
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
-        run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
+        run: cargo --config .github/ci/functional-tests.toml test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
       - name: Trusted Kernel WAL admission and platform refusal
-        run: cargo test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
       - name: Logical file size across CAS manifest and partial writes
-        run: cargo test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
 
   durable-runtime-build:
     name: Durable runtime executables / Linux
@@ -228,7 +228,7 @@ jobs:
         with:
           shared-key: ci-runtime-observations-${{ matrix.os }}
       - name: Real RPC instance, ownership, expiry and partial-directory journeys
-        run: cargo test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
 
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}
@@ -252,8 +252,8 @@ jobs:
         with:
           shared-key: ci-process-instances-${{ matrix.os }}
       # Linux exercises these in the full workspace test job below.
-      - run: cargo --config .github/ci/process-instances.toml test -p kernel --no-default-features core::agents::registry --lib
-      - run: cargo --config .github/ci/process-instances.toml test -p managed-agent --all-features --test session_mailbox --test session_resume
+      - run: cargo --config .github/ci/functional-tests.toml test -p kernel --no-default-features core::agents::registry --lib
+      - run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --test session_mailbox --test session_resume
 
   search-windows:
     name: Search FTS / Windows

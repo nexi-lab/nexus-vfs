@@ -50,8 +50,23 @@ fn authenticated_peer(extensions: &http::Extensions) -> Result<Option<Authentica
     Ok(None)
 }
 
-fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+/// The Node or replica id the TLS connection authenticated, `None` on a
+/// plaintext listener.
+pub(super) fn authenticated_node_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
     Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
+}
+
+/// Storage format preparation requires Node authority even on a development
+/// listener. Numeric replica identity alone carries no control authority.
+pub(super) fn require_authenticated_control_node(
+    extensions: &http::Extensions,
+) -> Result<(), Status> {
+    match authenticated_peer(extensions)? {
+        Some(AuthenticatedPeer::Node(_)) => Ok(()),
+        _ => Err(Status::permission_denied(
+            "storage reader preparation requires a cluster Node mTLS connection",
+        )),
+    }
 }
 
 /// Authorize before parsing payloads, learning routes or reading zone data.

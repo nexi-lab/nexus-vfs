@@ -43,7 +43,7 @@ fn unresolved_managed_store_keeps_first_ordinary_reads_open_and_owned_operations
         )
         .unwrap(),
     );
-    let root = runtime.0.create_zone("root", vec![]).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(10)));
     let ready = Arc::new(ZoneMetaStore::new(
         root.consensus_node().clone(),

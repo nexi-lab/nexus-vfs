@@ -26,11 +26,15 @@ mod metadata_rename;
 mod node_identity;
 mod protected_metadata;
 mod record_guard;
+mod replica_activation;
 mod replica_binding;
 mod replica_issuance;
 mod storage_admission;
 pub use conditional_metadata::VersionedMetadata;
 pub use record_guard::GuardedRecordMutation;
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use replica_activation::validate_operation as validate_replica_activation_operation;
+pub use replica_activation::ReplicaControlActivation;
 
 const OWNED_CONTROL_NAMESPACES: &[&str] = &[
     conditional_metadata::NAMESPACE,
@@ -334,6 +338,8 @@ pub enum Command {
     /// Compare issuer/binding authority and publish the original credential
     /// receipt in the same transaction. Appended for log compatibility.
     ApplyReplicaIssuance(Box<contracts::replica_credential::ReplicaIssuanceRequest>),
+    /// Commit the one-way reader-protocol activation and its original operation.
+    ActivateReplicaControl { operation_id: String },
 }
 
 impl Command {
@@ -415,6 +421,11 @@ pub enum CommandResult {
 /// File content is NOT stored in the state machine - it remains in
 /// the content-addressable storage (CAS) backend (S3, GCS, local).
 pub trait StateMachine: Send + Sync {
+    /// The committed activation fact; a transport probe is not a stored fact.
+    fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
+        Ok(None)
+    }
+
     /// Check durable storage requirements against the selected replica policy.
     fn validate_membership_policy(&self, _policy: super::MembershipPolicy) -> Result<()> {
         Ok(())
@@ -429,9 +440,31 @@ pub trait StateMachine: Send + Sync {
         Ok(())
     }
 
+    /// Validate retained state against the original local Raft reader floor.
+    /// Implementations keep their existing refusal unless they own this format.
+    fn validate_storage_reader(
+        &self,
+        policy: super::MembershipPolicy,
+        _replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_membership_policy(policy)
+    }
+
+    /// Validate a snapshot against the admitted transport or retained reader.
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        _replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_snapshot_membership(data, policy)
+    }
+
     /// Admission shared by EC origin, ingress and state-machine apply.
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
-        Ok(command.requires_conditional_sc() || command.requires_replica_sc())
+        Ok(command.requires_conditional_sc()
+            || command.requires_replica_sc()
+            || super::member_address::is_record_command(command))
     }
 
     /// Apply a committed command to the state machine.
@@ -463,6 +496,25 @@ pub trait StateMachine: Send + Sync {
     /// Called when a node receives a snapshot from the leader (typically
     /// when the node is far behind or just joined the cluster).
     fn restore_snapshot(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Apply the state-machine effect of a committed membership entry at
+    /// `index`: the member-address `commands` derived from its ConfChange,
+    /// committed in one transaction with the applied-index marker. An entry
+    /// with no address effect only advances the marker.
+    ///
+    /// Default: a state machine without a control store records the entry
+    /// as applied and nothing else.
+    fn apply_membership(&mut self, index: u64, commands: &[Command]) -> Result<()> {
+        let _ = commands;
+        self.apply(index, &Command::Noop).map(drop)
+    }
+
+    /// Every member-address record this state machine holds, as
+    /// `(node_id, bare host:port)`. Default: none (no control store, e.g. a
+    /// witness).
+    fn member_addresses(&self) -> Result<Vec<(u64, String)>> {
+        Ok(Vec::new())
+    }
 
     /// Apply a command locally for EC (eventual consistency) writes.
     ///
@@ -670,6 +722,19 @@ impl WitnessStateMachineInMemory {
 }
 
 impl StateMachine for WitnessStateMachineInMemory {
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        storage_admission::validate_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
     fn apply(&mut self, index: u64, _command: &Command) -> Result<CommandResult> {
         self.last_applied = index;
         Ok(CommandResult::Success)
@@ -765,6 +830,19 @@ impl WitnessStateMachine {
 }
 
 impl StateMachine for WitnessStateMachine {
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        storage_admission::validate_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
     fn apply(&mut self, index: u64, _command: &Command) -> Result<CommandResult> {
         // Witness nodes don't apply commands - they just track the index
         self.last_index = index;
@@ -1845,6 +1923,17 @@ struct Snapshot {
     last_applied: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn assert_snapshots_equal(left: &[u8], right: &[u8]) {
+    let left: Snapshot = bincode::deserialize(left).unwrap();
+    let right: Snapshot = bincode::deserialize(right).unwrap();
+    assert_eq!(left.metadata, right.metadata);
+    assert_eq!(left.stream_entries, right.stream_entries);
+    assert_eq!(left.control_state, right.control_state);
+    assert_eq!(left.advisory.locks, right.advisory.locks);
+    assert_eq!(left.last_applied, right.last_applied);
+}
+
 impl FullStateMachine {
     /// Shared command dispatch — the actual redb operations.
     ///
@@ -1907,7 +1996,8 @@ impl FullStateMachine {
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
-            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_) => Err(super::RaftError::InvalidState(
+            Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_)
+                | Command::ActivateReplicaControl { .. } => Err(super::RaftError::InvalidState(
                 "replica binding requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -2321,6 +2411,9 @@ impl FullStateMachine {
             Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
             Command::ReserveNodeIdentity(request) => self.reserve_node_identity(txn, request),
             Command::ApplyReplicaIssuance(request) => self.apply_replica_issuance(txn, request),
+            Command::ActivateReplicaControl { operation_id } => {
+                self.activate_replica_control_in_txn(txn, operation_id)
+            }
 
             Command::WriteVersionedMetadata {
                 key,
@@ -2363,6 +2456,95 @@ impl FullStateMachine {
         }
     }
 
+    /// Run `execute` and persist `index` as applied in ONE redb write
+    /// transaction, then publish the new applied index. This matches etcd
+    /// (boltdb txn), CockroachDB (Pebble WriteBatch) and TiKV (RocksDB
+    /// WriteBatch): without atomicity, a crash between the mutation and the
+    /// marker would replay non-idempotent commands on restart and silently
+    /// diverge from other replicas.
+    ///
+    /// Storage errors while applying a committed entry are non-deterministic
+    /// and unrecoverable — if this replica fails but others succeed, state has
+    /// diverged. Following etcd/CockroachDB, they panic (the node must be
+    /// restored from a snapshot).
+    fn commit_applied<R>(
+        &self,
+        index: u64,
+        execute: impl FnOnce(&redb::WriteTransaction) -> R,
+    ) -> R {
+        let db = self.metadata.raw_db();
+        let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
+
+        let write_txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                panic!(
+                    "Fatal: cannot begin write transaction for apply at index {}: {}. \
+                     Node must be restored from snapshot to recover.",
+                    index, e
+                );
+            }
+        };
+
+        let outcome = execute(&write_txn);
+
+        // Persist last_applied in the SAME transaction — atomic with the
+        // command mutations. On crash, either both are persisted or neither.
+        match write_txn.open_table(meta_def) {
+            Ok(mut table) => {
+                if let Err(e) = table.insert(KEY_LAST_APPLIED, index.to_be_bytes().as_slice()) {
+                    panic!(
+                        "Fatal: failed to write last_applied in apply txn at index {}: {}. \
+                         Node must be restored from snapshot to recover.",
+                        index, e
+                    );
+                }
+            }
+            Err(e) => {
+                panic!(
+                    "Fatal: failed to open metadata table for last_applied at index {}: {}. \
+                     Node must be restored from snapshot to recover.",
+                    index, e
+                );
+            }
+        }
+
+        if let Err(e) = write_txn.commit() {
+            panic!(
+                "Fatal: failed to commit apply transaction at index {}: {}. \
+                 Node must be restored from snapshot to recover.",
+                index, e
+            );
+        }
+
+        // Update in-memory state only after successful commit. Release
+        // ordering pairs with Acquire loads in sync readers (e.g. the
+        // gRPC gate helper) so a reader observing a new last_applied
+        // value also sees the metadata write that preceded it.
+        self.last_applied.store(index, Ordering::Release);
+        outcome
+    }
+
+    /// Execute one committed command inside the apply transaction; a storage
+    /// error is fatal (see [`Self::commit_applied`]).
+    fn execute_committed(
+        &self,
+        txn: &redb::WriteTransaction,
+        index: u64,
+        command: &Command,
+    ) -> CommandResult {
+        match self.execute_metadata_in_txn(txn, command) {
+            Ok(result) => result,
+            Err(e) => {
+                panic!(
+                    "Fatal: storage error applying committed entry at index {}: {}. \
+                     Node must be restored from snapshot to recover.",
+                    index, e
+                );
+            }
+        }
+    }
+
     fn is_lock_command(command: &Command) -> bool {
         matches!(
             command,
@@ -2375,6 +2557,28 @@ impl FullStateMachine {
 }
 
 impl StateMachine for FullStateMachine {
+    fn validate_storage_reader(
+        &self,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        self.validate_owned_storage_reader(policy, replica_reader)
+    }
+
+    fn validate_snapshot_reader(
+        &self,
+        data: &[u8],
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        let snapshot: Snapshot = bincode::deserialize(data)?;
+        self.validate_owned_snapshot_reader(&snapshot, policy, replica_reader)
+    }
+
+    fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
+        self.read_replica_control_activation()
+    }
+
     fn validate_membership_policy(&self, policy: super::MembershipPolicy) -> Result<()> {
         self.validate_owned_storage_policy(policy)
     }
@@ -2385,12 +2589,13 @@ impl StateMachine for FullStateMachine {
         policy: super::MembershipPolicy,
     ) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
-        Self::validate_owned_snapshot_policy(&snapshot, policy)
+        self.validate_owned_snapshot_policy(&snapshot, policy)
     }
 
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
         Ok(command.requires_conditional_sc()
             || command.requires_replica_sc()
+            || super::member_address::is_record_command(command)
             || self.ordinary_write_is_protected(command)?)
     }
 
@@ -2630,77 +2835,7 @@ impl StateMachine for FullStateMachine {
             _ => None,
         };
 
-        // Atomic apply: execute the metadata command AND persist
-        // `last_applied` in a single redb write transaction. This
-        // matches etcd (boltdb txn), CockroachDB (Pebble WriteBatch),
-        // and TiKV (RocksDB WriteBatch). Without atomicity, a crash
-        // between execute() and save_last_applied() would cause
-        // non-idempotent commands to replay on restart, silently
-        // diverging from other replicas.
-        let db = self.metadata.raw_db();
-        let meta_def = redb::TableDefinition::<&[u8], &[u8]>::new(self.metadata.name());
-
-        let write_txn = match db.begin_write() {
-            Ok(txn) => txn,
-            Err(e) => {
-                panic!(
-                    "Fatal: cannot begin write transaction for apply at index {}: {}. \
-                     Node must be restored from snapshot to recover.",
-                    index, e
-                );
-            }
-        };
-
-        // Execute the command within the transaction.
-        // Storage errors during apply of committed entries are non-deterministic
-        // and unrecoverable — if this replica fails but others succeed, state
-        // has diverged. Following etcd/CockroachDB: panic to prevent silent
-        // divergence (node must be restored from snapshot).
-        let result = match self.execute_metadata_in_txn(&write_txn, command) {
-            Ok(result) => result,
-            Err(e) => {
-                panic!(
-                    "Fatal: storage error applying committed entry at index {}: {}. \
-                     Node must be restored from snapshot to recover.",
-                    index, e
-                );
-            }
-        };
-
-        // Persist last_applied in the SAME transaction — atomic with the
-        // command mutation. On crash, either both are persisted or neither.
-        match write_txn.open_table(meta_def) {
-            Ok(mut table) => {
-                if let Err(e) = table.insert(KEY_LAST_APPLIED, index.to_be_bytes().as_slice()) {
-                    panic!(
-                        "Fatal: failed to write last_applied in apply txn at index {}: {}. \
-                         Node must be restored from snapshot to recover.",
-                        index, e
-                    );
-                }
-            }
-            Err(e) => {
-                panic!(
-                    "Fatal: failed to open metadata table for last_applied at index {}: {}. \
-                     Node must be restored from snapshot to recover.",
-                    index, e
-                );
-            }
-        }
-
-        if let Err(e) = write_txn.commit() {
-            panic!(
-                "Fatal: failed to commit apply transaction at index {}: {}. \
-                 Node must be restored from snapshot to recover.",
-                index, e
-            );
-        }
-
-        // Update in-memory state only after successful commit. Release
-        // ordering pairs with Acquire loads in sync readers (e.g. the
-        // gRPC gate helper) so a reader observing a new last_applied
-        // value also sees the metadata write that preceded it.
-        self.last_applied.store(index, Ordering::Release);
+        let result = self.commit_applied(index, |txn| self.execute_committed(txn, index, command));
 
         // Fire the unified apply-side observers *after* commit — one
         // spine for federation-mount wiring, DCache invalidation, and
@@ -2717,6 +2852,42 @@ impl StateMachine for FullStateMachine {
         self.emit_apply_observers(index, command, &result, removed_mount_key);
 
         Ok(result)
+    }
+
+    fn apply_membership(&mut self, index: u64, commands: &[Command]) -> Result<()> {
+        if index <= self.last_applied.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let commands = if commands.is_empty() {
+            std::slice::from_ref(&Command::Noop)
+        } else {
+            commands
+        };
+        let results: Vec<CommandResult> = self.commit_applied(index, |txn| {
+            commands
+                .iter()
+                .map(|command| self.execute_committed(txn, index, command))
+                .collect()
+        });
+        for (command, result) in commands.iter().zip(&results) {
+            self.emit_apply_observers(index, command, result, None);
+        }
+        Ok(())
+    }
+
+    fn member_addresses(&self) -> Result<Vec<(u64, String)>> {
+        let prefix = control_key(super::member_address::NAMESPACE, "");
+        let mut records = Vec::new();
+        self.control_state.for_each_prefix(&prefix, |key, value| {
+            if let Some(record) = std::str::from_utf8(&key[prefix.len()..])
+                .ok()
+                .and_then(|key| super::member_address::decode(key, value))
+            {
+                records.push(record);
+            }
+            Ok(true)
+        })?;
+        Ok(records)
     }
 
     fn snapshot(&self) -> Result<Vec<u8>> {
@@ -2772,6 +2943,10 @@ impl StateMachine for FullStateMachine {
 
     fn restore_snapshot(&mut self, data: &[u8]) -> Result<()> {
         let snapshot: Snapshot = bincode::deserialize(data)?;
+
+        // Check the reader format and original activation before replacing any
+        // durable state. The owning driver also checks its membership policy.
+        self.validate_owned_snapshot_policy(&snapshot, super::MembershipPolicy::FixedLocal)?;
 
         // Atomic restore for metadata: clear + repopulate in a single
         // redb transaction. Advisory locks are in-memory only — they

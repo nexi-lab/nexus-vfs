@@ -66,8 +66,18 @@ use super::storage_protocol::StorageProtocol;
 use super::PROPOSAL_TIMEOUT_SECS;
 use super::{Command, CommandResult, RaftError, Result};
 
+#[cfg(all(feature = "grpc", has_protos))]
+mod member_registration;
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use member_registration::MemberRegistration;
 mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
+mod storage_activation;
+pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
+#[cfg(all(feature = "grpc", has_protos))]
+mod replica_preparation;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use replica_preparation::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod storage_submission_tests;
 
@@ -99,42 +109,7 @@ fn channel_try_send_err<T>(e: mpsc::error::TrySendError<T>) -> RaftError {
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
-use crate::transport::{NodeAddress, RaftClientPool, SharedPeerMap};
-
-#[cfg(all(feature = "grpc", has_protos))]
-fn node_address_from_conf_context(
-    node_id: u64,
-    context: &[u8],
-    use_tls: bool,
-) -> Option<NodeAddress> {
-    if context.is_empty() {
-        return None;
-    }
-
-    let address = String::from_utf8_lossy(context).to_string();
-    // A peer advertises a bare `host:port` authority; apply the cluster's
-    // transport scheme so the learned dial endpoint matches the peer's
-    // listener. Under mTLS a plaintext `http://` dial cannot complete the
-    // handshake — the leader→joiner replication direction (which dials the
-    // address recovered here from the AddNode ConfChange) depends on this
-    // becoming `https://`. An already-schemed address is used as-is.
-    let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
-        address
-    } else if use_tls {
-        format!("https://{}", address)
-    } else {
-        format!("http://{}", address)
-    };
-
-    // ConfChange struct carries `node_id` authoritatively; its
-    // `context` bytes carry the address bytes.  Construct directly
-    // via [`NodeAddress::new`] — both authoritative inputs are in
-    // hand, no need to synthesize a peer string and round-trip
-    // through `parse` (which hard-rejects any `id@host:port` shape,
-    // per the retired legacy form).  Raft-internal counterpart to
-    // the CLI-facing `parse` path.
-    Some(NodeAddress::new(node_id, endpoint))
-}
+use crate::transport::{RaftClientPool, SharedPeerMap};
 
 /// Configuration for a Raft node.
 #[derive(Debug, Clone)]
@@ -183,26 +158,6 @@ pub struct RaftConfig {
     /// Per raft contract: joining nodes must NOT bootstrap themselves.
     pub skip_bootstrap: bool,
 
-    /// Founder's advertise address — embedded in the bootstrap
-    /// `AddNode(self)` ConfChange's `context` field so future joiners,
-    /// after replaying that entry, populate their local peer map with
-    /// `(self.id -> bootstrap_self_address)` via the same code path
-    /// runtime `AddNode`/`AddLearnerNode` entries use
-    /// (`node_address_from_conf_context`).  Without this address the
-    /// bootstrap entry is structurally identical to a runtime
-    /// `AddNode` minus an address book entry — joiner reconstructs
-    /// ConfState correctly but has no way to reach the founder, so the
-    /// transport loop never delivers heartbeats and `leader_id` never
-    /// stabilises on the joiner.
-    ///
-    /// Empty `String` is treated as "no address known" — bootstrap
-    /// then writes the entry with an empty `context` (degraded mode,
-    /// joiner must learn the address via inbound transport on first
-    /// contact).  Callers should set this from `ZoneRaftRegistry::self_address()`
-    /// which is populated by `ZoneManager::new` before any zone is
-    /// registered.
-    pub bootstrap_self_address: String,
-
     /// Membership authority selected by the owning runtime.
     pub membership_policy: super::MembershipPolicy,
 }
@@ -219,7 +174,6 @@ impl Default for RaftConfig {
             is_witness: false,
             tick_interval: Duration::from_millis(10),
             skip_bootstrap: false,
-            bootstrap_self_address: String::new(),
             membership_policy: super::MembershipPolicy::Managed,
         }
     }
@@ -306,6 +260,41 @@ pub struct Membership {
     pub learner_matched: Vec<(u64, u64)>,
 }
 
+/// When this node last received a message from its current leader, measured
+/// in memory and never persisted: written by the driver on each step from the
+/// leader, read by the handle for status.
+struct LeaderContact {
+    started: Instant,
+    /// Milliseconds after `started`, plus one; zero before the first contact.
+    last: AtomicU64,
+}
+
+impl LeaderContact {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        self.last
+            .store(elapsed.saturating_add(1), Ordering::Relaxed);
+    }
+
+    fn age(&self) -> Option<Duration> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            last => Some(
+                self.started
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(last - 1)),
+            ),
+        }
+    }
+}
+
 /// Ephemeral read view published by the Raft driver from its ProgressTracker.
 #[derive(Default)]
 struct MembershipSnapshot {
@@ -345,12 +334,42 @@ impl Membership {
 pub enum RaftMsg {
     /// Feed an inbound Raft message (from a peer) into raft-rs.
     Step { msg: Message },
+    /// A network exchange acknowledges the driver's serialized admission.
+    StepTransport {
+        msg: Message,
+        protocol: RaftMessageProtocol,
+        tx: oneshot::Sender<Result<()>>,
+    },
     /// Propose a client command for replication.
     Propose {
         data: Vec<u8>,
         proposal_id: u64,
         tx: oneshot::Sender<Result<CommandResult>>,
     },
+    /// Submit through a native storage authority; the actor checks its domain.
+    ProposeStorage {
+        submission: StorageSubmission,
+        tx: oneshot::Sender<Result<CommandResult>>,
+    },
+    /// Capture the actual configuration before authenticated member probes.
+    StorageActivationView {
+        tx: oneshot::Sender<Result<StorageActivationView>>,
+    },
+    /// Recheck the original configuration after authenticated member preparation.
+    #[cfg(all(feature = "grpc", has_protos))]
+    CompleteReplicaControlPreparation {
+        observed: StorageActivationView,
+        tx: oneshot::Sender<Result<PreparedReplicaControl>>,
+    },
+    /// Consume an authenticated complete-member observation at the owning actor.
+    #[cfg(all(feature = "grpc", has_protos))]
+    ActivateReplicaControl {
+        prepared: PreparedReplicaControl,
+        operation_id: String,
+        tx: oneshot::Sender<Result<CommandResult>>,
+    },
+    /// Durably prepare this driver's local reader before member qualification.
+    PrepareReplicaControlReader { tx: oneshot::Sender<Result<()>> },
     /// Propose a configuration change (add/remove node).
     /// The tx resolves after the ConfChange is **committed and applied** (not just enqueued).
     ProposeConfChange {
@@ -441,6 +460,8 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// is a superset containing learners, witnesses, and stale
     /// wipe-rejoin ghosts).
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
+    /// Last contact from the current leader, written by the driver.
+    leader_contact: Arc<LeaderContact>,
     /// Shared clone of the state machine's ``last_applied`` atomic — not
     /// a second cache, the state machine IS the SSOT for applied index.
     /// ``commit_index`` reflects ``raft_log.committed`` which raft-rs
@@ -494,6 +515,7 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             cached_commit_index: self.cached_commit_index.clone(),
             cached_last_index: self.cached_last_index.clone(),
             cached_membership: self.cached_membership.clone(),
+            leader_contact: self.leader_contact.clone(),
             applied_index_atom: self.applied_index_atom.clone(),
             replication_log: self.replication_log.clone(),
             #[cfg(all(feature = "grpc", has_protos))]
@@ -523,6 +545,13 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// All access must go through the channel ([`RaftMsg`]). Exposing this
     /// field will cause `"not leader but has new msg after advance"` panics.
     raw_node: RawNode<RaftStorage>,
+    /// Process-local identity and configuration generation for probe results.
+    incarnation: Arc<()>,
+    membership_epoch: Option<u64>,
+    /// Derived from the mandatory Raft reader floor; updated after its commit.
+    replica_control_reader_prepared: bool,
+    /// Derived from committed state at boot, apply and snapshot installation.
+    replica_control_active: bool,
     /// Shared state machine (shared with handle for reads).
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
@@ -560,29 +589,24 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     cached_last_index: Arc<AtomicU64>,
     /// Cached membership shared with the handle for status and authorization.
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
-    /// Shared peer map — updated when ConfChange adds/removes nodes.
-    /// Set by `set_peer_map()` before the transport loop starts.
+    /// Last contact from the current leader, shared with the handle.
+    leader_contact: Arc<LeaderContact>,
+    /// Shared peer map whose registered layer this driver derives from the
+    /// applied member-address records. Set by `set_peer_map()` before the
+    /// transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
     peer_map: Option<SharedPeerMap>,
     /// Whether this node dials peers over TLS (the cluster's SSOT, from the
-    /// registry). Set alongside `peer_map`; used to scheme a peer's bare
-    /// advertised `host:port` into an `https://` dial endpoint when a
-    /// ConfChange learns a new member — under mTLS a plaintext dial cannot
-    /// complete the handshake.
+    /// registry). Set alongside `peer_map`; schemes each recorded bare
+    /// `host:port` into the matching `http`/`https` dial endpoint — under
+    /// mTLS a plaintext dial cannot complete the handshake.
     #[cfg(all(feature = "grpc", has_protos))]
     dial_uses_tls: bool,
-    /// Optional apply-callback invoked after every successful
-    /// `set_conf_state` in the ConfChange apply path.  Installed by
-    /// `ZoneRegistry` when the coordinator has an `identity_dir` in
-    /// hand.  Wires the ConfState apply → `identity::persist_zone_members`
-    /// flow that powers S3 完全体 Phase B auto-reconnect after
-    /// `data_dir` wipe.  See `docs/federation-architecture.md` § 6.3.1.
-    ///
-    /// Invoked SYNCHRONOUSLY inside the driver actor.  Kept synchronous
-    /// because ConfChanges are rare (join/leave only) and the disk
-    /// write is a bounded ~1-20 ms fsync — cheap relative to the
-    /// downstream cost of a wipe-rejoin operator escalation.
-    conf_state_applied_cb: Option<ConfStateAppliedCb>,
+    /// Set at construction, after a snapshot install, and when an applied
+    /// batch holds a member-address command or a ConfChange; cleared by
+    /// [`Self::refresh_registered_routes`]. Ordinary applies never set it.
+    #[cfg(all(feature = "grpc", has_protos))]
+    routes_stale: bool,
     /// EC replication WAL (shared with handle via Arc).
     /// Used by the transport loop for EC background replication.
     replication_log: Option<Arc<ReplicationLog>>,
@@ -612,17 +636,6 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// this gate. Updated on snapshot create AND on inbound snapshot install.
     last_index_at_snapshot: u64,
 }
-
-/// Callback fired after every successful ConfState apply.  Installed
-/// by [`ZoneConsensusDriver::set_conf_state_applied_cb`].  The callback
-/// receives a reference to the freshly-committed `ConfState` plus this
-/// node's own id (`self.config.id`) so implementations can determine
-/// this node's role (voter iff `cs.voters.contains(&self_id)`).
-///
-/// `zone_id` is captured by the installing closure (one closure per
-/// zone) — the driver does not need to thread zone identity through
-/// its own state, and a single writeback impl can serve many zones.
-pub type ConfStateAppliedCb = Arc<dyn Fn(&ConfState, u64) + Send + Sync + 'static>;
 
 // ---------------------------------------------------------------------------
 // ZoneConsensus (handle) implementation
@@ -664,11 +677,6 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             // that broke wipe-rejoin: with random IDs no two nodes can
             // independently agree on the same ConfState without a
             // round-trip, so we don't try.
-            //
-            // `config.peers` retains its meaning as the transport
-            // address book (raft messaging needs to know how to reach
-            // peers learned from snapshot's ConfState); it is NOT a
-            // ConfState seed.
             let voters = vec![config.id];
 
             let needs_bootstrap = if initial_state.conf_state.voters.is_empty() {
@@ -738,19 +746,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     RaftError::Storage(format!("failed to set initial ConfState: {e}"))
                 })?;
 
-                // Embed the founder's advertise address in `context` so
-                // a joiner's apply of this entry populates its peer map
-                // with `(config.id -> bootstrap_self_address)` via the
-                // same path runtime conf changes use (see
-                // `node_address_from_conf_context` + the apply branch
-                // around line 1714).  Without this the joiner replays
-                // ConfState correctly but never learns how to reach the
-                // founder; the transport loop has no heartbeat target
-                // and `leader_id` never stabilises.
+                // The entry is pre-applied below and never reaches the
+                // state machine, so it carries no address: the founder
+                // registers its member address with an ordinary put, which
+                // every replica applies identically.
                 let cc = ConfChange {
                     change_type: ConfChangeType::AddNode,
                     node_id: config.id,
-                    context: config.bootstrap_self_address.as_bytes().to_vec().into(),
                     ..Default::default()
                 };
                 let cc_data = protobuf::Message::write_to_bytes(&cc).map_err(|e| {
@@ -860,6 +862,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // durable past bootstrap milestone" invariant against the
         // legitimate just-loaded case.  One call to the SSOT mapping
         // helper pins all four atoms to truth from t=0.
+        let replica_control_active = state_machine.replica_control_activation()?.is_some();
         let state_machine = Arc::new(RwLock::new(state_machine));
         let proposal_id = Arc::new(AtomicU64::new(0));
         let cached_leader_id = Arc::new(AtomicU64::new(0));
@@ -867,6 +870,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let cached_commit_index = Arc::new(AtomicU64::new(0));
         let cached_last_index = Arc::new(AtomicU64::new(0));
         let cached_membership = Arc::new(parking_lot::RwLock::new(MembershipSnapshot::default()));
+        let leader_contact = Arc::new(LeaderContact::new());
         refresh_cached_status_from_raw_node(
             &raw_node,
             &cached_leader_id,
@@ -888,6 +892,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_commit_index: cached_commit_index.clone(),
             cached_last_index: cached_last_index.clone(),
             cached_membership: cached_membership.clone(),
+            leader_contact: leader_contact.clone(),
             applied_index_atom,
             replication_log,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -904,9 +909,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .map(|f| f.saturating_sub(1))
             .unwrap_or(0);
 
+        let replica_control_reader_prepared = raw_node.store().replica_control_reader_required()?;
         let read_request_ids = ReadRequestIds::new(config.id);
         let driver = ZoneConsensusDriver {
             raw_node,
+            incarnation: Arc::new(()),
+            membership_epoch: Some(0),
+            replica_control_reader_prepared,
+            replica_control_active,
             state_machine,
             config,
             pending: HashMap::new(),
@@ -923,11 +933,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_commit_index,
             cached_last_index,
             cached_membership,
+            leader_contact,
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
             #[cfg(all(feature = "grpc", has_protos))]
             dial_uses_tls: false,
-            conf_state_applied_cb: None,
+            #[cfg(all(feature = "grpc", has_protos))]
+            routes_stale: true,
             replication_log: handle.replication_log.clone(),
             snapshot_threshold: std::env::var("NEXUS_SC_SNAPSHOT_THRESHOLD")
                 .ok()
@@ -1017,7 +1029,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         ctx.peers
             .read()
             .ok()?
-            .get(&id)
+            .route(id)
             .map(|addr| addr.to_operator_str())
     }
 
@@ -1056,6 +1068,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Get the current term (atomic read, no channel).
     pub fn term(&self) -> u64 {
         self.cached_term.load(Ordering::Relaxed)
+    }
+
+    /// Time since this node last received a message from its current
+    /// leader: zero on the leader itself, `None` before the first contact
+    /// since this zone became resident. Memory only, never persisted.
+    pub fn leader_contact_age(&self) -> Option<Duration> {
+        if self.is_leader() {
+            Some(Duration::ZERO)
+        } else {
+            self.leader_contact.age()
+        }
     }
 
     /// Snapshot of the current voter set (raft-rs SSOT).
@@ -1410,6 +1433,11 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         command: Command,
         protocol: StorageProtocol,
     ) -> Result<CommandResult> {
+        if command.requires_activation_qualification() {
+            return Err(RaftError::UnsupportedOperation(
+                "protocol activation requires qualified member observation",
+            ));
+        }
         if command.storage_protocol() != Some(protocol) {
             return Err(RaftError::InvalidState(
                 "command belongs to a different storage protocol".into(),
@@ -1417,7 +1445,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
         let (supported, refusal) = match protocol {
             StorageProtocol::ReplicaControl => (
-                self.supports_replica_binding(),
+                self.supports_replica_binding().await?,
                 "replica binding protocol is not activated",
             ),
             StorageProtocol::ConditionalMetadata | StorageProtocol::RecordLifetime => (
@@ -1428,19 +1456,23 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         if !supported {
             return Err(RaftError::UnsupportedOperation(refusal));
         }
-        let receiver = self.enqueue_proposal(&command)?;
-        // Once enqueued, any failure without a proven refusal is ambiguous.
-        // The state machine may have committed before its answer was lost.
-        match super::proposal::wait_for_commit(
-            receiver,
-            tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS),
-        )
-        .await
-        {
-            Err(error @ RaftError::NotLeader { .. }) => Err(error),
-            Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
-            result => result,
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self.leader_hint_addr(),
+            });
         }
+        let (tx, receiver) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::ProposeStorage {
+                submission: StorageSubmission {
+                    command,
+                    protocol,
+                    configuration: None,
+                },
+                tx,
+            })
+            .map_err(channel_try_send_err)?;
+        storage_activation::await_storage_commit(receiver).await
     }
 
     /// The record owner submits through its own admission domain and the
@@ -1460,8 +1492,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
-    pub(crate) fn supports_replica_binding(&self) -> bool {
-        self.config.membership_policy == super::MembershipPolicy::FixedLocal
+    pub(crate) async fn supports_replica_binding(&self) -> Result<bool> {
+        if self.config.membership_policy == super::MembershipPolicy::FixedLocal {
+            return Ok(true);
+        }
+        Ok(self
+            .state_machine
+            .read()
+            .await
+            .replica_control_activation()?
+            .is_some())
     }
 
     #[cfg(all(feature = "grpc", has_protos))]
@@ -1621,7 +1661,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             // honest) rather than surface the bare id.  See
             // RaftError::NotLeader docstring.
             peers
-                .get(&leader_id)
+                .route(leader_id)
                 .cloned()
                 .ok_or(RaftError::NotLeader { leader_hint: None })?
         };
@@ -1824,6 +1864,31 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         rx.await.map_err(|_| RaftError::ProposalDropped)
     }
 
+    /// Observe the owning leader's configuration for authenticated probes.
+    /// The actor rechecks this ephemeral view at storage submission.
+    pub async fn storage_activation_view(&self) -> Result<StorageActivationView> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::StorageActivationView { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
+    /// Prepare the owning driver's durable local reader format.
+    ///
+    /// Voters, learners and witnesses can prepare without leading the zone.
+    /// Success acknowledges the local storage transaction. Member authentication
+    /// and replicated protocol activation have separate authorities. A dropped
+    /// response can follow a committed preparation; repeating it is idempotent.
+    pub async fn prepare_replica_control_reader(&self) -> Result<()> {
+        self.config.membership_policy.require_managed()?;
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::PrepareReplicaControlReader { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
     /// Process a message from another node (sends through channel to driver).
     ///
     /// Uses `send().await` (blocking until space is available) instead of
@@ -1833,7 +1898,39 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// correct behavior: the peer's gRPC call blocks until the driver
     /// can accept the message.
     pub async fn step(&self, msg: Message) -> Result<()> {
+        self.validate_step_message(&msg, RaftMessageProtocol::Legacy)
+            .await?;
+        self.msg_tx
+            .send(RaftMsg::Step { msg })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)
+    }
+
+    /// Acknowledge network admission after the owning driver checks the current
+    /// reader floor. The response does not acknowledge persistence or commit of
+    /// the Raft message. Cancellation leaves normal Raft retransmission intact.
+    #[cfg(any(all(feature = "grpc", has_protos), test))]
+    pub(crate) async fn step_transport(
+        &self,
+        msg: Message,
+        protocol: RaftMessageProtocol,
+    ) -> Result<()> {
+        self.validate_step_message(&msg, protocol).await?;
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .send(RaftMsg::StepTransport { msg, protocol, tx })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
+    async fn validate_step_message(
+        &self,
+        msg: &Message,
+        protocol: RaftMessageProtocol,
+    ) -> Result<()> {
         self.config.membership_policy.require_managed()?;
+        let replica_reader = protocol == RaftMessageProtocol::ReplicaControlV1;
         // ReadIndex also carries entries, whose data is an opaque request
         // context. Only proposal/append entries contain serialized commands.
         if matches!(
@@ -1841,22 +1938,20 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgPropose
         ) {
             for entry in &msg.entries {
-                self.config.membership_policy.validate_entry(entry)?;
+                self.config.membership_policy.validate_entry_for_reader(
+                    entry,
+                    replica_reader && msg.get_msg_type() == raft::eraftpb::MessageType::MsgAppend,
+                )?;
             }
         }
         if msg.has_snapshot() && !msg.get_snapshot().data.is_empty() {
-            self.state_machine
-                .read()
-                .await
-                .validate_snapshot_membership(
-                    &msg.get_snapshot().data,
-                    self.config.membership_policy,
-                )?;
+            self.state_machine.read().await.validate_snapshot_reader(
+                &msg.get_snapshot().data,
+                self.config.membership_policy,
+                replica_reader,
+            )?;
         }
-        self.msg_tx
-            .send(RaftMsg::Step { msg })
-            .await
-            .map_err(|_| RaftError::ChannelClosed)
+        Ok(())
     }
 
     /// Campaign to become leader (sends through channel to driver).
@@ -1879,24 +1974,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         &self.config
     }
 
-    /// Set the shared peer map so ConfChange can update peers at runtime,
-    /// plus this node's dial-TLS posture (the cluster's SSOT via the
-    /// registry) so a ConfChange that learns a new member schemes its bare
-    /// advertised authority into the matching `http`/`https` dial endpoint.
-    /// Must be called before the transport loop starts.
+    /// Set the shared peer map whose registered layer this driver derives
+    /// from the applied member-address records, plus this node's dial-TLS
+    /// posture (the cluster's SSOT via the registry) that schemes each
+    /// record's bare authority into its dial endpoint. Must be called before
+    /// the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
     pub fn set_peer_map(&mut self, peer_map: SharedPeerMap, dial_uses_tls: bool) {
         self.peer_map = Some(peer_map);
         self.dial_uses_tls = dial_uses_tls;
-    }
-
-    /// Install a callback to fire after every ConfState apply.  See
-    /// [`ConfStateAppliedCb`] for the signature contract.  Must be
-    /// called before the transport loop starts — mirrors
-    /// [`Self::set_peer_map`].  Optional: driver runs unchanged when
-    /// no callback is set (test harnesses, embedded mode).
-    pub fn set_conf_state_applied_cb(&mut self, cb: ConfStateAppliedCb) {
-        self.conf_state_applied_cb = Some(cb);
     }
 
     /// Get the EC replication log (if present).
@@ -2077,61 +2163,43 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     fn handle_msg(&mut self, msg: RaftMsg) {
         match msg {
             RaftMsg::Step { msg } => {
-                tracing::trace!(
-                    from = msg.from,
-                    to = msg.to,
-                    msg_type = ?msg.get_msg_type(),
-                    "raft.driver.step"
-                );
-                if let Err(e) = self.raw_node.step(msg) {
-                    tracing::warn!("raft step error: {}", e);
+                if let Err(error) = self.step_message(msg, RaftMessageProtocol::Legacy) {
+                    tracing::warn!(%error, "raft step refused");
                 }
             }
-            RaftMsg::Propose { data, tx, .. } => {
-                // The handle's leader check precedes this queue boundary. Check
-                // again against the actor's actual role before allocating an ID
-                // or calling RawNode::propose, which can otherwise reject a
-                // queued write with the unhelpful generic "proposal dropped".
-                if !self.is_leader() {
-                    self.update_cached_status();
-                    #[cfg(all(feature = "grpc", has_protos))]
-                    let leader_hint = self.peer_map.as_ref().and_then(|peers| {
-                        peers
-                            .read()
-                            .ok()?
-                            .get(&self.raw_node.raft.leader_id)
-                            .map(|address| address.to_operator_str())
-                    });
-                    #[cfg(not(all(feature = "grpc", has_protos)))]
-                    let leader_hint = None;
-                    tracing::debug!(
-                        local_node_id = self.config.id,
-                        leader_node_id = self.raw_node.raft.leader_id,
-                        leader_addr = leader_hint.as_deref().unwrap_or("unknown"),
-                        term = self.raw_node.raft.term,
-                        "leadership changed before local proposal; nothing submitted"
-                    );
-                    let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+            RaftMsg::StepTransport { msg, protocol, tx } => {
+                let _ = tx.send(self.step_message(msg, protocol));
+            }
+            RaftMsg::Propose { data, tx, .. } => self.propose_data(data, tx),
+            RaftMsg::ProposeStorage { submission, tx } => {
+                if let Err(error) = self.validate_storage_submission(&submission) {
+                    let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
                     return;
                 }
-                // Generate the real proposal ID here in the driver
-                let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
-
-                // Prepend proposal ID to the data
-                let mut proposal_data = Vec::with_capacity(8 + data.len());
-                proposal_data.extend_from_slice(&id.to_be_bytes());
-                proposal_data.extend_from_slice(&data);
-
-                tracing::debug!(proposal_id = id, "raft.driver.propose");
-                match self.raw_node.propose(vec![], proposal_data) {
-                    Ok(()) => {
-                        // Store pending — tx will be resolved in apply_entries
-                        self.pending.insert(id, PendingProposal { tx });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(RaftError::Raft(e.to_string())));
+                match bincode::serialize(&submission.command) {
+                    Ok(data) => self.propose_data(data, tx),
+                    Err(error) => {
+                        let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
                     }
                 }
+            }
+            RaftMsg::StorageActivationView { tx } => {
+                let _ = tx.send(self.storage_activation_view());
+            }
+            #[cfg(all(feature = "grpc", has_protos))]
+            RaftMsg::CompleteReplicaControlPreparation { observed, tx } => {
+                let _ = tx.send(self.complete_replica_control_preparation(observed));
+            }
+            #[cfg(all(feature = "grpc", has_protos))]
+            RaftMsg::ActivateReplicaControl {
+                prepared,
+                operation_id,
+                tx,
+            } => {
+                self.submit_replica_activation(prepared, operation_id, tx);
+            }
+            RaftMsg::PrepareReplicaControlReader { tx } => {
+                let _ = tx.send(self.prepare_replica_control_reader());
             }
             RaftMsg::ProposeConfChange { change, tx } => {
                 if let Err(error) = self.config.membership_policy.require_managed() {
@@ -2182,6 +2250,70 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
     }
 
+    fn step_message(&mut self, msg: Message, protocol: RaftMessageProtocol) -> Result<()> {
+        self.admit_raft_protocol(protocol)?;
+        tracing::trace!(from = msg.from, to = msg.to, msg_type = ?msg.get_msg_type(),
+            ?protocol, "raft.driver.step");
+        let from = msg.from;
+        // The RPC acknowledges protocol admission. Raft responses, emitted by
+        // advance after persistence, carry consensus acknowledgement. Preserve
+        // raft-rs's independent rejection of stale or unknown-peer responses.
+        if let Err(error) = self.raw_node.step(msg) {
+            tracing::warn!(%error, "raft step error");
+        }
+        if from != 0 && from != self.config.id && from == self.raw_node.raft.leader_id {
+            self.leader_contact.touch();
+        }
+        Ok(())
+    }
+
+    fn propose_data(&mut self, data: Vec<u8>, tx: oneshot::Sender<Result<CommandResult>>) {
+        // The handle's leader check precedes this queue boundary. Check
+        // again against the actor's actual role before allocating an ID
+        // or calling RawNode::propose, which can otherwise reject a
+        // queued write with the unhelpful generic "proposal dropped".
+        if !self.is_leader() {
+            self.update_cached_status();
+            #[cfg(all(feature = "grpc", has_protos))]
+            let leader_hint = self.peer_map.as_ref().and_then(|peers| {
+                peers
+                    .read()
+                    .ok()?
+                    .route(self.raw_node.raft.leader_id)
+                    .map(|address| address.to_operator_str())
+            });
+            #[cfg(not(all(feature = "grpc", has_protos)))]
+            let leader_hint = None;
+            tracing::debug!(
+                local_node_id = self.config.id,
+                leader_node_id = self.raw_node.raft.leader_id,
+                leader_addr = leader_hint.as_deref().unwrap_or("unknown"),
+                term = self.raw_node.raft.term,
+                "leadership changed before local proposal; nothing submitted"
+            );
+            let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+            return;
+        }
+        // Generate the real proposal ID here in the driver
+        let id = self.proposal_id.fetch_add(1, Ordering::SeqCst);
+
+        // Prepend proposal ID to the data
+        let mut proposal_data = Vec::with_capacity(8 + data.len());
+        proposal_data.extend_from_slice(&id.to_be_bytes());
+        proposal_data.extend_from_slice(&data);
+
+        tracing::debug!(proposal_id = id, "raft.driver.propose");
+        match self.raw_node.propose(vec![], proposal_data) {
+            Ok(()) => {
+                // Store pending — tx will be resolved in apply_entries
+                self.pending.insert(id, PendingProposal { tx });
+            }
+            Err(e) => {
+                let _ = tx.send(Err(RaftError::Raft(e.to_string())));
+            }
+        }
+    }
+
     /// Advance the Raft state machine: tick, process ready, apply entries.
     ///
     /// Returns outgoing messages to be sent to peers. The transport loop
@@ -2197,6 +2329,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             ));
         }
         let result = self.advance_ready().await;
+        #[cfg(all(feature = "grpc", has_protos))]
+        if result.is_ok() && self.routes_stale {
+            self.refresh_registered_routes().await;
+        }
         if result.is_err() {
             self.failed = true;
             self.msg_rx.close();
@@ -2208,6 +2344,32 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             self.cached_leader_id.store(0, Ordering::Release);
         }
         result
+    }
+
+    /// Rebuild the peer map's registered layer from the applied
+    /// member-address records — the only writer of that layer. Runs before
+    /// the messages of the advance that made it stale are sent.
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn refresh_registered_routes(&mut self) {
+        let Some(peer_map) = self.peer_map.clone() else {
+            return;
+        };
+        let records = match self.state_machine.read().await.member_addresses() {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "member addresses unreadable; routes retained");
+                return;
+            }
+        };
+        let routes = records
+            .into_iter()
+            .filter_map(|(id, address)| {
+                super::member_address::endpoint(id, &address, self.dial_uses_tls)
+                    .map(|route| (id, route))
+            })
+            .collect();
+        peer_map.write().unwrap().set_registered(routes);
+        self.routes_stale = false;
     }
 
     async fn advance_ready(&mut self) -> Result<Vec<Message>> {
@@ -2257,6 +2419,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
         // 1. Handle snapshot (received from leader during catch-up / join)
         if !ready.snapshot().is_empty() {
+            self.membership_epoch = self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
             let snapshot = ready.snapshot();
             // A snapshot puts a ConfState in force on this node exactly as applying a
             // ConfChange entry does, so it reports membership in the SAME shape —
@@ -2282,11 +2445,16 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 let mut sm = self.state_machine.write().await;
                 sm.restore_snapshot(&snapshot.data)
                     .map_err(|e| RaftError::Storage(format!("restore snapshot: {e}")))?;
+                self.replica_control_active = sm.replica_control_activation()?.is_some();
             }
             // Reset the cheap compaction gate: the log now starts at the
             // snapshot index, so a freshly-installed follower does not re-open
             // the gate every ready.
             self.last_index_at_snapshot = snapshot.get_metadata().index;
+            #[cfg(all(feature = "grpc", has_protos))]
+            {
+                self.routes_stale = true;
+            }
         }
 
         // 2. Persist entries and hard state
@@ -2499,15 +2667,22 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         let mut sm = self.state_machine.write().await;
 
         for entry in entries {
-            if entry.data.is_empty() {
-                sm.apply(entry.index, &Command::Noop)?;
-                continue;
-            }
-
             match entry.get_entry_type() {
+                // A leader's empty entry, and a V1 entry raft-rs never writes
+                // empty, have no command to apply.
+                EntryType::EntryNormal | EntryType::EntryConfChange if entry.data.is_empty() => {
+                    sm.apply(entry.index, &Command::Noop)?;
+                }
                 EntryType::EntryNormal => {
                     let (proposal_id, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
+                    if command.requires_activation_qualification() {
+                        self.replica_control_active = sm.replica_control_activation()?.is_some();
+                    }
+                    #[cfg(all(feature = "grpc", has_protos))]
+                    if super::member_address::is_record_command(&command) {
+                        self.routes_stale = true;
+                    }
 
                     // Notify waiting proposal (if any) — direct HashMap, no lock
                     if let Some(proposal) = self.pending.remove(&proposal_id) {
@@ -2551,24 +2726,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     // to include the new/removed member before it is used to
                     // catch anyone up (see the field docstring).
                     self.membership_changed_since_snapshot = true;
+                    self.membership_epoch =
+                        self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
 
-                    // Update peer map from ConfChange context (etcd pattern)
                     #[cfg(all(feature = "grpc", has_protos))]
-                    if let Some(ref peer_map) = self.peer_map {
-                        match cc.get_change_type() {
-                            ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
-                                if let Some(address) = node_address_from_conf_context(
-                                    cc.node_id,
-                                    &cc.context,
-                                    self.dial_uses_tls,
-                                ) {
-                                    peer_map.write().unwrap().insert(cc.node_id, address);
-                                }
-                            }
-                            ConfChangeType::RemoveNode => {
-                                peer_map.write().unwrap().remove(&cc.node_id);
-                            }
-                        }
+                    {
+                        self.routes_stale = true;
                     }
 
                     // Emitted on EVERY node that applies the entry, not only the
@@ -2589,16 +2752,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         voter_count = cs.voters.len(),
                         "raft.conf_change.applied",
                     );
-                    sm.apply(entry.index, &Command::Noop)?;
-
-                    // S3 Phase B: mirror the fresh ConfState into
-                    // `identity.json` so a subsequent `data_dir` wipe
-                    // can auto-rejoin.  Sync inline — see field
-                    // docstring for the latency budget.  `zone_id` is
-                    // captured by the callback closure.
-                    if let Some(ref cb) = self.conf_state_applied_cb {
-                        cb(&cs, self.config.id);
-                    }
+                    sm.apply_membership(
+                        entry.index,
+                        &super::member_address::conf_change_commands(
+                            &[(cc.get_change_type(), cc.node_id)],
+                            &cc.context,
+                        ),
+                    )?;
 
                     self.update_cached_status();
 
@@ -2608,6 +2768,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     }
                 }
                 EntryType::EntryConfChangeV2 => {
+                    // An empty V2 is raft-rs's automatic leave of a joint
+                    // configuration; it applies like any other change.
                     let cc: ConfChangeV2 = protobuf::Message::parse_from_bytes(&entry.data)
                         .map_err(|e| RaftError::Serialization(e.to_string()))?;
 
@@ -2648,25 +2810,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     );
                     // Membership changed → refresh the stored snapshot (see V1 arm).
                     self.membership_changed_since_snapshot = true;
+                    self.membership_epoch =
+                        self.membership_epoch.and_then(|epoch| epoch.checked_add(1));
 
                     #[cfg(all(feature = "grpc", has_protos))]
-                    if let Some(ref peer_map) = self.peer_map {
-                        for single in &cc.changes {
-                            match single.get_change_type() {
-                                ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
-                                    if let Some(address) = node_address_from_conf_context(
-                                        single.node_id,
-                                        &cc.context,
-                                        self.dial_uses_tls,
-                                    ) {
-                                        peer_map.write().unwrap().insert(single.node_id, address);
-                                    }
-                                }
-                                ConfChangeType::RemoveNode => {
-                                    peer_map.write().unwrap().remove(&single.node_id);
-                                }
-                            }
-                        }
+                    {
+                        self.routes_stale = true;
                     }
 
                     tracing::info!(
@@ -2675,12 +2824,15 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         voters = ?cs.voters,
                         "raft.conf_change_v2.applied",
                     );
-                    sm.apply(entry.index, &Command::Noop)?;
-
-                    // S3 Phase B: same identity mirror as the V1 arm.
-                    if let Some(ref cb) = self.conf_state_applied_cb {
-                        cb(&cs, self.config.id);
-                    }
+                    let changes: Vec<_> = cc
+                        .changes
+                        .iter()
+                        .map(|single| (single.get_change_type(), single.node_id))
+                        .collect();
+                    sm.apply_membership(
+                        entry.index,
+                        &super::member_address::conf_change_commands(&changes, &cc.context),
+                    )?;
 
                     self.update_cached_status();
 
@@ -2990,33 +3142,6 @@ mod tests {
 
         let (handle, driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
         (handle, driver, dir)
-    }
-
-    #[cfg(all(feature = "grpc", has_protos))]
-    #[test]
-    fn conf_context_address_preserves_explicit_node_id_and_hostname() {
-        // Bare authority + no TLS → http:// dial endpoint (unchanged).
-        let addr = node_address_from_conf_context(42, b"nexus-2:2126", false).expect("address");
-        assert_eq!(addr.id, 42);
-        assert_eq!(addr.hostname, "nexus-2");
-        assert_eq!(addr.port, 2126);
-        assert_eq!(addr.endpoint, "http://nexus-2:2126");
-        // Bare authority + TLS → https:// dial endpoint. The leader→joiner
-        // replication direction dials the address recovered here; under mTLS
-        // a plaintext dial cannot complete the handshake.
-        let tls = node_address_from_conf_context(42, b"nexus-2:2126", true).expect("address");
-        assert_eq!(tls.endpoint, "https://nexus-2:2126");
-    }
-
-    #[cfg(all(feature = "grpc", has_protos))]
-    #[test]
-    fn conf_context_address_accepts_uri_context() {
-        // An already-schemed context is used as-is, regardless of use_tls.
-        let addr =
-            node_address_from_conf_context(42, b"https://nexus-2:2126", false).expect("address");
-        assert_eq!(addr.id, 42);
-        assert_eq!(addr.hostname, "nexus-2");
-        assert_eq!(addr.endpoint, "https://nexus-2:2126");
     }
 
     #[tokio::test]
@@ -3453,6 +3578,146 @@ mod tests {
         }
         assert!(handle.is_leader(), "single voter must self-elect");
         (handle, driver, dir)
+    }
+
+    /// Advance `driver` until the applied membership satisfies `done`.
+    async fn advance_until_membership(
+        driver: &mut ZoneConsensusDriver<FullStateMachine>,
+        done: impl Fn(&Membership) -> bool,
+    ) {
+        for _ in 0..100 {
+            driver.process_messages();
+            driver
+                .advance()
+                .await
+                .expect("advance during membership apply");
+            let state = read_membership(&driver.raw_node);
+            let joint = !driver
+                .raw_node
+                .store()
+                .conf_state()
+                .unwrap()
+                .voters_outgoing
+                .is_empty();
+            if done(&state) && !joint {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "membership change did not apply within the bounded loop: {:?} {:?}",
+            read_membership(&driver.raw_node),
+            driver.raw_node.store().conf_state()
+        );
+    }
+
+    async fn applied_member_addresses(
+        driver: &ZoneConsensusDriver<FullStateMachine>,
+    ) -> (Vec<(u64, String)>, u64) {
+        let sm = driver.state_machine.read().await;
+        let mut records = sm.member_addresses().unwrap();
+        records.sort();
+        (records, sm.last_applied_index())
+    }
+
+    /// A V1 change writes its address effect at its own log index: the
+    /// AddLearnerNode context becomes the learner's record, and RemoveNode
+    /// deletes it, each committed with that entry's applied marker.
+    #[tokio::test]
+    async fn conf_change_v1_writes_and_deletes_the_member_address_at_its_index() {
+        let (_handle, mut driver, _dir) = leader_1voter().await;
+
+        let mut add = ConfChange::default();
+        add.set_change_type(ConfChangeType::AddLearnerNode);
+        add.node_id = 2;
+        add.context = b"https://nexus-2:9000".to_vec().into();
+        driver.raw_node.propose_conf_change(vec![], add).unwrap();
+        let add_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![2]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (vec![(2, "nexus-2:9000".to_string())], add_index)
+        );
+
+        let mut remove = ConfChange::default();
+        remove.set_change_type(ConfChangeType::RemoveNode);
+        remove.node_id = 2;
+        driver.raw_node.propose_conf_change(vec![], remove).unwrap();
+        let remove_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners.is_empty()).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (Vec::new(), remove_index)
+        );
+    }
+
+    /// The V2 arm derives the same effect from the shared context: a single
+    /// add is named, several adds are not, and a removal deletes.
+    #[tokio::test]
+    async fn conf_change_v2_writes_and_deletes_the_member_address_at_its_index() {
+        use raft::eraftpb::ConfChangeSingle;
+        fn v2(changes: &[(ConfChangeType, u64)], context: &[u8]) -> ConfChangeV2 {
+            ConfChangeV2 {
+                changes: changes
+                    .iter()
+                    .map(|&(change_type, node_id)| ConfChangeSingle {
+                        change_type,
+                        node_id,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                context: context.to_vec().into(),
+                ..Default::default()
+            }
+        }
+        let (_handle, mut driver, _dir) = leader_1voter().await;
+
+        driver
+            .raw_node
+            .propose_conf_change(
+                vec![],
+                v2(&[(ConfChangeType::AddLearnerNode, 3)], b"nexus-3:9000"),
+            )
+            .unwrap();
+        let add_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![3]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (vec![(3, "nexus-3:9000".to_string())], add_index)
+        );
+
+        // Two adds share one context, so neither is named; the joint
+        // transition and raft-rs's automatic leave apply without records.
+        driver
+            .raw_node
+            .propose_conf_change(
+                vec![],
+                v2(
+                    &[
+                        (ConfChangeType::AddLearnerNode, 4),
+                        (ConfChangeType::AddLearnerNode, 5),
+                    ],
+                    b"nexus-4:9000",
+                ),
+            )
+            .unwrap();
+        advance_until_membership(&mut driver, |m| m.learners == vec![3, 4, 5]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await.0,
+            vec![(3, "nexus-3:9000".to_string())]
+        );
+
+        driver
+            .raw_node
+            .propose_conf_change(vec![], v2(&[(ConfChangeType::RemoveNode, 3)], b""))
+            .unwrap();
+        let remove_index = driver.raw_node.raft.raft_log.last_index();
+        advance_until_membership(&mut driver, |m| m.learners == vec![4, 5]).await;
+        assert_eq!(
+            applied_member_addresses(&driver).await,
+            (Vec::new(), remove_index)
+        );
     }
 
     /// The promotion gate: a learner is tracked distinctly from voters, and

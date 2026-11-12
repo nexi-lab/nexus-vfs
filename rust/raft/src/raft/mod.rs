@@ -42,6 +42,7 @@
 #[cfg(feature = "consensus")]
 mod apply_observer;
 mod error;
+pub(crate) mod member_address;
 pub mod replication_log;
 mod state_machine;
 mod storage_protocol;
@@ -67,21 +68,26 @@ pub use state_machine::MountApplyEvent;
 pub use state_machine::MountDecl;
 pub use state_machine::{
     AppliedEntry, ApplyObserver, Command, CommandResult, FullStateMachine, GuardedRecordMutation,
-    HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, StateMachine,
-    WitnessStateMachine, WitnessStateMachineInMemory,
+    HolderInfo, LockAcquireResult, LockEntry, LockInfo, LockState, ReplicaControlActivation,
+    StateMachine, WitnessStateMachine, WitnessStateMachineInMemory,
 };
 
 pub use membership_policy::MembershipPolicy;
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) use node::MemberRegistration;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use node::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(feature = "consensus")]
-pub use node::{ConfStateAppliedCb, RaftConfig, RaftMsg, ZoneConsensus, ZoneConsensusDriver};
+pub use node::{
+    RaftConfig, RaftMessageProtocol, RaftMsg, StorageActivationView, StorageSubmission,
+    ZoneConsensus, ZoneConsensusDriver,
+};
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 #[cfg(feature = "consensus")]
 pub use storage::RaftStorage;
 #[cfg(all(feature = "grpc", has_protos))]
 pub use zone_persistence::{DeletionRecord, ZonePersistence};
-#[cfg(all(feature = "grpc", has_protos))]
-pub(crate) use zone_registry::reconcile_peers_with_conf_state;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use zone_registry::wait_until_caught_up;
 #[cfg(all(feature = "grpc", has_protos))]

@@ -16,6 +16,7 @@ pub(super) enum StorageFormat {
     ReplicaBinding,
     NodeIdentity,
     ReplicaIssuance,
+    ReplicaControlActive,
 }
 
 impl StorageFormat {
@@ -27,10 +28,11 @@ impl StorageFormat {
             Self::ReplicaBinding => b"replica-binding-v1",
             Self::NodeIdentity => b"node-identity-v1",
             Self::ReplicaIssuance => b"replica-issuance-v1",
+            Self::ReplicaControlActive => b"managed-replica-control-v2",
         }
     }
 
-    fn decode(bytes: Option<&[u8]>) -> Result<Option<Self>> {
+    pub(super) fn decode(bytes: Option<&[u8]>) -> Result<Option<Self>> {
         match bytes {
             None => Ok(None),
             Some(b"conditional-only-v1") => Ok(Some(Self::Conditional)),
@@ -39,16 +41,24 @@ impl StorageFormat {
             Some(b"replica-binding-v1") => Ok(Some(Self::ReplicaBinding)),
             Some(b"node-identity-v1") => Ok(Some(Self::NodeIdentity)),
             Some(b"replica-issuance-v1") => Ok(Some(Self::ReplicaIssuance)),
+            Some(b"managed-replica-control-v2") => Ok(Some(Self::ReplicaControlActive)),
             Some(_) => Err(storage_error("unsupported control storage format")),
         }
     }
 
-    fn validate_policy(self, policy: MembershipPolicy) -> Result<()> {
+    fn validate_policy(self, policy: MembershipPolicy, replica_reader: bool) -> Result<()> {
+        if policy == MembershipPolicy::Managed
+            && replica_reader
+            && self == Self::ReplicaControlActive
+        {
+            return Ok(());
+        }
         if policy != MembershipPolicy::FixedLocal {
             let records = match self {
-                Self::ReplicaBinding | Self::NodeIdentity | Self::ReplicaIssuance => {
-                    "replica-binding records"
-                }
+                Self::ReplicaBinding
+                | Self::NodeIdentity
+                | Self::ReplicaIssuance
+                | Self::ReplicaControlActive => "replica-binding records",
                 _ => "protected records",
             };
             return Err(RaftError::Config(format!(
@@ -59,7 +69,7 @@ impl StorageFormat {
     }
 }
 
-fn requirement_key() -> Vec<u8> {
+pub(super) fn requirement_key() -> Vec<u8> {
     // Preserve the existing reader admission key. Earlier readers reject an
     // unknown value here before admitting storage or restoring a snapshot.
     control_key(
@@ -68,22 +78,35 @@ fn requirement_key() -> Vec<u8> {
     )
 }
 
-fn validate_requirement(bytes: Option<&[u8]>, policy: MembershipPolicy) -> Result<()> {
+fn validate_requirement(
+    bytes: Option<&[u8]>,
+    policy: MembershipPolicy,
+    replica_reader: bool,
+) -> Result<()> {
     if let Some(required) = StorageFormat::decode(bytes)? {
-        required.validate_policy(policy)?;
+        required.validate_policy(policy, replica_reader)?;
     }
     Ok(())
 }
 
 fn validate_owned_namespaces(
     policy: MembershipPolicy,
-    mut contains: impl FnMut(&[u8]) -> Result<bool>,
+    replica_active: bool,
+    mut contains: impl FnMut(&[u8], Option<&[u8]>) -> Result<bool>,
 ) -> Result<()> {
     if policy == MembershipPolicy::FixedLocal {
         return Ok(());
     }
+    let marker = requirement_key();
     for namespace in OWNED_CONTROL_NAMESPACES {
-        if contains(&control_key(namespace, ""))? {
+        if replica_active && *namespace == contracts::constants::CONTROL_NS_REPLICA {
+            continue;
+        }
+        // The reader marker shares a namespace with protected records. Only
+        // that exact key is exempt; the format ordinal never grants a domain.
+        let except = (replica_active && *namespace == conditional_metadata::NAMESPACE)
+            .then_some(marker.as_slice());
+        if contains(&control_key(namespace, ""), except)? {
             return Err(RaftError::Config(format!(
                 "{namespace} records require qualified fixed-local storage"
             )));
@@ -115,15 +138,24 @@ impl FullStateMachine {
         Ok(())
     }
 
-    pub(super) fn validate_owned_storage_policy(&self, policy: MembershipPolicy) -> Result<()> {
+    pub(super) fn validate_owned_storage_reader(
+        &self,
+        policy: MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        let active = self.read_replica_control_activation()?.is_some();
         validate_requirement(
             self.control_state.get(&requirement_key())?.as_deref(),
             policy,
+            replica_reader,
         )?;
-        validate_owned_namespaces(policy, |prefix| {
-            // One bounded lookup per namespace, independent of its record count.
+        validate_owned_namespaces(policy, active && replica_reader, |prefix, except| {
+            // At most one excluded marker plus one record per namespace.
             let mut found = false;
-            self.control_state.for_each_prefix(prefix, |_, _| {
+            self.control_state.for_each_prefix(prefix, |key, _| {
+                if except == Some(key) {
+                    return Ok(true);
+                }
                 found = true;
                 Ok(false)
             })?;
@@ -131,20 +163,73 @@ impl FullStateMachine {
         })
     }
 
+    pub(super) fn validate_owned_storage_policy(&self, policy: MembershipPolicy) -> Result<()> {
+        self.validate_owned_storage_reader(policy, false)
+    }
+
     pub(super) fn validate_owned_snapshot_policy(
+        &self,
         snapshot: &Snapshot,
         policy: MembershipPolicy,
     ) -> Result<()> {
-        let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
-        validate_requirement(snapshot.control_state.get(&key).map(Vec::as_slice), policy)?;
-        validate_owned_namespaces(policy, |prefix| {
-            Ok(snapshot
-                .control_state
-                .keys()
-                .any(|key| key.as_bytes().starts_with(prefix)))
-        })
+        self.validate_owned_snapshot_reader(snapshot, policy, false)
+    }
+
+    pub(super) fn validate_owned_snapshot_reader(
+        &self,
+        snapshot: &Snapshot,
+        policy: MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        let incoming = snapshot_activation(snapshot)?;
+        if self
+            .read_replica_control_activation()?
+            .is_some_and(|current| incoming.as_ref() != Some(&current))
+        {
+            return Err(RaftError::Config(
+                "snapshot changes the committed replica activation".into(),
+            ));
+        }
+        validate_snapshot_reader(snapshot, policy, replica_reader)
     }
 }
+
+fn snapshot_activation(snapshot: &Snapshot) -> Result<Option<super::ReplicaControlActivation>> {
+    let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
+    let activation_key =
+        String::from_utf8(super::replica_activation::activation_key()).map_err(storage_error)?;
+    super::replica_activation::decode_activation(
+        snapshot.control_state.get(&key).map(Vec::as_slice),
+        snapshot
+            .control_state
+            .get(&activation_key)
+            .map(Vec::as_slice),
+    )
+}
+
+/// Full replicas and witnesses validate the same incoming reader requirements.
+pub(super) fn validate_snapshot_reader(
+    snapshot: &Snapshot,
+    policy: MembershipPolicy,
+    replica_reader: bool,
+) -> Result<()> {
+    let active = snapshot_activation(snapshot)?.is_some();
+    let key = String::from_utf8(requirement_key()).map_err(storage_error)?;
+    validate_requirement(
+        snapshot.control_state.get(&key).map(Vec::as_slice),
+        policy,
+        replica_reader,
+    )?;
+    validate_owned_namespaces(policy, active && replica_reader, |prefix, except| {
+        Ok(snapshot
+            .control_state
+            .keys()
+            .any(|key| key.as_bytes().starts_with(prefix) && except != Some(key.as_bytes())))
+    })
+}
+
+#[cfg(test)]
+mod managed_tests;
 
 #[cfg(test)]
 mod tests {

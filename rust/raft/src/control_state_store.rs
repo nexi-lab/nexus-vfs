@@ -121,8 +121,9 @@ impl ControlStateStore {
             .map_err(|e| format!("control proposal({}): {e}", self.namespace))
     }
 
-    pub(crate) fn supports_replica_binding(&self) -> bool {
-        self.node.supports_replica_binding()
+    pub(crate) fn supports_replica_binding(&self) -> Result<bool, String> {
+        bridge_block_on(&self.runtime, self.node.supports_replica_binding())
+            .map_err(|error| format!("replica activation observation: {error}"))
     }
 
     pub(crate) fn commit_replica_control(&self, command: Command) -> Result<CommandResult, String> {

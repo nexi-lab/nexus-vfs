@@ -69,7 +69,11 @@ pub use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_V
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::transport_primitives::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 #[cfg(all(feature = "grpc", has_protos))]
+mod replica_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
 mod session_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use replica_renewal::{replica_renewal_message, verify_replica_renewal, ReplicaRenewalProof};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use session_renewal::{
     session_renewal_message, verify_session_renewal, VerifiedSessionRenewal,
@@ -130,36 +134,16 @@ pub(crate) async fn forward_propose(
 ) -> crate::raft::Result<crate::raft::CommandResult> {
     use crate::raft::RaftError;
 
-    let raw_bytes =
-        bincode::serialize(command).map_err(|e| RaftError::Serialization(e.to_string()))?;
+    let request = propose_request(command, zone_id, true, deadline)?;
 
     // Get or create a cached API client. Evict if the leader endpoint changed.
     let mut api_client = {
         let mut guard = cached_client.lock().await;
         match guard.take() {
             Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
-            _ => {
-                // Connect with short timeouts — fail fast on unreachable leader.
-                let mut forward_config = client_pool.config().clone();
-                forward_config.connect_timeout = std::time::Duration::from_secs(2);
-                forward_config.request_timeout =
-                    std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
-
-                RaftApiClient::connect(&leader_addr.endpoint, forward_config)
-                    .await
-                    .map_err(|e| RaftError::Transport(e.to_string()))?
-            }
+            _ => connect_proposer(client_pool.config(), &leader_addr.endpoint).await?,
         }
     };
-
-    let mut request = tonic::Request::new(proto::nexus::raft::ProposeRequest {
-        command: None,
-        request_id: String::new(),
-        zone_id: zone_id.to_string(),
-        raw_command: raw_bytes,
-        forwarded: true,
-    });
-    request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
 
     let result = api_client
         .inner_mut()
@@ -181,6 +165,64 @@ pub(crate) async fn forward_propose(
             Err(e)
         }
     }
+}
+
+/// Submit `command` to the node at `endpoint` as an original request
+/// (`forwarded=false`): that node admits it as coming from this node and may
+/// forward it to its own leader. One connection per call — for rare control
+/// writes such as a member's self-registration.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) async fn propose_to(
+    config: &ClientConfig,
+    endpoint: &str,
+    command: &crate::raft::Command,
+    zone_id: &str,
+    deadline: tokio::time::Instant,
+) -> crate::raft::Result<crate::raft::CommandResult> {
+    let request = propose_request(command, zone_id, false, deadline)?;
+    let mut client = connect_proposer(config, endpoint).await?;
+    let response = client
+        .inner_mut()
+        .propose(request)
+        .await
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
+    decode_propose_response(response.into_inner())
+}
+
+/// A Propose RPC carrying `command` as `raw_command`, bounded by `deadline`.
+#[cfg(all(feature = "grpc", has_protos))]
+fn propose_request(
+    command: &crate::raft::Command,
+    zone_id: &str,
+    forwarded: bool,
+    deadline: tokio::time::Instant,
+) -> crate::raft::Result<tonic::Request<proto::nexus::raft::ProposeRequest>> {
+    let raw_command = bincode::serialize(command)
+        .map_err(|e| crate::raft::RaftError::Serialization(e.to_string()))?;
+    let mut request = tonic::Request::new(proto::nexus::raft::ProposeRequest {
+        command: None,
+        request_id: String::new(),
+        zone_id: zone_id.to_string(),
+        raw_command,
+        forwarded,
+    });
+    request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    Ok(request)
+}
+
+/// Connect a proposal client with short timeouts — fail fast on an
+/// unreachable node.
+#[cfg(all(feature = "grpc", has_protos))]
+async fn connect_proposer(
+    config: &ClientConfig,
+    endpoint: &str,
+) -> crate::raft::Result<RaftApiClient> {
+    let mut config = config.clone();
+    config.connect_timeout = std::time::Duration::from_secs(2);
+    config.request_timeout = std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
+    RaftApiClient::connect(endpoint, config)
+        .await
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
@@ -294,31 +336,23 @@ pub(crate) fn open_zone_store(sm_path: std::path::PathBuf) -> Result<crate::stor
     })
 }
 
-/// The transport peer address book for one zone — the dial addresses of the
-/// **other** nodes in the cluster.
+/// The transport route book for one zone — how this node dials each OTHER
+/// member. A cache derived from two sources (`docs/member-address.md`):
 ///
-/// ## Invariant: self is never a peer (enforced by construction)
+/// * **registered** — the zone's applied member-address records, replaced
+///   wholesale by the zone's consensus driver from its state machine
+///   ([`Self::set_registered`]); nothing else writes this layer;
+/// * **observed** — the `sender_address` of authenticated inbound Raft
+///   messages ([`Self::observe`]), held in memory only. An id's observation is
+///   cleared when its registered record changes.
 ///
-/// Under the opaque-ID contract (PR #3996) a node is a *member* of its own
-/// ConfState, not a *transport peer* of itself — it never dials itself. Several
-/// independent paths write this map: runtime `learn_peer_address` (from an
-/// inbound message's `sender_address`), `add_peer` (post-ConfChange), and the
-/// raft ConfChange-apply loop in `RaftNode` (which shares this very `Arc`). A
-/// stray self-entry from any of them — a self-`from` message under churn, or
-/// self appearing in a ConfChange context — would round-trip through
-/// `persist_peers` into `identity.json`, and a later restart would then trip
-/// the boot-time self-exclusion.
-///
-/// Rather than repeat an `if id == self.node_id` guard at every writer (fragile
-/// — a new writer silently reintroduces the bug), this type owns `self_id` and
-/// drops a self-entry inside [`PeerMap::insert`]. The invariant then holds no
-/// matter which path writes. Mutation is possible ONLY through `insert`/`remove`;
-/// reads go through a read-only [`Deref`](std::ops::Deref) to the inner map (no
-/// `DerefMut`), so the guard cannot be bypassed.
+/// [`Self::route`] prefers the observation, then the record. Self is never a
+/// peer: this type owns `self_id` and both writers drop a self-entry.
 #[derive(Debug)]
 pub struct PeerMap {
     self_id: u64,
-    inner: std::collections::HashMap<u64, NodeAddress>,
+    registered: std::collections::HashMap<u64, NodeAddress>,
+    observed: std::collections::HashMap<u64, NodeAddress>,
 }
 
 impl PeerMap {
@@ -326,60 +360,87 @@ impl PeerMap {
     pub fn new(self_id: u64) -> Self {
         Self {
             self_id,
-            inner: std::collections::HashMap::new(),
+            registered: std::collections::HashMap::new(),
+            observed: std::collections::HashMap::new(),
         }
     }
 
-    /// Seed the book from an initial peer set. Any self-entry in `peers` is
-    /// dropped, so the invariant holds even for a pre-poisoned seed (e.g. an
-    /// `identity.json` written before this type existed).
-    pub fn with_peers(self_id: u64, peers: std::collections::HashMap<u64, NodeAddress>) -> Self {
-        let mut map = Self::new(self_id);
-        for (id, addr) in peers {
-            map.insert(id, addr);
-        }
-        map
+    /// The dial address for `id`: its observation, else its record.
+    #[inline]
+    pub fn route(&self, id: u64) -> Option<&NodeAddress> {
+        self.observed.get(&id).or_else(|| self.registered.get(&id))
     }
 
-    /// Insert or update a peer's dial address.
-    ///
-    /// A self-entry (`id == self_id`) is silently dropped — self is not a
-    /// transport peer. Returns `true` if the map changed (a real peer was
-    /// inserted or its address updated), `false` if the entry was self.
-    pub fn insert(&mut self, id: u64, addr: NodeAddress) -> bool {
-        if id == self.self_id {
-            tracing::debug!(
-                self_id = self.self_id,
-                "peer map: dropped self-entry (self is a ConfState member, not a transport peer)"
-            );
+    /// Every routed peer once, as `(id, route)`.
+    pub fn routes(&self) -> impl Iterator<Item = (u64, &NodeAddress)> {
+        self.observed
+            .iter()
+            .map(|(id, address)| (*id, address))
+            .chain(
+                self.registered
+                    .iter()
+                    .filter(|(id, _)| !self.observed.contains_key(id))
+                    .map(|(id, address)| (*id, address)),
+            )
+    }
+
+    /// Whether no peer is routed.
+    pub fn is_empty(&self) -> bool {
+        self.observed.is_empty() && self.registered.is_empty()
+    }
+
+    /// Number of routed peers.
+    pub fn len(&self) -> usize {
+        self.routes().count()
+    }
+
+    /// Clone out the routes (self excluded by the invariant).
+    pub fn snapshot(&self) -> std::collections::HashMap<u64, NodeAddress> {
+        self.routes()
+            .map(|(id, address)| (id, address.clone()))
+            .collect()
+    }
+
+    /// Replace the registered layer with `records` — the zone driver's only
+    /// write, made from the applied member-address records. A self-entry is
+    /// dropped, and every id whose record changed loses its observation.
+    pub(crate) fn set_registered(
+        &mut self,
+        mut records: std::collections::HashMap<u64, NodeAddress>,
+    ) {
+        records.remove(&self.self_id);
+        let observed = &mut self.observed;
+        for (id, address) in &records {
+            if self.registered.get(id) != Some(address) {
+                observed.remove(id);
+            }
+        }
+        for id in self.registered.keys() {
+            if !records.contains_key(id) {
+                observed.remove(id);
+            }
+        }
+        self.registered = records;
+    }
+
+    /// Record `address` observed for `id` on an authenticated inbound
+    /// message. Returns `true` if the route changed; a self-entry, or an
+    /// address the route already has, changes nothing.
+    pub fn observe(&mut self, id: u64, address: NodeAddress) -> bool {
+        if id == self.self_id
+            || self
+                .route(id)
+                .is_some_and(|route| route.endpoint == address.endpoint)
+        {
             return false;
         }
-        self.inner.insert(id, addr);
+        self.observed.insert(id, address);
         true
     }
-
-    /// Remove a peer (e.g. on ConfChange `RemoveNode`).
-    pub fn remove(&mut self, id: &u64) -> Option<NodeAddress> {
-        self.inner.remove(id)
-    }
-
-    /// Clone out the inner address book (self already excluded by the invariant).
-    pub fn snapshot(&self) -> std::collections::HashMap<u64, NodeAddress> {
-        self.inner.clone()
-    }
 }
 
-/// Read-only view of the address book. Mutation is intentionally NOT exposed
-/// (no `DerefMut`) so every write funnels through `insert`/`remove` and the
-/// self-exclusion invariant cannot be bypassed.
-impl std::ops::Deref for PeerMap {
-    type Target = std::collections::HashMap<u64, NodeAddress>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// Shared peer map that can be updated at runtime (e.g., when new nodes join via ConfChange).
+/// Shared route book: written by its zone's driver (registered layer) and by
+/// inbound authentication (observed layer), read by every send path.
 ///
 /// Uses `std::sync::RwLock` (not tokio) because:
 /// - Read/write operations are very fast (HashMap insert/lookup)
@@ -423,75 +484,69 @@ pub mod proto {
 #[cfg(test)]
 mod peer_map_tests {
     use super::{NodeAddress, PeerMap};
+    use std::collections::HashMap;
 
     const SELF_ID: u64 = 1001;
 
-    fn addr(id: u64) -> NodeAddress {
-        NodeAddress::new(id, format!("http://node-{id}:9000"))
+    fn addr(id: u64, port: u16) -> NodeAddress {
+        NodeAddress::new(id, format!("http://node-{id}:{port}"))
+    }
+
+    fn records(entries: &[(u64, u16)]) -> HashMap<u64, NodeAddress> {
+        entries
+            .iter()
+            .map(|&(id, port)| (id, addr(id, port)))
+            .collect()
     }
 
     #[test]
-    fn insert_keeps_other_peers() {
+    fn an_observation_outranks_the_record_until_the_record_changes() {
         let mut m = PeerMap::new(SELF_ID);
-        assert!(m.insert(2002, addr(2002)), "a real peer is stored");
-        assert!(m.insert(3003, addr(3003)));
-        assert_eq!(m.len(), 2);
-        assert!(m.get(&2002).is_some());
-        assert!(m.get(&3003).is_some());
+        m.set_registered(records(&[(2002, 9000), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9000)));
+
+        assert!(m.observe(2002, addr(2002, 9100)), "a new address routes");
+        assert_eq!(m.route(2002), Some(&addr(2002, 9100)));
+        assert!(!m.observe(2002, addr(2002, 9100)), "repeat is unchanged");
+        assert_eq!(m.len(), 2, "each peer routes once");
+
+        // Re-installing identical records keeps the observation.
+        m.set_registered(records(&[(2002, 9000), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9100)));
+
+        // A changed record clears that peer's observation, and only that one.
+        assert!(m.observe(3003, addr(3003, 9300)));
+        m.set_registered(records(&[(2002, 9200), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9200)));
+        assert_eq!(m.route(3003), Some(&addr(3003, 9300)));
+
+        // A removed record clears its observation too.
+        m.set_registered(records(&[(2002, 9200)]));
+        assert_eq!(m.route(3003), None);
+        assert_eq!(m.snapshot(), records(&[(2002, 9200)]));
     }
 
     #[test]
-    fn insert_drops_self() {
+    fn self_is_never_a_peer() {
         let mut m = PeerMap::new(SELF_ID);
-        // Self is a ConfState member, not a transport peer — dropped on insert,
-        // no matter which caller (learn_peer_address, add_peer, ConfChange apply)
-        // hands it to us.
-        assert!(
-            !m.insert(SELF_ID, addr(SELF_ID)),
-            "self returns 'unchanged'"
-        );
-        assert!(m.is_empty(), "self never enters the book");
-        assert!(m.get(&SELF_ID).is_none());
-    }
-
-    #[test]
-    fn with_peers_filters_a_pre_poisoned_seed() {
-        // A seed built from a stale identity.json that already contains self
-        // (written before this invariant existed) must not brick the node.
-        let seed = std::collections::HashMap::from([
-            (SELF_ID, addr(SELF_ID)),
-            (2002, addr(2002)),
-            (3003, addr(3003)),
-        ]);
-        let m = PeerMap::with_peers(SELF_ID, seed);
-        assert_eq!(m.len(), 2, "self filtered out of the seed");
-        assert!(m.get(&SELF_ID).is_none());
-        assert!(m.get(&2002).is_some());
-    }
-
-    #[test]
-    fn remove_and_snapshot() {
-        let mut m = PeerMap::new(SELF_ID);
-        m.insert(2002, addr(2002));
-        m.insert(3003, addr(3003));
-        assert!(m.remove(&2002).is_some());
-        let snap = m.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert!(snap.contains_key(&3003));
-        assert!(!snap.contains_key(&SELF_ID));
-    }
-
-    #[test]
-    fn conf_change_self_add_is_a_noop() {
-        // Mirrors the raft ConfChange-apply path (node.rs): AddNode for self
-        // must not land self in the transport book. The type enforces it — the
-        // apply loop does `peer_map.write().unwrap().insert(id, addr)` with no
-        // self-guard of its own.
-        let mut m = PeerMap::new(SELF_ID);
-        m.insert(2002, addr(2002));
-        let changed = m.insert(SELF_ID, addr(SELF_ID)); // ConfChange::AddNode(self)
-        assert!(!changed);
+        assert!(!m.observe(SELF_ID, addr(SELF_ID, 9000)));
+        m.set_registered(records(&[(SELF_ID, 9000), (2002, 9000)]));
+        assert_eq!(m.route(SELF_ID), None);
         assert_eq!(m.len(), 1);
+        assert!(!m.snapshot().contains_key(&SELF_ID));
+    }
+
+    #[test]
+    fn an_observation_routes_a_peer_without_a_record() {
+        let mut m = PeerMap::new(SELF_ID);
+        assert!(m.is_empty());
+        assert!(m.observe(4004, addr(4004, 9000)));
+        assert!(!m.is_empty());
+        assert_eq!(m.route(4004), Some(&addr(4004, 9000)));
+        // An observation equal to the record adds nothing to hold.
+        m.set_registered(records(&[(5005, 9000)]));
+        assert!(!m.observe(5005, addr(5005, 9000)));
+        assert_eq!(m.len(), 2);
     }
 }
 

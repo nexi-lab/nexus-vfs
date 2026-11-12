@@ -16,7 +16,7 @@ pub enum RaftError {
     /// Node is not the leader.
     ///
     /// `leader_hint` carries the operator-form address (`host:port`) of
-    /// the known leader when the local peer_map has an entry.  It is
+    /// the known leader when the local peer map routes to it.  It is
     /// intentionally NOT the raw u64 node_id: operators and peer AIs
     /// reading the resulting Display line commonly mistake a bare
     /// node_id (locally derived from `hostname_to_node_id(hostname)`)
@@ -35,6 +35,10 @@ pub enum RaftError {
     /// Proposal was dropped (e.g., leader changed).
     #[error("proposal dropped")]
     ProposalDropped,
+
+    /// The owning actor refused admission before submitting anything to Raft.
+    #[error("proposal refused before submission: {0}")]
+    ProposalRejected(String),
 
     /// A remote proposal failed without a definite pre-submission refusal.
     #[error("proposal outcome unknown: {0}")]
@@ -81,19 +85,6 @@ pub enum RaftError {
     /// survives the hop into this vocabulary; see that variant for why it is typed.
     #[error("data dir already open by another process: {0}")]
     DataDirLocked(String),
-
-    /// `create_zone` was called for a zone that already exists with a
-    /// different peer-address-book.  Idempotency holds when the
-    /// requested address book matches the existing one (same set of
-    /// `(hostname, port)` tuples); a different set is operator error
-    /// — surface it loudly rather than silently mutating ConfState.
-    #[error(
-        "zone already exists with different membership: actual={actual:?} requested={requested:?}"
-    )]
-    ZoneAlreadyExistsWithDifferentMembership {
-        actual: Vec<String>,
-        requested: Vec<String>,
-    },
 }
 
 impl RaftError {
@@ -123,7 +114,7 @@ impl RaftError {
             Self::ProposalDropped => true,
             // Answered, and the answer was "not me" or an explicit rejection: nothing
             // was applied by anyone on this path.
-            Self::NotLeader { .. } => false,
+            Self::NotLeader { .. } | Self::ProposalRejected(_) => false,
             // Local faults that never reached consensus.
             Self::Storage(_) | Self::Serialization(_) | Self::Config(_) => false,
             // Everything else is a definite answer from the raft layer.
@@ -318,6 +309,9 @@ mod outcome_tests {
         // Someone answered "not me", so nothing was applied on this path and a caller
         // may retry elsewhere without reading back first.
         assert!(!RaftError::NotLeader { leader_hint: None }.proposal_outcome_unknown());
+        assert!(
+            !RaftError::ProposalRejected("configuration changed".into()).proposal_outcome_unknown()
+        );
         assert!(!RaftError::NotLeader {
             leader_hint: Some("10.0.0.2:2126".into())
         }

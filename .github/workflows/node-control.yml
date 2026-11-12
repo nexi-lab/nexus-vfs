@@ -60,8 +60,9 @@ jobs:
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_binding::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::node_identity::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_issuance::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_activation::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::csr_intent::tests
-          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission
           cargo test --locked -p raft@0.1.0 --test replica_binding_authority
           cargo test --locked -p raft@0.1.0 --test test_durable_storage_admission -- --test-threads=1
           cargo test --locked -p raft@0.1.0 --test test_raft_apply_failure -- --test-threads=1
@@ -76,6 +77,7 @@ jobs:
           cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
+          cargo test --locked -p raft@0.1.0 --lib transport::replica_renewal::tests
           cargo test --locked -p transport --lib peer_identity::tests::owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface
       - name: Raft membership controls EC recipients
         run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests

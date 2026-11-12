@@ -132,7 +132,7 @@ async fn versioned_step_checks_current_replica_zone_membership_on_the_same_chann
     .await;
     let node = server
         .registry
-        .create_zone("shared", vec![], &tokio::runtime::Handle::current())
+        .create_zone("shared", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     node.propose_conf_change(raft::eraftpb::ConfChangeType::AddLearnerNode, 4, Vec::new())
@@ -242,7 +242,7 @@ async fn versioned_client_never_falls_back_on_legacy_peer_or_reconnect() {
     let directory = tempfile::tempdir().unwrap();
     let registry = Arc::new(ZoneRaftRegistry::new(directory.path().to_path_buf(), 7));
     let node = registry
-        .create_zone("root", vec![], &tokio::runtime::Handle::current())
+        .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
     let server = RaftGrpcServer::new(
@@ -320,4 +320,94 @@ async fn versioned_client_never_falls_back_on_legacy_peer_or_reconnect() {
     }
     assert_eq!(legacy.load(Ordering::SeqCst), 2);
     assert_eq!(unsupported.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_preparation_never_falls_back_after_authenticated_legacy_reconnect() {
+    let (ca, key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(7, "root", &ca, &key, &[], None).unwrap();
+    let server_tls = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    };
+    let server = PeerServer::start(server_tls.clone()).await;
+    let endpoint = server.endpoint.clone();
+    let address = endpoint.strip_prefix("http://").unwrap().to_owned();
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
+    let pool = RaftClientPool::with_config(ClientConfig {
+        tls: Arc::new(std::sync::RwLock::new(Some(TlsConfig {
+            ca_pem: ca,
+            cert_pem,
+            key_pem,
+        }))),
+        ..Default::default()
+    });
+    let peer = NodeAddress::new(7, endpoint);
+    let mut client = pool.get_node(&peer).await.unwrap();
+    client.prepare_replica_control_reader("root").await.unwrap();
+    drop(client);
+    pool.remove(7).await;
+    server.shutdown().await;
+
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let unsupported_calls = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let service = LegacyTransport {
+            legacy_calls: legacy_calls.clone(),
+            unsupported_calls: unsupported_calls.clone(),
+        };
+        let incoming = lib::transport_primitives::federated_mtls_incoming(
+            address.parse().unwrap(),
+            &server_tls,
+            None,
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        listener_ready(&address).await;
+        let mut client = pool.get_node(&peer).await.unwrap();
+        let original = legacy_calls.load(Ordering::SeqCst);
+        client
+            .step_message(message(2, 7), "root".into(), String::new())
+            .await
+            .unwrap();
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), original + 1);
+        let before = unsupported_calls.load(Ordering::SeqCst);
+        let error = client
+            .prepare_replica_control_reader("root")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::Status(ref status) if status.code() == tonic::Code::Unimplemented)
+        );
+        assert_eq!(unsupported_calls.load(Ordering::SeqCst), before + 1);
+        let error = client
+            .step_replica_control_v1(message(2, 7), "root".into(), String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransportError::Status(ref status)
+            if status.code() == tonic::Code::Unimplemented));
+        assert_eq!(unsupported_calls.load(Ordering::SeqCst), before + 2);
+        assert_eq!(
+            legacy_calls.load(Ordering::SeqCst),
+            original + 1,
+            "preparation reached the legacy handler"
+        );
+        drop(client);
+        pool.remove(7).await;
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(unsupported_calls.load(Ordering::SeqCst), 4);
 }

@@ -23,8 +23,8 @@ fn default_fetcher_resolves_scoped_files_and_indexed_segments_for_cas_and_pas() 
         None,
     )
     .unwrap();
-    let alice = manager.create_zone("agent-alice", vec![]).unwrap();
-    let bob = manager.create_zone("agent-bob", vec![]).unwrap();
+    let alice = manager.create_zone("agent-alice").unwrap();
+    let bob = manager.create_zone("agent-bob").unwrap();
     assert!(alice.wait_for_leader(Duration::from_secs(10)));
     assert!(bob.wait_for_leader(Duration::from_secs(10)));
     for cas in [false, true] {

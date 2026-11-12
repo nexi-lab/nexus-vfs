@@ -170,18 +170,19 @@ mod grpc_cluster {
             // the opaque-ID contract.
             pre_seed_conf_state(&temp_dirs[i].path().join("default"), &[1, 2, 3]);
 
-            // Create registry and register "default" zone (handles TransportLoop internally)
+            // Create registry and register "default" zone (handles TransportLoop internally).
+            // The pre-seeded members hold no member-address records: each node
+            // registers its own address through its seeds, which also routes
+            // the seeds back to it for the election.
             let registry = Arc::new(ZoneRaftRegistry::new(
                 temp_dirs[i].path().to_path_buf(),
                 node_id,
             ));
+            registry.set_self_address(format!("127.0.0.1:{}", base_port + i as u16));
+            registry.set_seeds(all_peers[i].clone());
 
             let _node = registry
-                .create_zone(
-                    "default",
-                    all_peers[i].clone(),
-                    &tokio::runtime::Handle::current(),
-                )
+                .create_zone("default", &tokio::runtime::Handle::current())
                 .expect("Failed to create zone");
 
             // Start gRPC server in background

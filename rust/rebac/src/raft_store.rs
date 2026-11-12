@@ -133,7 +133,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = RaftReBACTupleStore::new(node, runtime);
@@ -226,7 +226,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -270,7 +270,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -316,7 +316,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
-        let node = registry.create_zone("root", vec![], &runtime).unwrap();
+        let node = registry.create_zone("root", &runtime).unwrap();
         node.campaign().await.unwrap();
         let store = Arc::new(RaftReBACTupleStore::new(node.clone(), runtime));
         let tuple = lib::types::ReBACTuple {

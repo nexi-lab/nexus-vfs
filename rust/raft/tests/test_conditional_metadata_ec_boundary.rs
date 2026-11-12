@@ -59,9 +59,7 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
         None,
     )
     .unwrap();
-    let zone = manager
-        .create_zone(ZONE, vec![format!("1@{bind}")])
-        .unwrap();
+    let zone = manager.create_zone(ZONE).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !zone.is_leader() {
             tokio::time::sleep(Duration::from_millis(20)).await;

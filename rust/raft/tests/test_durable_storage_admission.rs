@@ -10,7 +10,8 @@ use contracts::replica_binding::{
 use kernel::meta_store::{ConditionalMetadataResult, FileMetadata, MetaStore};
 use nexus_raft::{
     raft::{
-        FullStateMachine, RaftConfig, RaftStorage, StateMachine, ZoneConsensus, ZonePersistence,
+        FullStateMachine, RaftConfig, RaftStorage, StateMachine, WitnessStateMachine,
+        ZoneConsensus, ZonePersistence,
     },
     replica_binding_store::RaftReplicaBindingStore,
     storage::RedbStore,
@@ -18,7 +19,7 @@ use nexus_raft::{
     ZoneManager,
 };
 use raft::{
-    eraftpb::{Message, MessageType, Snapshot},
+    eraftpb::{Entry, HardState, Message, MessageType, Snapshot},
     Storage,
 };
 use std::{path::Path, sync::Arc, time::Duration};
@@ -64,7 +65,7 @@ struct Runtime(Arc<ZoneManager>);
 impl Runtime {
     fn open(path: &Path) -> Self {
         let manager = ZoneManager::isolated(path.to_str().unwrap()).unwrap();
-        let root = manager.create_zone("root", vec![]).unwrap();
+        let root = manager.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(5)));
         Self(manager)
     }
@@ -298,6 +299,74 @@ fn replica_format_fixtures_for_previous_reader() {
             install_snapshot(&path, &destination.join(snapshot_name), &snapshot);
         }
     }
+    reader_floor_fixtures(&destination);
+}
+
+fn reader_floor_fixtures(destination: &Path) {
+    for name in ["reader-prepared", "reader-compacted", "reader-snapshot"] {
+        let directory = destination.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let storage = RaftStorage::open(&directory).unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 3;
+        snapshot.mut_metadata().term = 2;
+        snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2];
+        storage
+            .set_conf_state(snapshot.get_metadata().get_conf_state())
+            .unwrap();
+        storage
+            .append(
+                &(1..=3)
+                    .map(|index| Entry {
+                        index,
+                        term: 2,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage
+            .set_hard_state(&HardState {
+                term: 2,
+                vote: 1,
+                commit: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        storage.prepare_replica_control_reader().unwrap();
+        if name == "reader-compacted" {
+            storage.store_snapshot(&snapshot).unwrap();
+            storage.compact(4).unwrap();
+        } else if name == "reader-snapshot" {
+            storage.apply_snapshot(&snapshot).unwrap();
+        }
+        drop(storage);
+
+        // Real current driver boot uses this same retained storage for both
+        // business and witness state machines, including snapshot-only history.
+        for witness in [false, true] {
+            let storage = RaftStorage::open(&directory).unwrap();
+            assert!(storage.replica_control_reader_required().unwrap());
+            let config = RaftConfig {
+                id: 1,
+                is_witness: witness,
+                skip_bootstrap: true,
+                ..Default::default()
+            };
+            let state_store =
+                RedbStore::open(directory.join(if witness { "witness.redb" } else { "full.redb" }))
+                    .unwrap();
+            if witness {
+                let state = WitnessStateMachine::new(&state_store).unwrap();
+                let (node, _driver) = ZoneConsensus::new(config, storage, state, None).unwrap();
+                assert!(node.is_witness());
+            } else {
+                let state = FullStateMachine::new(&state_store).unwrap();
+                let (node, _driver) = ZoneConsensus::new(config, storage, state, None).unwrap();
+                assert!(!node.is_witness());
+            }
+        }
+    }
 }
 
 fn refuse_managed(path: &Path, id: u64, case: Case) {
@@ -388,7 +457,7 @@ fn snapshot_only_restart_refuses_before_restoring_into_an_empty_store() {
                 )
                 .unwrap(),
             );
-            let root = runtime.0.create_zone("root", vec![]).unwrap();
+            let root = runtime.0.create_zone("root").unwrap();
             assert!(root.wait_for_leader(Duration::from_secs(5)));
             assert!(
                 runtime

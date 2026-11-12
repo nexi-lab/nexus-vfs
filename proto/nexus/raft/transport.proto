@@ -29,6 +29,22 @@ service ZoneTransportService {
   // committed protocol activation are checked independently by the receiver.
   rpc StepStorageV1(StepMessageRequest) returns (StepMessageResponse);
 
+  // Replica-control transport carries every Raft exchange after local reader
+  // preparation. Both endpoints authenticate exact cluster Node identities.
+  // The owning driver persists its reader floor before accepting the message;
+  // subsequent legacy exchanges are refused at that same serialized boundary.
+  // This method acknowledges admission, not Raft commit or zone activation.
+  rpc StepReplicaControlV1(StepMessageRequest) returns (StepMessageResponse);
+
+  // Persist the local Raft reader floor for replica-control preparation on an
+  // already hosted Managed zone. Only an authenticated cluster Node may call
+  // this method. Success follows the owning driver's durable transaction on
+  // full nodes, learners and witnesses. Retrying this request is idempotent;
+  // an uncertain response preserves the original zone and destination.
+  // Replicated activation and membership qualification are separate operations.
+  rpc PrepareReplicaControlReaderV1(PrepareReplicaControlReaderRequest)
+      returns (PrepareReplicaControlReaderResponse);
+
   // ReplicateEntries sends EC (eventually consistent) entries to a peer.
   // This is NOT Raft consensus — EC writes bypass Raft and use async replication.
   // Used by the background replication loop (Phase C) for peer data sync.
@@ -234,6 +250,17 @@ service ZoneApiService {
   // ListForeignCas enumerates registered foreign-CA anchors from this daemon's
   // LOCAL control-zone replica (a read). Same node-cert gate.
   rpc ListForeignCas(ListForeignCasRequest) returns (ListForeignCasResponse);
+}
+
+message PrepareReplicaControlReaderRequest {
+  string zone_id = 1;
+}
+message PrepareReplicaControlReaderResponse {
+  // True only after the owning driver durably prepares and enforces
+  // StepReplicaControlV1 for both inbound and outbound traffic. Earlier
+  // readers return an empty reply, which decodes to false. Member-set
+  // validation and replicated activation remain separate.
+  bool replica_control_transport_v1 = 1;
 }
 
 message AgentCsrCapabilitiesRequest {}

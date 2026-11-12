@@ -113,7 +113,7 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
     let mut namespaces = Vec::new();
     let mut metadata = Vec::new();
     for name in ["agent-alice", "conversation-alice-bob", "agent-charlie"] {
-        let zone = manager.create_zone_async(name, vec![]).await.unwrap();
+        let zone = manager.create_zone_async(name).await.unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         let objects = stores.prepare(name).unwrap();
         let source = fetcher.bind(&zone, objects.clone()).unwrap();
