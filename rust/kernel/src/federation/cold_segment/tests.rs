@@ -49,12 +49,12 @@ fn cold_peer_reads_preserve_owning_zone() {
             (
                 "writer:2028".into(),
                 "agent-alice".into(),
-                "/__stream_segments__/agent-alice/history/8".into()
+                "nexus-cold-v1:c2FtZS1oYXNo/agent-alice/history/8".into()
             ),
             (
                 "writer:2028".into(),
                 "agent-bob".into(),
-                "/__stream_segments__/agent-bob/history/8".into()
+                "nexus-cold-v1:c2FtZS1oYXNo/agent-bob/history/8".into()
             ),
         ]
     );

@@ -18,6 +18,17 @@ struct ZoneContentBinding {
     metadata: Arc<ZoneMetaStore>,
 }
 
+impl ZoneContentBinding {
+    fn check_unscoped_io(&self, path: &str) -> Result<(), &'static str> {
+        if let Some(records) = self.metadata.as_guarded_records() {
+            records
+                .check_unscoped_io(&records.record_storage_key(path))
+                .map_err(|_| UNAVAILABLE)?;
+        }
+        Ok(())
+    }
+}
+
 /// The owning runtime binds each admitted zone's metadata and physical store.
 /// The cluster-wide reader retains its existing administrator-only surface.
 pub struct ZoneContentBlobFetcher {
@@ -87,14 +98,11 @@ impl BlobFetcher for ZoneContentBlobFetcher {
         let content_id = content_id.to_owned();
         let zone_id = zone_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            if let Some(segment) =
-                ColdSegmentAddress::parse(&zone_id, &content_id).map_err(|_| UNAVAILABLE)?
+            if let Some(read) =
+                ColdSegmentAddress::parse_read(&zone_id, &content_id).map_err(|_| UNAVAILABLE)?
             {
-                if let Some(records) = binding.metadata.as_guarded_records() {
-                    records
-                        .check_unscoped_io(&records.record_storage_key(segment.stream_path))
-                        .map_err(|_| UNAVAILABLE)?;
-                }
+                let segment = &read.address;
+                binding.check_unscoped_io(segment.stream_path)?;
                 binding
                     .metadata
                     .get(segment.stream_path)
@@ -105,7 +113,9 @@ impl BlobFetcher for ZoneContentBlobFetcher {
                     .metadata
                     .find_stream_segment(&wal_stream_prefix(segment.stream_path), segment.base)
                     .map_err(|_| UNAVAILABLE)?
-                    .filter(|entry| entry.base == segment.base)
+                    .filter(|entry| {
+                        entry.base == segment.base && read.matches_content_id(&entry.content_id)
+                    })
                     .ok_or(UNAVAILABLE)?;
                 return binding
                     .objects
@@ -115,6 +125,7 @@ impl BlobFetcher for ZoneContentBlobFetcher {
             if content_id.starts_with('/') {
                 // Read the zone's own metadata; mount aliases and links cannot
                 // redirect this request into another zone's private directory.
+                binding.check_unscoped_io(&content_id)?;
                 let metadata = binding
                     .metadata
                     .get(&content_id)
