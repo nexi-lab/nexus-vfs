@@ -1,19 +1,26 @@
 //! Native host-to-issuer composition. The public request contains neither a
 //! caller certificate nor an issuer URL: only the boot composition supplies
-//! this daemon's selected TLS identity and the existing CA issuer slot.
+//! this daemon's selected TLS identity and the existing minter slot.
 
 use super::*;
+use lib::transport_primitives::{SharedTlsConfig, TlsSnapshot};
 use nexus_raft::{
     ca_issuer::{CaIssuer, CaIssuerSlot},
-    transport::{current_local_node_certificate, proto::AgentCsrState, TlsConfig},
+    transport::{current_local_node_certificate, proto::AgentCsrState},
 };
 
 pub(crate) struct NativeIssuer {
     slot: CaIssuerSlot,
-    /// This daemon's current Node leaf, replaced on each renewal.
-    node_der: Arc<std::sync::RwLock<Vec<u8>>>,
+    credentials: SharedTlsConfig,
+    node_id: u64,
     issuer_der: Vec<u8>,
     runtime: tokio::runtime::Handle,
+}
+
+pub(super) struct NativeAdmission {
+    installation: TlsSnapshot,
+    minter: Arc<dyn CaIssuer>,
+    node_der: Vec<u8>,
 }
 
 impl NativeIssuer {
@@ -22,68 +29,109 @@ impl NativeIssuer {
     /// its TLS identity or turn this optional capability into a boot failure.
     pub(crate) fn for_host(
         slot: CaIssuerSlot,
-        tls: &TlsConfig,
+        credentials: SharedTlsConfig,
         runtime: tokio::runtime::Handle,
     ) -> Option<Self> {
-        Self::from_tls(slot, tls, runtime).ok()
+        Self::from_shared_tls(slot, credentials, runtime).ok()
     }
 
-    /// Only the trusted profile calls this with the SAME TLS configuration
+    /// Only the trusted profile calls this with the SAME credential source
     /// used by the daemon. This is an in-process native call, not a claim that
     /// a public DER supplied over Call proves possession or Node authority.
-    pub(crate) fn from_tls(
+    pub(crate) fn from_shared_tls(
         slot: CaIssuerSlot,
-        tls: &TlsConfig,
+        credentials: SharedTlsConfig,
         runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
+        let installation = credentials.snapshot();
+        let tls = installation
+            .config()
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("native issuance requires Node TLS"))?;
         let node_der =
             first_certificate_der(&tls.cert_pem, "native Node").map_err(anyhow::Error::msg)?;
         let issuer_der =
             first_certificate_der(&tls.ca_pem, "native issuer").map_err(anyhow::Error::msg)?;
-        current_local_node_certificate(&node_der, &issuer_der).map_err(anyhow::Error::msg)?;
+        let node =
+            current_local_node_certificate(&node_der, &issuer_der).map_err(anyhow::Error::msg)?;
+        credentials
+            .with_current(&installation, || ())
+            .ok_or_else(|| anyhow::anyhow!("native TLS changed during issuer construction"))?;
         Ok(Self {
             slot,
-            node_der: Arc::new(std::sync::RwLock::new(node_der)),
+            credentials,
+            node_id: node.node_id,
             issuer_der,
             runtime,
         })
     }
 
-    /// Follow this daemon's renewed Node identity.
-    pub(crate) fn node_identity_holder(&self) -> nexus_raft::zone_manager::NodeIdentityHolder {
-        let node_der = Arc::clone(&self.node_der);
-        Box::new(
-            move |tls| match first_certificate_der(&tls.cert_pem, "native Node") {
-                Ok(der) => *node_der.write().unwrap_or_else(|e| e.into_inner()) = der,
-                Err(error) => tracing::warn!(%error, "native issuer kept its Node identity"),
-            },
-        )
-    }
-
-    fn node_der(&self) -> Vec<u8> {
-        self.node_der
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub(super) fn minter(&self, ca: &[u8]) -> Result<Arc<dyn CaIssuer>, String> {
+    pub(super) fn admit(&self, ca: &[u8]) -> Result<NativeAdmission, String> {
         if first_certificate_der(ca, "prepared issuer")? != self.issuer_der {
             return Err("prepared issuer differs from the daemon's native TLS authority".into());
         }
-        current_local_node_certificate(&self.node_der(), &self.issuer_der)?;
+        let installation = self.credentials.snapshot();
+        let tls = installation
+            .config()?
+            .ok_or("native issuing TLS is unavailable")?;
+        if first_certificate_der(&tls.ca_pem, "current native issuer")? != self.issuer_der {
+            return Err("native issuer CA changed; original preparation cannot be rebound".into());
+        }
+        let node_der = first_certificate_der(&tls.cert_pem, "current native Node")?;
         let minter = self
             .slot
             .read()
             .clone()
             .ok_or("native CA holder is not installed on this host")?;
-        let capabilities = minter.csr_capabilities();
+        let admitted = NativeAdmission {
+            installation,
+            minter,
+            node_der,
+        };
+        self.with_current(&admitted, || Ok(()))?;
+        Ok(admitted)
+    }
+
+    fn validate(&self, admitted: &NativeAdmission) -> Result<(), String> {
+        admitted.installation.config()?;
+        let node = current_local_node_certificate(&admitted.node_der, &self.issuer_der)?;
+        if node.node_id != self.node_id {
+            return Err("native issuing Node differs from the original host".into());
+        }
+        let capabilities = admitted.minter.csr_capabilities();
         if capabilities.version != 1
             || capabilities.issuer_sha256 != Sha256::digest(&self.issuer_der).to_vec()
         {
             return Err("native issuer does not support the exact prepared CSR authority".into());
         }
-        Ok(minter)
+        Ok(())
+    }
+
+    // No credential/slot lock crosses issuer awaits. Publication and the final
+    // observation are synchronous and linearize against the same installation.
+    // The native issuer continues to own CA/CRL and durable I/F authorization.
+    fn with_current<T>(
+        &self,
+        admitted: &NativeAdmission,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.credentials
+            .with_current(&admitted.installation, || {
+                let slot = self.slot.read();
+                if !slot
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &admitted.minter))
+                {
+                    return Err("native CA holder changed during issuer work".into());
+                }
+                self.validate(admitted)?;
+                let result = action()?;
+                self.validate(admitted)?;
+                Ok(result)
+            })
+            .ok_or_else(|| {
+                "native TLS installation changed or was refused during issuer work".to_string()
+            })?
     }
 }
 
@@ -104,7 +152,7 @@ impl PreparationService {
                 .issuer
                 .as_ref()
                 .ok_or("native managed CSR issuance is unsupported on this host")?;
-            let minter = issuer.minter(&self.ca)?;
+            let admitted = issuer.admit(&self.ca)?;
             let binding = AgentCsrBinding {
                 agent_name: managed.agent(),
                 owner_id: managed.owner(),
@@ -122,47 +170,61 @@ impl PreparationService {
                 .map_err(|e| e.to_string())?;
             response["requestSha256"] = json!(agent_csr_request_digest(pending.request())?);
             response["binding"] = json!({"pid":managed.pid(),"agentId":managed.agent(),"ownerId":managed.owner(),"zone":managed.zone()});
+            issuer.with_current(&admitted, || Ok(()))?;
             response["submissionAttempted"] = json!(verb == "issue_v1");
             // The existing issuer rechecks the native Node, current CA and
             // revocation at every I/F stage. One invocation; no retry/fallback.
             let observed = lib::rt::block_on_via(
                 &issuer.runtime,
-                minter.agent_csr_v1(
-                    Some(issuer.node_der()),
+                admitted.minter.agent_csr_v1(
+                    Some(admitted.node_der.clone()),
                     pending.request().clone(),
                     verb != "issue_v1",
                 ),
             );
             // Keep the attempted flag even when a later validation fails.
-            let state = response_observation(&mut response, &pending, &observed)?;
-            if let Err(error) = managed.ensure_current(registry) {
-                response["issuanceOutcome"] = "unknown".into();
-                response["error"] =
-                    format!("managed binding changed after issuer work: {error}").into();
-                return Ok(());
-            }
-            if verb == "publish_v1" && state == AgentCsrState::Finalized {
-                let directory = self.root.join(format!(
-                    "managed-agent-{}",
-                    Self::operation_key(managed.agent(), managed.owner(), &target.operation_id)
-                ));
-                // This loader is shared with the explicit operator path. It
-                // verifies stored F, caller key/profile and writes manifest last.
-                pending.publish(&observed, &directory)?;
+            issuer.with_current(&admitted, || {
                 managed
                     .ensure_current(registry)
                     .map_err(|e| e.to_string())?;
-                response["credentialPublished"] = true.into();
-                response["localCredentialId"] =
-                    Self::operation_key(managed.agent(), managed.owner(), &target.operation_id)
-                        .into();
-            }
-            Ok(())
+                let state = response_observation(&mut response, &pending, &observed)?;
+                if verb == "publish_v1" && state == AgentCsrState::Finalized {
+                    let directory = self.root.join(format!(
+                        "managed-agent-{}",
+                        Self::operation_key(managed.agent(), managed.owner(), &target.operation_id)
+                    ));
+                    // This loader is shared with the explicit operator path. It
+                    // verifies stored F, caller key/profile and writes manifest last.
+                    pending.publish(&observed, &directory)?;
+                    managed
+                        .ensure_current(registry)
+                        .map_err(|e| e.to_string())?;
+                    response["credentialPublished"] = true.into();
+                    response["localCredentialId"] =
+                        Self::operation_key(managed.agent(), managed.owner(), &target.operation_id)
+                            .into();
+                }
+                Ok(())
+            })
         };
         if let Err(error) = execute() {
             // A prior operation or local publication may already exist.
             // Only explicit query of the SAME key/request can reconcile it.
             response["issuanceOutcome"] = "unknown".into();
+            response["credentialPublished"] = false.into();
+            // Do not release a successful issuer observation from a withdrawn
+            // installation. Keep the original request/operation and attempted
+            // flag: an I/F record or local file may already have been written.
+            for field in [
+                "issuerObservation",
+                "certificateSha256",
+                "localCredentialId",
+            ] {
+                response
+                    .as_object_mut()
+                    .expect("response is an object")
+                    .remove(field);
+            }
             response["error"] = error.into();
         }
         Ok(response)
