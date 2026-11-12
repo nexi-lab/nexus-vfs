@@ -69,7 +69,11 @@ pub use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_V
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::transport_primitives::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 #[cfg(all(feature = "grpc", has_protos))]
+mod replica_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
 mod session_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use replica_renewal::{replica_renewal_message, verify_replica_renewal, ReplicaRenewalProof};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use session_renewal::{
     session_renewal_message, verify_session_renewal, VerifiedSessionRenewal,
