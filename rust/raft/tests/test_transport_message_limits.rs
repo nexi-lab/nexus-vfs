@@ -241,6 +241,7 @@ async fn snapshot_catchup(role: Role, full: bool) {
     metadata.term = leader.term();
     metadata.mut_conf_state().voters = membership.voters;
     metadata.mut_conf_state().learners = membership.learners;
+    let expected_snapshot = message.get_snapshot().clone();
     let mut client = ZoneTransportServiceClient::new(second.channel(node_tls(&ca, &key, 1)).await);
     let response = client
         .step_message(StepMessageRequest {
@@ -253,12 +254,12 @@ async fn snapshot_catchup(role: Role, full: bool) {
         .into_inner();
     assert!(response.success, "{response:?}");
     tokio::time::timeout(Duration::from_secs(10), async {
-        while second.applied_index() < index {
+        while !second.snapshot_ready(index) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("snapshot must actually apply before acceptance");
+    .expect("snapshot must reach the receiver's post-persistence observation");
     if full {
         assert_eq!(
             second
@@ -272,7 +273,7 @@ async fn snapshot_catchup(role: Role, full: bool) {
     }
     drop(client);
     drop(leader);
-    second.shutdown().await;
+    second.shutdown_with_snapshot(&expected_snapshot).await;
     first.shutdown().await;
 }
 
@@ -282,6 +283,6 @@ async fn full_node_applies_large_state_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn witness_applies_large_state_snapshot() {
+async fn witness_persists_large_state_snapshot() {
     snapshot_catchup(Role::Witness, false).await;
 }

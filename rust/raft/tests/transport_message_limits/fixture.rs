@@ -5,6 +5,7 @@ use nexus_raft::{
         WitnessZoneRegistry,
     },
 };
+use raft::{eraftpb::Snapshot, Storage};
 use std::{sync::Arc, time::Duration};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -57,7 +58,7 @@ impl Server {
                     id,
                     Some(tls),
                 ));
-                registry.create_zone(ZONE, vec![1], &handle).unwrap();
+                registry.create_zone(ZONE, Vec::new(), &handle).unwrap();
                 let server = RaftWitnessServer::new(registry.clone(), config);
                 let task = tokio::spawn(async move {
                     server
@@ -121,10 +122,13 @@ impl Server {
         }
     }
 
-    pub fn applied_index(&self) -> u64 {
+    pub fn snapshot_ready(&self, index: u64) -> bool {
         match self.registry.as_ref().unwrap() {
-            Registry::Full(registry) => registry.get_node(ZONE).unwrap().applied_index(),
-            Registry::Witness(registry) => registry.get_node(ZONE).unwrap().applied_index(),
+            Registry::Full(registry) => registry.get_node(ZONE).unwrap().applied_index() >= index,
+            // Witnesses have no shared state-machine applied-index counter.
+            // The driver publishes commit_index after persistence; shutdown
+            // additionally reopens the store and compares the exact snapshot.
+            Registry::Witness(registry) => registry.get_node(ZONE).unwrap().commit_index() >= index,
         }
     }
 
@@ -144,7 +148,15 @@ impl Server {
             .unwrap()
     }
 
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
+        self.finish(None).await;
+    }
+
+    pub async fn shutdown_with_snapshot(self, expected: &Snapshot) {
+        self.finish(Some(expected)).await;
+    }
+
+    async fn finish(mut self, expected: Option<&Snapshot>) {
         self.stop.take().unwrap().send(()).unwrap();
         (&mut self.task).await.unwrap();
         self.stop_registry();
@@ -164,6 +176,15 @@ impl Server {
         })
         .await
         .expect("private actor must release its original store");
+        if let Some(expected) = expected {
+            let metadata = expected.get_metadata();
+            assert_eq!(store.snapshot(metadata.index, 0).unwrap(), *expected);
+            let state = store.initial_state().unwrap();
+            assert_eq!(&state.conf_state, metadata.get_conf_state());
+            assert!(state.hard_state.commit >= metadata.index);
+            assert!(state.hard_state.term >= metadata.term);
+            assert_eq!(store.first_index().unwrap(), metadata.index + 1);
+        }
         drop(store);
         directory
             .close()
