@@ -1204,6 +1204,6 @@ mod tests {
         let listed = store.list("/corp").expect("list from runtime");
         assert_eq!(listed.len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

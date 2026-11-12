@@ -153,11 +153,8 @@ mod tests {
         assert_eq!(store.create(&winner), Err(PolicyError::Revoked));
         store.revoke(SPACE).unwrap();
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
         drop(registry);
-        // Like the existing native restart fixtures: driver/transport cleanup
-        // is asynchronous. This is not a production handoff/lease guarantee.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let node = registry
@@ -169,6 +166,6 @@ mod tests {
         assert_eq!(store.current(SPACE), Err(PolicyError::Revoked));
         assert_eq!(store.create(&winner), Err(PolicyError::Revoked));
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

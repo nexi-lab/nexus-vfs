@@ -418,7 +418,6 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     drop(another_operator);
     drop(store);
     drop(node);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }

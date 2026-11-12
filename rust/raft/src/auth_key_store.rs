@@ -177,7 +177,7 @@ mod tests {
         assert!(!store.delete("hash-a").expect("re-revoke a"));
         assert_eq!(store.list().expect("list after revoke").len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Records are a kernel-internal primitive, not files: they live in
@@ -219,6 +219,6 @@ mod tests {
             "auth record leaked into a file-metadata listing"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

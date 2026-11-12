@@ -117,20 +117,6 @@ pub struct RaftConfig {
     /// Unique node ID within the cluster.
     pub id: u64,
 
-    /// IDs of **OTHER** peer nodes in the cluster (MUST NOT include `self.id`).
-    ///
-    /// raft-rs builds the voter set as `{self.id} ∪ config.peers`. Including
-    /// `self.id` here produces duplicate voter IDs in ConfState, which
-    /// raft-rs's quorum math counts as distinct members and skews the
-    /// required majority (e.g. a 3-voter cluster persisted as
-    /// `[self, self, v2, v3]` would need 3/4 to commit instead of 2/3).
-    ///
-    /// Callers MUST filter out `self.id` before constructing `RaftConfig`.
-    /// As a defense-in-depth, `ZoneConsensus::new` de-duplicates and logs
-    /// a warning when duplicates are detected — treat that warning as a
-    /// caller bug, not a runtime fix.
-    pub peers: Vec<u64>,
-
     /// Number of ticks before triggering election.
     /// An election tick is typically 100-500ms.
     pub election_tick: usize,
@@ -166,7 +152,6 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             id: 1,
-            peers: vec![],
             election_tick: 10,
             heartbeat_tick: 3,
             max_size_per_msg: 1024 * 1024, // 1MB
@@ -189,14 +174,15 @@ impl Default for RaftConfig {
 const WITNESS_ELECTION_TICK: usize = 10_000_000;
 
 impl RaftConfig {
-    /// Create a configuration for a witness node.
-    pub fn witness(id: u64, peers: Vec<u64>) -> Self {
-        let peers = peers.into_iter().filter(|peer_id| *peer_id != id).collect();
+    /// Create a configuration for a witness node. A witness never founds a
+    /// zone, so it never bootstraps a ConfState: its membership is what its
+    /// storage holds, else what the leader's log or snapshot brings.
+    pub fn witness(id: u64) -> Self {
         Self {
             id,
-            peers,
             is_witness: true,
             election_tick: WITNESS_ELECTION_TICK,
+            skip_bootstrap: true,
             ..Default::default()
         }
     }
@@ -3142,7 +3128,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 
@@ -3192,10 +3177,14 @@ mod tests {
         let store = RedbStore::open(dir.path().join("witness")).unwrap();
         let state_machine = WitnessStateMachine::new(&store).unwrap();
 
-        let config = RaftConfig::witness(1, vec![2, 3]);
+        let config = RaftConfig::witness(1);
         let (handle, _driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
 
         assert!(handle.is_witness());
+        assert!(
+            handle.voters().is_empty() && handle.last_index() == 0,
+            "a witness never bootstraps a ConfState of its own"
+        );
     }
 
     #[tokio::test]
@@ -3207,7 +3196,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![2, 3],
             ..Default::default()
         };
 
@@ -3244,7 +3232,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3330,7 +3317,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
         let (handle, mut driver) =
@@ -3424,7 +3410,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
         let (handle, mut driver) =
@@ -3490,8 +3475,8 @@ mod tests {
     /// `ZoneApiService::GetClusterInfo`) reads from raft-rs ConfState,
     /// NOT the transport peer_addrs union that made the leader appear
     /// twice.  Contract: fresh 1-voter bootstrap ⇒ `voters() == [self.id]`;
-    /// handle and driver mirrors agree; no duplicates; `config.peers`
-    /// (the transport address book) does NOT bleed into the voter set.
+    /// handle and driver mirrors agree; no duplicates; the transport
+    /// address book does NOT bleed into the voter set.
     #[tokio::test]
     async fn test_voters_ssot_matches_confstate_not_peer_addrs() {
         let dir = TempDir::new().unwrap();
@@ -3499,15 +3484,12 @@ mod tests {
         let store = RedbStore::open(dir.path().join("sm")).unwrap();
         let state_machine = FullStateMachine::new(&store).unwrap();
 
-        // `peers` is intentionally non-empty: it is the transport
-        // address book, NOT a ConfState seed.  The bug (#7) was that
-        // this list bled into `GetClusterInfo.config.voters`; the fix
-        // pins voters to `cached_membership` populated from raft-rs's
-        // `ProgressTracker`, which for a fresh 1-voter bootstrap
-        // holds exactly `[self.id]`.
+        // The bug (#7) was that the transport address book bled into
+        // `GetClusterInfo.config.voters`; voters come from
+        // `cached_membership` populated from raft-rs's `ProgressTracker`,
+        // which for a fresh 1-voter bootstrap holds exactly `[self.id]`.
         let config = RaftConfig {
             id: 42,
-            peers: vec![7, 99, 42],
             ..Default::default()
         };
         let (handle, driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
@@ -3564,7 +3546,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3803,7 +3784,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 
@@ -3836,7 +3816,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3964,7 +3943,6 @@ mod tests {
             let config = RaftConfig {
                 id,
                 // Address book — no ConfState role anymore.
-                peers: vec![],
                 skip_bootstrap: true,
                 tick_interval: Duration::from_millis(10),
                 ..Default::default()
@@ -4084,13 +4062,9 @@ mod tests {
 
     /// Regression test: single-node ConfState must include self as voter.
     ///
-    /// Before the fix, empty `config.peers` skipped ConfState bootstrap,
-    /// leaving the voter set empty.  This violated raft-rs's contract:
-    /// `RawNode` expects the node to be in the voter set before `campaign()`.
-    /// The result was a panic at `raft.rs:1225` (`unwrap()` on `None`).
-    ///
-    /// The fix: bootstrap ConfState with `voters=[self.id]` even when
-    /// `config.peers` is empty (single-node cluster).
+    /// raft-rs's `RawNode` expects the node to be in the voter set before
+    /// `campaign()`; an empty voter set panics at `raft.rs:1225`. A founder's
+    /// bootstrap writes ConfState `voters=[self.id]`.
     ///
     /// This test is deterministic: no async, no timers, no polling.
     /// It verifies the persisted ConfState directly after ZoneConsensus::new().
@@ -4106,7 +4080,6 @@ mod tests {
 
             let config = RaftConfig {
                 id: 1,
-                peers: vec![], // single-node: no peers
                 ..Default::default()
             };
 
@@ -4123,43 +4096,6 @@ mod tests {
             state.conf_state.voters,
             vec![1],
             "Single-node ConfState must include self as voter"
-        );
-    }
-
-    /// Pin the opaque-ID contract: bootstrap (`skip_bootstrap=false`)
-    /// produces a 1-voter ConfState consisting of `config.id` only,
-    /// regardless of `config.peers`.  Multi-voter ConfState only forms
-    /// via ConfChangeV2 AddNode driven by JoinZone, never via boot-
-    /// time peer-list seeding.  See
-    /// `docs/rfcs/adr-raft-node-id-opaque.md`.
-    #[test]
-    fn test_bootstrap_produces_single_voter_conf_state() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let storage = RaftStorage::open(dir.path()).unwrap();
-            let store = RedbStore::open(dir.path().join("sm")).unwrap();
-            let state_machine = FullStateMachine::new(&store).unwrap();
-
-            let config = RaftConfig {
-                id: 1,
-                // Peers in this slot are an *address book* under the
-                // new contract, not ConfState seeds — bootstrap must
-                // still produce voters=[1].
-                peers: vec![2, 3],
-                ..Default::default()
-            };
-
-            let (_handle, _driver) =
-                ZoneConsensus::new(config, storage, state_machine, None).unwrap();
-        }
-
-        let storage = RaftStorage::open(dir.path()).unwrap();
-        let state = Storage::initial_state(&storage).unwrap();
-        assert_eq!(
-            state.conf_state.voters,
-            vec![1],
-            "bootstrap must produce a 1-voter ConfState (self only)",
         );
     }
 
@@ -4196,7 +4132,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 

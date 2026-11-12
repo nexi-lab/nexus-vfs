@@ -90,20 +90,8 @@ async fn all_configured_learners_prepare_but_unconfigured_routes_do_not() {
     drop((node, second_node, third_node, pool));
     for server in [first, second, third] {
         let directory = server.stop().await;
-        let storage = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match nexus_raft::raft::RaftStorage::open(directory.path().join(zone).join("raft"))
-                {
-                    Ok(storage) => break storage,
-                    Err(error) => {
-                        assert!(error.to_string().contains("already open"), "{error}");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let storage =
+            nexus_raft::raft::RaftStorage::open(directory.path().join(zone).join("raft")).unwrap();
         assert!(storage.replica_control_reader_required().unwrap());
     }
 }

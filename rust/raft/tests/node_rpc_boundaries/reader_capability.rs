@@ -139,11 +139,10 @@ async fn empty_durable_reader_reply_cannot_qualify_transport_on_the_same_node_ch
     drop(clients);
     stop.send(()).unwrap();
     task.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(node);
     drop(registry);
     assert!(reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }
@@ -218,10 +217,9 @@ async fn all_member_preparation_refuses_an_old_member_even_when_the_quorum_is_cu
     first.stop().await;
     stop.send(()).unwrap();
     task.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop((old_node, registry));
     assert!(reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }

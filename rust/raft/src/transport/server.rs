@@ -2497,12 +2497,10 @@ pub async fn serve_node_enrollment(
 struct WitnessZoneEntry {
     node: ZoneConsensus<WitnessStateMachine>,
     /// Per-zone route book. A witness state machine holds no member-address
-    /// records, so its routes are the observed senders; ``auto_join_zone``
-    /// reads root's routes for a new zone's voter roster.
+    /// records, so its routes are the observed senders.
     peers: SharedPeerMap,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    _transport_handle: JoinHandle<()>,
-    _registration_handle: Option<JoinHandle<()>>,
+    /// The transport loop and member-address registration running the zone.
+    tasks: super::ZoneTasks,
 }
 
 /// Multi-zone registry for witness nodes.
@@ -2515,10 +2513,13 @@ pub struct WitnessZoneRegistry {
     base_path: PathBuf,
     node_id: u64,
     tls: Arc<RwLock<Option<super::TlsConfig>>>,
-    /// Cluster peer addresses — used by auto_join_zone() for transport routing.
+    /// Operator seed addresses (`NEXUS_PEERS`): JoinZone and member-address
+    /// registration targets.
     peers: Vec<NodeAddress>,
     /// This node's advertise address — carried in outbound StepMessage.
     self_address: String,
+    /// Set by [`Self::shutdown`]: no zone opens, and boot joins stop.
+    closed: std::sync::atomic::AtomicBool,
     /// Serializes ``auto_join_zone`` so concurrent step_messages from
     /// multiple data nodes for the same fresh zone don't both pass the
     /// ``zones.get()`` check, both call ``setup_witness_zone``, and
@@ -2545,6 +2546,7 @@ impl WitnessZoneRegistry {
             tls: Arc::new(RwLock::new(tls)),
             peers: Vec::new(),
             self_address: String::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
             auto_join_lock: parking_lot::Mutex::new(()),
         }
     }
@@ -2580,33 +2582,6 @@ impl WitnessZoneRegistry {
             endpoint,
             self.tls.read().unwrap().is_some(),
         )
-    }
-
-    /// Create a witness Raft group for a zone (static bootstrap).
-    ///
-    /// Opens zone-specific storage at `{base_path}/{zone_id}/`, creates a
-    /// `ZoneConsensus<WitnessStateMachine>`, and spawns a `TransportLoop` task.
-    #[allow(clippy::result_large_err)]
-    pub fn create_zone(
-        &self,
-        zone_id: &str,
-        peers: Vec<NodeAddress>,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use crate::raft::RaftConfig;
-
-        if self.zones.contains_key(zone_id) {
-            return Err(TransportError::Connection(format!(
-                "Witness zone '{}' already exists",
-                zone_id
-            )));
-        }
-
-        // Witness RaftConfig (no replication log, cannot become leader)
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
-        let config = RaftConfig::witness(self.node_id, peer_ids);
-
-        self.setup_witness_zone(zone_id, config, runtime_handle)
     }
 
     /// Bootstrap or join a zone at boot time under the opaque-ID
@@ -2648,6 +2623,11 @@ impl WitnessZoneRegistry {
         // be held across the `.await` below (RwLockReadGuard is not Send).
         let tls = self.tls.read().unwrap().clone();
         loop {
+            if self.is_closed() {
+                return Err(TransportError::Connection(format!(
+                    "witness shut down before zone '{zone_id}' joined"
+                )));
+            }
             for peer in &peers {
                 if peer.id == self.node_id {
                     continue;
@@ -2711,15 +2691,43 @@ impl WitnessZoneRegistry {
         }
     }
 
-    /// Auto-join a zone when receiving Raft messages for an unknown zone.
+    /// Join each of `zones` at boot, one task per zone: each resumes and
+    /// retries on its own (see [`Self::bootstrap_or_join_zone`]), so a zone
+    /// whose leader cannot be reached delays no other.
+    pub fn join_at_boot(
+        self: &Arc<Self>,
+        zones: Vec<String>,
+        retry_interval: std::time::Duration,
+    ) -> Vec<JoinHandle<()>> {
+        zones
+            .into_iter()
+            .map(|zone_id| {
+                let registry = Arc::clone(self);
+                tokio::spawn(async move {
+                    match registry
+                        .bootstrap_or_join_zone(&zone_id, false, 5, retry_interval)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(zone = %zone_id, "Witness joined zone"),
+                        Err(_) if registry.is_closed() => {}
+                        Err(error) => tracing::error!(
+                            zone = %zone_id,
+                            %error,
+                            "Witness JoinZone failed permanently",
+                        ),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Open a witness replica of `zone_id` — on an inbound Raft message for a
+    /// zone not yet open, and for the boot join.
     ///
-    /// A zone this witness holds on disk resumes its stored raft state, whose
-    /// ConfState is the authority. A fresh zone with no known roster starts
-    /// with `skip_bootstrap=true` (empty ConfState) and the leader's snapshot
-    /// brings the correct one — the standard raft-rs contract for
-    /// late-joining nodes.
-    ///
-    /// Used by step_message() handler for dynamic zone support.
+    /// A witness never founds a zone: the replica starts with
+    /// `skip_bootstrap=true`, so its membership is the ConfState it stored
+    /// for a zone it holds on disk, else empty until the leader's log or
+    /// snapshot brings it — the raft-rs contract for a late-joining node.
     #[allow(clippy::result_large_err)]
     pub fn auto_join_zone(
         &self,
@@ -2748,34 +2756,14 @@ impl WitnessZoneRegistry {
         if let Some(existing) = self.zones.get(zone_id) {
             return Ok(existing.node.clone());
         }
+        // Under the same lock `shutdown` drains under: no zone opens after it.
+        if self.is_closed() {
+            return Err(TransportError::Connection(format!(
+                "witness is shut down; zone '{zone_id}' does not open"
+            )));
+        }
 
-        let peer_ids: Vec<u64> = if self.holds_zone(zone_id) {
-            Vec::new()
-        } else {
-            self.current_auto_join_peers()
-                .iter()
-                .map(|p| p.id)
-                .collect()
-        };
-        let config = if peer_ids.is_empty() {
-            // Resuming, or no known roster yet: never bootstrap; the stored
-            // or the leader's snapshot ConfState is the membership.
-            RaftConfig {
-                id: self.node_id,
-                peers: vec![],
-                is_witness: true,
-                skip_bootstrap: true,
-                election_tick: 10_000_000, // witness never initiates election
-                ..Default::default()
-            }
-        } else {
-            // Dynamic federation zones are initially bootstrapped from a
-            // static voter roster; that ConfState is not a log entry. If the
-            // witness auto-joins with an empty ConfState it can replay appends
-            // but never learn that it may vote, so failover loses quorum.
-            RaftConfig::witness(self.node_id, peer_ids)
-        };
-        self.setup_witness_zone(zone_id, config, runtime_handle)
+        self.setup_witness_zone(zone_id, RaftConfig::witness(self.node_id), runtime_handle)
     }
 
     /// Whether this witness holds `zone_id`'s raft state on disk.
@@ -2783,20 +2771,8 @@ impl WitnessZoneRegistry {
         self.base_path.join(zone_id).join("raft").exists()
     }
 
-    fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
-        if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
-            let peers = root.peers.read().unwrap();
-            if !peers.is_empty() {
-                return peers.routes().map(|(_, address)| address.clone()).collect();
-            }
-        }
-        self.peers.clone()
-    }
-
     /// Internal: open storage, create ZoneConsensus + driver, start the zone
     /// (transport loop and member-address registration), register it.
-    ///
-    /// Shared by `create_zone()` (static bootstrap) and `auto_join_zone()` (dynamic federation).
     #[allow(clippy::result_large_err)]
     fn setup_witness_zone(
         &self,
@@ -2823,9 +2799,7 @@ impl WitnessZoneRegistry {
 
         let super::StartedZone {
             peers: shared_peers,
-            shutdown_tx,
-            transport_handle,
-            registration_handle,
+            tasks,
         } = super::start_zone(
             &mut handle,
             driver,
@@ -2847,9 +2821,7 @@ impl WitnessZoneRegistry {
             WitnessZoneEntry {
                 node: handle.clone(),
                 peers: shared_peers,
-                shutdown_tx,
-                _transport_handle: transport_handle,
-                _registration_handle: registration_handle,
+                tasks,
             },
         );
 
@@ -2866,13 +2838,25 @@ impl WitnessZoneRegistry {
         self.zones.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Shutdown all zones.
-    pub fn shutdown_all(&self) {
-        for entry in self.zones.iter() {
-            let _ = entry.shutdown_tx.send(true);
-        }
-        self.zones.clear();
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stop every open zone; no zone opens afterwards and boot joins end.
+    /// Await [`super::ZonesStopped::released`] to know the zones' tasks — and
+    /// with them the registry's hold on their storage — are gone.
+    pub fn shutdown(&self) -> super::ZonesStopped {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _guard = self.auto_join_lock.lock();
+        let open: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
+        let stopped = open
+            .iter()
+            .filter_map(|zone_id| self.zones.remove(zone_id))
+            .map(|(_, entry)| entry.tasks.stop())
+            .collect();
         tracing::info!("All witness zones shut down");
+        stopped
     }
 }
 
@@ -3120,8 +3104,10 @@ mod tests {
         assert!(registry.list_zones().is_empty());
     }
 
+    /// A witness opening a zone it does not hold — even with seeds known —
+    /// never founds it: no bootstrap entry, no ConfState of its own.
     #[test]
-    fn test_witness_auto_join_bootstraps_known_peer_roster() {
+    fn a_witness_opening_a_fresh_zone_never_founds_it() {
         use tempfile::TempDir;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -3136,25 +3122,13 @@ mod tests {
 
         let node = registry
             .auto_join_zone("corp-eng", runtime.handle())
-            .expect("witness auto-join");
+            .expect("witness opens the zone");
 
-        assert!(
-            !node.config().skip_bootstrap,
-            "known witness rosters must bootstrap ConfState so the witness can vote"
-        );
-        let mut peers = node.config().peers.clone();
-        peers.sort_unstable();
-        let mut expected = vec![
-            NodeAddress::parse("nexus-1:2126", false).unwrap().id,
-            NodeAddress::parse("nexus-2:2126", false).unwrap().id,
-        ];
-        expected.sort_unstable();
-        assert_eq!(
-            peers, expected,
-            "witness RaftConfig.peers must include full voters and exclude self"
-        );
+        assert!(node.config().skip_bootstrap);
+        assert!(node.voters().is_empty(), "no ConfState of its own");
+        assert_eq!(node.last_index(), 0, "no bootstrap entry");
 
-        registry.shutdown_all();
+        runtime.block_on(registry.shutdown().released());
     }
 
     // ---------------------------------------------------------------

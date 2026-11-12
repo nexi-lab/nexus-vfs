@@ -80,7 +80,6 @@ async fn required_wire_prepares_full_node_and_refuses_both_legacy_methods() {
     drop(clients);
     let directory = server.shutdown_preserving_storage().await;
     assert!(reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }
@@ -110,7 +109,6 @@ async fn required_wire_refuses_replica_and_agent_before_unknown_zone_creation() 
     assert!(server.registry.get_node("unopened").is_none());
     let directory = server.shutdown_preserving_storage().await;
     assert!(!reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }
@@ -126,7 +124,7 @@ async fn required_wire_prepares_witness_and_refuses_legacy_traffic() {
         Some(tls.clone()),
     ));
     let node = registry
-        .create_zone("root", Vec::new(), &tokio::runtime::Handle::current())
+        .auto_join_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     let address = common::node_bind_addr();
     let server = RaftWitnessServer::new(
@@ -167,11 +165,10 @@ async fn required_wire_prepares_witness_and_refuses_legacy_traffic() {
     drop(clients);
     stop.send(()).unwrap();
     task.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(node);
     drop(registry);
     assert!(reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }
@@ -230,7 +227,7 @@ impl RunningNode {
     pub(super) async fn stop(self) -> tempfile::TempDir {
         self.stop.send(()).unwrap();
         self.task.await.unwrap();
-        self.registry.shutdown_all();
+        self.registry.shutdown().released().await;
         drop(self.registry);
         self.directory
     }
@@ -314,20 +311,8 @@ async fn original_transport_loop_uses_required_wire_for_new_learner_and_replicat
     let first_directory = first.stop().await;
     let second_directory = second.stop().await;
     for directory in [first_directory, second_directory] {
-        let store = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match nexus_raft::raft::RaftStorage::open(directory.path().join(zone).join("raft"))
-                {
-                    Ok(store) => break store,
-                    Err(error) => {
-                        assert!(error.to_string().contains("already open"), "{error}");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let store =
+            nexus_raft::raft::RaftStorage::open(directory.path().join(zone).join("raft")).unwrap();
         assert!(store.replica_control_reader_required().unwrap());
         assert!(store
             .initial_state_impl()

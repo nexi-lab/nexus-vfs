@@ -220,7 +220,7 @@ impl RunningWitness {
         }
         let _ = self.stop.send(());
         self.server.await.expect("witness server task");
-        self.registry.shutdown_all();
+        self.registry.shutdown().released().await;
         drop(self.registry);
         let zone = witness.dir.path().join(ZONE);
         let deadline = Instant::now() + Duration::from_secs(10);

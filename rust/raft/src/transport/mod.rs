@@ -367,15 +367,63 @@ pub(crate) fn open_zone_store(sm_path: std::path::PathBuf) -> Result<crate::stor
     })
 }
 
-/// A started zone's running parts: its route book, the shutdown signal its
-/// tasks observe, its transport loop and, when it registers, its
-/// member-address registration.
+/// A started zone: its route book and the tasks that run it.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) struct StartedZone {
     pub(crate) peers: SharedPeerMap,
-    pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub(crate) transport_handle: tokio::task::JoinHandle<()>,
-    pub(crate) registration_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) tasks: ZoneTasks,
+}
+
+/// The tasks that run one zone on this node: the transport loop, which owns
+/// the zone's driver and with it the raft storage and state machine, and —
+/// when the member registers — its member-address registration.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) struct ZoneTasks {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    transport: tokio::task::JoinHandle<()>,
+    registration: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl ZoneTasks {
+    /// Tell the tasks to stop.
+    pub(crate) fn stop(self) -> ZonesStopped {
+        let _ = self.shutdown_tx.send(true);
+        ZonesStopped {
+            tasks: std::iter::once(self.transport)
+                .chain(self.registration)
+                .collect(),
+        }
+    }
+}
+
+/// Zones told to stop. [`Self::released`] returns once every task that held
+/// their storage has finished, so their data directories can be reopened.
+#[cfg(all(feature = "grpc", has_protos))]
+#[must_use = "await `released()` before reopening the zones' data directories"]
+pub struct ZonesStopped {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl ZonesStopped {
+    /// Wait until the stopped zones' tasks have finished.
+    pub async fn released(self) {
+        for task in self.tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "a stopped zone task did not finish cleanly");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl FromIterator<ZonesStopped> for ZonesStopped {
+    fn from_iter<I: IntoIterator<Item = ZonesStopped>>(stopped: I) -> Self {
+        Self {
+            tasks: stopped.into_iter().flat_map(|zone| zone.tasks).collect(),
+        }
+    }
 }
 
 /// Run a zone's consensus on this node. Every zone start — data node and
@@ -416,7 +464,7 @@ pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
     .with_self_address(advertise.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // The fixed local root has no network members.
-    let registration_handle = (handle.config().membership_policy
+    let registration = (handle.config().membership_policy
         == crate::raft::MembershipPolicy::Managed
         && !advertise.is_empty())
     .then(|| {
@@ -425,12 +473,14 @@ pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
             shutdown_rx.clone(),
         ))
     });
-    let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+    let transport = runtime_handle.spawn(transport_loop.run(shutdown_rx));
     StartedZone {
         peers,
-        shutdown_tx,
-        transport_handle,
-        registration_handle,
+        tasks: ZoneTasks {
+            shutdown_tx,
+            transport,
+            registration,
+        },
     }
 }
 

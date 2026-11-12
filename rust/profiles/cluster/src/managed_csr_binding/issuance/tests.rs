@@ -390,7 +390,7 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
         .await
         .unwrap()
         .unwrap();
-    zones.shutdown_all();
+    zones.shutdown().released().await;
 }
 
 #[test]

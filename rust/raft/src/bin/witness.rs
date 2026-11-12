@@ -133,8 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Start the gRPC server FIRST so the witness can receive
         // inbound traffic the moment AddNode commits on the leader.
-        // The JoinZone-bootstrap loop runs in parallel after the
-        // server is up.
+        // The boot joins run in parallel with it.
         let server_config = ServerConfig {
             bind_address: bind_addr,
             tls: tls_config,
@@ -179,36 +178,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Witness server starting on {}", bind_addr);
 
-        // Spawn the JoinZone-bootstrap loop in parallel with the gRPC
-        // server.  The loop sends `JoinZone` RPCs against NEXUS_PEERS
-        // until a leader accepts; under the opaque-ID contract the
-        // witness's id is hostname-derived (well-known) but the data
-        // plane's ids are random, so the witness must JoinZone like
-        // any other late-arriving voter rather than self-bootstrapping.
-        let join_registry = registry.clone();
+        // Join every boot zone in parallel with the gRPC server, each on its
+        // own task: a zone held on disk resumes at once, then JoinZone against
+        // NEXUS_PEERS re-asserts the voter role until a leader accepts. Under
+        // the opaque-ID contract the witness's id is hostname-derived but the
+        // data plane's ids are random, so the witness joins like any other
+        // late-arriving voter and never founds a zone.
         let join_zones: Vec<String> = std::iter::once(contracts::ROOT_ZONE_ID.to_string())
             .chain(federation_zones.iter().cloned())
             .collect();
-        tokio::spawn(async move {
-            for zone_id in join_zones {
-                let result = join_registry
-                    .bootstrap_or_join_zone(
-                        &zone_id,
-                        /* as_learner */ false,
-                        /* timeout_secs */ 5,
-                        std::time::Duration::from_secs(2),
-                    )
-                    .await;
-                match result {
-                    Ok(_) => tracing::info!(zone = %zone_id, "Witness joined zone"),
-                    Err(e) => tracing::error!(
-                        zone = %zone_id,
-                        error = %e,
-                        "Witness JoinZone failed permanently",
-                    ),
-                }
-            }
-        });
+        registry.join_at_boot(join_zones, std::time::Duration::from_secs(2));
 
         let shutdown_registry = registry.clone();
         let shutdown = async move {
@@ -216,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .expect("Failed to install Ctrl+C handler");
             tracing::info!("Shutdown signal received");
-            shutdown_registry.shutdown_all();
+            shutdown_registry.shutdown().released().await;
         };
 
         server
