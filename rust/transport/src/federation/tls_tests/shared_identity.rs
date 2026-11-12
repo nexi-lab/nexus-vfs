@@ -115,6 +115,7 @@ async fn an_incoming_handshake_cannot_finish_under_a_replaced_identity() {
         let (mut server_read, mut server_write) = outgoing.into_split();
         let forward = async {
             let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+            let _ = server_write.shutdown().await;
         };
         let response = async {
             let mut bytes = [0; 8192];
@@ -127,6 +128,7 @@ async fn an_incoming_handshake_cannot_finish_under_a_replaced_identity() {
             released.await.unwrap();
             client_write.write_all(&bytes[..count]).await.unwrap();
             let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+            let _ = client_write.shutdown().await;
         };
         tokio::join!(forward, response);
     });
