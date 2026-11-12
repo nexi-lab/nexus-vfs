@@ -3230,7 +3230,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
                 &self_addr_cz,
                 peers,
                 /* bootstrap_new */ is_founder,
-                /* max_attempts  */ if is_founder { None } else { Some(15) },
+                /* max_attempts  */
+                (!is_founder).then_some(nexus_raft::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
                 /* as_learner    */ !is_founder,
             )
         })
@@ -4361,14 +4362,13 @@ async fn reconcile_federation_from_peers(
 ///      in this zone's metastore).  Idempotent: `bootstrap_or_join_zone`
 ///      Branch 1 resumes when ConfState is on disk.
 ///   2. `bootstrap_or_join_zone(zone, peers, bootstrap_new=false,
-///      max_attempts=Some(15), as_learner)` against the leader.
+///      max_attempts=Some(BOUNDED_JOIN_ATTEMPTS), as_learner)` against the leader.
 ///   3. If `mounts` maps a `local_path -> zone`, propose the DT_MOUNT
 ///      entry via `zm.mount_async(parent_zone, local_path, zone, true)`.
 ///
-/// `max_attempts=Some(15)` × `JOIN_ZONE_RETRY_INTERVAL` matches
-/// `run_join`'s previous behavior — ~30 s upper bound, long enough to
-/// absorb a leader election on the remote, short enough that a stuck
-/// boot terminates with a clear error.
+/// `BOUNDED_JOIN_ATTEMPTS` is the bound every terminating join shares — ~30 s,
+/// long enough to absorb a leader election on the remote, short enough that a
+/// stuck boot terminates with a clear error.
 ///
 /// Runs `bootstrap_or_join_zone` inside `tokio::task::spawn_blocking`
 /// because that helper spins a nested tokio runtime for its JoinZone
@@ -4451,7 +4451,8 @@ async fn join_zones_for_boot(
                 &self_addr_for_join,
                 &peers_for_join,
                 /* bootstrap_new */ false,
-                /* max_attempts  */ Some(15),
+                /* max_attempts  */
+                Some(nexus_raft::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
                 as_learner,
             )
         })
@@ -4576,11 +4577,10 @@ async fn run_join(
     //     SSD swap without first transferring its voter slot away —
     //     operator-aware tradeoff.
     //
-    // ``max_attempts=Some(15)`` × ``JOIN_ZONE_RETRY_INTERVAL`` (2 s)
-    // ≈ 30 s upper bound on the operator command — long enough to
-    // absorb a leader election round on the remote, short enough that
-    // a stuck command terminates with a clear error rather than
-    // hanging forever like the daemon-boot path does.
+    // ``BOUNDED_JOIN_ATTEMPTS`` (≈ 30 s) bounds the operator command —
+    // long enough to absorb a leader election round on the remote, short
+    // enough that a stuck command terminates with a clear error rather
+    // than hanging forever like the daemon-boot path does.
     let use_tls = !common.no_tls;
     // Operator-facing strict parse: rejects `<id>@host:port`, forces
     // bare `host:port`.  See PeerAddress::parse_operator_addr for the

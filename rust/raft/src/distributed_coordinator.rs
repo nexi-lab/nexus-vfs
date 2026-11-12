@@ -77,8 +77,10 @@ const FOUNDER_REJOIN_PROBE_ATTEMPTS: u32 = 3;
 /// operator-actionable.
 const JOIN_ZONE_APPLY_WAIT: Duration = Duration::from_secs(10);
 
-/// Join rounds a bounded join (the offline `join` CLI, the typed ZoneJoin
-/// RPC) spends on failures before it gives up — about 30 s at
+/// Join rounds every terminating join (the offline `join` CLI, a boot
+/// joiner's federation and control zones, the coordinator's follower
+/// `create_zone`, the typed ZoneJoin RPC) spends on failures before it gives
+/// up — about 30 s at
 /// [`JOIN_ZONE_RETRY_INTERVAL`], enough to absorb a leader election on the
 /// remote. A round that finds this node a learner the leader is still
 /// catching up spends nothing.

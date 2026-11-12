@@ -161,7 +161,8 @@ async fn offline_join_persists_confstate_before_returning() {
             &joiner_self_addr_for_task,
             &peer_addrs,
             /* bootstrap_new */ false,
-            /* max_attempts  */ Some(15),
+            /* max_attempts  */
+            Some(nexus_raft::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
             /* as_learner    */ true,
         )
     })
