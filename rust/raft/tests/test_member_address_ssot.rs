@@ -8,6 +8,10 @@
 //! nothing ever taught the leader its address, and the learner served stale
 //! reads indefinitely.
 //!
+//! A witness never initiates either, and its state machine keeps no records:
+//! it registers its own address through the same path, reading the zone's
+//! records from its leader or a seed.
+//!
 //! A dedicated binary: `NEXUS_SC_SNAPSHOT_THRESHOLD` is read in
 //! `ZoneConsensus::new`, so it is set once per process before any zone opens.
 
@@ -22,7 +26,11 @@ use std::time::{Duration, Instant};
 
 use nexus_raft::prelude::Command;
 use nexus_raft::raft::{RaftStorage, StateMachine};
-use nexus_raft::transport::{call_join_zone_rpc, ClientConfig, RaftApiClient};
+use nexus_raft::storage::RedbStore;
+use nexus_raft::transport::{
+    call_join_zone_rpc, ClientConfig, NodeAddress, RaftApiClient, RaftWitnessServer, ServerConfig,
+    WitnessZoneRegistry,
+};
 use nexus_raft::ZoneManager;
 use raft::eraftpb::ConfChangeType;
 use raft::Storage;
@@ -92,6 +100,141 @@ impl Node {
                 }
                 Err(error) => panic!("start node {}: {error}", self.id),
             }
+        }
+    }
+}
+
+/// A witness voter's durable identity: its id, data directory and address.
+struct Witness {
+    id: u64,
+    dir: TempDir,
+    bind: String,
+}
+
+/// A running witness: its zone registry, gRPC server and boot join.
+struct RunningWitness {
+    registry: Arc<WitnessZoneRegistry>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+    boot: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Witness {
+    fn new() -> Self {
+        let id = loop {
+            let id = rand::random::<u64>();
+            if id != 0 {
+                break id;
+            }
+        };
+        Self {
+            id,
+            dir: TempDir::new().expect("witness dir"),
+            bind: common::node_bind_addr(),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.bind)
+    }
+
+    /// Boot the witness as `nexus-witness` does: advertising its address,
+    /// with `seeds` as `NEXUS_PEERS`, joining `ZONE` at boot.
+    async fn boot(&self, seeds: &[&Node]) -> RunningWitness {
+        let mut registry = WitnessZoneRegistry::new(self.dir.path().to_path_buf(), self.id, None);
+        registry.set_peers(
+            seeds
+                .iter()
+                .map(|seed| NodeAddress::parse(&seed.bind, false).expect("seed address"))
+                .collect(),
+        );
+        registry.set_self_address(self.endpoint());
+        let mut running = self.serve(registry).await;
+        let registry = running.registry.clone();
+        running.boot = Some(tokio::spawn(async move {
+            registry
+                .bootstrap_or_join_zone(ZONE, false, 5, Duration::from_millis(200))
+                .await
+                .expect("witness boot join");
+        }));
+        running
+    }
+
+    /// Serve the witness the way witnesses ran before they registered: no
+    /// advertise address and no seeds. It joins `ZONE` when the leader's
+    /// first message arrives and never registers its address.
+    async fn start_unregistered(&self) -> RunningWitness {
+        self.serve(WitnessZoneRegistry::new(
+            self.dir.path().to_path_buf(),
+            self.id,
+            None,
+        ))
+        .await
+    }
+
+    async fn serve(&self, registry: WitnessZoneRegistry) -> RunningWitness {
+        wait_until_bindable(&self.bind).await;
+        let registry = Arc::new(registry);
+        let server = RaftWitnessServer::new(
+            registry.clone(),
+            ServerConfig {
+                bind_address: self.bind.parse().expect("witness bind"),
+                ..Default::default()
+            },
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("witness server");
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tokio::net::TcpStream::connect(&self.bind).await.is_err() {
+            assert!(Instant::now() < deadline, "witness never listened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        RunningWitness {
+            registry,
+            stop,
+            server,
+            boot: None,
+        }
+    }
+}
+
+impl RunningWitness {
+    fn follows(&self, leader: u64) -> bool {
+        self.registry
+            .get_node(ZONE)
+            .is_some_and(|node| node.leader_id() == Some(leader))
+    }
+
+    /// Stop the witness and wait until its zone's stores are free to reopen.
+    async fn stop(self, witness: &Witness) {
+        if let Some(boot) = self.boot {
+            boot.abort();
+            let _ = boot.await;
+        }
+        let _ = self.stop.send(());
+        self.server.await.expect("witness server task");
+        self.registry.shutdown_all();
+        drop(self.registry);
+        let zone = witness.dir.path().join(ZONE);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let released = RedbStore::open(zone.join("sm")).is_ok()
+                && RaftStorage::open(zone.join("raft")).is_ok();
+            if released {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stopped witness still holds its stores"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 }
@@ -488,5 +631,173 @@ async fn remove_node_deletes_the_record_with_the_membership() {
     .await;
 
     stop(learner_zm).await;
+    stop(founder_zm).await;
+}
+
+/// The state of a witness that joined before member addresses were recorded:
+/// a voter of the founder's zone with no record, and the founder's log
+/// compacted past the change that added it. The founder reaches the witness
+/// only through an observation held in memory, as it once did through a
+/// hostname-derived seed. Returns the index the membership change applied at.
+async fn witness_without_a_record(
+    founder: &Node,
+    founder_zm: &ZoneManager,
+    witness: &Witness,
+) -> (RunningWitness, u64) {
+    wait_for_records(
+        founder_zm,
+        &[(founder.id, founder.bind.as_str())],
+        "the founder's own record",
+    )
+    .await;
+    let running = witness.start_unregistered().await;
+    assert!(founder_zm
+        .registry()
+        .learn_peer_address(ZONE, witness.id, &witness.bind));
+    let mut voters = consensus(founder_zm)
+        .propose_conf_change(ConfChangeType::AddNode, witness.id, Vec::new())
+        .await
+        .expect("AddNode(witness) commits")
+        .voters;
+    voters.sort();
+    let mut expected = vec![founder.id, witness.id];
+    expected.sort();
+    assert_eq!(voters, expected);
+    let membership_index = consensus(founder_zm).applied_index();
+    eventually("the witness to follow the founder", || async {
+        running.follows(founder.id)
+    })
+    .await;
+    // Every write of the two-voter zone commits with the witness's ack.
+    for i in 0..WRITES_PAST_THRESHOLD {
+        write(founder_zm, &format!("/before/{i}")).await;
+    }
+    assert_eq!(
+        records(founder_zm).await,
+        vec![(founder.id, founder.bind.clone())],
+        "no record names the witness"
+    );
+    (running, membership_index)
+}
+
+/// A witness without a record registers its own once it boots, and the
+/// founder, restarted after compaction with no seeds, reaches it from that
+/// record: the founder cannot even lead the two-voter zone without the
+/// witness's vote, and every write needs the witness's ack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_booted_witness_registers_and_a_restarted_founder_reaches_it() {
+    configure_compaction();
+    let founder = Node::new();
+    let witness = Witness::new();
+    let founder_zm = found(&founder, Vec::new()).await;
+    let (unregistered, membership_index) =
+        witness_without_a_record(&founder, &founder_zm, &witness).await;
+
+    unregistered.stop(&witness).await;
+    let booted = witness.boot(&[&founder]).await;
+    let both = [
+        (founder.id, founder.bind.as_str()),
+        (witness.id, witness.bind.as_str()),
+    ];
+    wait_for_records(
+        &founder_zm,
+        &both,
+        "the witness's registration on the founder",
+    )
+    .await;
+
+    stop(founder_zm).await;
+    let first = first_retained_index(&founder.raft_dir()).await;
+    assert!(
+        first > membership_index,
+        "the founder's log must be compacted past the witness's membership entry \
+         (first retained index {first}, membership applied at {membership_index})"
+    );
+
+    let founder_zm = restart_member(&founder, Vec::new()).await;
+    await_leader(&founder_zm, founder.id).await;
+    assert_eq!(
+        founder_zm
+            .registry()
+            .get_peers(ZONE)
+            .unwrap()
+            .get(&witness.id)
+            .map(|route| route.endpoint.clone()),
+        Some(witness.endpoint()),
+        "the restarted founder routes to its witness from the record"
+    );
+    write(&founder_zm, "/after-restart").await;
+    eventually("the witness to follow the restarted founder", || async {
+        booted.follows(founder.id)
+    })
+    .await;
+
+    let info = cluster_info(&founder.endpoint()).await;
+    let mut voters: Vec<(u64, String)> = info
+        .config
+        .expect("cluster config")
+        .voters
+        .iter()
+        .map(|node| (node.id, node.address.clone()))
+        .collect();
+    voters.sort();
+    let mut expected = vec![
+        (founder.id, founder.endpoint()),
+        (witness.id, witness.endpoint()),
+    ];
+    expected.sort();
+    assert_eq!(voters, expected);
+
+    booted.stop(&witness).await;
+    stop(founder_zm).await;
+}
+
+/// The witness and its founder restart together while no record names the
+/// witness: the founder has no route to it and cannot lead alone. The witness
+/// resumes the zone from its own storage at boot and registers through its
+/// seed; that registration routes the founder to it, and the witness's vote
+/// elects the founder that commits the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_witness_and_its_founder_restarted_together_reach_each_other() {
+    configure_compaction();
+    let founder = Node::new();
+    let witness = Witness::new();
+    let founder_zm = found(&founder, Vec::new()).await;
+    let (unregistered, _) = witness_without_a_record(&founder, &founder_zm, &witness).await;
+    stop(founder_zm).await;
+    unregistered.stop(&witness).await;
+
+    let founder_zm = restart_member(&founder, Vec::new()).await;
+    // Ten election timeouts: a founder that could reach the witness would
+    // have been elected by now.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_ne!(
+        consensus(&founder_zm).leader_id(),
+        Some(founder.id),
+        "the founder cannot lead the two-voter zone without the witness's vote"
+    );
+    assert!(
+        !founder_zm
+            .registry()
+            .get_peers(ZONE)
+            .unwrap()
+            .contains_key(&witness.id),
+        "the restarted founder has no route to an unregistered witness"
+    );
+
+    let booted = witness.boot(&[&founder]).await;
+    await_leader(&founder_zm, founder.id).await;
+    wait_for_records(
+        &founder_zm,
+        &[
+            (founder.id, founder.bind.as_str()),
+            (witness.id, witness.bind.as_str()),
+        ],
+        "the witness's registration on the founder",
+    )
+    .await;
+    write(&founder_zm, "/after-registration").await;
+
+    booted.stop(&witness).await;
     stop(founder_zm).await;
 }
