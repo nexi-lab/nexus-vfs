@@ -343,9 +343,9 @@ impl ZoneRaftRegistry {
         base_path: PathBuf,
         node_id: u64,
         root_node_id: u64,
-        tls: Option<TlsConfig>,
+        tls: lib::transport_primitives::SharedTlsConfig,
     ) -> Self {
-        let mut registry = Self::with_tls(base_path, node_id, tls);
+        let mut registry = Self::with_shared_tls(base_path, node_id, tls);
         registry.storage_policy = ZoneStoragePolicy::LocalRoot {
             node_id: root_node_id,
         };
@@ -354,6 +354,18 @@ impl ZoneRaftRegistry {
 
     /// Create a new empty registry with TLS configuration.
     pub fn with_tls(base_path: PathBuf, node_id: u64, tls: Option<TlsConfig>) -> Self {
+        Self::with_shared_tls(
+            base_path,
+            node_id,
+            lib::transport_primitives::SharedTlsConfig::new(tls),
+        )
+    }
+
+    pub(crate) fn with_shared_tls(
+        base_path: PathBuf,
+        node_id: u64,
+        tls: lib::transport_primitives::SharedTlsConfig,
+    ) -> Self {
         Self {
             zones: DashMap::new(),
             closed: AtomicBool::new(false),
@@ -362,7 +374,7 @@ impl ZoneRaftRegistry {
             base_path,
             storage_policy: ZoneStoragePolicy::Managed,
             node_id,
-            tls: lib::transport_primitives::SharedTlsConfig::new(tls),
+            tls,
             self_address: Arc::new(RwLock::new(String::new())),
             seeds: RwLock::new(Vec::new()),
             identity_dir: Arc::new(RwLock::new(None)),
