@@ -228,7 +228,9 @@ jobs:
         with:
           shared-key: ci-runtime-observations-${{ matrix.os }}
       - name: Real RPC instance, ownership, expiry and partial-directory journeys
-        run: cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+        run: |
+          cargo --config .github/ci/functional-tests.toml test --locked -p kernel --no-default-features core::agents::registry::runtime_observation::tests:: --lib
+          cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
 
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}
