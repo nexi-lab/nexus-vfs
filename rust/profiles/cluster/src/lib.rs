@@ -3512,6 +3512,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         }),
     };
     let mut service_decls = build_decls(&svc_ctx);
+    let service_tls = zm.registry().tls_config().map_err(anyhow::Error::msg)?;
     #[cfg(feature = "experimental-managed-agent-csr")]
     if identity_armed && !common.no_tls {
         service_decls.push(managed_csr_binding::service_decl(
@@ -3519,7 +3520,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             identity_armed,
             managed_csr_binding::NativeIssuer::for_host(
                 zm.agent_minter_slot(),
-                cluster_tls.as_ref().ok_or_else(|| {
+                service_tls.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("managed credentials require the selected native TLS identity")
                 })?,
                 svc_ctx.runtime.clone(),
@@ -3529,7 +3530,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     service_decls.extend(authorization::service_decls(
         &common,
         &svc_ctx,
-        cluster_tls.as_ref(),
+        service_tls.as_ref(),
         Arc::clone(&data_plane_ready),
     )?);
     kernel
