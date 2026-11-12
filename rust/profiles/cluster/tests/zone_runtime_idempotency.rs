@@ -44,15 +44,12 @@ async fn a_lost_response_never_creates_a_second_zone() {
     let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
 
     // ── 1. Execute, then "lose the response" and retry the SAME request ──
-    let first = rt
-        .zone_create(ZONE, &[], OP, "")
-        .await
-        .expect("first create");
+    let first = rt.zone_create(ZONE, OP, "").await.expect("first create");
     assert_eq!(first.outcome, "CREATED");
     assert!(!first.replayed);
 
     let retry = rt
-        .zone_create(ZONE, &[], OP, "")
+        .zone_create(ZONE, OP, "")
         .await
         .expect("the retry must be answered (replay), not hung");
     assert!(
@@ -65,8 +62,7 @@ async fn a_lost_response_never_creates_a_second_zone() {
     // ALREADY_PRESENT fresh execution (which would mean the journal missed).
     assert_eq!(retry.zone_id, ZONE);
 
-    // Still exactly one zone — presence answers RESIDENT (not two stores,
-    // not a different-membership error).
+    // Still exactly one zone — presence answers RESIDENT (not two stores).
     let status = rt.zone_status(ZONE, "").await.expect("status");
     assert_eq!(
         status.presence,
@@ -99,7 +95,7 @@ async fn a_lost_response_never_creates_a_second_zone() {
 
     // ── 3. Same operation_id, DIFFERENT request → refused ──
     let err = rt
-        .zone_create("other-zone", &[], OP, "")
+        .zone_create("other-zone", OP, "")
         .await
         .expect_err("a reused operation_id with a different request must be refused");
     assert_eq!(
@@ -127,7 +123,7 @@ async fn a_lost_response_never_creates_a_second_zone() {
     let _d2 = Daemon::spawn(&["--bind-addr", &adv, "--no-tls"], &e);
     let mut rt2 = ZoneRuntime::dial_ready(port, BUDGET).await;
     let restart_retry = rt2
-        .zone_create(ZONE, &[], OP, "")
+        .zone_create(ZONE, OP, "")
         .await
         .expect("the post-restart retry must be answered (replay), not hung");
     assert!(

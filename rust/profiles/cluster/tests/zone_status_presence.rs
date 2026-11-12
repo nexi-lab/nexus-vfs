@@ -97,7 +97,7 @@ async fn presence_ladder_and_mount_gates() {
     );
 
     // ── RESIDENT after a typed create ──
-    rt.zone_create(ZONE, &[], "op-presence-create-0001", &admin)
+    rt.zone_create(ZONE, "op-presence-create-0001", &admin)
         .await
         .expect("admin creates the zone");
     let hot = rt.zone_status(ZONE, &admin).await.expect("status");
