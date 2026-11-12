@@ -23,6 +23,14 @@ pub struct LocalNodeCertificate {
     pub serial: Vec<u8>,
 }
 
+impl LocalNodeCertificate {
+    /// The canonical identity URI the certificate's SAN carries. It names the
+    /// Node, not one credential: renewal keeps it while serial and key change.
+    pub fn identity_uri(&self) -> String {
+        lib::transport_primitives::node_identity_uri(&self.zone_id, self.node_id)
+    }
+}
+
 /// Identity taken from the authenticated TLS connection.
 #[derive(Clone, Copy)]
 enum AuthenticatedPeer {
@@ -149,6 +157,16 @@ pub fn current_local_node_certificate(
 ) -> Result<LocalNodeCertificate, String> {
     let leaf = current_local_leaf(der, local_ca_der)?;
     node_certificate_identity(&leaf)
+}
+
+/// The Node a data directory's PEM TLS bundle names, under exactly the checks
+/// above: its first certificate is current, signed by the bundle's own CA and
+/// carries one canonical Node identity. Boot, operator grants and `doctor`
+/// all read a local Node identity through this one function.
+pub fn local_node_identity(cert_pem: &[u8], ca_pem: &[u8]) -> Result<LocalNodeCertificate, String> {
+    let leaf = lib::transport_primitives::first_certificate_der(cert_pem, "Node")?;
+    let ca = lib::transport_primitives::first_certificate_der(ca_pem, "cluster CA")?;
+    current_local_node_certificate(&leaf, &ca)
 }
 
 fn current_local_leaf<'a>(
@@ -362,6 +380,28 @@ mod tests {
         assert!(current_local_node_certificate(&der(&outsider), &der(&local)).is_err());
         assert!(current_local_node_certificate(&der(&agent), &der(&local)).is_err());
         assert!(current_local_node_certificate(b"not DER", &der(&local)).is_err());
+    }
+
+    #[test]
+    fn renewal_keeps_the_node_identity_while_the_credential_changes() {
+        let (ca, key) = generate_zone_ca("root").unwrap();
+        let (foreign, _) = generate_zone_ca("root").unwrap();
+        // A founder's bootstrap leaf names its host in the CN; `enroll` renews
+        // it with the Node ID there. Both name the Node by the same URI SAN.
+        let host = Some("DESKTOP-K2PHFNR");
+        let (issued, _) = generate_node_cert(7, "root", &ca, &key, &[], host).unwrap();
+        let (renewed, _) = generate_node_cert(7, "root", &ca, &key, &[], None).unwrap();
+        let (other, _) = generate_node_cert(8, "root", &ca, &key, &[], None).unwrap();
+        let identity = local_node_identity(&issued, &ca).unwrap();
+        let renewal = local_node_identity(&renewed, &ca).unwrap();
+        assert_eq!(identity.identity_uri(), "nexus://zone/root/node/7");
+        assert_eq!(renewal.identity_uri(), identity.identity_uri());
+        assert_ne!(renewal.serial, identity.serial);
+        assert_ne!(
+            local_node_identity(&other, &ca).unwrap().identity_uri(),
+            identity.identity_uri()
+        );
+        assert!(local_node_identity(&issued, &foreign).is_err());
     }
 
     #[test]
