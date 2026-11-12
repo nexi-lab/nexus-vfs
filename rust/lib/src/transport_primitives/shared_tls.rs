@@ -70,7 +70,7 @@ impl TlsSnapshot {
 
     /// Prepare listener trust without admitting a request or a handshake.
     /// A listener may wait for a projected replacement of an expired certificate.
-    pub(super) fn configured_material(&self) -> Result<Option<&TlsConfig>, &'static str> {
+    pub fn configured_material(&self) -> Result<Option<&TlsConfig>, &'static str> {
         self.0.validity?;
         match &self.0.policy {
             TlsPolicy::Plaintext => Ok(None),

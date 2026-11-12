@@ -52,6 +52,10 @@ pub enum RaftError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Another process holds the configured listener address.
+    #[error("listener address already in use: {0}")]
+    ListenerAddressInUse(String),
+
     /// Serialization/deserialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
