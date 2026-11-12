@@ -70,6 +70,10 @@ use super::{Command, CommandResult, RaftError, Result};
 mod member_registration;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use member_registration::MemberRegistration;
+#[cfg(all(feature = "grpc", has_protos))]
+mod member_readback;
+#[cfg(all(feature = "grpc", has_protos))]
+use member_readback::MemberAddressView;
 mod read_index;
 use read_index::{PendingRead, ReadContext, ReadRequestIds};
 mod storage_activation;
@@ -396,6 +400,11 @@ pub enum RaftMsg {
     /// to classify an incoming join and decide promotion statelessly,
     /// without holding the RPC open to wait for catch-up.
     Membership { tx: oneshot::Sender<Membership> },
+    /// Capture applied membership and its address records in one actor turn.
+    #[cfg(all(feature = "grpc", has_protos))]
+    MemberAddressView {
+        tx: oneshot::Sender<Result<MemberAddressView>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2246,6 +2255,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             }
             RaftMsg::Membership { tx } => {
                 let _ = tx.send(read_membership(&self.raw_node));
+            }
+            #[cfg(all(feature = "grpc", has_protos))]
+            RaftMsg::MemberAddressView { tx } => {
+                let _ = tx.send(self.member_address_view());
             }
         }
     }

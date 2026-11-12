@@ -867,6 +867,16 @@ fn peer_cert_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
 
 /// Each member's dial endpoint from the zone's member-address records — the
 /// one source for addresses reported to clients, the local node's included.
+fn member_endpoints(records: Vec<(u64, String)>, use_tls: bool) -> HashMap<u64, String> {
+    records
+        .into_iter()
+        .filter_map(|(id, address)| {
+            crate::raft::member_address::endpoint(id, &address, use_tls)
+                .map(|route| (id, route.endpoint))
+        })
+        .collect()
+}
+
 async fn recorded_endpoints(
     node: &ZoneConsensus<FullStateMachine>,
     use_tls: bool,
@@ -876,13 +886,7 @@ async fn recorded_endpoints(
         .with_state_machine(|sm| sm.member_addresses())
         .await
         .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?;
-    Ok(records
-        .into_iter()
-        .filter_map(|(id, address)| {
-            crate::raft::member_address::endpoint(id, &address, use_tls)
-                .map(|route| (id, route.endpoint))
-        })
-        .collect())
+    Ok(member_endpoints(records, use_tls))
 }
 
 /// Voters and learners with their recorded addresses; a member without a
@@ -931,6 +935,9 @@ struct ZoneApiServiceImpl {
     /// empty) → `RenewLocalNodeCertificate` refuses.
     local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
 }
+
+#[path = "server/replica_join.rs"]
+mod replica_join;
 
 impl ZoneApiServiceImpl {
     async fn blob_response(
@@ -1424,6 +1431,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<JoinZoneRequest>,
     ) -> std::result::Result<Response<JoinZoneResponse>, Status> {
+        if let Some(replica_id) = super::node_authority::current_replica_id(request.extensions())? {
+            return self.read_replica_join(request, replica_id).await;
+        }
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
