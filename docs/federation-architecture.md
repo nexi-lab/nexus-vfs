@@ -314,7 +314,7 @@ safety argument is that it only rides the encrypted overlay.
 
 ##### Witness
 
-The standalone witness binary derives `node_id = hostname_to_node_id(hostname)` (SHA-256 of hostname).  Witnesses live at well-known addresses, so binding identity to hostname is sufficient for them.
+The standalone witness binary derives `node_id = hostname_to_node_id(hostname)` (SHA-256 of hostname).  Witnesses live at well-known addresses, so binding identity to hostname is sufficient for them.  A witness never founds a zone: it joins each boot zone (root and `NEXUS_FEDERATION_ZONES`) on its own through JoinZone against `NEXUS_PEERS`, resumes a zone it holds on disk from its stored ConfState, and opens any other zone when a member's message reaches it.
 
 #### 6.3.2 Federation Control-Plane API Surface
 
