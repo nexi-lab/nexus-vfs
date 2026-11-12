@@ -2355,7 +2355,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             return;
         };
         let records = match self.state_machine.read().await.member_addresses() {
-            Ok(records) => records,
+            Ok(Some(records)) => records,
+            // A state machine without records (a witness) routes by
+            // observation only.
+            Ok(None) => {
+                self.routes_stale = false;
+                return;
+            }
             Err(error) => {
                 tracing::warn!(%error, "member addresses unreadable; routes retained");
                 return;
@@ -3615,7 +3621,7 @@ mod tests {
         driver: &ZoneConsensusDriver<FullStateMachine>,
     ) -> (Vec<(u64, String)>, u64) {
         let sm = driver.state_machine.read().await;
-        let mut records = sm.member_addresses().unwrap();
+        let mut records = sm.member_addresses().unwrap().unwrap();
         records.sort();
         (records, sm.last_applied_index())
     }

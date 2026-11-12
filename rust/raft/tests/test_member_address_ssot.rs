@@ -135,7 +135,7 @@ fn consensus(
 
 async fn records(manager: &ZoneManager) -> Vec<(u64, String)> {
     let mut records = consensus(manager)
-        .with_state_machine(|sm| sm.member_addresses().unwrap())
+        .with_state_machine(|sm| sm.member_addresses().unwrap().unwrap())
         .await;
     records.sort();
     records

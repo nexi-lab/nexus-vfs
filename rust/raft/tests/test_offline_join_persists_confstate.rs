@@ -214,7 +214,7 @@ async fn offline_join_persists_confstate_before_returning() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let mut records = joiner_node
-            .with_state_machine(|sm| sm.member_addresses().unwrap())
+            .with_state_machine(|sm| sm.member_addresses().unwrap().unwrap())
             .await;
         records.sort();
         if records == expected {
