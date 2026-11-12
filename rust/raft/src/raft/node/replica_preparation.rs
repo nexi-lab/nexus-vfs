@@ -113,3 +113,68 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         Ok(PreparedReplicaControl { view: observed })
     }
 }
+
+impl<S: StateMachine + 'static> ZoneConsensus<S> {
+    /// Commit activation using the original complete-member observation.
+    ///
+    /// A returned fact identifies the original committed operation, which can
+    /// differ from this request after a competing activation. On uncertainty,
+    /// read the existing fact through `read_linearizable`; retain this request.
+    pub async fn activate_replica_control(
+        &self,
+        prepared: PreparedReplicaControl,
+        operation_id: String,
+    ) -> Result<crate::raft::ReplicaControlActivation> {
+        crate::raft::state_machine::validate_replica_activation_operation(&operation_id)?;
+        let (tx, receiver) = oneshot::channel();
+        self.msg_tx
+            .try_send(super::RaftMsg::ActivateReplicaControl {
+                prepared,
+                operation_id,
+                tx,
+            })
+            .map_err(channel_try_send_err)?;
+        match super::storage_activation::await_storage_commit(receiver).await? {
+            super::CommandResult::Value(bytes) => bincode::deserialize(&bytes)
+                .map_err(|error| RaftError::ProposalOutcomeUnknown(error.to_string())),
+            other => Err(RaftError::ProposalOutcomeUnknown(format!(
+                "activation result: {other:?}"
+            ))),
+        }
+    }
+}
+
+impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
+    pub(super) fn submit_replica_activation(
+        &mut self,
+        prepared: PreparedReplicaControl,
+        operation_id: String,
+        tx: oneshot::Sender<Result<super::CommandResult>>,
+    ) {
+        let admitted = self
+            .validate_storage_activation_view(&prepared.view)
+            .and_then(|()| {
+                if self.replica_control_reader_prepared {
+                    Ok(())
+                } else {
+                    Err(RaftError::InvalidState(
+                        "local replica-control reader has not prepared".into(),
+                    ))
+                }
+            })
+            .and_then(|()| {
+                crate::raft::state_machine::validate_replica_activation_operation(&operation_id)
+            });
+        if let Err(error) = admitted {
+            let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
+            return;
+        }
+        let command = crate::raft::Command::ActivateReplicaControl { operation_id };
+        match bincode::serialize(&command) {
+            Ok(data) => self.propose_data(data, tx),
+            Err(error) => {
+                let _ = tx.send(Err(RaftError::ProposalRejected(error.to_string())));
+            }
+        }
+    }
+}

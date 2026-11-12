@@ -54,7 +54,7 @@ jobs:
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_issuance::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_activation::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::csr_intent::tests
-          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission::tests
+          cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission
           cargo test --locked -p raft@0.1.0 --test replica_binding_authority
           cargo test --locked -p raft@0.1.0 --test test_durable_storage_admission -- --test-threads=1
           cargo test --locked -p raft@0.1.0 --test test_raft_apply_failure -- --test-threads=1

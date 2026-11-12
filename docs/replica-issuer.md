@@ -95,6 +95,39 @@ consumes and revalidates that observation at its own submission boundary.
 Completed local preparations survive a failed group attempt. Retrying observes
 the current configuration and repeats the same idempotent local preparation.
 
+`ZoneConsensus::activate_replica_control` consumes that observation and the
+original operation ID. Its owning actor rechecks the incarnation, term,
+membership epoch and local reader floor immediately before proposing the
+existing activation command. The first operation and the state machine's
+last-applied marker commit atomically. An uncertain response is reconciled by reading that
+fact through the same zone's ReadIndex; the caller preserves its original
+request.
+
+```mermaid
+sequenceDiagram
+    participant Controller
+    participant Leader as Owning Raft driver
+    participant Members as All configured members
+    Controller->>Leader: prepare_replica_control_members
+    Leader->>Members: Prepare original reader and required transport
+    Members-->>Leader: Durable preparation acknowledgements
+    Leader-->>Controller: PreparedReplicaControl for original configuration
+    Controller->>Leader: activate_replica_control(observation, operation)
+    Leader->>Leader: Recheck original view and propose activation
+    Leader->>Members: Existing Raft replication and commit
+    Leader-->>Controller: Original committed activation fact
+```
+
+Managed replica-control submissions use their typed storage door after that
+fact commits. Startup and incoming snapshots combine the retained local reader
+floor with the replicated format and activation record. The format marker
+qualifies its exact domain; conditional metadata and record-lifetime records
+retain their own admission requirements. Witnesses check the incoming format
+and retain their local reader floor while the full replicas own business state.
+New members receive the required transport before acknowledging replicated
+storage commands. Generic proposal forwarding retains its ordinary command
+boundary.
+
 This durable local format upgrade and the replicated activation fact have
 separate purposes: the former defines which program can open the files, while
 the latter enables commands for the zone after authenticated member checks.
@@ -243,3 +276,10 @@ certificate recovery, and races publication against allocation retirement and
 CA rotation through Raft. The shared CSR tests verify exact TBS commitment,
 owner/replica scope, lifetime limits and the existing ordinary-Agent record
 format. Revocation and renewal ordering also have state-machine coverage.
+
+The managed activation suites exercise configuration and incarnation changes,
+lost responses, compaction, original-store restart, snapshot admission and
+cross-domain refusal. The Node RPC suite prepares actual authenticated members,
+commits a Node identity, catches up a learner and promotes it through the
+existing membership path. These cases use the same three-platform Node-control
+CI job.

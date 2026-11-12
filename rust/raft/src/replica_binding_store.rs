@@ -108,7 +108,11 @@ impl RaftReplicaBindingStore {
         &self,
         command: Command,
     ) -> Result<T, ReplicaBindingError> {
-        if !self.inner.supports_replica_binding() {
+        if !self
+            .inner
+            .supports_replica_binding()
+            .map_err(ReplicaBindingError::Unavailable)?
+        {
             return Err(ReplicaBindingError::Unsupported);
         }
         let result = self
