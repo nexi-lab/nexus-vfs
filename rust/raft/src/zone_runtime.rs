@@ -93,13 +93,6 @@ const CATCHUP_BUDGET: Duration = Duration::from_secs(10);
 /// (`ZoneOpJournal::refresh`) so its own execution window is protected.
 const PENDING_TAKEOVER_GRACE_MS: i64 = 120_000;
 
-/// Resource-hygiene bound on `ZoneCreateRequest.peers`: the set is sorted,
-/// joined and hashed in a blocking context, and a 64 MiB message could
-/// otherwise carry an unbounded membership spec into that work.
-const MAX_CREATE_PEERS: usize = 32;
-/// One peer is a `host:port` string (host ≤ 253 + separator + port ≤ 5).
-const MAX_CREATE_PEER_LEN: usize = 256;
-
 pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
     journal: ZoneOpJournal,
@@ -148,22 +141,7 @@ impl ZoneRuntimeBackend {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
-        // Resource hygiene: bound the peer set BEFORE the sort+join+hash —
-        // an unbounded membership inside the 64 MiB message budget would
-        // otherwise land that work in this blocking context.
-        if req.peers.len() > MAX_CREATE_PEERS {
-            return Err(ZoneRuntimeError::Invalid(format!(
-                "peers: at most {MAX_CREATE_PEERS} allowed, got {}",
-                req.peers.len()
-            )));
-        }
-        if let Some(peer) = req.peers.iter().find(|p| p.len() > MAX_CREATE_PEER_LEN) {
-            return Err(ZoneRuntimeError::Invalid(format!(
-                "peers: an entry exceeds {MAX_CREATE_PEER_LEN} bytes (got {})",
-                peer.len()
-            )));
-        }
-        let hash = request_hash(b"create", &[&req.zone_id, &join_sorted(&req.peers)]);
+        let hash = request_hash(b"create", &[&req.zone_id]);
 
         if let Some(replay) =
             self.begin_or_replay(&header.operation_id, hash, "create", &req.zone_id)?
@@ -233,14 +211,7 @@ impl ZoneRuntimeBackend {
                 req.zone_id
             )));
         }
-        let hash = request_hash(
-            b"join",
-            &[
-                &req.zone_id,
-                &join_sorted(&req.peers),
-                &req.learner.to_string(),
-            ],
-        );
+        let hash = request_hash(b"join", &[&req.zone_id, &req.learner.to_string()]);
 
         if let Some(replay) =
             self.begin_or_replay(&header.operation_id, hash, "join", &req.zone_id)?
@@ -1013,12 +984,6 @@ fn request_hash(kind: &[u8], fields: &[&str]) -> u64 {
             .try_into()
             .expect("8 bytes"),
     )
-}
-
-fn join_sorted(peers: &[String]) -> String {
-    let mut sorted = peers.to_vec();
-    sorted.sort();
-    sorted.join("\u{1}")
 }
 
 fn wall_now_ms() -> i64 {

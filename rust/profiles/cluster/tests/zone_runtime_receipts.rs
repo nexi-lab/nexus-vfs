@@ -61,7 +61,7 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
 
     // ── 1. CREATE: a receipt with real raft facts, outcome explicit ──
     let receipt = f_rt
-        .zone_create(ZONE, &[], "op-create-tenant-a-0001", "")
+        .zone_create(ZONE, "op-create-tenant-a-0001", "")
         .await
         .expect("typed ZoneCreate must succeed on the founder");
     assert_eq!(receipt.outcome, "CREATED", "a fresh create says CREATED");
@@ -117,13 +117,7 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
     let mut j_rt = ZoneRuntime::dial_ready(jport, BUDGET).await;
 
     let joined = j_rt
-        .zone_join(
-            ZONE,
-            std::slice::from_ref(&fadv),
-            false,
-            "op-join-tenant-a-0003",
-            "",
-        )
+        .zone_join(ZONE, false, "op-join-tenant-a-0003", "")
         .await
         .expect("typed ZoneJoin must reach the founder");
     assert_eq!(
@@ -138,15 +132,7 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
     // The typed path has no founder fallback: the joiner may hold a local
     // learner runtime WAITING for a leader's snapshot, but it must never
     // SELF-FOUND — no voters, no committed log, no leader elected.
-    let _ = j_rt
-        .zone_join(
-            GHOST,
-            std::slice::from_ref(&fadv),
-            true,
-            "op-join-ghost-0004",
-            "",
-        )
-        .await;
+    let _ = j_rt.zone_join(GHOST, true, "op-join-ghost-0004", "").await;
     let ghost_status = j_rt
         .zone_status(GHOST, "")
         .await
