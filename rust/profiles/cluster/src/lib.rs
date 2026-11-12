@@ -6683,7 +6683,13 @@ async fn crl_refresh_loop(
                 // CRL costs revocation.
                 Err(e) => tracing::warn!(error = %e, "could not prune the revocation list"),
             }
-            Some(nexus_raft::transport::read_revoked_serials(&path))
+            match nexus_raft::transport::read_revoked_serials_checked(&path) {
+                Ok(serials) => Some(serials),
+                Err(error) => {
+                    tracing::warn!(%error, "revocation list unreadable; keeping current set");
+                    None
+                }
+            }
         } else if let Some(addr) = &founder_enroll {
             match nexus_raft::transport::call_get_crl(addr, 10).await {
                 Ok(crl) => match std::fs::read(&ca_path) {

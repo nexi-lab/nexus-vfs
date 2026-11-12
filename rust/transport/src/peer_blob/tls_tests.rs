@@ -14,10 +14,31 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 const BODY: &[u8] = b"private peer fixture";
 
+mod kernel_reads;
+
+type ScopedCall = (Option<u64>, String, String);
+
 #[derive(Clone)]
 struct BlobService {
     calls: Arc<Mutex<Vec<Option<u64>>>>,
+    scoped_calls: Arc<Mutex<Vec<ScopedCall>>>,
+    supports_scoped: bool,
     ca_der: Arc<Vec<u8>>,
+}
+
+impl BlobService {
+    fn peer_node<T>(&self, request: &tonic::Request<T>) -> Option<u64> {
+        request
+            .extensions()
+            .get::<TlsConnectInfo<TcpConnectInfo>>()
+            .and_then(|info| info.peer_certs())
+            .and_then(|certs| certs.first().cloned())
+            .map(|leaf| {
+                nexus_raft::transport::current_local_node_certificate(leaf.as_ref(), &self.ca_der)
+                    .unwrap()
+                    .node_id
+            })
+    }
 }
 
 impl tonic::server::NamedService for BlobService {
@@ -29,17 +50,32 @@ impl tonic::server::UnaryService<ReadBlobRequest> for BlobService {
     type Future = Ready<Result<tonic::Response<ReadBlobResponse>, tonic::Status>>;
 
     fn call(&mut self, request: tonic::Request<ReadBlobRequest>) -> Self::Future {
-        let node = request
-            .extensions()
-            .get::<TlsConnectInfo<TcpConnectInfo>>()
-            .and_then(|info| info.peer_certs())
-            .and_then(|certs| certs.first().cloned())
-            .map(|leaf| {
-                nexus_raft::transport::current_local_node_certificate(leaf.as_ref(), &self.ca_der)
-                    .unwrap()
-                    .node_id
-            });
+        let node = self.peer_node(&request);
         self.calls.lock().unwrap().push(node);
+        ready(Ok(tonic::Response::new(ReadBlobResponse {
+            content: BODY.to_vec(),
+            error: String::new(),
+        })))
+    }
+}
+
+impl tonic::server::UnaryService<ReadZoneBlobRequest> for BlobService {
+    type Response = ReadBlobResponse;
+    type Future = Ready<Result<tonic::Response<ReadBlobResponse>, tonic::Status>>;
+
+    fn call(&mut self, request: tonic::Request<ReadZoneBlobRequest>) -> Self::Future {
+        let node = self.peer_node(&request);
+        let request = request.into_inner();
+        self.scoped_calls.lock().unwrap().push((
+            node,
+            request.zone_id.clone(),
+            request.content_id.clone(),
+        ));
+        if request.zone_id != "agent-alice" || request.content_id != "/sessions/shared" {
+            return ready(Err(tonic::Status::permission_denied(
+                "unavailable zone content",
+            )));
+        }
         ready(Ok(tonic::Response::new(ReadBlobResponse {
             content: BODY.to_vec(),
             error: String::new(),
@@ -60,6 +96,15 @@ impl Service<http::Request<tonic::body::Body>> for BlobService {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let handler = self.clone();
         Box::pin(async move {
+            if handler.supports_scoped
+                && request.uri().path() == "/nexus.raft.ZoneApiService/ReadZoneBlob"
+            {
+                let codec =
+                    tonic_prost::ProstCodec::<ReadBlobResponse, ReadZoneBlobRequest>::default();
+                return Ok(tonic::server::Grpc::new(codec)
+                    .unary(handler, request)
+                    .await);
+            }
             if request.uri().path() != "/nexus.raft.ZoneApiService/ReadBlob" {
                 return Ok(http::Response::builder()
                     .status(200)
@@ -79,6 +124,7 @@ impl Service<http::Request<tonic::body::Body>> for BlobService {
 struct Fixture {
     address: String,
     calls: Arc<Mutex<Vec<Option<u64>>>>,
+    scoped_calls: Arc<Mutex<Vec<ScopedCall>>>,
     ca: Vec<u8>,
     ca_key: Vec<u8>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -87,14 +133,21 @@ struct Fixture {
 
 impl Fixture {
     async fn start(is_tls: bool) -> Self {
+        Self::start_with_scoped(is_tls, false).await
+    }
+
+    async fn start_with_scoped(is_tls: bool, supports_scoped: bool) -> Self {
         lib::transport_primitives::ensure_crypto_provider();
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
         let (cert, key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let scoped_calls = Arc::new(Mutex::new(Vec::new()));
         let service = BlobService {
             calls: Arc::clone(&calls),
+            scoped_calls: Arc::clone(&scoped_calls),
+            supports_scoped,
             ca_der: Arc::new(pem::parse(&ca).unwrap().into_contents()),
         };
         let mut builder = Server::builder();
@@ -123,6 +176,7 @@ impl Fixture {
         Self {
             address,
             calls,
+            scoped_calls,
             ca,
             ca_key,
             stop: Some(stop),

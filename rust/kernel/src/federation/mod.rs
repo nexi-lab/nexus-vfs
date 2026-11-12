@@ -54,6 +54,7 @@
 
 mod blob_fetcher_slot;
 mod cold_segment;
+pub use cold_segment::ColdSegmentAddress;
 mod coordinator_wiring;
 pub mod grpc_ops;
 

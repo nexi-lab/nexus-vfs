@@ -12,7 +12,15 @@ on:
       - 'rust/contracts/src/replica_credential.rs'
       - 'rust/kernel/src/abc/meta_store.rs'
       - 'rust/kernel/src/core/meta_store/**'
+      - 'rust/kernel/src/core/vfs_router.rs'
       - 'rust/kernel/src/extensions/conditional_metadata.rs'
+      - 'rust/kernel/src/federation/cold_segment.rs'
+      - 'rust/kernel/src/federation/cold_segment/**'
+      - 'rust/kernel/src/kernel/syscall_impl.rs'
+      - 'rust/kernel/src/kernel/mount.rs'
+      - 'rust/kernel/src/kernel/mount/**'
+      - 'rust/transport/src/peer_blob.rs'
+      - 'rust/transport/src/peer_blob/**'
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
@@ -70,6 +78,7 @@ jobs:
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
           cargo test --locked -p raft@0.1.0 --lib transport::replica_renewal::tests
+          cargo test --locked -p raft@0.1.0 --lib transport::crl::
           cargo test --locked -p transport --lib peer_identity::tests::owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface
       - name: Raft membership controls EC recipients
         run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
