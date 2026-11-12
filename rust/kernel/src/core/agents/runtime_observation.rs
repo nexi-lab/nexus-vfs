@@ -106,6 +106,10 @@ pub(super) enum RuntimeObservationSource {
 // Unknown after a missed publisher interval. Expiry never proves remote exit.
 const EXTERNAL_FRESHNESS: Duration = Duration::from_secs(3);
 
+fn age_millis(age: Duration) -> u64 {
+    u64::try_from(age.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl AgentRegistry {
     /// Retry only this authenticated admission intent. A caller cannot adopt
     /// another registration merely because it now owns the same logical PID.
@@ -253,11 +257,9 @@ impl AgentRegistry {
         if let Some(info) = entry.external_info.as_mut() {
             info.last_heartbeat_ms = Some(now);
         }
-        entry.runtime = Some(RuntimeObservationSource::External {
-            update,
-            received: Instant::now(),
-        });
-        entry.runtime_last_seen = Some(Instant::now());
+        let received = Instant::now();
+        entry.runtime = Some(RuntimeObservationSource::External { update, received });
+        entry.runtime_last_seen = Some(received);
         drop(entry);
         self.finish_state_change(instance, false);
         Ok(true)
@@ -265,6 +267,14 @@ impl AgentRegistry {
 
     /// Query outside registry locks, then recheck the exact incarnation.
     pub fn runtime_observation(&self, instance: &AgentInstance) -> Option<RuntimeObservation> {
+        self.runtime_observation_with_clock(instance, Instant::now)
+    }
+
+    fn runtime_observation_with_clock(
+        &self,
+        instance: &AgentInstance,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<RuntimeObservation> {
         let (name, source, last_seen) = {
             let entry = self.agents.get(&instance.pid)?;
             if entry.removing || !entry.matches(instance) || entry.state == AgentState::Terminated {
@@ -276,26 +286,22 @@ impl AgentRegistry {
                 entry.runtime_last_seen,
             )
         };
-        let (mut availability, mut age_ms, mut update) = match &source {
+        let observed_at = now();
+        let (mut availability, mut age, mut update) = match &source {
             Some(RuntimeObservationSource::Live(read)) => match read() {
                 Some(facts) => (
                     RuntimeAvailability::Fresh,
-                    Some(0),
+                    Some(Duration::ZERO),
                     Some(RuntimeStatusUpdate::from_facts(0, facts)),
                 ),
                 None => (RuntimeAvailability::Unavailable, None, None),
             },
             Some(RuntimeObservationSource::External { update, received }) => {
-                let age = received.elapsed();
-                let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+                let age = observed_at.saturating_duration_since(*received);
                 if age <= EXTERNAL_FRESHNESS {
-                    (
-                        RuntimeAvailability::Fresh,
-                        Some(age_ms),
-                        Some(update.clone()),
-                    )
+                    (RuntimeAvailability::Fresh, Some(age), Some(update.clone()))
                 } else {
-                    (RuntimeAvailability::Stale, Some(age_ms), None)
+                    (RuntimeAvailability::Stale, Some(age), None)
                 }
             }
             None => (RuntimeAvailability::Unsupported, None, None),
@@ -317,7 +323,7 @@ impl AgentRegistry {
                 // Rebinding can replace the SID reader while preserving the
                 // host instance. Never pair retired identity with new facts.
                 availability = RuntimeAvailability::Unavailable;
-                age_ms = None;
+                age = None;
                 update = None;
             } else if matches!(&source, Some(RuntimeObservationSource::Live(_))) {
                 if let Some(frame) = update.as_mut() {
@@ -328,25 +334,22 @@ impl AgentRegistry {
                         frame.revision = revision;
                     } else {
                         availability = RuntimeAvailability::Unavailable;
-                        age_ms = None;
+                        age = None;
                         update = None;
                     }
                 }
             }
             self.runtime_instance_key(instance)
         };
-        let heartbeat_age =
-            last_seen.map(|seen| u64::try_from(seen.elapsed().as_millis()).unwrap_or(u64::MAX));
-        let last_seen_age_ms = match (
+        let heartbeat_age = last_seen.map(|seen| observed_at.saturating_duration_since(seen));
+        let last_seen_age = match (
             heartbeat_age,
-            age_ms.filter(|_| availability == RuntimeAvailability::Fresh),
+            age.filter(|_| availability == RuntimeAvailability::Fresh),
         ) {
             (Some(heartbeat), Some(observation)) => Some(heartbeat.min(observation)),
             (heartbeat, observation) => heartbeat.or(observation),
         };
-        let presence = if last_seen_age_ms
-            .is_some_and(|age| Duration::from_millis(age) <= EXTERNAL_FRESHNESS)
-        {
+        let presence = if last_seen_age.is_some_and(|age| age <= EXTERNAL_FRESHNESS) {
             RuntimePresence::Online
         } else {
             RuntimePresence::Unknown
@@ -355,9 +358,9 @@ impl AgentRegistry {
             instance: id,
             agent_id: name,
             presence,
-            last_seen_age_ms,
+            last_seen_age_ms: last_seen_age.map(age_millis),
             availability,
-            age_ms,
+            age_ms: age.map(age_millis),
             update,
         })
     }
@@ -394,5 +397,139 @@ impl AgentRegistry {
             },
             instances: observations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contracts::runtime_status::{
+        BackgroundTaskSummary, ForegroundState, RegisterRuntimeRequest, RuntimeIdentity,
+        RuntimeStatus,
+    };
+
+    fn external_runtime() -> (AgentRegistry, AgentInstance, RuntimeStatusUpdate) {
+        let registry = AgentRegistry::new();
+        let instance = registry
+            .register_runtime_instance(
+                &RegisterRuntimeRequest {
+                    name: "agent-a".into(),
+                    connection_id: "connection-a".into(),
+                    registration_id: "registration-a".into(),
+                    owner_id: None,
+                    zone_id: None,
+                },
+                "alice",
+                "alpha",
+            )
+            .unwrap();
+        let update = RuntimeStatusUpdate {
+            revision: 1,
+            identity: RuntimeIdentity {
+                session_id: Some("session-a".into()),
+                os_pid: Some(std::process::id()),
+            },
+            status: RuntimeStatus {
+                foreground: ForegroundState::Running,
+                background: BackgroundTaskSummary {
+                    terminals: 0,
+                    agents: 0,
+                    execution_unconfirmed: 0,
+                    tool_operations: 0,
+                },
+            },
+        };
+        assert!(registry
+            .publish_runtime_status(&instance, update.clone())
+            .unwrap());
+        (registry, instance, update)
+    }
+
+    #[test]
+    fn external_observation_and_presence_share_the_exact_expiry_boundary() {
+        let (registry, instance, update) = external_runtime();
+        let received = {
+            let entry = registry.agents.get(&instance.pid).unwrap();
+            let Some(RuntimeObservationSource::External { received, .. }) = &entry.runtime else {
+                panic!("external publication required");
+            };
+            assert_eq!(entry.runtime_last_seen, Some(*received));
+            *received
+        };
+        for (age, availability, presence) in [
+            (
+                EXTERNAL_FRESHNESS - Duration::from_nanos(1),
+                RuntimeAvailability::Fresh,
+                RuntimePresence::Online,
+            ),
+            (
+                EXTERNAL_FRESHNESS,
+                RuntimeAvailability::Fresh,
+                RuntimePresence::Online,
+            ),
+            (
+                EXTERNAL_FRESHNESS + Duration::from_nanos(1),
+                RuntimeAvailability::Stale,
+                RuntimePresence::Unknown,
+            ),
+        ] {
+            let observation = registry
+                .runtime_observation_with_clock(&instance, || received + age)
+                .unwrap();
+            assert_eq!(observation.availability, availability);
+            assert_eq!(observation.presence, presence);
+            assert_eq!(observation.age_ms, Some(age_millis(age)));
+            assert_eq!(observation.last_seen_age_ms, observation.age_ms);
+            assert_eq!(
+                observation.update.is_some(),
+                availability == RuntimeAvailability::Fresh
+            );
+        }
+        assert!(registry.publish_runtime_status(&instance, update).unwrap());
+        let replay = registry
+            .runtime_observation_with_clock(&instance, || {
+                received + EXTERNAL_FRESHNESS + Duration::from_nanos(1)
+            })
+            .unwrap();
+        assert_eq!(replay.availability, RuntimeAvailability::Stale);
+        assert_eq!(replay.presence, RuntimePresence::Unknown);
+        assert!(replay.update.is_none());
+    }
+
+    #[test]
+    fn heartbeat_refreshes_presence_without_refreshing_external_work() {
+        let (registry, instance, update) = external_runtime();
+        let old = Instant::now() - EXTERNAL_FRESHNESS * 2;
+        {
+            let mut entry = registry.agents.get_mut(&instance.pid).unwrap();
+            let Some(RuntimeObservationSource::External { received, .. }) = &mut entry.runtime
+            else {
+                panic!("external publication required");
+            };
+            *received = old;
+            entry.runtime_last_seen = Some(old);
+        }
+        let stale = registry.runtime_observation(&instance).unwrap();
+        assert_eq!(stale.availability, RuntimeAvailability::Stale);
+        assert_eq!(stale.presence, RuntimePresence::Unknown);
+        assert!(registry.heartbeat_instance(&instance).unwrap().is_some());
+        let heartbeat = registry
+            .agents
+            .get(&instance.pid)
+            .unwrap()
+            .runtime_last_seen
+            .unwrap();
+        let online = registry
+            .runtime_observation_with_clock(&instance, || heartbeat)
+            .unwrap();
+        assert_eq!(online.availability, RuntimeAvailability::Stale);
+        assert_eq!(online.presence, RuntimePresence::Online);
+        assert_eq!(online.last_seen_age_ms, Some(0));
+        assert!(online.update.is_none());
+        assert!(registry.publish_runtime_status(&instance, update).unwrap());
+        let replay = registry
+            .runtime_observation_with_clock(&instance, || heartbeat)
+            .unwrap();
+        assert_eq!(replay, online);
     }
 }
