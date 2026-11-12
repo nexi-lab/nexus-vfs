@@ -1,7 +1,7 @@
 # Managed Agent caller-owned CSR interface (experimental)
 
 This adds the network frontend to the existing unsigned I / selected F
-coordinator. It reuses `AgentMinter`, the configured local CA holder and the
+coordinator. It reuses `CaIssuer`, the configured local CA holder and the
 existing auth control store. The cluster profile opts in with
 `experimental-managed-agent-csr`; default builds report version 0 and refuse
 issuance. No running node, managed Agent, trust registration or session is
