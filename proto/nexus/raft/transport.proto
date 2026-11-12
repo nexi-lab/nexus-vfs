@@ -150,6 +150,7 @@ service ZoneApiService {
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 
+
   // Versioned, Node-only caller-owned key issuance. These methods use the same
   // CA-holder slot and immutable I/F records, never MintAgent's generated key
   // or allow_existing path. Query is read-only; NotObserved cannot prove a
@@ -304,9 +305,10 @@ message AgentCsrResponse {
 // on this listener. GetCrl serves only a public CA-signed artifact.
 service NodeEnrollmentService {
   // JoinCluster provisions a new node with cluster TLS certificates. The caller
-  // authenticates with the join token password (k3s/kubeadm "join" model); the
-  // server verifies it, signs a node cert, and returns it with the CA cert. The
-  // CA key never leaves the signing node.
+  // authenticates with the join token password (k3s/kubeadm "join" model) and
+  // sends a CSR for a key it generated; the server verifies the token, certifies
+  // that key for the requested Node ID, and returns the cert with the CA cert.
+  // No private key crosses this plaintext channel.
   rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
 
   // GetCrl returns the cluster's current CA-signed agent-cert revocation list.
@@ -732,6 +734,9 @@ message JoinClusterRequest {
   // Reserved: was peers_bootstrap (removed — only token-based auth supported).
   reserved 5;
   reserved "peers_bootstrap";
+  // PKCS#10 request for the joiner's own P-256 key. Only the proven public key
+  // is certified; the identity is the token-authorized `node_id`.
+  bytes csr_pem = 6;
 }
 
 // JoinClusterResponse returns cluster TLS material on success.
@@ -744,10 +749,10 @@ message JoinClusterResponse {
   // Reserved: was ca_key_pem — removed for security (CA key stays on node-1).
   reserved 4;
   reserved "ca_key_pem";
-  // Server-signed node certificate (PEM-encoded).
+  // Server-signed node certificate (PEM-encoded) for the request's CSR key.
   bytes node_cert_pem = 5;
-  // Node private key (PEM-encoded). Generated server-side for the joiner.
-  bytes node_key_pem = 6;
+  reserved 6;
+  reserved "node_key_pem";
   // Cluster API-key HMAC secret (the `sk-` token signing key), served so a
   // joiner inherits it over the SAME token-gated channel as the CA. It must be
   // byte-identical cluster-wide for a minted key to resolve on any node

@@ -2182,10 +2182,11 @@ impl Drop for ZoneManager {
 
 // ── Join-cluster helper (pre-ZoneManager-exists TLS bootstrap) ────────
 
-/// K3s-style join: connect to leader with TOFU TLS, verify CA
-/// fingerprint from the join token, write `ca.pem` / `node.pem` /
-/// `node-key.pem` into `<data_dir>/tls`. Enrollment and ZoneManager use the same
-/// persisted opaque Node ID. Called BEFORE ZoneManager exists.
+/// K3s-style join: generate this node's key, have the leader certify it for
+/// the persisted opaque Node ID (token-authorized), verify the CA fingerprint
+/// from the join token, and write `ca.pem` / `node.pem` / `node-key.pem` into
+/// `<data_dir>/tls`. The key never leaves this node. Called BEFORE ZoneManager
+/// exists.
 pub fn join_cluster_and_provision_tls(
     peer_address: &str,
     join_token: &str,
@@ -2245,9 +2246,11 @@ pub fn join_cluster_and_provision_tls(
             .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
     );
 
+    let (csr_pem, key_pem) =
+        crate::transport::generate_node_key_request().map_err(RaftError::Config)?;
     let result = runtime
         .block_on(call_join_cluster(
-            &endpoint, node_id, "", "root", password, 30,
+            &endpoint, node_id, "", "root", password, &csr_pem, 30,
         ))
         .map_err(|e| RaftError::Raft(format!("JoinCluster RPC failed: {}", e)))?;
 
@@ -2266,11 +2269,8 @@ pub fn join_cluster_and_provision_tls(
 
     std::fs::write(dir.join("ca.pem"), &result.ca_pem)
         .map_err(|e| RaftError::Config(format!("Failed to write ca.pem: {}", e)))?;
-    std::fs::write(dir.join("node.pem"), &result.node_cert_pem)
-        .map_err(|e| RaftError::Config(format!("Failed to write node.pem: {}", e)))?;
-
-    lib::transport_primitives::write_secret(&dir.join("node-key.pem"), &result.node_key_pem)
-        .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
+    crate::transport::persist_node_identity(&dir, &result.node_cert_pem, &key_pem)
+        .map_err(RaftError::Config)?;
 
     // Persist the cluster API-key secret (if the founder served one) to the
     // single SSOT `tls/api-key-secret`, so this joiner authenticates

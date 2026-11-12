@@ -50,6 +50,7 @@ pub(crate) mod certgen;
 pub(crate) use certgen::verified_csr_key;
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
+    generate_node_key_request, persist_node_identity,
     generate_node_cert, generate_session_agent_cert, generate_user_replica_cert,
     generate_user_runtime_cert, generate_zone_ca, join_token_hash_path, node_identity_uri,
     parse_node_identity_uri, prepare_agent_csr_intent, prepare_replica_csr_intent,

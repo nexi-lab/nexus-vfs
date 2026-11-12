@@ -2319,9 +2319,9 @@ struct NodeEnrollmentServiceImpl {
 
 #[tonic::async_trait]
 impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
-    /// Provision a joining node: verify the join token, sign a node cert with
-    /// the cluster CA, return CA + cert + key. The CA private key never leaves
-    /// this process.
+    /// Provision a joining node: verify the join token, certify the key in its
+    /// CSR with the cluster CA, return CA + cert. Neither private key — the CA's
+    /// nor the joiner's — crosses this channel.
     async fn join_cluster(
         &self,
         request: Request<JoinClusterRequest>,
@@ -2333,7 +2333,6 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
                 error: Some(msg.to_string()),
                 ca_pem: Vec::new(),
                 node_cert_pem: Vec::new(),
-                node_key_pem: Vec::new(),
                 api_key_secret: None,
             })
         };
@@ -2387,7 +2386,9 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             }
         };
 
-        // --- Sign node certificate ---
+        // --- Certify the joiner's own key ---
+        // The token authorizes the requested Node ID; the CSR contributes only
+        // the proven public key. The joiner's private key never leaves it.
         let zone_id = if req.zone_id.is_empty() {
             contracts::ROOT_ZONE_ID
         } else {
@@ -2395,7 +2396,8 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         };
         let extra_hostnames = super::certgen::extract_hostnames(&req.node_address);
         let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
-        let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
+        let node_cert_pem = match super::certgen::sign_node_csr(
+            &req.csr_pem,
             req.node_id,
             zone_id,
             &ca_pem,
@@ -2403,10 +2405,10 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             &extra_hostnames,
             peer_hostname,
         ) {
-            Ok(pair) => pair,
+            Ok(cert) => cert,
             Err(e) => {
-                tracing::error!("Failed to generate node cert: {}", e);
-                return Ok(err_resp(&format!("Failed to generate node cert: {}", e)));
+                tracing::warn!(peer_node_id = req.node_id, error = %e, "JoinCluster: CSR refused");
+                return Ok(err_resp(&format!("JoinCluster CSR refused: {e}")));
             }
         };
 
@@ -2421,7 +2423,6 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             error: None,
             ca_pem,
             node_cert_pem,
-            node_key_pem,
             api_key_secret: self.api_key_secret.clone(),
         }))
     }

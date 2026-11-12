@@ -877,11 +877,10 @@ pub struct ClusterInfoResult {
 // JoinCluster client — shared by cluster nodes and witness binary
 // =============================================================================
 
-/// Result of a successful JoinCluster call.
+/// Result of a successful JoinCluster call: the certificate for the CSR's key.
 pub struct JoinClusterResult {
     pub ca_pem: Vec<u8>,
     pub node_cert_pem: Vec<u8>,
-    pub node_key_pem: Vec<u8>,
     /// Cluster API-key HMAC secret the founder served (over the same
     /// token-gated channel as the CA). `None` when the founder is auth-off.
     /// The caller persists it to `tls/api-key-secret` (the single SSOT) so the
@@ -927,10 +926,12 @@ async fn connect_zone_api(
     Ok(ZoneApiServiceClient::new(channel))
 }
 
-/// Call JoinCluster on a leader to get a signed node certificate.
+/// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
+/// [`super::generate_node_key_request`]).
 ///
 /// K3s-style: authenticates with join token password. The leader signs
-/// the cert server-side — CA key never leaves node-1.
+/// the cert server-side — the CA key never leaves it, and the joiner's key
+/// never leaves the joiner.
 ///
 /// Intentionally plaintext: this is the pre-identity bootstrap RPC a
 /// certless joiner uses to *obtain* its node cert, so it cannot present a
@@ -942,6 +943,7 @@ pub async fn call_join_cluster(
     node_address: &str,
     zone_id: &str,
     password: &str,
+    csr_pem: &[u8],
     timeout_secs: u64,
 ) -> Result<JoinClusterResult> {
     let ep = Endpoint::from_shared(leader_addr.to_string())
@@ -960,6 +962,7 @@ pub async fn call_join_cluster(
         node_id,
         node_address: node_address.to_string(),
         zone_id: zone_id.to_string(),
+        csr_pem: csr_pem.to_vec(),
     };
 
     let response = client
@@ -978,7 +981,6 @@ pub async fn call_join_cluster(
     Ok(JoinClusterResult {
         ca_pem: response.ca_pem,
         node_cert_pem: response.node_cert_pem,
-        node_key_pem: response.node_key_pem,
         api_key_secret: response.api_key_secret,
     })
 }
