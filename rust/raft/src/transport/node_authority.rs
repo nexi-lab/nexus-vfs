@@ -64,6 +64,23 @@ pub(super) fn authenticated_node_id(extensions: &http::Extensions) -> Result<Opt
     Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
 }
 
+/// Recheck a replica's original TLS caller before and after a blocking read.
+pub(super) fn current_replica_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+    let Some(AuthenticatedPeer::Replica(id)) = authenticated_peer(extensions)? else {
+        return Ok(None);
+    };
+    let policy = extensions.get::<NodeControlPolicy>().ok_or_else(|| {
+        Status::permission_denied("replica request has no listener admission policy")
+    })?;
+    policy.check_local_credentials()?;
+    match policy.check(extensions)? {
+        Some(AuthenticatedPeer::Replica(current)) if current == id => Ok(Some(id)),
+        _ => Err(Status::permission_denied(
+            "replica caller is no longer current",
+        )),
+    }
+}
+
 /// Storage format preparation requires Node authority even on a development
 /// listener. Numeric replica identity alone carries no control authority.
 pub(super) fn require_authenticated_control_node(
@@ -380,6 +397,9 @@ impl RequestAdmission {
                 }
                 Ok(Some(peer)) => {
                     request.extensions_mut().insert(peer);
+                    if matches!(peer, AuthenticatedPeer::Replica(_)) {
+                        request.extensions_mut().insert(self.policy.clone());
+                    }
                 }
                 Ok(None) => {}
                 Err(status) => return Err(status),
@@ -406,6 +426,7 @@ const REPLICA_DATA_METHODS: &[&str] = &[
     "Propose",
     "Query",
     "GetClusterInfo",
+    "JoinZone",
     "GetSearchCapabilities",
     "ReadZoneBlob",
 ];

@@ -510,10 +510,10 @@ pub trait StateMachine: Send + Sync {
     }
 
     /// Every member-address record this state machine holds, as
-    /// `(node_id, bare host:port)`. Default: none (no control store, e.g. a
-    /// witness).
-    fn member_addresses(&self) -> Result<Vec<(u64, String)>> {
-        Ok(Vec::new())
+    /// `(node_id, bare host:port)`. `None` when it keeps no control store and
+    /// therefore cannot hold the records (the default, e.g. a witness).
+    fn member_addresses(&self) -> Result<Option<Vec<(u64, String)>>> {
+        Ok(None)
     }
 
     /// Apply a command locally for EC (eventual consistency) writes.
@@ -2875,7 +2875,7 @@ impl StateMachine for FullStateMachine {
         Ok(())
     }
 
-    fn member_addresses(&self) -> Result<Vec<(u64, String)>> {
+    fn member_addresses(&self) -> Result<Option<Vec<(u64, String)>>> {
         let prefix = control_key(super::member_address::NAMESPACE, "");
         let mut records = Vec::new();
         self.control_state.for_each_prefix(&prefix, |key, value| {
@@ -2887,7 +2887,7 @@ impl StateMachine for FullStateMachine {
             }
             Ok(true)
         })?;
-        Ok(records)
+        Ok(Some(records))
     }
 
     fn snapshot(&self) -> Result<Vec<u8>> {

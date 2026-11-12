@@ -12,6 +12,8 @@ mod member_preparation;
 mod reader_capability;
 #[path = "node_rpc_boundaries/reader_preparation.rs"]
 mod reader_preparation;
+#[path = "node_rpc_boundaries/replica_join.rs"]
+mod replica_join;
 #[path = "node_rpc_boundaries/replica_transport.rs"]
 mod replica_transport;
 #[path = "node_rpc_boundaries/revocation.rs"]
