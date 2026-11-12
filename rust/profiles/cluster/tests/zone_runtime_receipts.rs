@@ -14,9 +14,9 @@
 //!      once the leader committed the membership — the founder's
 //!      GetClusterInfo lists the joiner as a voter at its address — and the
 //!      joiner's status answers RESIDENT with live cluster facts.
-//!   5. JOIN of a zone no leader serves: refused UNAVAILABLE, never JOINED,
-//!      and the joiner must NOT bootstrap it into existence (no founder
-//!      fallback on the typed path).
+//!   5. JOIN of a zone no leader serves: refused UNAVAILABLE, never JOINED;
+//!      the joiner must NOT bootstrap it into existence (no founder fallback
+//!      on the typed path) and keeps no replica of it.
 
 mod common;
 
@@ -163,9 +163,9 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
     assert_eq!(j_status.presence, i32::from(Presence::Resident));
 
     // ── 5. JOIN of a zone no leader serves: UNAVAILABLE, never JOINED (R9) ──
-    // The typed path has no founder fallback: the joiner may hold a local
-    // learner runtime WAITING for a leader's snapshot, but it must never
-    // SELF-FOUND — no voters, no committed log, no leader elected.
+    // The typed path has no founder fallback, and an unadmitted join keeps
+    // nothing: the joiner neither SELF-FOUNDS the zone nor holds a replica of
+    // it afterwards.
     let refused = j_rt
         .zone_join(GHOST, true, "op-join-ghost-0004", "")
         .await
@@ -180,17 +180,14 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
         .zone_status(GHOST, "")
         .await
         .expect("status of the never-created zone");
-    let ghost_facts = ghost_status
-        .cluster
-        .as_ref()
-        .expect("a local learner runtime reports its (empty) facts");
     assert_eq!(
-        ghost_facts.voter_count, 0,
-        "a join must not self-found: the ghost zone has NO voters (R9)"
+        ghost_status.presence,
+        i32::from(Presence::LocalNotFound),
+        "no replica and no self-founded zone remain (R9)"
     );
-    assert_eq!(
-        ghost_facts.commit_index, 0,
-        "nothing was committed — no founder bootstrap happened (R9)"
+    assert!(ghost_status.cluster.is_none(), "no raft group runs for it");
+    assert!(
+        !std::path::Path::new(&jdata).join(GHOST).exists(),
+        "no zone directory remains"
     );
-    assert_eq!(ghost_facts.leader_id, 0, "no leader was ever elected");
 }

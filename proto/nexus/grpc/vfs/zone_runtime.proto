@@ -25,8 +25,10 @@ service ZoneRuntimeService {
 
   // Join an existing zone: request membership through the node's seed
   // addresses. JOINED means this node's applied ConfState names it as the
-  // requested learner or voter; no leader admitting it is UNAVAILABLE. NEVER
-  // bootstraps a founder — a join can never degrade into a create (R9).
+  // requested learner or voter. No leader admitting it is UNAVAILABLE: the
+  // operation stays PENDING with no replica left behind, and a retry of the
+  // same operation_id drives it again. NEVER bootstraps a founder — a join
+  // can never degrade into a create (R9).
   rpc ZoneJoin(ZoneJoinRequest) returns (ZoneReceipt);
 
   // Hosted/resident/local-not-found presence + raft facts (R10).

@@ -101,6 +101,11 @@ pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
     journal: ZoneOpJournal,
     deletions: Arc<ZoneDeletionRegistry>,
+    /// Operations whose execution on this node stopped without a terminal
+    /// outcome, with when it stopped. Memory only: it records that no
+    /// executor on this node runs them, so a same-operation retry drives one
+    /// again at once instead of waiting out the takeover grace.
+    stopped: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl ZoneRuntimeBackend {
@@ -113,6 +118,7 @@ impl ZoneRuntimeBackend {
             zm,
             journal,
             deletions,
+            stopped: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -198,13 +204,14 @@ impl ZoneRuntimeBackend {
         self.complete(&header.operation_id, &req.zone_id, receipt)
     }
 
-    /// Join an existing zone (R9/D2): host its replica, then request
-    /// membership through JoinZone against the operator seeds — the same
-    /// join loop as boot and the offline `join` CLI
+    /// Join an existing zone (R9/D2): host its replica and request membership
+    /// through JoinZone against the operator seeds — the same join loop as
+    /// boot and the offline `join` CLI
     /// ([`crate::distributed_coordinator::join_zone_via_peers`]). JOINED means
     /// this node's applied ConfState names it as the requested learner or
-    /// voter. There is NO founder fallback: a join no leader admits fails
-    /// loudly and can never degrade into a create.
+    /// voter. There is NO founder fallback: a join no leader admits is
+    /// UNAVAILABLE, leaves no replica no leader reached, stays PENDING, and a
+    /// retry of the same operation id drives it again.
     pub fn zone_join(&self, req: &ZoneJoinRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::RemoteLearned, &req.zone_id)
@@ -245,11 +252,6 @@ impl ZoneRuntimeBackend {
             ));
             return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
         }
-        if self.zm.get_zone(&req.zone_id).is_none() {
-            if let Err(e) = self.zm.join_zone(&req.zone_id, req.learner) {
-                return self.fail(&header.operation_id, map_raft_err(e), "join", &req.zone_id);
-            }
-        }
         let node_id = self.zm.node_id();
         if let Err(e) = crate::distributed_coordinator::join_zone_via_peers(
             &self.zm,
@@ -260,12 +262,13 @@ impl ZoneRuntimeBackend {
             Some(crate::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
             req.learner,
         ) {
-            return self.fail(
-                &header.operation_id,
-                ZoneRuntimeError::Unavailable(e),
-                "join",
-                &req.zone_id,
-            );
+            let refusal = match e {
+                crate::distributed_coordinator::JoinZoneError::Local(e) => map_raft_err(e),
+                crate::distributed_coordinator::JoinZoneError::NotAdmitted(reason) => {
+                    ZoneRuntimeError::Unavailable(reason)
+                }
+            };
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
         }
         let mut facts = self.cluster_facts_caught_up(&req.zone_id);
         facts.has_store = facts.has_store && self.zm.hosts_zone(&req.zone_id);
@@ -810,7 +813,20 @@ impl ZoneRuntimeBackend {
                 // in flight.
                 crate::zone_op_journal::STATUS_PENDING if rec.request_hash == hash => {
                     let now = wall_now_ms();
-                    if !pending_takeover_allowed(&rec, now) {
+                    if self.take_stopped(&rec) {
+                        tracing::info!(
+                            operation_id,
+                            zone_id,
+                            "driving a PENDING operation again: its execution on this node stopped \
+                             without an outcome and no executor has claimed it since",
+                        );
+                    } else if pending_takeover_allowed(&rec, now) {
+                        tracing::warn!(
+                            operation_id,
+                            zone_id,
+                            "taking over an orphaned PENDING journal record (crash between begin and complete)"
+                        );
+                    } else {
                         return Err(ZoneRuntimeError::Conflict(format!(
                             "operation_id '{operation_id}' is still in flight (PENDING for \
                              {} ms); retry after {PENDING_TAKEOVER_GRACE_MS} ms, query \
@@ -818,12 +834,8 @@ impl ZoneRuntimeBackend {
                             now - rec.updated_at_ms
                         )));
                     }
-                    tracing::warn!(
-                        operation_id,
-                        zone_id,
-                        "taking over an orphaned PENDING journal record (crash between begin and complete)"
-                    );
-                    // Restart the grace window from the takeover point.
+                    // Restart the grace window: this execution is protected
+                    // like any other.
                     if let Err(e) = self.journal.refresh(operation_id) {
                         return Err(ZoneRuntimeError::Internal(format!(
                             "journal refresh for takeover: {e}"
@@ -862,7 +874,22 @@ impl ZoneRuntimeBackend {
         Ok(receipt)
     }
 
-    /// Persist definitive refusals; unknown outcomes remain recoverable.
+    /// Claim a PENDING operation whose execution on this node stopped without
+    /// an outcome, when no executor has re-stamped its record since. The
+    /// removal is the claim: of two concurrent retries, one drives it.
+    fn take_stopped(&self, rec: &JournalRecord) -> bool {
+        let mut stopped = self.stopped.lock();
+        match stopped.get(&rec.operation_id) {
+            Some(&stopped_at) if rec.updated_at_ms <= stopped_at => {
+                stopped.remove(&rec.operation_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Persist definitive refusals; unknown outcomes remain recoverable and,
+    /// on this node, drivable again by a retry at once.
     fn fail(
         &self,
         operation_id: &str,
@@ -878,6 +905,9 @@ impl ZoneRuntimeBackend {
             // business refusal. Keep the original intent PENDING so polling and
             // a same-operation takeover can recover it after the grace period.
             tracing::error!(zone = %zone_id, kind = %kind, "zone runtime mutation outcome unknown: {err}");
+            self.stopped
+                .lock()
+                .insert(operation_id.to_string(), wall_now_ms());
             return Err(err);
         }
         if let Err(journal_err) = self.journal.reject(operation_id, &err.to_string()) {

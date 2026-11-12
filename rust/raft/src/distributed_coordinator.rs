@@ -894,68 +894,32 @@ fn create_founder_zone(
         .map(|_| ())
 }
 
-fn block_on_zone_manager<F>(zm: &ZoneManager, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    let handle = zm.runtime_handle();
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        handle.block_on(fut)
+/// Remove the local replica of `zone_id` that a join set up, if no leader
+/// ever reached it — no log entry, no leader contact, no ConfState naming
+/// this node — through the zone's ordinary local removal. Such a replica
+/// holds nothing; one a leader reached may already be a member's, and stays.
+/// Returns whether no replica of the zone remains.
+fn discard_unadmitted_replica(zm: &ZoneManager, zone_id: &str) -> bool {
+    let Some(zone) = zm.get_zone(zone_id) else {
+        return true;
+    };
+    let node = zone.consensus_node();
+    let reached = node.last_index() > 0
+        || node.leader_contact_age().is_some()
+        || node.is_replication_member(node.id());
+    drop((node, zone));
+    if reached {
+        return false;
+    }
+    match zm.remove_local_zone(zone_id) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(zone = %zone_id, %error, "unadmitted join replica not removed");
+            false
+        }
     }
 }
 
-fn remove_local_probe_zone(zm: &ZoneManager, zone_id: &str) {
-    if zm.get_zone(zone_id).is_none() {
-        return;
-    }
-    if let Err(e) = block_on_zone_manager(zm, zm.registry().remove_zone(zone_id)) {
-        tracing::warn!(
-            zone = %zone_id,
-            error = %e,
-            "founder rejoin probe cleanup failed before local create",
-        );
-    }
-}
-
-/// Block until the joiner's local raft state machine has received,
-/// committed, and persisted the leader's first AppendEntries after
-/// a successful `JoinZone` RPC.
-///
-/// Contract this enforces (and the SSOT for it):
-///
-/// The JoinZone RPC returns "success" the moment the leader's
-/// `AddNode`/`AddLearnerNode` proposal commits on the leader's log.
-/// At that instant the joiner's persisted on-disk state still
-/// reflects the pre-join `skip_bootstrap=true` registration —
-/// `peers=0`, no `leader_id`, no log entries.  Authoritative
-/// `ConfState` only lands on the joiner's disk once raft-rs replays
-/// the leader's append-entries through its `Ready` cycle: the
-/// driver loop calls `apply_entries`, which invokes
-/// `storage.set_conf_state(&cs)` synchronously for the conf-change
-/// entry, then `update_cached_status` refreshes `cached_commit_index`
-/// from `raft_log.committed`.  Order matters: `cached_commit_index`
-/// transitions 0 → ≥1 AFTER the `set_conf_state` write returns Ok.
-///
-/// Without this gate, an offline `nexusd-cluster join` CLI that
-/// returns immediately after the RPC ack leaves the data dir in a
-/// "solo cluster of self" state.  The next daemon restart loads
-/// the pre-snapshot state, treats the zone as 1-voter (self only),
-/// and floods `raft: cannot step as peer not found` when the
-/// leader's heartbeats finally arrive — because the leader was
-/// never added to the joiner's `Progress` map.
-///
-/// Termination signal: `leader_id().is_some()` (we have heard from
-/// the leader) AND `commit_index() > 0` (the apply pipeline has
-/// completed at least one cycle, which by construction includes the
-/// conf-change containing our membership — `applied_index` would be
-/// the stricter signal but it only advances for data entries, since
-/// `FullStateMachine::apply(Noop)` short-circuits past
-/// `last_applied.store(...)`; conf-only commits stay invisible to
-/// it).  The pair is what `bootstrap_or_join_zone`'s "snapshot has
-/// installed authoritative ConfState locally" comment promised —
-/// this function makes the claim true instead of aspirational.
 /// Operator-experience integrity check on a loaded zone before
 /// short-circuiting `bootstrap_or_join_zone` to "resume from ConfState".
 ///
@@ -1016,8 +980,11 @@ fn is_member_as(zh: &ZoneHandle, node_id: u64, as_learner: bool) -> bool {
 
 /// Wait until the leader's committed membership change reached this node:
 /// its replica knows the leader and its applied ConfState names it as
-/// requested. Only then does the data dir hold the authoritative ConfState
-/// — and only then may a join report this node a member.
+/// requested. JoinZone succeeds once the change commits on the LEADER; until
+/// the entry or snapshot applies here, this data dir still holds the
+/// pre-join `skip_bootstrap` registration, and a restart would treat the zone
+/// as a solo cluster of self. Only after this wait may a join report this
+/// node a member.
 fn wait_for_membership(
     zh: &ZoneHandle,
     zone_id: &str,
@@ -1463,7 +1430,12 @@ pub fn bootstrap_or_join_zone(
             last_error = %last_err,
             "founder probe found no existing cluster; creating local 1-voter zone",
         );
-        remove_local_probe_zone(zm, zone_id);
+        if !discard_unadmitted_replica(zm, zone_id) {
+            return Err(format!(
+                "the {zone_id} replica the founder probe set up was reached by a leader \
+                 without admitting this node; refusing to found the zone over it"
+            ));
+        }
         create_founder_zone(
             zm,
             zone_id,
@@ -1483,6 +1455,26 @@ pub fn bootstrap_or_join_zone(
         max_attempts,
         as_learner,
     )
+    .map_err(|error| error.to_string())
+}
+
+/// Why [`join_zone_via_peers`] ended without this node's membership.
+#[derive(Debug)]
+pub enum JoinZoneError {
+    /// This node refused to host the zone's replica: a deprovisioned zone,
+    /// storage admission, an unusable data dir.
+    Local(crate::raft::RaftError),
+    /// No leader admitted this node within the join budget.
+    NotAdmitted(String),
+}
+
+impl std::fmt::Display for JoinZoneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(error) => write!(f, "local zone setup refused: {error}"),
+            Self::NotAdmitted(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// Request membership of `zone_id` through JoinZone against `peer_addrs`
@@ -1493,10 +1485,11 @@ pub fn bootstrap_or_join_zone(
 /// founds the zone.
 ///
 /// The local replica is registered with `skip_bootstrap=true` before the
-/// first JoinZone so the leader's snapshot has somewhere to install.
-/// `max_attempts=None` retries forever (daemon boot — misconfig surfaces as
-/// "daemon stays up retrying"); `Some(n)` bounds the failed rounds (see
-/// [`BOUNDED_JOIN_ATTEMPTS`]).
+/// first JoinZone so the leader's snapshot has somewhere to install; when
+/// the join ends unadmitted, a replica this call registered and no leader
+/// reached is removed again. `max_attempts=None` retries forever (daemon
+/// boot — misconfig surfaces as "daemon stays up retrying"); `Some(n)`
+/// bounds the failed rounds (see [`BOUNDED_JOIN_ATTEMPTS`]).
 pub fn join_zone_via_peers(
     zm: &ZoneManager,
     zone_id: &str,
@@ -1505,7 +1498,7 @@ pub fn join_zone_via_peers(
     peer_addrs: &[NodeAddress],
     max_attempts: Option<u32>,
     as_learner: bool,
-) -> Result<(), String> {
+) -> Result<(), JoinZoneError> {
     tracing::info!(
         local_node_id = node_id,
         zone = %zone_id,
@@ -1513,7 +1506,12 @@ pub fn join_zone_via_peers(
         max_attempts = ?max_attempts,
         "requesting zone membership through JoinZone",
     );
-    let join_runtime = join_runtime()?;
+    let created = zm.get_zone(zone_id).is_none();
+    if created {
+        zm.join_zone(zone_id, as_learner)
+            .map_err(JoinZoneError::Local)?;
+    }
+    let join_runtime = join_runtime().map_err(JoinZoneError::NotAdmitted)?;
     let mut attempts: u32 = 0;
     // Furthest the leader has been seen to replicate to us. The budget is spent
     // on STALL, not on elapsed attempts — see `record_join_attempt`.
@@ -1534,11 +1532,17 @@ pub fn join_zone_via_peers(
             max_attempts,
             zone_id,
             &mut replication_high_water,
-        )?;
-        if joined {
-            return Ok(());
+        );
+        match joined {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::thread::sleep(JOIN_ZONE_RETRY_INTERVAL),
+            Err(reason) => {
+                if created {
+                    discard_unadmitted_replica(zm, zone_id);
+                }
+                return Err(JoinZoneError::NotAdmitted(reason));
+            }
         }
-        std::thread::sleep(JOIN_ZONE_RETRY_INTERVAL);
     }
 }
 
