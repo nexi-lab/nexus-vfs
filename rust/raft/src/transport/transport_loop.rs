@@ -715,7 +715,9 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             // `report_snapshot(_, Failure)` — without the latter, the
             // peer's Progress stays in the `Snapshot` state and raft-rs
             // never retries.
-            let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
+            let msg_type = msg.get_msg_type();
+            let is_snapshot = msg_type == MessageType::MsgSnapshot;
+            let raft_message_bytes = msg.compute_size();
 
             let client_pool = self.client_pool.clone();
             let zone_id = self.zone_id.clone();
@@ -725,7 +727,14 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     RAFT_SEND_TIMEOUT,
-                    send_raft_message(&client_pool, &addr, msg, zone_id, self_address, protocol),
+                    send_raft_message(
+                        &client_pool,
+                        &addr,
+                        msg,
+                        zone_id.clone(),
+                        self_address,
+                        protocol,
+                    ),
                 )
                 .await;
 
@@ -735,6 +744,9 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                         tracing::warn!(
                             peer_node_id = target_id,
                             peer_addr = %addr.to_operator_str(),
+                            zone = %zone_id,
+                            ?msg_type,
+                            raft_message_bytes,
                             "Raft message send failed: {}",
                             e,
                         );
@@ -745,6 +757,9 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                         tracing::warn!(
                             peer_node_id = target_id,
                             peer_addr = %addr.to_operator_str(),
+                            zone = %zone_id,
+                            ?msg_type,
+                            raft_message_bytes,
                             "Raft message send timeout after {:?}",
                             RAFT_SEND_TIMEOUT,
                         );

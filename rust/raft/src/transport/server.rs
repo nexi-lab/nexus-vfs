@@ -82,7 +82,8 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Maximum message size in bytes.
+    /// Maximum decoded incoming protobuf message size, including its envelope.
+    /// Applied to the full-node Raft/API services and the witness Raft service.
     pub max_message_size: usize,
     /// Optional TLS configuration for mTLS. None = plain HTTP/2.
     pub tls: Option<super::TlsConfig>,
@@ -172,10 +173,16 @@ impl RaftGrpcServer {
             local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
         Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
-                .with_owner_replica_data(),
             NodeControlService::new(
-                ZoneApiServiceServer::new(api),
+                ZoneTransportServiceServer::new(raft)
+                    .max_decoding_message_size(self.config.max_message_size),
+                policy.clone(),
+                &[],
+            )
+            .with_owner_replica_data(),
+            NodeControlService::new(
+                ZoneApiServiceServer::new(api)
+                    .max_decoding_message_size(self.config.max_message_size),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
             )
@@ -3029,7 +3036,8 @@ impl RaftWitnessServer {
         let policy = super::node_authority::NodeControlPolicy::from_tls(self.config.tls.as_ref())
             .map_err(TransportError::Connection)?;
         let router = builder.add_service(super::node_authority::NodeControlService::new(
-            ZoneTransportServiceServer::new(service),
+            ZoneTransportServiceServer::new(service)
+                .max_decoding_message_size(self.config.max_message_size),
             policy,
             &[],
         ));
