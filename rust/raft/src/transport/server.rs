@@ -300,111 +300,65 @@ impl RaftGrpcServer {
         self.config.bind_address
     }
 
-    /// Start the gRPC server.
-    pub async fn serve(self) -> Result<()> {
-        let addr = self.config.bind_address;
-        let credentials =
-            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
-        let tls_enabled = credentials.snapshot().uses_tls();
-        tracing::info!(
-            "Starting Raft gRPC server on {} (zones={}, tls={})",
-            addr,
-            self.registry.list_zones().len(),
-            tls_enabled,
-        );
-
-        let (raft_service, client_service) = self.guarded_services()?;
-
-        let mut builder =
-            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-
-        // If extra services are provided, add them first via add_routes
-        // (which returns a Router), then add the raft services.
-        // Otherwise, add raft services directly.
-        let router = if let Some(extra) = self.extra_services {
-            builder
-                .add_routes(extra)
-                .add_service(raft_service)
-                .add_service(client_service)
-        } else {
-            builder
-                .add_service(raft_service)
-                .add_service(client_service)
-        };
-
-        // The listener and outbound clients share one credential installation;
-        // foreign trust updates retain their existing verifier Arc.
-        if tls_enabled {
-            let incoming = lib::transport_primitives::shared_mtls_incoming(
-                addr,
-                credentials,
-                self.foreign_ca_verifier.clone(),
-            )
-            .await
-            .map_err(TransportError::Connection)?;
-            router
-                .serve_with_incoming(incoming)
-                .await
-                .map_err(TransportError::Tonic)?;
-        } else {
-            router.serve(addr).await.map_err(TransportError::Tonic)?;
-        }
-
-        Ok(())
+    /// Prepare the listener and run it until termination.
+    pub fn serve(self) -> impl std::future::Future<Output = Result<()>> + Send {
+        self.serve_with_shutdown(std::future::pending())
     }
 
-    /// Start the gRPC server with graceful shutdown.
-    pub async fn serve_with_shutdown(
+    /// Prepare trust and service policy before the returned future is scheduled.
+    /// Live credential replacement remains visible to handshakes and requests.
+    pub fn serve_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let addr = self.config.bind_address;
-        let credentials =
-            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
-        let tls_enabled = credentials.snapshot().uses_tls();
-        tracing::info!(
-            "Starting Raft gRPC server on {} (zones={}, tls={}, with shutdown signal)",
-            addr,
-            self.registry.list_zones().len(),
-            tls_enabled,
-        );
-
-        let (raft_service, client_service) = self.guarded_services()?;
-
-        let mut builder =
-            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-
-        let router = if let Some(extra) = self.extra_services {
-            builder
-                .add_routes(extra)
-                .add_service(raft_service)
-                .add_service(client_service)
-        } else {
-            builder
-                .add_service(raft_service)
-                .add_service(client_service)
-        };
-
-        if tls_enabled {
-            let incoming = lib::transport_primitives::shared_mtls_incoming(
+        let prepared = (|| {
+            let credentials =
+                listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+            let services = self.guarded_services()?;
+            let incoming = self.config.tls.is_some().then(|| {
+                lib::transport_primitives::shared_mtls_incoming(
+                    addr,
+                    credentials,
+                    self.foreign_ca_verifier.clone(),
+                )
+            });
+            Ok::<_, TransportError>((services, incoming))
+        })();
+        async move {
+            let ((raft_service, client_service), incoming) = prepared?;
+            tracing::info!(
+                "Starting Raft gRPC server on {} (zones={}, tls={})",
                 addr,
-                credentials,
-                self.foreign_ca_verifier.clone(),
-            )
-            .await
-            .map_err(TransportError::Connection)?;
-            router
-                .serve_with_incoming_shutdown(incoming, shutdown)
-                .await
-                .map_err(TransportError::Tonic)?;
-        } else {
-            router
-                .serve_with_shutdown(addr, shutdown)
-                .await
-                .map_err(TransportError::Tonic)?;
+                self.registry.list_zones().len(),
+                incoming.is_some(),
+            );
+            let mut builder =
+                lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
+            let router = if let Some(extra) = self.extra_services {
+                builder
+                    .add_routes(extra)
+                    .add_service(raft_service)
+                    .add_service(client_service)
+            } else {
+                builder
+                    .add_service(raft_service)
+                    .add_service(client_service)
+            };
+            if let Some(incoming) = incoming {
+                let incoming = incoming.await.map_err(TransportError::Connection)?;
+                router
+                    .serve_with_incoming_shutdown(incoming, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            } else {
+                router
+                    .serve_with_shutdown(addr, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            }
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
@@ -3037,58 +2991,56 @@ impl RaftWitnessServer {
         self.config.bind_address
     }
 
-    /// Start the gRPC server with graceful shutdown.
-    pub async fn serve_with_shutdown(
+    /// Prepare trust and service policy before scheduling the witness listener.
+    pub fn serve_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let addr = self.config.bind_address;
-        let credentials =
-            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
-        let tls_enabled = credentials.snapshot().uses_tls();
-        let zone_count = self.registry.list_zones().len();
-        tracing::info!(
-            "Starting Raft Witness gRPC server on {} (tls={}, zones={})",
-            addr,
-            tls_enabled,
-            zone_count,
-        );
-
-        let service = WitnessServiceImpl {
-            registry: self.registry.clone(),
-        };
-
-        let mut builder =
-            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        let policy =
-            super::node_authority::NodeControlPolicy::from_shared_tls(self.registry.shared_tls())
-                .map_err(TransportError::Connection)?;
-        let router = builder.add_service(super::node_authority::NodeControlService::new(
-            ZoneTransportServiceServer::new(service),
-            policy,
-            &[],
-        ));
-
-        // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
-        // a target for foreign agents (those write mailboxes on the broker), so
-        // it passes `None` and `shared_mtls_incoming` builds a verifier with
-        // just the cluster CA — byte-equivalent to the prior client_ca_root.
-        if tls_enabled {
-            let incoming = lib::transport_primitives::shared_mtls_incoming(addr, credentials, None)
-                .await
-                .map_err(TransportError::Connection)?;
-            router
-                .serve_with_incoming_shutdown(incoming, shutdown)
-                .await
-                .map_err(TransportError::Tonic)?;
-        } else {
-            router
-                .serve_with_shutdown(addr, shutdown)
-                .await
-                .map_err(TransportError::Tonic)?;
+        let prepared = (|| {
+            let credentials =
+                listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+            let policy =
+                super::node_authority::NodeControlPolicy::from_shared_tls(credentials.clone())
+                    .map_err(TransportError::Connection)?;
+            let incoming =
+                self.config.tls.is_some().then(|| {
+                    lib::transport_primitives::shared_mtls_incoming(addr, credentials, None)
+                });
+            Ok::<_, TransportError>((policy, incoming))
+        })();
+        async move {
+            let (policy, incoming) = prepared?;
+            tracing::info!(
+                "Starting Raft Witness gRPC server on {} (tls={}, zones={})",
+                addr,
+                incoming.is_some(),
+                self.registry.list_zones().len(),
+            );
+            let service = WitnessServiceImpl {
+                registry: self.registry.clone(),
+            };
+            let mut builder =
+                lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
+            let router = builder.add_service(super::node_authority::NodeControlService::new(
+                ZoneTransportServiceServer::new(service),
+                policy,
+                &[],
+            ));
+            if let Some(incoming) = incoming {
+                let incoming = incoming.await.map_err(TransportError::Connection)?;
+                router
+                    .serve_with_incoming_shutdown(incoming, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            } else {
+                router
+                    .serve_with_shutdown(addr, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
+            }
+            Ok(())
         }
-
-        Ok(())
     }
 }
 

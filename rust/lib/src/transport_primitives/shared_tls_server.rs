@@ -18,6 +18,44 @@ struct SharedServerConfig {
 }
 
 impl SharedServerConfig {
+    fn new(
+        source: SharedTlsConfig,
+        verifier: Option<Arc<FederatedClientCertVerifier>>,
+    ) -> Result<Self, String> {
+        source.read(|initial| {
+            let tls = initial
+                .config()?
+                .ok_or("TLS listener requires credentials")?;
+            let verifier = match verifier {
+                Some(verifier) => verifier,
+                None => FederatedClientCertVerifier::new(&tls.ca_pem)?,
+            };
+            let config = Arc::new(server_config(
+                Arc::clone(&verifier),
+                &tls.cert_pem,
+                &tls.key_pem,
+            )?);
+            Ok(Self {
+                source: source.clone(),
+                ca_pem: tls.ca_pem.clone(),
+                verifier,
+                cached: Mutex::new(Some((initial.clone(), config))),
+            })
+        })
+    }
+
+    fn incoming(
+        self,
+        listener: TcpListener,
+    ) -> impl Stream<Item = std::io::Result<TlsStream<TcpStream>>> {
+        let source = self.source.clone();
+        super::federated_tls::tls_incoming_checked(
+            listener,
+            move || self.config().ok(),
+            move |snapshot| source.is_current(snapshot),
+        )
+    }
+
     fn config(&self) -> Result<(Arc<rustls::ServerConfig>, TlsSnapshot), String> {
         self.source.read(|snapshot| {
             let tls = snapshot
@@ -50,36 +88,25 @@ pub fn shared_tls_incoming(
     source: SharedTlsConfig,
     verifier: Option<Arc<FederatedClientCertVerifier>>,
 ) -> Result<impl Stream<Item = std::io::Result<TlsStream<TcpStream>>>, String> {
-    let initial = source.snapshot();
-    let tls = initial
-        .config()?
-        .ok_or("TLS listener requires credentials")?;
-    let verifier = match verifier {
-        Some(verifier) => verifier,
-        None => FederatedClientCertVerifier::new(&tls.ca_pem)?,
-    };
-    let server = SharedServerConfig {
-        source: source.clone(),
-        ca_pem: tls.ca_pem.clone(),
-        verifier,
-        cached: Mutex::new(None),
-    };
-    server.config()?;
-    Ok(super::federated_tls::tls_incoming_checked(
-        listener,
-        move || server.config().ok(),
-        move |snapshot| source.is_current(snapshot),
-    ))
+    Ok(SharedServerConfig::new(source, verifier)?.incoming(listener))
 }
 
 /// Bind a listener that consumes the same credential source as its clients.
-pub async fn shared_mtls_incoming(
+/// Validate its trust configuration before scheduling the bind. Each handshake
+/// still reads the current installation, including withdrawal and replacement.
+pub fn shared_mtls_incoming(
     address: SocketAddr,
     source: SharedTlsConfig,
     verifier: Option<Arc<FederatedClientCertVerifier>>,
-) -> Result<impl Stream<Item = std::io::Result<TlsStream<TcpStream>>>, String> {
-    let listener = TcpListener::bind(address)
-        .await
-        .map_err(|e| e.to_string())?;
-    shared_tls_incoming(listener, source, verifier)
+) -> impl std::future::Future<
+    Output = Result<impl Stream<Item = std::io::Result<TlsStream<TcpStream>>>, String>,
+> {
+    let prepared = SharedServerConfig::new(source, verifier);
+    async move {
+        let server = prepared?;
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(server.incoming(listener))
+    }
 }

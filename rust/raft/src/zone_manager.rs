@@ -700,12 +700,16 @@ impl ZoneManager {
         // this borrow.
         let bind_for_error = bind_addr.to_string();
         if !matches!(profile, RuntimeProfile::IsolatedRoot) {
+            let shutdown = async move {
+                let mut rx = shutdown_rx_server;
+                let _ = rx.changed().await;
+            };
+            // Prepare trust before the manager exposes its credential owner.
+            // A withdrawal before the first poll then denies handshakes while
+            // preserving the listener for a later authorized replacement.
+            let serving = server.serve_with_shutdown(shutdown);
             runtime.spawn(async move {
-                let shutdown = async move {
-                    let mut rx = shutdown_rx_server;
-                    let _ = rx.changed().await;
-                };
-                if let Err(e) = server.serve_with_shutdown(shutdown).await {
+                if let Err(e) = serving.await {
                     // gRPC bind failure (port in use, IP not assigned to any
                     // interface — e.g. Tailscale in NoState — TLS cert
                     // mismatch, etc.) leaves the daemon half-alive: raft
