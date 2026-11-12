@@ -359,8 +359,7 @@ async fn reader_preparation_never_falls_back_after_authenticated_legacy_reconnec
         };
         let incoming = lib::transport_primitives::federated_mtls_incoming(
             address.parse().unwrap(),
-            &server_tls,
-            None,
+            common::cluster_server_identity(&server_tls),
         )
         .await
         .unwrap();

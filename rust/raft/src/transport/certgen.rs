@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 /// 90 days follows the Let's Encrypt convention — short enough that an
 /// expired-cert incident drives rotation discipline, long enough that
 /// routine ops don't churn certs. The CA outlives node certs (see
-/// `CA_VALIDITY_DAYS`); operators renew a node cert with `enroll` against the
-/// CA holder, which re-issues it for the data directory's persisted Node ID.
+/// `CA_VALIDITY_DAYS`); a daemon renews its own node cert through the CA holder
+/// once a third of this lifetime remains, and an expired one re-`enroll`s.
 const NODE_CERT_VALIDITY_DAYS: i64 = 90;
 
 /// Validity window for the cluster CA. Long-lived by design — every
@@ -684,9 +684,10 @@ pub fn bootstrap_tls(
     let tls_dir = base_path.join("tls");
     let ca_path = tls_dir.join("ca.pem");
     let ca_key_path = tls_dir.join("ca-key.pem");
-    let node_cert_path = tls_dir.join("node.pem");
-    let node_key_path = tls_dir.join("node-key.pem");
+    let node_cert_path = tls_dir.join(NODE_CERT_FILE);
+    let node_key_path = tls_dir.join(NODE_KEY_FILE);
     let join_token_hash_path = tls_dir.join("join-token-hash");
+    settle_node_identity(&tls_dir)?;
 
     let read_hash = || {
         std::fs::read_to_string(&join_token_hash_path)
@@ -771,6 +772,132 @@ pub fn bootstrap_tls(
         node_key_path,
         join_token_hash,
     })
+}
+
+const NODE_CERT_FILE: &str = "node.pem";
+const NODE_KEY_FILE: &str = "node-key.pem";
+
+/// Staged names of a Node identity being replaced; present only between
+/// [`persist_node_identity`] staging the pair and publishing it.
+const STAGED_CERT_FILE: &str = "node.pem.next";
+const STAGED_KEY_FILE: &str = "node-key.pem.next";
+
+/// Generate a fresh P-256 Node key and the CSR proving possession of it. The
+/// key stays with the caller; an issuer certifies only the CSR's public key,
+/// for the identity its own admission establishes ([`sign_node_csr`]).
+/// Returns `(csr_pem, key_pem)`.
+pub fn generate_node_key_request() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("Failed to generate node key: {e}"))?;
+    let csr = CertificateParams::default()
+        .serialize_request(&key)
+        .and_then(|request| request.pem())
+        .map_err(|e| format!("Failed to serialize node CSR: {e}"))?;
+    Ok((csr.into_bytes(), key.serialize_pem().into_bytes()))
+}
+
+/// Whether `key_pem` is the private key of the first certificate in `cert_pem`.
+fn node_pair_matches(cert_pem: &[u8], key_pem: &[u8]) -> bool {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let Ok(der) = lib::transport_primitives::first_certificate_der(cert_pem, "Node") else {
+        return false;
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(&der) else {
+        return false;
+    };
+    std::str::from_utf8(key_pem)
+        .ok()
+        .and_then(|pem| KeyPair::from_pem(pem).ok())
+        .is_some_and(|key| {
+            rcgen::PublicKeyData::subject_public_key_info(&key) == cert.public_key().raw
+        })
+}
+
+/// Replace `<tls_dir>/node.pem` + `node-key.pem` with a matching pair, crash
+/// safely. Both files are staged and synced first, then published key-first;
+/// [`settle_node_identity`] completes a publication a crash interrupted, so a
+/// restart never sees a certificate and key that do not belong together. The
+/// key is owner-only throughout.
+pub fn persist_node_identity(
+    tls_dir: &Path,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(), String> {
+    if !node_pair_matches(cert_pem, key_pem) {
+        return Err("Node certificate and key do not belong together".into());
+    }
+    std::fs::create_dir_all(tls_dir)
+        .map_err(|e| format!("Failed to mkdir {}: {e}", tls_dir.display()))?;
+    let staged_key = tls_dir.join(STAGED_KEY_FILE);
+    let staged_cert = tls_dir.join(STAGED_CERT_FILE);
+    for staged in [&staged_key, &staged_cert] {
+        remove_if_present(staged)?;
+    }
+    lib::transport_primitives::create_secret(&staged_key, key_pem)
+        .map_err(|e| format!("Failed to stage {}: {e}", staged_key.display()))?;
+    stage_public(&staged_cert, cert_pem)?;
+    publish_staged(tls_dir, &staged_key, NODE_KEY_FILE)?;
+    publish_staged(tls_dir, &staged_cert, NODE_CERT_FILE)
+}
+
+/// Finish or discard a Node identity publication a crash interrupted: publish
+/// the staged files when they form a matching pair with what is (or will be)
+/// beside them, otherwise discard them and keep the published pair.
+fn settle_node_identity(tls_dir: &Path) -> Result<(), String> {
+    let staged_key = tls_dir.join(STAGED_KEY_FILE);
+    let staged_cert = tls_dir.join(STAGED_CERT_FILE);
+    if !staged_key.exists() && !staged_cert.exists() {
+        return Ok(());
+    }
+    let read = |staged: &Path, published: &str| {
+        std::fs::read(staged)
+            .or_else(|_| std::fs::read(tls_dir.join(published)))
+            .unwrap_or_default()
+    };
+    let key = read(&staged_key, NODE_KEY_FILE);
+    let cert = read(&staged_cert, NODE_CERT_FILE);
+    if !node_pair_matches(&cert, &key) {
+        tracing::warn!(tls_dir = %tls_dir.display(), "discarding an incomplete Node identity replacement");
+        for staged in [&staged_key, &staged_cert] {
+            remove_if_present(staged)?;
+        }
+        return Ok(());
+    }
+    tracing::info!(tls_dir = %tls_dir.display(), "completing an interrupted Node identity replacement");
+    for (staged, published) in [(&staged_key, NODE_KEY_FILE), (&staged_cert, NODE_CERT_FILE)] {
+        if staged.exists() {
+            publish_staged(tls_dir, staged, published)?;
+        }
+    }
+    Ok(())
+}
+
+fn stage_public(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("Failed to stage {}: {e}", path.display()))?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("Failed to stage {}: {e}", path.display()))
+}
+
+fn publish_staged(tls_dir: &Path, staged: &Path, published: &str) -> Result<(), String> {
+    let destination = tls_dir.join(published);
+    lib::file_durability::replace_file(staged, &destination)
+        .map_err(|e| format!("Failed to publish {}: {e}", destination.display()))?;
+    // Directory synchronization exists only on Unix.
+    #[cfg(unix)]
+    lib::file_durability::sync_directory(tls_dir)
+        .map_err(|e| format!("Failed to sync {}: {e}", tls_dir.display()))?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to remove {}: {e}", path.display())),
+    }
 }
 
 /// Extract the reachable hostname/IP from a node address, for cert SAN
@@ -1387,6 +1514,94 @@ mod tests {
             read_join_token_hashes(&path),
             vec!["a".repeat(64), "b".repeat(64)]
         );
+    }
+
+    /// A Node's own key request: the issuer certifies exactly that key for the
+    /// identity it decides, ignoring every identity claim in the request.
+    #[test]
+    fn a_node_key_request_is_certified_for_the_issuer_chosen_identity() {
+        let (ca, ca_key) = generate_zone_ca("root").unwrap();
+        let (csr, key) = generate_node_key_request().unwrap();
+        let cert = sign_node_csr(&csr, 7, "root", &ca, &ca_key, &[], None).unwrap();
+        assert!(node_pair_matches(&cert, &key));
+        let named = super::super::local_node_identity(&cert, &ca).unwrap();
+        assert_eq!(named.node_id, 7);
+        let (_, other_key) = generate_node_key_request().unwrap();
+        assert!(!node_pair_matches(&cert, &other_key));
+    }
+
+    /// The pair is replaced together: a crash between staging and publishing
+    /// either completes on the next settle or leaves the published pair.
+    #[test]
+    fn a_node_identity_replacement_never_leaves_a_mismatched_pair() {
+        let (ca, ca_key) = generate_zone_ca("root").unwrap();
+        let issue = || {
+            let (csr, key) = generate_node_key_request().unwrap();
+            (
+                sign_node_csr(&csr, 7, "root", &ca, &ca_key, &[], None).unwrap(),
+                key,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path();
+        let read = |name: &str| std::fs::read(tls.join(name)).unwrap();
+        let (old_cert, old_key) = issue();
+        persist_node_identity(tls, &old_cert, &old_key).unwrap();
+        assert_eq!(
+            (read(NODE_CERT_FILE), read(NODE_KEY_FILE)),
+            (old_cert.clone(), old_key.clone())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tls.join(NODE_KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the Node key stays owner-only");
+        }
+        let (new_cert, new_key) = issue();
+        assert!(persist_node_identity(tls, &new_cert, &old_key).is_err());
+        assert_eq!(
+            read(NODE_CERT_FILE),
+            old_cert,
+            "a mismatched pair is never published"
+        );
+
+        // Crashed after the key was published, before the certificate.
+        std::fs::write(tls.join(NODE_KEY_FILE), &new_key).unwrap();
+        std::fs::write(tls.join(STAGED_CERT_FILE), &new_cert).unwrap();
+        settle_node_identity(tls).unwrap();
+        assert_eq!(
+            (read(NODE_CERT_FILE), read(NODE_KEY_FILE)),
+            (new_cert.clone(), new_key.clone())
+        );
+
+        // Crashed while staging the certificate: the published pair stays.
+        let (next_cert, next_key) = issue();
+        std::fs::write(tls.join(STAGED_KEY_FILE), &next_key).unwrap();
+        std::fs::write(
+            tls.join(STAGED_CERT_FILE),
+            &next_cert[..next_cert.len() / 2],
+        )
+        .unwrap();
+        settle_node_identity(tls).unwrap();
+        assert_eq!(
+            (read(NODE_CERT_FILE), read(NODE_KEY_FILE)),
+            (new_cert, new_key)
+        );
+
+        // Crashed with both staged: the replacement completes.
+        std::fs::write(tls.join(STAGED_KEY_FILE), &next_key).unwrap();
+        std::fs::write(tls.join(STAGED_CERT_FILE), &next_cert).unwrap();
+        settle_node_identity(tls).unwrap();
+        assert_eq!(
+            (read(NODE_CERT_FILE), read(NODE_KEY_FILE)),
+            (next_cert, next_key)
+        );
+        for staged in [STAGED_CERT_FILE, STAGED_KEY_FILE] {
+            assert!(!tls.join(staged).exists());
+        }
     }
 
     /// Every issuance path opens its window before the issuer's clock, so a

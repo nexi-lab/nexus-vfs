@@ -1,5 +1,5 @@
 use super::*;
-use crate::{managed_csr::tests::LoseReply, FounderAgentMinter};
+use crate::{managed_csr::tests::LoseReply, FounderCaIssuer};
 use kernel::kernel::vfs_proto::{nexus_vfs_service_client::NexusVfsServiceClient, CallRequest};
 use managed_agent::{SpawnHandle, SpawnOptions, SpawnTask};
 use nexus_raft::{
@@ -157,8 +157,8 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
     let verifier = lib::transport_primitives::FederatedClientCertVerifier::new(&ca).unwrap();
     let verifier_slot = Arc::new(std::sync::OnceLock::new());
     verifier_slot.set(verifier).unwrap();
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
-    *slot.write() = Some(Arc::new(FounderAgentMinter {
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
+    *slot.write() = Some(Arc::new(FounderCaIssuer {
         store: store.clone(),
         tls_dir: tls_dir.clone(),
         data_dir: private.path().to_path_buf(),
@@ -398,7 +398,7 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
     let runtime = lib::rt::OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap());
     let (ca, ca_key) = generate_zone_ca("local").unwrap();
     let (agent, key) = generate_agent_cert("ordinary", &ca, &ca_key).unwrap();
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
     let tls = TlsConfig {
         ca_pem: ca.clone(),
         cert_pem: agent,
@@ -437,7 +437,7 @@ fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_fai
         key_pem: key,
     };
     let native = NativeIssuer::for_host(
-        nexus_raft::agent_minter::new_agent_minter_slot(),
+        nexus_raft::ca_issuer::new_ca_issuer_slot(),
         &tls,
         runtime.handle().clone(),
     );

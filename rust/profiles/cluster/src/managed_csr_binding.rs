@@ -14,7 +14,7 @@ use lib::transport_primitives::first_certificate_der;
 use managed_agent::credential_binding::ManagedCredentialBinding;
 use nexus_raft::{
     agent_csr_client::{AgentCsrBinding, PendingAgentCsr},
-    agent_minter::agent_csr_request_digest,
+    ca_issuer::agent_csr_request_digest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
