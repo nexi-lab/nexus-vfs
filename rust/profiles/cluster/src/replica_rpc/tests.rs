@@ -164,10 +164,9 @@ impl Fixture {
             cert_pem: cert,
             key_pem: key,
         };
-        self.manager
-            .registry()
-            .shared_tls()
-            .replace(lib::transport_primitives::TlsPolicy::Configured(tls.clone()));
+        self.manager.registry().shared_tls().replace(
+            lib::transport_primitives::TlsPolicy::Configured(tls.clone()),
+        );
         let server = RaftGrpcServer::new(
             self.manager.registry(),
             ServerConfig {
