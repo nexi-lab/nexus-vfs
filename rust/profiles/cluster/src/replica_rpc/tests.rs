@@ -159,15 +159,20 @@ impl Fixture {
         let (cert, key) = generate_node_cert(1, "root", &self.ca, &self.ca_key, &[], None).unwrap();
         let slot = nexus_raft::agent_minter::new_agent_minter_slot();
         *slot.write() = Some(self.founder.clone());
+        let tls = TlsConfig {
+            ca_pem: self.ca.clone(),
+            cert_pem: cert,
+            key_pem: key,
+        };
+        self.manager
+            .registry()
+            .shared_tls()
+            .replace(lib::transport_primitives::TlsPolicy::Configured(tls.clone()));
         let server = RaftGrpcServer::new(
             self.manager.registry(),
             ServerConfig {
                 bind_address: address.parse().unwrap(),
-                tls: Some(TlsConfig {
-                    ca_pem: self.ca.clone(),
-                    cert_pem: cert,
-                    key_pem: key,
-                }),
+                tls: Some(tls),
                 ..Default::default()
             },
         )
