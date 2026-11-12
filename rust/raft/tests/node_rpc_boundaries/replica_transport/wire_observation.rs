@@ -95,8 +95,7 @@ async fn prepared_production_sender_selects_required_rpc_before_replication_wait
     let address = common::node_bind_addr();
     let incoming = lib::transport_primitives::federated_mtls_incoming(
         address.parse().unwrap(),
-        &node_tls(&ca, &key, 2),
-        None,
+        common::cluster_server_identity(&node_tls(&ca, &key, 2)),
     )
     .await
     .unwrap();

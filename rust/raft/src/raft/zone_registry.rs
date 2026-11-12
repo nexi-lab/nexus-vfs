@@ -566,6 +566,12 @@ impl ZoneRaftRegistry {
         self.tls.read().unwrap().clone()
     }
 
+    /// Replace the Node TLS identity outbound clients present. Pooled Raft
+    /// clients see the change on their next use and reconnect with it.
+    pub fn install_tls(&self, tls: TlsConfig) {
+        *self.tls.write().unwrap() = Some(tls);
+    }
+
     /// Create a new zone with its own Raft group.
     ///
     /// Sync — `setup_zone` does only sync work (open redb, construct

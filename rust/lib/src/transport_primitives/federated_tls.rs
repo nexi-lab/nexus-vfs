@@ -80,6 +80,27 @@ impl ReloadableServerIdentity {
         })
     }
 
+    /// A Node's server identity: its PEM leaf and key, gating clients with
+    /// `verifier`, live until the leaf's notAfter.
+    pub fn from_tls(
+        verifier: Arc<FederatedClientCertVerifier>,
+        tls: &super::TlsConfig,
+    ) -> Result<Arc<Self>, String> {
+        let (config, expires_at) = tls_identity(verifier, tls)?;
+        Ok(Self::new(config, expires_at))
+    }
+
+    /// Publish a renewed Node bundle; established connections keep their session.
+    pub fn replace_tls(
+        &self,
+        verifier: Arc<FederatedClientCertVerifier>,
+        tls: &super::TlsConfig,
+    ) -> Result<(), String> {
+        let (config, expires_at) = tls_identity(verifier, tls)?;
+        self.replace(config, expires_at);
+        Ok(())
+    }
+
     /// Publish a complete replacement without interrupting established connections.
     pub fn replace(&self, config: ServerConfig, expires_at: u64) {
         self.current.store(Arc::new(ServerIdentity {
@@ -98,6 +119,22 @@ impl ReloadableServerIdentity {
         let snapshot = self.current.load();
         snapshot.is_live().then(|| Arc::clone(&snapshot.config))
     }
+}
+
+fn tls_identity(
+    verifier: Arc<FederatedClientCertVerifier>,
+    tls: &super::TlsConfig,
+) -> Result<(ServerConfig, u64), String> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let leaf = first_certificate_der(&tls.cert_pem, "server cert")?;
+    let (_, cert) =
+        X509Certificate::from_der(&leaf).map_err(|_| "server cert is not X.509".to_string())?;
+    let expires_at = u64::try_from(cert.validity().not_after.timestamp())
+        .map_err(|_| "server cert expired before the Unix epoch".to_string())?;
+    Ok((
+        server_config(verifier, &tls.cert_pem, &tls.key_pem)?,
+        expires_at,
+    ))
 }
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
@@ -399,26 +436,18 @@ fn tls_incoming(
 /// assembled HERE so callers (raft `server.rs`) name no rustls / tokio-rustls
 /// types and every serve site is one line.
 ///
-/// `verifier` is the shared hot-swappable client-cert verifier when the caller
-/// owns one (so a runtime `set_foreign_cas` reaches this live socket); `None`
-/// builds a cluster-only verifier from `tls.ca_pem` (base mTLS — e.g. the
-/// witness bind, which never trusts foreign CAs). Mandatory client-auth, same
-/// as the prior `client_ca_root(cluster_ca)`. `server_config` pins the crypto
-/// provider internally, so no separate `ensure_crypto_provider` call is needed.
+/// Each handshake presents `identity`'s current certificate, so a renewed Node
+/// identity ([`ReloadableServerIdentity::replace_tls`]) serves new connections
+/// without rebinding while established ones keep their session. The identity's
+/// client-cert verifier gates clients (mandatory client-auth).
 pub async fn federated_mtls_incoming(
     addr: std::net::SocketAddr,
-    tls: &super::TlsConfig,
-    verifier: Option<std::sync::Arc<FederatedClientCertVerifier>>,
+    identity: Arc<ReloadableServerIdentity>,
 ) -> Result<impl Stream<Item = std::io::Result<TlsStream<TcpStream>>>, String> {
-    let verifier = match verifier {
-        Some(v) => v,
-        None => FederatedClientCertVerifier::new(&tls.ca_pem)?,
-    };
-    let cfg = server_config(verifier, &tls.cert_pem, &tls.key_pem)?;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
-    Ok(federated_tls_incoming(listener, std::sync::Arc::new(cfg)))
+    Ok(reloadable_tls_incoming(listener, identity))
 }
 
 #[cfg(test)]
@@ -588,6 +617,104 @@ mod tests {
         let key_pem = key.serialize_pem().into_bytes();
 
         assert!(server_config(v, &cert_pem, &key_pem).is_ok());
+    }
+
+    /// A leaf of `ca` for the cluster server name (server + client auth), PEM.
+    fn mint_node(ca_der: &[u8], ca_key_pem: &str) -> super::super::TlsConfig {
+        let ca_pem = pem_of(ca_der);
+        let issuer = Issuer::from_ca_cert_pem(
+            std::str::from_utf8(&ca_pem).unwrap(),
+            KeyPair::from_pem(ca_key_pem).unwrap(),
+        )
+        .unwrap();
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut p = CertificateParams::new(vec![
+            super::super::TlsConfig::CLUSTER_SERVER_NAME.to_string()
+        ])
+        .unwrap();
+        p.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        super::super::TlsConfig {
+            cert_pem: p.signed_by(&key, &issuer).unwrap().pem().into_bytes(),
+            key_pem: key.serialize_pem().into_bytes(),
+            ca_pem,
+        }
+    }
+
+    /// A replaced Node identity is what every NEW handshake presents, while a
+    /// connection established before the replacement keeps its session.
+    #[test]
+    fn a_replaced_identity_is_served_to_new_connections() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(replaced_identity_journey());
+    }
+
+    async fn replaced_identity_journey() {
+        use tokio_stream::StreamExt;
+        super::super::ensure_crypto_provider();
+        let (ca_der, ca_key) = mint_ca("cluster");
+        let (first, renewed, client) = (
+            mint_node(&ca_der, &ca_key),
+            mint_node(&ca_der, &ca_key),
+            mint_node(&ca_der, &ca_key),
+        );
+        let verifier = FederatedClientCertVerifier::new(&first.ca_pem).unwrap();
+        let identity = ReloadableServerIdentity::from_tls(Arc::clone(&verifier), &first).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut incoming = Box::pin(reloadable_tls_incoming(listener, Arc::clone(&identity)));
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Some(stream) = incoming.next().await {
+                accepted.push(stream);
+            }
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca_der.clone())).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    certificate_ders(&client.cert_pem, "client")
+                        .unwrap()
+                        .into_iter()
+                        .map(CertificateDer::from)
+                        .collect(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                        ::pem::parse(&client.key_pem).unwrap().into_contents(),
+                    )),
+                )
+                .unwrap(),
+        ));
+        let presented = |connector: tokio_rustls::TlsConnector| async move {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let name = rustls::pki_types::ServerName::try_from(
+                super::super::TlsConfig::CLUSTER_SERVER_NAME,
+            )
+            .unwrap();
+            let stream = connector.connect(name, tcp).await.unwrap();
+            let leaf = stream.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+            (stream, leaf)
+        };
+        let leaf_of =
+            |tls: &super::super::TlsConfig| first_certificate_der(&tls.cert_pem, "node").unwrap();
+
+        let (established, before) = presented(connector.clone()).await;
+        assert_eq!(before, leaf_of(&first));
+        identity.replace_tls(verifier, &renewed).unwrap();
+        let (_, after) = presented(connector).await;
+        assert_eq!(after, leaf_of(&renewed));
+        assert_eq!(
+            established.get_ref().1.peer_certificates().unwrap()[0].to_vec(),
+            leaf_of(&first),
+            "an established session is not torn down"
+        );
+        held.abort();
     }
 
     /// A non-PKCS#8 key label is rejected with a clear error, not a silent

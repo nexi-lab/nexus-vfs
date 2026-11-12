@@ -59,13 +59,13 @@ impl std::error::Error for SessionMintAllowError {}
 ///
 /// The gate that reads it is constructed at boot, from the CA key; the control
 /// zone it is replicated through is not ready until later. Mirrors
-/// [`crate::agent_minter::AgentMinterSlot`], including the reason the slot
+/// [`crate::ca_issuer::CaIssuerSlot`], including the reason the slot
 /// exists rather than the value. **Unbound means closed** — a gate that cannot
 /// read its policy denies.
 pub type SessionMintAllowSlot = Arc<parking_lot::RwLock<Option<Arc<RaftSessionMintAllowStore>>>>;
 
 /// Construct an unbound slot — spelt once here so callers don't import
-/// parking_lot (mirrors [`crate::agent_minter::new_agent_minter_slot`]).
+/// parking_lot (mirrors [`crate::ca_issuer::new_ca_issuer_slot`]).
 pub fn new_session_mint_allow_slot() -> SessionMintAllowSlot {
     Arc::new(parking_lot::RwLock::new(None))
 }
