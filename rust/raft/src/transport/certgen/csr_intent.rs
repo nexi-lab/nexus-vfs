@@ -225,6 +225,8 @@ fn capture_certificate_tbs(
         .ok_or_else(|| "failed to serialize unsigned certificate".into())
 }
 
+// Share certificate construction across verification and signing callers.
+#[inline(never)]
 fn replica_params(intent: &ReplicaCertificateIntent) -> Result<CertificateParams, String> {
     intent.validate_shape()?;
     let fields = intent.certificate.as_ref();
@@ -287,6 +289,7 @@ pub fn sign_committed_replica_intent(
     )
 }
 
+#[inline(never)]
 fn sign_committed_certificate(
     params: CertificateParams,
     intent: CertificateIntentRef<'_>,
