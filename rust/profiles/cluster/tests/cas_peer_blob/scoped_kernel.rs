@@ -11,7 +11,18 @@ use nexus_raft::zone_meta_store::ZoneMetaStore;
 #[test]
 fn default_fetcher_resolves_scoped_files_and_indexed_segments_for_cas_and_pas() {
     let directory = tempfile::tempdir().unwrap();
-    let manager = ZoneManager::isolated(directory.path().join("raft").to_str().unwrap()).unwrap();
+    let address = format!("127.0.0.1:{}", ports::free_port());
+    let manager = ZoneManager::with_node_id(
+        "scoped-peer-reader",
+        1,
+        directory.path().join("raft").to_str().unwrap(),
+        vec![],
+        &address,
+        None,
+        Some(format!("http://{address}")),
+        None,
+    )
+    .unwrap();
     let alice = manager.create_zone("agent-alice", vec![]).unwrap();
     let bob = manager.create_zone("agent-bob", vec![]).unwrap();
     assert!(alice.wait_for_leader(Duration::from_secs(10)));
