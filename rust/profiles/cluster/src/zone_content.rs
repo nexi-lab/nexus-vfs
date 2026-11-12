@@ -18,17 +18,6 @@ struct ZoneContentBinding {
     metadata: Arc<ZoneMetaStore>,
 }
 
-impl ZoneContentBinding {
-    fn check_unscoped_io(&self, path: &str) -> Result<(), &'static str> {
-        if let Some(records) = self.metadata.as_guarded_records() {
-            records
-                .check_unscoped_io(&records.record_storage_key(path))
-                .map_err(|_| UNAVAILABLE)?;
-        }
-        Ok(())
-    }
-}
-
 /// The owning runtime binds each admitted zone's metadata and physical store.
 /// The cluster-wide reader retains its existing administrator-only surface.
 pub struct ZoneContentBlobFetcher {
@@ -102,7 +91,11 @@ impl BlobFetcher for ZoneContentBlobFetcher {
                 ColdSegmentAddress::parse_read(&zone_id, &content_id).map_err(|_| UNAVAILABLE)?
             {
                 let segment = &read.address;
-                binding.check_unscoped_io(segment.stream_path)?;
+                if let Some(records) = binding.metadata.as_guarded_records() {
+                    records
+                        .check_unscoped_io(&records.record_storage_key(segment.stream_path))
+                        .map_err(|_| UNAVAILABLE)?;
+                }
                 binding
                     .metadata
                     .get(segment.stream_path)
@@ -125,7 +118,6 @@ impl BlobFetcher for ZoneContentBlobFetcher {
             if content_id.starts_with('/') {
                 // Read the zone's own metadata; mount aliases and links cannot
                 // redirect this request into another zone's private directory.
-                binding.check_unscoped_io(&content_id)?;
                 let metadata = binding
                     .metadata
                     .get(&content_id)
