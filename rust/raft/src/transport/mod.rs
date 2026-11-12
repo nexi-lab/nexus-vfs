@@ -95,6 +95,7 @@ pub use crl::{
 mod client;
 #[cfg(all(feature = "grpc", has_protos))]
 mod server;
+pub(crate) use server::PreparedRaftListener;
 #[cfg(all(feature = "grpc", has_protos))]
 mod transport_loop;
 
