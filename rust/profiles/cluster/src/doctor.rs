@@ -399,7 +399,9 @@ mod tests {
     /// The current instant on a whole second, the precision of X.509 validity,
     /// so windows built from it and the audit judge the same instant.
     fn now() -> SystemTime {
-        let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let elapsed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
         SystemTime::UNIX_EPOCH + Duration::from_secs(elapsed.as_secs())
     }
 
