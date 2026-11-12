@@ -199,10 +199,12 @@ fn node_certificate_identity(leaf: &X509Certificate<'_>) -> Result<LocalNodeCert
 #[derive(Clone)]
 pub(super) struct NodeControlPolicy {
     local_ca: Option<Arc<[u8]>>,
+    local_credentials: Option<(lib::transport_primitives::SharedTlsConfig, Option<Vec<u8>>)>,
 }
 impl NodeControlPolicy {
     pub(super) fn from_tls(tls: Option<&super::TlsConfig>) -> Result<Self, String> {
         Ok(Self {
+            local_credentials: None,
             local_ca: tls
                 .map(|t| {
                     lib::transport_primitives::first_certificate_der(&t.ca_pem, "local cluster CA")
@@ -210,6 +212,29 @@ impl NodeControlPolicy {
                 })
                 .transpose()?,
         })
+    }
+
+    pub(super) fn from_shared_tls(
+        source: lib::transport_primitives::SharedTlsConfig,
+    ) -> Result<Self, String> {
+        let initial = source.snapshot();
+        let tls = initial.config()?;
+        let mut policy = Self::from_tls(tls)?;
+        policy.local_credentials = Some((source, tls.map(|tls| tls.ca_pem.clone())));
+        Ok(policy)
+    }
+
+    fn check_local_credentials(&self) -> Result<(), Status> {
+        if let Some((source, ca)) = &self.local_credentials {
+            source.read(|snapshot| -> Result<(), Status> {
+                let tls = snapshot.config().map_err(Status::unavailable)?;
+                if tls.map(|tls| tls.ca_pem.as_slice()) != ca.as_deref() {
+                    return Err(Status::unavailable("local listener trust anchor changed"));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
     fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
         // Explicit plaintext/development listeners retain their old contract.
@@ -299,6 +324,7 @@ impl RequestAdmission {
     // Keep one implementation across all generated tonic service wrappers.
     #[inline(never)]
     fn check(&self, request: &mut http::Request<Body>) -> Result<(), Status> {
+        self.policy.check_local_credentials()?;
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
                 Ok(Some(AuthenticatedPeer::Replica(_)))

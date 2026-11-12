@@ -146,12 +146,28 @@ type GuardedRaftService =
 type GuardedApiService =
     super::node_authority::NodeControlService<ZoneApiServiceServer<ZoneApiServiceImpl>>;
 
+fn listener_credentials(
+    source: lib::transport_primitives::SharedTlsConfig,
+    configured: Option<&super::TlsConfig>,
+) -> Result<lib::transport_primitives::SharedTlsConfig> {
+    let snapshot = source.snapshot();
+    let current = snapshot
+        .config()
+        .map_err(|e| TransportError::Connection(e.into()))?;
+    if current != configured {
+        return Err(TransportError::Connection(
+            "listener and registry TLS configuration differ".into(),
+        ));
+    }
+    Ok(source)
+}
+
 impl RaftGrpcServer {
     fn guarded_services(&self) -> Result<(GuardedRaftService, GuardedApiService)> {
         use super::node_authority::{
             NodeControlPolicy, NodeControlService, AGENT_CREDENTIAL_METHODS,
         };
-        let policy = NodeControlPolicy::from_tls(self.config.tls.as_ref())
+        let policy = NodeControlPolicy::from_shared_tls(self.registry.shared_tls())
             .map_err(TransportError::Connection)?;
         let raft = ZoneTransportServiceImpl {
             registry: self.registry.clone(),
@@ -276,7 +292,9 @@ impl RaftGrpcServer {
     /// Start the gRPC server.
     pub async fn serve(self) -> Result<()> {
         let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
+        let credentials =
+            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+        let tls_enabled = credentials.snapshot().uses_tls();
         tracing::info!(
             "Starting Raft gRPC server on {} (zones={}, tls={})",
             addr,
@@ -303,29 +321,22 @@ impl RaftGrpcServer {
                 .add_service(client_service)
         };
 
-        // mTLS via a custom acceptor whose client-cert verifier is HOT-SWAPPABLE
-        // (cluster CA + runtime-registered foreign CAs), so a cross-org CA
-        // registered live is trusted without a restart — the SAME Arc the
-        // cross-org apply-observer swaps via `set_foreign_cas`. All rustls /
-        // tokio-rustls / bind assembly lives in `transport_primitives`
-        // (`federated_mtls_incoming`), so server.rs names no TLS types. With no
-        // foreign CAs registered it is byte-equivalent to the prior
-        // `client_ca_root(cluster_ca)` mandatory-client-auth config.
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
-                    tls,
-                    self.foreign_ca_verifier.clone(),
-                )
+        // The listener and outbound clients share one credential installation;
+        // foreign trust updates retain their existing verifier Arc.
+        if tls_enabled {
+            let incoming = lib::transport_primitives::shared_mtls_incoming(
+                addr,
+                credentials,
+                self.foreign_ca_verifier.clone(),
+            )
+            .await
+            .map_err(TransportError::Connection)?;
+            router
+                .serve_with_incoming(incoming)
                 .await
-                .map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming(incoming)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            None => router.serve(addr).await.map_err(TransportError::Tonic)?,
+                .map_err(TransportError::Tonic)?;
+        } else {
+            router.serve(addr).await.map_err(TransportError::Tonic)?;
         }
 
         Ok(())
@@ -337,7 +348,9 @@ impl RaftGrpcServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
+        let credentials =
+            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+        let tls_enabled = credentials.snapshot().uses_tls();
         tracing::info!(
             "Starting Raft gRPC server on {} (zones={}, tls={}, with shutdown signal)",
             addr,
@@ -361,28 +374,23 @@ impl RaftGrpcServer {
                 .add_service(client_service)
         };
 
-        // Hot-swappable federated mTLS acceptor — see `serve` for the rationale
-        // (client-auth roots = cluster CA + runtime-registered foreign CAs, the
-        // shared verifier the cross-org observer swaps; assembly lives in
-        // `transport_primitives::federated_mtls_incoming`).
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
-                    tls,
-                    self.foreign_ca_verifier.clone(),
-                )
+        if tls_enabled {
+            let incoming = lib::transport_primitives::shared_mtls_incoming(
+                addr,
+                credentials,
+                self.foreign_ca_verifier.clone(),
+            )
+            .await
+            .map_err(TransportError::Connection)?;
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
                 .await
-                .map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming_shutdown(incoming, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            None => router
+                .map_err(TransportError::Tonic)?;
+        } else {
+            router
                 .serve_with_shutdown(addr, shutdown)
                 .await
-                .map_err(TransportError::Tonic)?,
+                .map_err(TransportError::Tonic)?;
         }
 
         Ok(())
@@ -1331,7 +1339,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             .membership()
             .await
             .map_err(|e| Status::unavailable(format!("read zone membership: {e}")))?;
-        let addresses = recorded_endpoints(&node, self.registry.tls_config().is_some()).await?;
+        let addresses = recorded_endpoints(&node, self.registry.tls_enabled()).await?;
         let leader_addr = addresses.get(&leader_id).cloned();
         let config = cluster_config(&addresses, &membership.voters, &membership.learners);
 
@@ -1413,7 +1421,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // Response configs carry the recorded member addresses, read after
         // any membership change this handler commits (the change writes the
         // joiner's record at its own index).
-        let use_tls = self.registry.tls_config().is_some();
+        let use_tls = self.registry.tls_enabled();
         let make_config = |voters: Vec<u64>, learners: Vec<u64>| {
             let node = node.clone();
             async move {
@@ -2512,7 +2520,7 @@ pub struct WitnessZoneRegistry {
     zones: DashMap<String, WitnessZoneEntry>,
     base_path: PathBuf,
     node_id: u64,
-    tls: Arc<RwLock<Option<super::TlsConfig>>>,
+    tls: lib::transport_primitives::SharedTlsConfig,
     /// Cluster peer addresses — used by auto_join_zone() for transport routing.
     peers: Vec<NodeAddress>,
     /// This node's advertise address — carried in outbound StepMessage.
@@ -2534,13 +2542,17 @@ pub struct WitnessZoneRegistry {
 }
 
 impl WitnessZoneRegistry {
+    pub fn shared_tls(&self) -> lib::transport_primitives::SharedTlsConfig {
+        self.tls.clone()
+    }
+
     /// Create a new empty witness zone registry.
     pub fn new(base_path: PathBuf, node_id: u64, tls: Option<super::TlsConfig>) -> Self {
         Self {
             zones: DashMap::new(),
             base_path,
             node_id,
-            tls: Arc::new(RwLock::new(tls)),
+            tls: lib::transport_primitives::SharedTlsConfig::new(tls),
             peers: Vec::new(),
             self_address: String::new(),
             auto_join_lock: parking_lot::Mutex::new(()),
@@ -2645,9 +2657,6 @@ impl WitnessZoneRegistry {
 
         let peers = self.peers.clone();
         let self_address = self.self_address.clone();
-        // Snapshot the TLS config once (owned) — a live read guard must not
-        // be held across the `.await` below (RwLockReadGuard is not Send).
-        let tls = self.tls.read().unwrap().clone();
         loop {
             for peer in &peers {
                 if peer.id == self.node_id {
@@ -2656,6 +2665,12 @@ impl WitnessZoneRegistry {
                 let mut endpoint = peer.endpoint.clone();
                 let mut redirected_once = false;
                 loop {
+                    let tls = self
+                        .tls
+                        .snapshot()
+                        .config()
+                        .map_err(|e| TransportError::Connection(e.into()))?
+                        .cloned();
                     match call_join_zone_rpc(
                         &endpoint,
                         zone_id,
@@ -2811,7 +2826,7 @@ impl WitnessZoneRegistry {
 
         let shared_peers: super::SharedPeerMap =
             Arc::new(RwLock::new(super::PeerMap::new(self.node_id)));
-        driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
+        driver.set_peer_map(shared_peers.clone(), self.tls.snapshot().uses_tls());
 
         // Spawn transport loop with zone_id routing
         let client_config = ClientConfig {
@@ -2898,7 +2913,9 @@ impl RaftWitnessServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
+        let credentials =
+            listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+        let tls_enabled = credentials.snapshot().uses_tls();
         let zone_count = self.registry.list_zones().len();
         tracing::info!(
             "Starting Raft Witness gRPC server on {} (tls={}, zones={})",
@@ -2913,8 +2930,9 @@ impl RaftWitnessServer {
 
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        let policy = super::node_authority::NodeControlPolicy::from_tls(self.config.tls.as_ref())
-            .map_err(TransportError::Connection)?;
+        let policy =
+            super::node_authority::NodeControlPolicy::from_shared_tls(self.registry.shared_tls())
+                .map_err(TransportError::Connection)?;
         let router = builder.add_service(super::node_authority::NodeControlService::new(
             ZoneTransportServiceServer::new(service),
             policy,
@@ -2923,22 +2941,21 @@ impl RaftWitnessServer {
 
         // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
         // a target for foreign agents (those write mailboxes on the broker), so
-        // it passes `None` and `federated_mtls_incoming` builds a verifier with
+        // it passes `None` and `shared_mtls_incoming` builds a verifier with
         // just the cluster CA — byte-equivalent to the prior client_ca_root.
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, tls, None)
-                    .await
-                    .map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming_shutdown(incoming, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            None => router
+        if tls_enabled {
+            let incoming = lib::transport_primitives::shared_mtls_incoming(addr, credentials, None)
+                .await
+                .map_err(TransportError::Connection)?;
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await
+                .map_err(TransportError::Tonic)?;
+        } else {
+            router
                 .serve_with_shutdown(addr, shutdown)
                 .await
-                .map_err(TransportError::Tonic)?,
+                .map_err(TransportError::Tonic)?;
         }
 
         Ok(())

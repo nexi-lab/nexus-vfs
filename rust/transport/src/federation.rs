@@ -31,7 +31,7 @@ use crate::peer_channels::{PeerChannels, TlsPolicy};
 use kernel::abc::object_store::BackendStat;
 use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
 use kernel::kernel::vfs_proto;
-use lib::transport_primitives::TlsConfig;
+use lib::transport_primitives::{SharedTlsConfig, TlsConfig};
 use nexus_raft::federation::TofuTrustStore;
 use nexus_raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,
@@ -53,6 +53,10 @@ pub struct FederationClient {
 
 impl FederationClient {
     pub fn new(runtime: tokio::runtime::Handle, tls: Option<TlsConfig>) -> Self {
+        Self::with_shared_tls(runtime, SharedTlsConfig::new(tls))
+    }
+
+    pub fn with_shared_tls(runtime: tokio::runtime::Handle, tls: SharedTlsConfig) -> Self {
         Self {
             runtime,
             channels: PeerChannels::new(tls, Duration::from_secs(10)),
@@ -616,11 +620,8 @@ mod tests {
         let plain = FederationClient::new(rt.handle().clone(), None);
         assert!(!plain.channels.uses_tls());
 
-        // TLS variant — the material isn't parsed until the first
-        // `channel_for` call, so we just check it was stored.  Uses
-        // the shared `lib::transport_primitives::TlsConfig` so the
-        // sibling `PeerBlobClient` and `FederationClient` share a
-        // single TLS material type.
+        // A configured TLS policy remains distinguishable from plaintext;
+        // malformed material is refused when a channel is requested.
         let tls = FederationClient::new(
             rt.handle().clone(),
             Some(TlsConfig {

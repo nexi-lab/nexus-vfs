@@ -356,6 +356,19 @@ fn tls_incoming(
     listener: TcpListener,
     config: impl Fn() -> Option<Arc<ServerConfig>> + Send + 'static,
 ) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
+    tls_incoming_checked(
+        listener,
+        move || config().map(|config| (config, ())),
+        |_: &()| true,
+    )
+}
+
+pub(super) fn tls_incoming_checked<I: Send + 'static>(
+    listener: TcpListener,
+    config: impl Fn() -> Option<(Arc<ServerConfig>, I)> + Send + 'static,
+    is_current: impl Fn(&I) -> bool + Send + Sync + 'static,
+) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
+    let is_current = Arc::new(is_current);
     let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_BUFFER);
     tokio::spawn(async move {
         loop {
@@ -378,16 +391,27 @@ fn tls_incoming(
                     continue;
                 }
             };
-            let Some(config) = config() else {
+            let Some((config, installation)) = config() else {
                 drop(tcp);
                 continue;
             };
             let acceptor = TlsAcceptor::from(config);
             let tx = tx.clone();
+            let is_current = Arc::clone(&is_current);
             tokio::spawn(async move {
                 // A failed handshake (untrusted cert, garbage) is surfaced as an
                 // Err item; tonic drops that one connection and keeps serving.
-                let _ = tx.send(acceptor.accept(tcp).await).await;
+                let accepted = acceptor.accept(tcp).await.and_then(|stream| {
+                    if is_current(&installation) {
+                        Ok(stream)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "TLS credentials changed while accepting connection",
+                        ))
+                    }
+                });
+                let _ = tx.send(accepted).await;
             });
         }
     });

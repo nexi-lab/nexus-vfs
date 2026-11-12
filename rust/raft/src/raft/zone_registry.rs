@@ -231,7 +231,7 @@ pub struct ZoneRaftRegistry {
     node_id: u64,
     /// Shared TLS config — can be updated at runtime for plaintext→mTLS upgrade.
     /// All zones' client pools read from this on new connections.
-    tls: Arc<RwLock<Option<TlsConfig>>>,
+    tls: lib::transport_primitives::SharedTlsConfig,
     /// This node's advertise address — carried in outbound StepMessage
     /// `sender_address` so peers learn `(self.node_id -> address)` on
     /// inbound contact.  Set once at boot via [`Self::set_self_address`];
@@ -362,7 +362,7 @@ impl ZoneRaftRegistry {
             base_path,
             storage_policy: ZoneStoragePolicy::Managed,
             node_id,
-            tls: Arc::new(RwLock::new(tls)),
+            tls: lib::transport_primitives::SharedTlsConfig::new(tls),
             self_address: Arc::new(RwLock::new(String::new())),
             seeds: RwLock::new(Vec::new()),
             identity_dir: Arc::new(RwLock::new(None)),
@@ -573,8 +573,22 @@ impl ZoneRaftRegistry {
     }
 
     /// Get a snapshot of the current TLS config.
-    pub fn tls_config(&self) -> Option<TlsConfig> {
-        self.tls.read().unwrap().clone()
+    pub fn tls_config(&self) -> Result<Option<TlsConfig>, String> {
+        self.tls
+            .snapshot()
+            .config()
+            .map(|tls| tls.cloned())
+            .map_err(str::to_owned)
+    }
+
+    /// The credential source shared by outbound transports and the listener.
+    pub fn shared_tls(&self) -> lib::transport_primitives::SharedTlsConfig {
+        self.tls.clone()
+    }
+
+    /// Select the endpoint scheme; actual I/O validates the current installation.
+    pub(crate) fn tls_enabled(&self) -> bool {
+        self.tls.snapshot().uses_tls()
     }
 
     /// Create a new zone with its own Raft group.
@@ -1089,7 +1103,7 @@ impl ZoneRaftRegistry {
         // layer from the applied member-address records.
         let shared_peers: SharedPeerMap = Arc::new(RwLock::new(PeerMap::new(node_id)));
 
-        driver.set_peer_map(shared_peers.clone(), self.tls_config().is_some());
+        driver.set_peer_map(shared_peers.clone(), self.tls_enabled());
 
         // Record the DURABLE role intent — the SSOT for "what role do I
         // want" that boot reads to reissue JoinZone after a data-dir wipe.
@@ -1355,7 +1369,7 @@ impl ZoneRaftRegistry {
         // TLS config), not by sniffing the string. A scheme-less address
         // under mTLS must become `https://` or the dial fails the handshake.
         // An already-qualified `https://` address parses the same either way.
-        let use_tls = self.tls_config().is_some();
+        let use_tls = self.tls_enabled();
         let parsed = match NodeAddress::parse(endpoint, use_tls) {
             Ok(mut p) => {
                 p.id = peer_id;

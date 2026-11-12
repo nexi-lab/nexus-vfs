@@ -2,74 +2,49 @@
 use std::time::Duration;
 
 use dashmap::DashMap;
-use lib::transport_primitives::{create_channel, ClientConfig, TlsConfig};
-use parking_lot::RwLock;
+pub(crate) use lib::transport_primitives::TlsPolicy;
+use lib::transport_primitives::{create_channel, ClientConfig, SharedTlsConfig, TlsSnapshot};
 use tonic::transport::Channel;
 
-pub(crate) enum TlsPolicy {
-    Plaintext,
-    Configured(TlsConfig),
-    Rejected(&'static str),
-}
-
-struct ConnectionPolicy {
-    generation: u64,
-    tls: TlsPolicy,
-}
-
 struct CachedChannel {
-    generation: u64,
+    snapshot: TlsSnapshot,
     channel: Channel,
 }
 
 pub(crate) struct PeerChannels {
-    policy: RwLock<ConnectionPolicy>,
+    credentials: SharedTlsConfig,
     channels: DashMap<String, CachedChannel>,
     request_timeout: Duration,
 }
 
 impl PeerChannels {
-    pub(crate) fn new(tls: Option<TlsConfig>, request_timeout: Duration) -> Self {
+    pub(crate) fn new(credentials: SharedTlsConfig, request_timeout: Duration) -> Self {
         Self {
-            policy: RwLock::new(ConnectionPolicy {
-                generation: 0,
-                tls: tls.map_or(TlsPolicy::Plaintext, TlsPolicy::Configured),
-            }),
+            credentials,
             channels: DashMap::new(),
             request_timeout,
         }
     }
 
     pub(crate) fn replace_tls(&self, tls: TlsPolicy) {
-        let mut policy = self.policy.write();
-        policy.tls = match policy.generation.checked_add(1) {
-            Some(generation) => {
-                policy.generation = generation;
-                tls
-            }
-            None => TlsPolicy::Rejected("peer TLS generation exhausted"),
-        };
-        // A completing dial holds the same policy lock while publishing.
+        self.credentials.replace(tls);
         self.channels.clear();
     }
 
     pub(crate) async fn channel_for(&self, address: &str) -> Result<Channel, String> {
-        let (generation, tls) = {
-            let policy = self.policy.read();
-            if let TlsPolicy::Rejected(error) = &policy.tls {
-                return Err((*error).into());
-            }
+        let (snapshot, cached) = self.credentials.read(|snapshot| {
+            snapshot.config().map_err(str::to_owned)?;
             if let Some(cached) = self.channels.get(address) {
-                if cached.generation == policy.generation {
-                    return Ok(cached.channel.clone());
+                if cached.snapshot.same_installation(snapshot) {
+                    return Ok((snapshot.clone(), Some(cached.channel.clone())));
                 }
             }
-            let tls = match &policy.tls {
-                TlsPolicy::Configured(tls) => Some(tls.clone()),
-                TlsPolicy::Plaintext | TlsPolicy::Rejected(_) => None,
-            };
-            (policy.generation, tls)
-        };
+            Ok::<_, String>((snapshot.clone(), None))
+        })?;
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let tls = snapshot.config()?.cloned();
         let scheme = if tls.is_some() { "https" } else { "http" };
         let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
             address.to_string()
@@ -84,18 +59,18 @@ impl PeerChannels {
         let channel = create_channel(&endpoint, &config)
             .await
             .map_err(|error| format!("peer channel {address}: {error}"))?;
-        let policy = self.policy.read();
-        if policy.generation != generation || matches!(policy.tls, TlsPolicy::Rejected(_)) {
-            return Err("peer TLS configuration changed while connecting".into());
-        }
-        let cached = self
-            .channels
-            .entry(address.to_string())
-            .or_insert_with(|| CachedChannel {
-                generation,
-                channel,
-            });
-        Ok(cached.channel.clone())
+        self.credentials
+            .with_current(&snapshot, || {
+                self.channels.insert(
+                    address.to_string(),
+                    CachedChannel {
+                        snapshot: snapshot.clone(),
+                        channel: channel.clone(),
+                    },
+                );
+                channel
+            })
+            .ok_or_else(|| "peer TLS configuration changed while connecting".into())
     }
 
     #[cfg(test)]
@@ -104,6 +79,6 @@ impl PeerChannels {
     }
 
     pub(crate) fn uses_tls(&self) -> bool {
-        matches!(self.policy.read().tls, TlsPolicy::Configured(_))
+        self.credentials.read(TlsSnapshot::uses_tls)
     }
 }

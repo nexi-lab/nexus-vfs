@@ -18,6 +18,7 @@ use super::proto::nexus::raft::{
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
+use lib::transport_primitives::{SharedTlsConfig, TlsSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -86,9 +87,8 @@ pub struct ClientConfig {
     pub keep_alive_interval: Duration,
     /// Keep-alive timeout.
     pub keep_alive_timeout: Duration,
-    /// Shared TLS configuration — reads from registry's Arc<RwLock<>> so
-    /// transport loops pick up TLS upgrades without restart.
-    pub tls: Arc<std::sync::RwLock<Option<super::TlsConfig>>>,
+    /// The credential installation shared with the registry and listener.
+    pub tls: SharedTlsConfig,
 }
 
 impl Default for ClientConfig {
@@ -128,7 +128,7 @@ impl Default for ClientConfig {
             request_timeout: Duration::from_secs(10),
             keep_alive_interval: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(10),
-            tls: Arc::new(std::sync::RwLock::new(None)),
+            tls: SharedTlsConfig::default(),
         }
     }
 }
@@ -160,7 +160,6 @@ fn channel_config(
 struct CachedClient {
     client: RaftClient,
     created_at: Instant,
-    tls: Option<super::TlsConfig>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,27 +228,33 @@ impl RaftClientPool {
         // refreshing a stale entry (routine, TTL-driven) or connecting with no
         // prior entry, so the lifecycle event below logs at the right level
         // instead of an ambiguous reconnect line.
-        let (stale_age_secs, tls_snapshot) = {
+        let (stale_age_secs, tls_snapshot, cached) = {
             let clients = self.clients.read().await;
-            let tls = self.config.tls.read().unwrap();
-            let age = match clients.get(&key) {
-                Some(cached)
-                    if cached.created_at.elapsed() < self.client_ttl
-                        && cached.client.endpoint() == addr.endpoint
-                        && cached.tls == *tls =>
-                {
-                    return Ok(cached.client.clone());
-                }
-                Some(cached) if cached.created_at.elapsed() >= self.client_ttl => {
-                    Some(cached.created_at.elapsed().as_secs())
-                }
-                _ => None,
-            };
-            (age, tls.clone())
+            self.config.tls.read(|tls| -> Result<_> {
+                tls.config()
+                    .map_err(|e| TransportError::Connection(e.into()))?;
+                let age = match clients.get(&key) {
+                    Some(cached)
+                        if cached.created_at.elapsed() < self.client_ttl
+                            && cached.client.endpoint() == addr.endpoint
+                            && cached.client.tls_snapshot.same_installation(tls) =>
+                    {
+                        return Ok((None, tls.clone(), Some(cached.client.clone())));
+                    }
+                    Some(cached) if cached.created_at.elapsed() >= self.client_ttl => {
+                        Some(cached.created_at.elapsed().as_secs())
+                    }
+                    _ => None,
+                };
+                Ok((age, tls.clone(), None))
+            })?
         };
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
 
         // Create new client (may replace a stale one).
-        let expected = if tls_snapshot.is_some() || role == PeerRole::Node {
+        let expected = if tls_snapshot.uses_tls() || role == PeerRole::Node {
             Some((
                 std::num::NonZeroU64::new(addr.id).ok_or_else(|| {
                     TransportError::Connection(
@@ -272,20 +277,22 @@ impl RaftClientPool {
         // Store in pool with current timestamp.
         {
             let mut clients = self.clients.write().await;
-            let current_tls = self.config.tls.read().unwrap();
-            if *current_tls != tls_snapshot {
-                return Err(TransportError::Connection(
-                    "Raft TLS configuration changed while connecting".into(),
-                ));
-            }
-            clients.insert(
-                key,
-                CachedClient {
-                    client: client.clone(),
-                    created_at: Instant::now(),
-                    tls: tls_snapshot,
-                },
-            );
+            self.config
+                .tls
+                .with_current(&tls_snapshot, || {
+                    clients.insert(
+                        key,
+                        CachedClient {
+                            client: client.clone(),
+                            created_at: Instant::now(),
+                        },
+                    );
+                })
+                .ok_or_else(|| {
+                    TransportError::Connection(
+                        "Raft TLS configuration changed while connecting".into(),
+                    )
+                })?;
         }
 
         match stale_age_secs {
@@ -328,10 +335,20 @@ impl Default for RaftClientPool {
 #[derive(Clone)]
 pub struct RaftClient {
     endpoint: String,
-    #[allow(dead_code)]
     config: ClientConfig,
+    tls_snapshot: TlsSnapshot,
     inner: ZoneTransportServiceClient<Channel>,
     is_node_channel: bool,
+}
+
+fn require_current_credentials(config: &ClientConfig, snapshot: &TlsSnapshot) -> Result<()> {
+    if config.tls.is_current(snapshot) {
+        Ok(())
+    } else {
+        Err(TransportError::Connection(
+            "Raft connection credential installation is no longer current".into(),
+        ))
+    }
 }
 
 fn decode_step_response(response: StepMessageResponse) -> Result<()> {
@@ -346,16 +363,21 @@ fn decode_step_response(response: StepMessageResponse) -> Result<()> {
 }
 
 impl RaftClient {
+    fn inner_mut(&mut self) -> Result<&mut ZoneTransportServiceClient<Channel>> {
+        require_current_credentials(&self.config, &self.tls_snapshot)?;
+        Ok(&mut self.inner)
+    }
+
     /// Connect to a Raft node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
-        let tls_snapshot = config.tls.read().unwrap().clone();
+        let tls_snapshot = config.tls.snapshot();
         Self::connect_with_identity(endpoint, config, tls_snapshot, None).await
     }
 
     async fn connect_with_identity(
         endpoint: &str,
         config: ClientConfig,
-        tls_snapshot: Option<super::TlsConfig>,
+        tls_snapshot: TlsSnapshot,
         expected: Option<(std::num::NonZeroU64, PeerRole)>,
     ) -> Result<Self> {
         // Pre-dial diagnostic only (surfaces a hang inside `create_channel`);
@@ -363,11 +385,15 @@ impl RaftClient {
         // (`RaftClientPool::get`) via `ClientPoolEvent` once the dial succeeds.
         tracing::debug!(
             endpoint = endpoint,
-            tls = tls_snapshot.is_some(),
+            tls = tls_snapshot.uses_tls(),
             "dialing raft node",
         );
 
-        let channel_config = channel_config(&config, tls_snapshot);
+        let tls = tls_snapshot
+            .config()
+            .map_err(|e| TransportError::Connection(e.into()))?
+            .cloned();
+        let channel_config = channel_config(&config, tls);
         let channel = match expected {
             Some((expected, PeerRole::Replication)) => {
                 lib::transport_primitives::create_peer_channel(endpoint, &channel_config, expected)
@@ -380,10 +406,16 @@ impl RaftClient {
             None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
         };
         let inner = ZoneTransportServiceClient::new(channel);
+        if !config.tls.is_current(&tls_snapshot) {
+            return Err(TransportError::Connection(
+                "Raft TLS configuration changed while connecting".into(),
+            ));
+        }
 
         Ok(Self {
             endpoint: endpoint.to_string(),
             config,
+            tls_snapshot,
             inner,
             is_node_channel: matches!(expected, Some((_, PeerRole::Node))),
         })
@@ -427,7 +459,7 @@ impl RaftClient {
             ));
         }
         Ok(self
-            .inner
+            .inner_mut()?
             .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
                 zone_id: zone_id.to_owned(),
             })
@@ -457,7 +489,7 @@ impl RaftClient {
             sender_address,
         });
 
-        let response = self.inner.step_message(request).await?;
+        let response = self.inner_mut()?.step_message(request).await?;
         decode_step_response(response.into_inner())
     }
 
@@ -475,7 +507,7 @@ impl RaftClient {
             zone_id,
             sender_address,
         });
-        let response = self.inner.step_storage_v1(request).await?;
+        let response = self.inner_mut()?.step_storage_v1(request).await?;
         decode_step_response(response.into_inner())
     }
 
@@ -493,7 +525,7 @@ impl RaftClient {
             ));
         }
         let response = self
-            .inner
+            .inner_mut()?
             .step_replica_control_v1(StepMessageRequest {
                 message: message_bytes,
                 zone_id,
@@ -519,7 +551,7 @@ impl RaftClient {
             sender_node_id,
         });
 
-        let response = self.inner.replicate_entries(request).await?;
+        let response = self.inner_mut()?.replicate_entries(request).await?;
         let resp = response.into_inner();
 
         if !resp.success {
@@ -551,7 +583,7 @@ impl RaftClient {
             sender_node_id,
         });
 
-        let response = self.inner.snapshot_ec_state(request).await?;
+        let response = self.inner_mut()?.snapshot_ec_state(request).await?;
         let resp = response.into_inner();
 
         if !resp.success {
@@ -578,7 +610,7 @@ impl RaftClient {
 pub struct RaftApiClient {
     endpoint: String,
     config: ClientConfig,
-    tls_snapshot: Option<super::TlsConfig>,
+    tls_snapshot: TlsSnapshot,
     inner: ZoneApiServiceClient<Channel>,
     /// Zone ID for multi-zone routing (included in all requests).
     zone_id: String,
@@ -587,19 +619,21 @@ pub struct RaftApiClient {
 impl RaftApiClient {
     /// Connect to a Raft cluster node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
-        let tls_snapshot = config.tls.read().unwrap().clone();
+        let tls_snapshot = config.tls.snapshot();
         tracing::info!(
             "Connecting to Raft API at {} (tls={})",
             endpoint,
-            tls_snapshot.is_some()
+            tls_snapshot.uses_tls()
         );
 
-        let channel = lib::transport_primitives::create_channel(
-            endpoint,
-            &channel_config(&config, tls_snapshot.clone()),
-        )
-        .await?;
-        if *config.tls.read().unwrap() != tls_snapshot {
+        let tls = tls_snapshot
+            .config()
+            .map_err(|e| TransportError::Connection(e.into()))?
+            .cloned();
+        let channel =
+            lib::transport_primitives::create_channel(endpoint, &channel_config(&config, tls))
+                .await?;
+        if !config.tls.is_current(&tls_snapshot) {
             return Err(TransportError::Connection(
                 "Raft API TLS configuration changed while connecting".into(),
             ));
@@ -630,13 +664,13 @@ impl RaftApiClient {
 
     /// A cached proposal channel belongs to its original credential source and snapshot.
     pub(crate) fn uses_current_credentials(&self, config: &ClientConfig) -> bool {
-        Arc::ptr_eq(&self.config.tls, &config.tls)
-            && *config.tls.read().unwrap() == self.tls_snapshot
+        config.tls.is_current(&self.tls_snapshot)
     }
 
     /// Get mutable access to the inner gRPC client (for raw requests).
-    pub(crate) fn inner_mut(&mut self) -> &mut ZoneApiServiceClient<Channel> {
-        &mut self.inner
+    pub(crate) fn inner_mut(&mut self) -> Result<&mut ZoneApiServiceClient<Channel>> {
+        require_current_credentials(&self.config, &self.tls_snapshot)?;
+        Ok(&mut self.inner)
     }
 
     // === Propose Methods (Writes) ===
@@ -734,7 +768,7 @@ impl RaftApiClient {
             forwarded: false,
         });
 
-        let response = self.inner.propose(request).await?;
+        let response = self.inner_mut()?.propose(request).await?;
         let resp = response.into_inner();
 
         Ok(ProposeResult {
@@ -808,7 +842,7 @@ impl RaftApiClient {
             zone_id: self.zone_id.clone(),
         });
 
-        let response = self.inner.query(request).await?;
+        let response = self.inner_mut()?.query(request).await?;
         let resp = response.into_inner();
 
         Ok(QueryResult {
@@ -827,7 +861,7 @@ impl RaftApiClient {
             zone_id: self.zone_id.clone(),
         });
 
-        let response = self.inner.get_cluster_info(request).await?;
+        let response = self.inner_mut()?.get_cluster_info(request).await?;
         let resp = response.into_inner();
 
         Ok(ClusterInfoResult {
@@ -1666,7 +1700,6 @@ mod tests {
                 (42, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
-                    tls: None,
                     created_at: Instant::now(),
                 },
             );
@@ -1692,7 +1725,6 @@ mod tests {
                 (99, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
-                    tls: None,
                     created_at: Instant::now() - Duration::from_secs(10),
                 },
             );
@@ -1717,7 +1749,6 @@ mod tests {
                 (1, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
-                    tls: None,
                     created_at: now - Duration::from_secs(10),
                 },
             );
@@ -1726,7 +1757,6 @@ mod tests {
                 (2, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
-                    tls: None,
                     created_at: now - Duration::from_secs(120),
                 },
             );
@@ -1735,7 +1765,6 @@ mod tests {
                 (3, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
-                    tls: None,
                     created_at: now - Duration::from_secs(59),
                 },
             );
@@ -1777,9 +1806,11 @@ mod tests {
     fn create_dummy_client() -> RaftClient {
         // Create a channel pointing to a non-existent endpoint
         let channel = Channel::from_static("http://[::1]:1").connect_lazy();
+        let config = ClientConfig::default();
         RaftClient {
             endpoint: "http://[::1]:1".to_string(),
-            config: ClientConfig::default(),
+            tls_snapshot: config.tls.snapshot(),
+            config,
             inner: ZoneTransportServiceClient::new(channel),
             is_node_channel: false,
         }

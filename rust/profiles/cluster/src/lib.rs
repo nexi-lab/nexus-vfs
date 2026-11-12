@@ -3143,19 +3143,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // would carry no `last_writer_address`, and ReadBlob would have
     // nothing to serve.  Held until shutdown so the apply-cb closures +
     // their Arc clones see a stable provider lifetime.
-    // ONE trust anchor for every outbound cluster-mTLS peer client.
-    //
-    // Both the federation fan-out (`FederationClient`) and the blob fetch
-    // (`PeerBlobClient`) ride the cluster's raft-port mTLS: a fan-out RPC sends
-    // an empty `auth_token`, so the ONLY thing that authenticates it is this
-    // node cert (the peer plane), and `ReadBlob` is co-located on the same
-    // `ZoneApiService`. A client left without this cert material dials the peer
-    // in plaintext and the mTLS server closes the connection. Read the SSOT
-    // (the zone registry's resolved TLS) ONCE here and arm every such client
-    // from it, so a new peer client is wired in one obvious place instead of
-    // each site remembering its own `install_tls`. `None` under `--no-tls`
-    // correctly leaves the clients plaintext.
-    let cluster_tls = zm.registry().tls_config();
+    // Raft, federation and content fetches share the registry's live credentials.
+    let cluster_tls = zm.registry().shared_tls();
 
     // Outbound federation-peer typed-RPC client.  Constructed BEFORE
     // the coordinator so it can be passed in via `install_with_kernel`
@@ -3163,7 +3152,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // peer dispatch.  Without this the coordinator's `peer_*` impls
     // surface every cross-node dispatch as a silent miss via the
     // PR #94 observability warn-loud path (`grpc_ops not installed`).
-    let federation_client = Arc::new(transport::federation::FederationClient::new(
+    let federation_client = Arc::new(transport::federation::FederationClient::with_shared_tls(
         kernel.runtime().handle().clone(),
         cluster_tls.clone(),
     ));
@@ -3193,16 +3182,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // default so `Kernel::try_remote_fetch` can actually fetch bytes
     // from origin nodes on local-backend misses.  Sits above raft in
     // the dep graph; kept out of `install_with_kernel` for that reason.
-    transport::peer_blob::install(kernel.as_ref());
-    // Arm the blob client from the same `cluster_tls` SSOT read above (see the
-    // "ONE trust anchor" note) — `ReadBlob` over mTLS otherwise dials plaintext
-    // and the server closes the connection.
-    if let Some(tls) = &cluster_tls {
-        kernel
-            .peer_client_arc()
-            .install_tls(&tls.ca_pem, Some(&tls.cert_pem), Some(&tls.key_pem));
-        tracing::info!("peer-blob client armed with cluster mTLS (ReadBlob over TLS)");
-    }
+    transport::peer_blob::install_with_shared_tls(kernel.as_ref(), cluster_tls);
 
     // Control zone (B2): the single REPLICATED home for the cluster-control
     // store (auth records + cross-org anchors), bound just below. The founder
@@ -4271,7 +4251,7 @@ async fn reconcile_federation_from_peers(
     for peer in &peers {
         match nexus_raft::transport::call_discover_zones_rpc(
             &peer.endpoint,
-            zm.registry().tls_config(),
+            zm.registry().tls_config().map_err(anyhow::Error::msg)?,
             /* timeout */ 10,
         )
         .await

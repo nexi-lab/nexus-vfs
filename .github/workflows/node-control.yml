@@ -90,6 +90,7 @@ jobs:
         run: cargo test --locked -p raft@0.1.0 --lib transport::transport_loop::tests
       - name: Content peer TLS configuration and connection rotation
         run: |
+          cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls::tests
           cargo test --locked -p transport --lib peer_blob::
           cargo test --locked -p transport --lib federation::
       - name: Forwarded proposal credentials and pending TLS dials

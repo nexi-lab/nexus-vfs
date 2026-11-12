@@ -143,6 +143,7 @@ pub(crate) struct Fixture {
     pub(crate) address: String,
     pub(crate) calls: Arc<Mutex<Vec<Option<u64>>>>,
     pub(crate) scoped_calls: Arc<Mutex<Vec<ScopedCall>>>,
+    pub(crate) shared_tls: Option<lib::transport_primitives::SharedTlsConfig>,
     ca: Vec<u8>,
     ca_key: Vec<u8>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -155,6 +156,14 @@ impl Fixture {
     }
 
     pub(crate) async fn start_with_scoped(is_tls: bool, supports_scoped: bool) -> Self {
+        Self::start_with_options(is_tls, supports_scoped, false).await
+    }
+
+    pub(crate) async fn start_with_shared_tls() -> Self {
+        Self::start_with_options(true, true, true).await
+    }
+
+    async fn start_with_options(is_tls: bool, supports_scoped: bool, is_shared: bool) -> Self {
         lib::transport_primitives::ensure_crypto_provider();
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
         let (cert, key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
@@ -169,7 +178,16 @@ impl Fixture {
             ca_der: Arc::new(pem::parse(&ca).unwrap().into_contents()),
         };
         let mut builder = Server::builder();
-        if is_tls {
+        let shared_tls = is_shared.then(|| {
+            lib::transport_primitives::SharedTlsConfig::new(Some(
+                lib::transport_primitives::TlsConfig {
+                    cert_pem: cert.clone(),
+                    key_pem: key.clone(),
+                    ca_pem: ca.clone(),
+                },
+            ))
+        });
+        if is_tls && !is_shared {
             builder = builder
                 .tls_config(
                     ServerTlsConfig::new()
@@ -179,22 +197,36 @@ impl Fixture {
                 .unwrap();
         }
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving_tls = shared_tls.clone();
         let task = tokio::spawn(async move {
-            builder
-                .add_service(service)
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-                .unwrap();
+            let router = builder.add_service(service);
+            let shutdown = async {
+                let _ = stopped.await;
+            };
+            if let Some(source) = serving_tls {
+                router
+                    .serve_with_incoming_shutdown(
+                        lib::transport_primitives::shared_tls_incoming(listener, source, None)
+                            .unwrap(),
+                        shutdown,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                router
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        shutdown,
+                    )
+                    .await
+                    .unwrap();
+            }
         });
         Self {
             address,
             calls,
             scoped_calls,
+            shared_tls,
             ca,
             ca_key,
             stop: Some(stop),

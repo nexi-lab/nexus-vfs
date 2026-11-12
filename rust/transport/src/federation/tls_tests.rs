@@ -1,6 +1,8 @@
 use super::*;
 use crate::test_peer::{Fixture, PausedDial};
 
+mod shared_identity;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_membership_connection_uses_the_replacement_identity() {
     let server = Fixture::start(true).await;

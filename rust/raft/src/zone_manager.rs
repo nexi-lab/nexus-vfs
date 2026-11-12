@@ -1455,13 +1455,13 @@ impl ZoneManager {
 
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
         bridge_block_on(self.rt().handle(), async {
             for (peer_id, peer) in peers {
                 if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
-                call_delete_zone(&peer.endpoint, zone_id, force, tls.clone(), 10)
+                let tls = self.registry.tls_config().map_err(RaftError::Config)?;
+                call_delete_zone(&peer.endpoint, zone_id, force, tls, 10)
                     .await
                     .map_err(|e| {
                         RaftError::Raft(format!(
@@ -1485,7 +1485,6 @@ impl ZoneManager {
     pub(crate) fn fan_out_delete_best_effort(&self, zone_id: &str, force: bool) {
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
         let zid = zone_id.to_string();
         let handle = self.rt().handle().clone();
         bridge_block_on(&handle, async move {
@@ -1493,8 +1492,14 @@ impl ZoneManager {
                 if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
                     continue;
                 }
-                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls.clone(), 10).await
-                {
+                let tls = match self.registry.tls_config() {
+                    Ok(tls) => tls,
+                    Err(error) => {
+                        tracing::warn!(zone = %zid, error = %error, "deprovision credentials unavailable");
+                        return;
+                    }
+                };
+                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls, 10).await {
                     tracing::warn!(
                         zone = %zid,
                         peer = %peer.endpoint,

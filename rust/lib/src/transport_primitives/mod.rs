@@ -24,6 +24,8 @@ mod replica_credential;
 mod runtime_credential;
 mod secret_file;
 mod server_limits;
+mod shared_tls;
+mod shared_tls_server;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
@@ -51,4 +53,6 @@ pub use runtime_credential::{
 };
 pub use secret_file::{create_secret, protect_secret, write_secret};
 pub use server_limits::apply_server_limits;
+pub use shared_tls::{SharedTlsConfig, TlsPolicy, TlsSnapshot};
+pub use shared_tls_server::{shared_mtls_incoming, shared_tls_incoming};
 pub use tofu::{cert_fingerprint, TofuError, TofuResult, TofuTrustStore, TrustedZone};

@@ -153,6 +153,7 @@ pub(crate) async fn forward_propose(
 
     let result = api_client
         .inner_mut()
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?
         .propose(request)
         .await
         .map_err(|e| RaftError::Transport(e.to_string()));
@@ -191,6 +192,7 @@ pub(crate) async fn propose_to(
     let mut client = connect_proposer(config, endpoint).await?;
     let response = client
         .inner_mut()
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?
         .propose(request)
         .await
         .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;

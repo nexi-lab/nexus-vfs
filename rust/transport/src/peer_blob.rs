@@ -60,10 +60,20 @@ impl PeerBlobClient {
     /// keeps runtime shutdown a kernel-side responsibility and makes
     /// drops here side-effect-free.
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self::with_shared_tls(
+            runtime,
+            lib::transport_primitives::SharedTlsConfig::default(),
+        )
+    }
+
+    pub fn with_shared_tls(
+        runtime: tokio::runtime::Handle,
+        tls: lib::transport_primitives::SharedTlsConfig,
+    ) -> Self {
         Self {
             runtime,
             channels: PeerChannels::new(
-                None,
+                tls,
                 lib::transport_primitives::ClientConfig::default().request_timeout,
             ),
             per_peer_semaphores: DashMap::new(),
@@ -273,7 +283,21 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
 /// runtime via `Handle` and installs it via `Kernel::set_peer_client`,
 /// replacing the `NoopPeerBlobClient` default.
 pub fn install(kernel: &kernel::kernel::Kernel) {
-    let client = Arc::new(PeerBlobClient::new(kernel.runtime().handle().clone()));
+    install_with_shared_tls(
+        kernel,
+        lib::transport_primitives::SharedTlsConfig::default(),
+    );
+}
+
+/// Share the running node's credential installation with content fetches.
+pub fn install_with_shared_tls(
+    kernel: &kernel::kernel::Kernel,
+    credentials: lib::transport_primitives::SharedTlsConfig,
+) {
+    let client = Arc::new(PeerBlobClient::with_shared_tls(
+        kernel.runtime().handle().clone(),
+        credentials,
+    ));
     kernel.set_peer_client(client as Arc<dyn kernel::hal::peer::PeerBlobClient>);
 }
 
