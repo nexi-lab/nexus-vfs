@@ -21,10 +21,7 @@ use crate::raft::{
     FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, StateMachine, ZoneConsensus,
     ZonePersistence,
 };
-use crate::transport::{
-    ClientConfig, NodeAddress, PeerMap, RaftClientPool, SharedPeerMap, TlsConfig, TransportError,
-    TransportLoop,
-};
+use crate::transport::{NodeAddress, SharedPeerMap, TlsConfig, TransportError};
 use crate::zone_deletion_registry::DeletionEpochSource;
 use dashmap::DashMap;
 use lib::rt::block_on_via as bridge_block_on;
@@ -1112,17 +1109,10 @@ impl ZoneRaftRegistry {
         };
 
         // Create ZoneConsensus handle + driver
-        let (mut handle, mut driver) =
+        let (mut handle, driver) =
             ZoneConsensus::new(config, raft_storage, state_machine, replication_log).map_err(
                 |e| TransportError::Connection(format!("Failed to create ZoneConsensus: {}", e)),
             )?;
-
-        // Route book — shared between ZoneEntry, TransportLoop, the forwarding
-        // context and the ZoneConsensusDriver, which derives its registered
-        // layer from the applied member-address records.
-        let shared_peers: SharedPeerMap = Arc::new(RwLock::new(PeerMap::new(node_id)));
-
-        driver.set_peer_map(shared_peers.clone(), self.tls_enabled());
 
         // Record the DURABLE role intent — the SSOT for "what role do I
         // want" that boot reads to reissue JoinZone after a data-dir wipe.
@@ -1150,53 +1140,23 @@ impl ZoneRaftRegistry {
             }
         }
 
-        let client_config = ClientConfig {
-            tls: self.tls.clone(),
-            ..Default::default()
-        };
-
-        // Set up transparent leader forwarding on the handle.
-        // When propose() is called on a follower, it forwards to the leader
-        // via gRPC instead of returning NotLeader.
-        handle.set_forward_ctx(
-            RaftClientPool::with_config(client_config.clone()),
-            shared_peers.clone(),
-            zone_id.to_string(),
-        );
-
-        let transport_loop = TransportLoop::new(
+        // Route book, leader forwarding, transport loop and member-address
+        // registration — the parts every zone member runs.
+        let crate::transport::StartedZone {
+            peers: shared_peers,
+            shutdown_tx,
+            transport_handle,
+            registration_handle,
+            task_completion,
+        } = crate::transport::start_zone(
+            &mut handle,
             driver,
-            shared_peers.clone(),
-            RaftClientPool::with_config(client_config),
-        )
-        .with_zone_id(zone_id.to_string())
-        .with_self_address(self.self_address());
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (task_lifetime, task_completion) = watch::channel(false);
-        // A managed zone keeps its member's address record current; the
-        // fixed local root has no network members.
-        let advertise = self.self_address();
-        let registration_handle = (membership_policy == super::MembershipPolicy::Managed
-            && !advertise.is_empty())
-        .then(|| {
-            let task = handle.clone().register_member_address(
-                crate::raft::MemberRegistration {
-                    advertise,
-                    seeds: self.seeds(),
-                },
-                shutdown_rx.clone(),
-            );
-            let lifetime = task_lifetime.clone();
-            runtime_handle.spawn(async move {
-                let _lifetime = lifetime;
-                task.await;
-            })
-        });
-        let transport_handle = runtime_handle.spawn(async move {
-            let _lifetime = task_lifetime;
-            transport_loop.run(shutdown_rx).await;
-        });
+            zone_id,
+            &self.tls,
+            self.self_address(),
+            self.seeds(),
+            runtime_handle,
+        );
 
         // Leader election is owned by raft-rs's tick loop inside the
         // spawned transport task. We do NOT call `campaign()` here —
@@ -1377,27 +1337,10 @@ impl ZoneRaftRegistry {
     /// Empty `endpoint` is "no advertise — keep the existing route". Zone
     /// authorization upstream verifies the sender.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
-        if endpoint.is_empty() || peer_id == 0 {
-            return false;
-        }
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        // The peer advertises a bare `host:port` authority; scheme it with
-        // THIS node's transport posture (the cluster's SSOT — the registry
-        // TLS config), not by sniffing the string. A scheme-less address
-        // under mTLS must become `https://` or the dial fails the handshake.
-        // An already-qualified `https://` address parses the same either way.
-        let use_tls = self.tls_enabled();
-        let parsed = match NodeAddress::parse(endpoint, use_tls) {
-            Ok(mut p) => {
-                p.id = peer_id;
-                p
-            }
-            Err(_) => return false,
-        };
-        let changed = entry.peers.write().unwrap().observe(peer_id, parsed);
-        changed
+        crate::transport::observe_sender(&entry.peers, peer_id, endpoint, self.tls_enabled())
     }
 
     /// The network replica identity used by managed data zones.

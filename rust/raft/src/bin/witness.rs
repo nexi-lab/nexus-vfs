@@ -118,9 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Create registry.  The witness's own advertise address is
-        // the entry in NEXUS_PEERS that matches its node_id — recorded
-        // so it can be carried in outbound StepMessage.sender_address
-        // (peer-map runtime SSOT under the opaque-ID contract).
+        // the entry in NEXUS_PEERS that matches its node_id — carried in
+        // outbound StepMessage.sender_address and registered as this
+        // witness's member address in every zone it joins.
         let mut registry = WitnessZoneRegistry::new(data_path.clone(), node_id, tls_config.clone());
         registry.set_peers(peers.clone());
         let self_advertise = peers

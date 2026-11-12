@@ -35,7 +35,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             .map_err(|_| RaftError::InvalidState("member address state is being updated".into()))?;
         Ok(MemberAddressView {
             membership: read_membership(&self.raw_node),
-            addresses: state.member_addresses()?,
+            addresses: state.member_addresses()?.ok_or_else(|| {
+                RaftError::InvalidState("member address store is unavailable".into())
+            })?,
         })
     }
 }
@@ -43,7 +45,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{FullStateMachine, RaftConfig, RaftStorage};
+    use crate::raft::{FullStateMachine, RaftConfig, RaftStorage, WitnessStateMachine};
     use crate::storage::RedbStore;
     use raft::eraftpb::ConfState;
     use std::{
@@ -90,6 +92,29 @@ mod tests {
         )
         .unwrap();
         (handle, driver, directory)
+    }
+
+    #[tokio::test]
+    async fn member_readback_refuses_an_absent_authoritative_address_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RaftStorage::open(directory.path()).unwrap();
+        let store = RedbStore::open(directory.path().join("state")).unwrap();
+        let state = WitnessStateMachine::new(&store).unwrap();
+        let (_handle, driver) = ZoneConsensus::new(
+            RaftConfig {
+                id: 7,
+                is_witness: true,
+                ..Default::default()
+            },
+            storage,
+            state,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            driver.member_address_view(),
+            Err(RaftError::InvalidState(detail)) if detail == "member address store is unavailable"
+        ));
     }
 
     #[tokio::test]
