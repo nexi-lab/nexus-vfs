@@ -577,8 +577,8 @@ impl RaftClient {
 #[derive(Clone)]
 pub struct RaftApiClient {
     endpoint: String,
-    #[allow(dead_code)]
     config: ClientConfig,
+    tls_snapshot: Option<super::TlsConfig>,
     inner: ZoneApiServiceClient<Channel>,
     /// Zone ID for multi-zone routing (included in all requests).
     zone_id: String,
@@ -596,9 +596,14 @@ impl RaftApiClient {
 
         let channel = lib::transport_primitives::create_channel(
             endpoint,
-            &channel_config(&config, tls_snapshot),
+            &channel_config(&config, tls_snapshot.clone()),
         )
         .await?;
+        if *config.tls.read().unwrap() != tls_snapshot {
+            return Err(TransportError::Connection(
+                "Raft API TLS configuration changed while connecting".into(),
+            ));
+        }
         let inner = ZoneApiServiceClient::new(channel);
 
         tracing::info!("Connected to Raft API at {}", endpoint);
@@ -606,6 +611,7 @@ impl RaftApiClient {
         Ok(Self {
             endpoint: endpoint.to_string(),
             config,
+            tls_snapshot,
             inner,
             zone_id: String::new(),
         })
@@ -620,6 +626,12 @@ impl RaftApiClient {
     /// Get the endpoint this client is connected to.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// A cached proposal channel belongs to its original credential source and snapshot.
+    pub(crate) fn uses_current_credentials(&self, config: &ClientConfig) -> bool {
+        Arc::ptr_eq(&self.config.tls, &config.tls)
+            && *config.tls.read().unwrap() == self.tls_snapshot
     }
 
     /// Get mutable access to the inner gRPC client (for raw requests).
