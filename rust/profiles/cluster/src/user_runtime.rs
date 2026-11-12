@@ -8,9 +8,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use kernel::kernel::Kernel;
 use lib::transport_primitives::{
-    reloadable_tls_incoming, server_config, user_runtime_name_from_x509, user_runtime_server_name,
-    AgentCredential, FederatedClientCertVerifier, LoadedCredential, ReloadableServerIdentity,
-    USER_RUNTIME_MAX_VALIDITY_SECS,
+    server_config, user_runtime_name_from_x509, user_runtime_server_name, AgentCredential,
+    FederatedClientCertVerifier, LoadedCredential, SharedTlsConfig, SharedTlsListener, TlsConfig,
+    TlsPolicy, USER_RUNTIME_MAX_VALIDITY_SECS,
 };
 use transport::grpc::{build_user_runtime_routes, DataPlaneReady};
 use transport::runtime_scope::RuntimeScope;
@@ -22,7 +22,16 @@ const OWNER_FILE: &str = ".user-runtime-owner";
 
 struct ValidatedCredential {
     bundle: LoadedCredential,
-    expires_at: u64,
+}
+
+impl ValidatedCredential {
+    fn tls(&self) -> TlsConfig {
+        TlsConfig {
+            cert_pem: self.bundle.cert_pem.clone(),
+            key_pem: self.bundle.key_pem.clone(),
+            ca_pem: self.bundle.ca_pem.clone(),
+        }
+    }
 }
 
 enum CredentialUse {
@@ -83,11 +92,8 @@ fn validate_credential(
     {
         bail!("runtime credential must be an ordinary agent of its fixed owner");
     }
-    Ok(ValidatedCredential {
-        expires_at: u64::try_from(cert.validity().not_after.timestamp())
-            .context("invalid runtime expiry")?,
-        bundle,
-    })
+    u64::try_from(cert.validity().not_after.timestamp()).context("invalid runtime expiry")?;
+    Ok(ValidatedCredential { bundle })
 }
 
 fn bind_owner(dir: &Path, owner: &str) -> Result<()> {
@@ -156,15 +162,9 @@ pub(super) async fn serve(
     let initial = AgentCredential::load(&credential_path).map_err(anyhow::Error::msg)?;
     let verifier = FederatedClientCertVerifier::new(&initial.ca_pem).map_err(anyhow::Error::msg)?;
     let initial = validate_credential(initial, &owner, &verifier, CredentialUse::Bootstrap)?;
-    let identity = ReloadableServerIdentity::new(
-        server_config(
-            Arc::clone(&verifier),
-            &initial.bundle.cert_pem,
-            &initial.bundle.key_pem,
-        )
-        .map_err(anyhow::Error::msg)?,
-        initial.expires_at,
-    );
+    let identity = SharedTlsConfig::new(Some(initial.tls()));
+    let tls_listener = SharedTlsListener::prepare(identity.clone(), Some(Arc::clone(&verifier)))
+        .map_err(anyhow::Error::msg)?;
     bind_owner(&common.data_dir, &owner)?;
     super::set_provider(Arc::new(super::DefaultObjectStoreProvider))
         .unwrap_or_else(|_| tracing::warn!("ObjectStoreProvider already registered"));
@@ -197,9 +197,9 @@ pub(super) async fn serve(
     {
         bail!("user root zone has no leader; durable writes are unavailable");
     }
-    let peer_client = Arc::new(transport::federation::FederationClient::new(
+    let peer_client = Arc::new(transport::federation::FederationClient::with_shared_tls(
         kernel.runtime().handle().clone(),
-        None,
+        identity.clone(),
     ));
     transport::federation::runtime_directory::install(
         &kernel,
@@ -235,7 +235,7 @@ pub(super) async fn serve(
     verifier_slot
         .set(Arc::clone(&verifier))
         .map_err(|_| anyhow::anyhow!("runtime verifier already installed"))?;
-    let scope = scope.with_server_identity(Arc::clone(&identity));
+    let scope = scope.with_server_identity(identity.clone());
     let ready = DataPlaneReady::open();
     let routes = build_user_runtime_routes(
         Arc::clone(&kernel),
@@ -259,7 +259,7 @@ pub(super) async fn serve(
         .await
         .with_context(|| format!("bind user runtime {bind}"))?;
     tracing::info!(owner = %owner, bind = %listener.local_addr()?, "confined user runtime ready");
-    let incoming = reloadable_tls_incoming(listener, Arc::clone(&identity));
+    let incoming = tls_listener.incoming(listener);
     let reload = tokio::spawn(async move {
         let mut previous = initial.bundle;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -298,8 +298,8 @@ pub(super) async fn serve(
                 &candidate.bundle.cert_pem,
                 &candidate.bundle.key_pem,
             ) {
-                Ok(config) => {
-                    identity.replace(config, candidate.expires_at);
+                Ok(_) => {
+                    identity.replace(TlsPolicy::Configured(candidate.tls()));
                     previous = candidate.bundle;
                     tracing::info!("runtime server identity rotated");
                 }

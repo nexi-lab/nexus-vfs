@@ -54,5 +54,5 @@ pub use runtime_credential::{
 pub use secret_file::{create_secret, protect_secret, write_secret};
 pub use server_limits::apply_server_limits;
 pub use shared_tls::{SharedTlsConfig, TlsPolicy, TlsSnapshot};
-pub use shared_tls_server::{shared_mtls_incoming, shared_tls_incoming};
+pub use shared_tls_server::{shared_mtls_incoming, shared_tls_incoming, SharedTlsListener};
 pub use tofu::{cert_fingerprint, TofuError, TofuResult, TofuTrustStore, TrustedZone};

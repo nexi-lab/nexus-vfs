@@ -213,6 +213,65 @@ struct Placement {
     owners: Mutex<Vec<String>>,
 }
 
+#[tokio::test]
+async fn retained_user_connection_obeys_the_shared_credential_source() {
+    use lib::transport_primitives::{SharedTlsConfig, TlsPolicy};
+
+    lib::transport_primitives::ensure_crypto_provider();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let tls = TlsConfig {
+        cert_pem: cert.clone(),
+        key_pem: key.clone(),
+        ca_pem: ca.clone(),
+    };
+    let source = SharedTlsConfig::new(Some(tls.clone()));
+    let scope = RuntimeScope::new("alice".into(), [])
+        .unwrap()
+        .with_server_identity(source.clone());
+    let listener = Listener::start(&ca, &cert, &key, Some(scope)).await;
+    let (client_cert, client_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let mut client = listener.client(&ca, &client_cert, &client_key).await;
+    let request = || WriteRequest {
+        path: "/shared-identity.txt".into(),
+        content: b"retained".to_vec(),
+        ..Default::default()
+    };
+    assert!(!client.write(request()).await.unwrap().into_inner().is_error);
+    let before = listener.observed.lock().unwrap().len();
+    for policy in [TlsPolicy::Rejected("withdrawn"), TlsPolicy::Plaintext] {
+        source.replace(policy);
+        let refusal = client.write(request()).await.unwrap().into_inner();
+        assert!(
+            refusal.is_error,
+            "withdrawn identity must refuse VFS writes"
+        );
+        assert!(refusal.content_id.is_empty());
+        assert_eq!(refusal.size, 0);
+        let error: serde_json::Value = serde_json::from_slice(&refusal.error_payload).unwrap();
+        assert_eq!(error["message"], "user runtime server credential expired");
+        assert_eq!(
+            client
+                .ping(PingRequest::default())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        assert_eq!(
+            listener.observed.lock().unwrap().len(),
+            before,
+            "unavailable identity must stop before storage authorization"
+        );
+    }
+    source.replace(TlsPolicy::Configured(tls));
+    assert!(!client.write(request()).await.unwrap().into_inner().is_error);
+    assert!(listener.observed.lock().unwrap().len() > before);
+    drop(client);
+    listener.close().await;
+}
+
 #[tonic::async_trait]
 impl UserRuntimeResolver for Placement {
     async fn resolve(&self, user_id: &str) -> Result<Channel, tonic::Status> {
