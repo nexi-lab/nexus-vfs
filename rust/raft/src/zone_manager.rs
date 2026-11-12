@@ -357,194 +357,38 @@ enum RuntimeProfile {
     IsolatedRoot,
 }
 
-impl ZoneManager {
-    /// Create a new `ZoneManager`.
-    ///
-    /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted
-    /// zone from disk before the gRPC server accepts traffic (R15.e), and
-    /// materializes each on first access.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        hostname: &str,
-        base_path: &str,
-        peers: Vec<String>,
-        bind_addr: &str,
-        tls: Option<TlsFiles>,
-    ) -> Result<Arc<Self>> {
-        Self::with_node_id(
-            hostname,
-            hostname_to_node_id(hostname),
-            base_path,
-            peers,
-            bind_addr,
-            tls,
-            None,
-            None,
-        )
-    }
+/// Validated transport and a reserved listener, ready to open durable zones.
+/// Dropping this value releases its socket. Opening consumes that same socket
+/// and credential source, allowing callers to prepare before their own storage.
+pub struct PreparedZoneManager {
+    hostname: String,
+    node_id: u64,
+    peers: Vec<String>,
+    tls: SharedTlsConfig,
+    tls_config: Option<TlsConfig>,
+    self_address: Option<String>,
+    load_policy: ZoneLoadPolicy,
+    profile: RuntimeProfile,
+    bind_socket: std::net::SocketAddr,
+    foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    prepared_listener: Option<(
+        crate::transport::PreparedRaftListener,
+        std::net::TcpListener,
+    )>,
+}
 
-    /// Create a `ZoneManager` with an explicit node ID.
-    ///
-    /// Used by `RaftDistributedCoordinator::init_from_env` to bind the
-    /// node ID returned by `read_or_mint_node_id` (opaque random u64
-    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` are the
-    /// operator seed addresses (`NEXUS_PEERS` / `--peers`): RPC targets for
-    /// JoinZone and for self-registration, never zone routes and never
-    /// ConfState — ConfState is mutated only by ConfChange driven by
-    /// JoinZone.
-    /// Callers that supply an explicit ID also supply its matching TLS identity.
-    /// `self_address` is this node's advertise address (e.g.,
-    /// `"http://10.0.0.3:2126"` or `"10.0.0.3:2126"`).  Carried in every
-    /// outbound `StepMessageRequest.sender_address` so peers learn
-    /// `(self.node_id -> self_address)` from inbound messages — the
-    /// runtime SSOT for transport routing under the opaque-ID contract.
-    /// `None` disables sender-address advertisement; use only for
-    /// tests / sync-only deployments.
+impl PreparedZoneManager {
     #[allow(clippy::too_many_arguments)]
-    pub fn with_node_id(
+    fn prepare(
         hostname: &str,
         node_id: u64,
-        base_path: &str,
-        peers: Vec<String>,
-        bind_addr: &str,
-        tls: Option<TlsFiles>,
-        self_address: Option<String>,
-        extra_grpc_services: Option<tonic::service::Routes>,
-    ) -> Result<Arc<Self>> {
-        // Default: the daemon contract — every hosted zone is reachable, and
-        // becomes resident when something asks for it.
-        Self::with_node_id_opts(
-            hostname,
-            node_id,
-            base_path,
-            peers,
-            bind_addr,
-            tls,
-            self_address,
-            extra_grpc_services,
-            ZoneLoadPolicy::OnDemand,
-        )
-    }
-
-    /// [`Self::with_node_id`] plus an explicit [`ZoneLoadPolicy`] — lets offline
-    /// tooling open only the zones it needs (e.g. `Only(["root"])`) and be
-    /// structurally unable to reach any other, instead of spinning up federated
-    /// zones as lone nodes. See [`ZoneLoadPolicy`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_node_id_opts(
-        hostname: &str,
-        node_id: u64,
-        base_path: &str,
-        peers: Vec<String>,
-        bind_addr: &str,
-        tls: Option<TlsFiles>,
-        self_address: Option<String>,
-        extra_grpc_services: Option<tonic::service::Routes>,
-        load_policy: ZoneLoadPolicy,
-    ) -> Result<Arc<Self>> {
-        Self::with_node_id_profile(
-            hostname,
-            node_id,
-            base_path,
-            peers,
-            bind_addr,
-            load_tls_source(tls.as_ref())?,
-            self_address,
-            extra_grpc_services,
-            load_policy,
-            RuntimeProfile::Networked,
-        )
-    }
-
-    /// Host data-zone replicas alongside a root with fixed local membership.
-    /// The root uses its existing `.node_id`; `node_id` identifies the network
-    /// replica and never replaces the root's committed membership.
-    /// The existing TLS, control authorization and per-zone Raft paths apply.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_local_root(
-        hostname: &str,
-        node_id: u64,
-        base_path: &str,
-        peers: Vec<String>,
-        bind_addr: &str,
-        tls: Option<TlsFiles>,
-        self_address: Option<String>,
-        extra_grpc_services: Option<tonic::service::Routes>,
-    ) -> Result<Arc<Self>> {
-        Self::with_node_id_profile(
-            hostname,
-            node_id,
-            base_path,
-            peers,
-            bind_addr,
-            load_tls_source(tls.as_ref())?,
-            self_address,
-            extra_grpc_services,
-            ZoneLoadPolicy::OnDemand,
-            RuntimeProfile::NetworkedLocalRoot,
-        )
-    }
-
-    /// Host a fixed local root and admitted data zones using the credential
-    /// owner's live installation. Listener and Raft clients retain this source.
-    /// The owner validates replacements against the same peer and trust anchor.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_local_root_shared(
-        hostname: &str,
-        node_id: u64,
-        base_path: &str,
         peers: Vec<String>,
         bind_addr: &str,
         tls: SharedTlsConfig,
         self_address: Option<String>,
-        extra_grpc_services: Option<tonic::service::Routes>,
-    ) -> Result<Arc<Self>> {
-        Self::with_node_id_profile(
-            hostname,
-            node_id,
-            base_path,
-            peers,
-            bind_addr,
-            tls,
-            self_address,
-            extra_grpc_services,
-            ZoneLoadPolicy::OnDemand,
-            RuntimeProfile::NetworkedLocalRoot,
-        )
-    }
-
-    /// Open one local durable root zone without a peer or control-plane listener.
-    /// The persisted node ID and ConfState retain the normal Raft restart contract.
-    pub fn isolated(base_path: &str) -> Result<Arc<Self>> {
-        let node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
-            .map_err(RaftError::Config)?;
-        Self::with_node_id_profile(
-            "user-runtime",
-            node_id,
-            base_path,
-            Vec::new(),
-            "127.0.0.1:0",
-            SharedTlsConfig::default(),
-            None,
-            None,
-            ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
-            RuntimeProfile::IsolatedRoot,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn with_node_id_profile(
-        hostname: &str,
-        node_id: u64,
-        base_path: &str,
-        peers: Vec<String>,
-        bind_addr: &str,
-        tls: SharedTlsConfig,
-        self_address: Option<String>,
-        extra_grpc_services: Option<tonic::service::Routes>,
         load_policy: ZoneLoadPolicy,
         profile: RuntimeProfile,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Self> {
         // Initialize tracing once.
         static TRACING_INIT: std::sync::Once = std::sync::Once::new();
         TRACING_INIT.call_once(|| {
@@ -616,6 +460,41 @@ impl ZoneManager {
             Some((prepared, listener))
         };
 
+        Ok(Self {
+            hostname: hostname.to_owned(),
+            node_id,
+            peers,
+            tls,
+            tls_config,
+            self_address,
+            load_policy,
+            profile,
+            bind_socket,
+            foreign_ca_verifier,
+            prepared_listener,
+        })
+    }
+
+    /// Open storage and serve the prepared transport with the supplied services.
+    pub fn open(
+        self,
+        base_path: &str,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<ZoneManager>> {
+        let Self {
+            hostname,
+            node_id,
+            peers,
+            tls,
+            tls_config,
+            self_address,
+            load_policy,
+            profile,
+            bind_socket,
+            foreign_ca_verifier,
+            prepared_listener,
+        } = self;
+        let bind_addr = bind_socket.to_string();
         // This runtime hosts BOTH the tonic gRPC server (accept loop +
         // per-connection HTTP/2 handshakes for raft and VFS) and every
         // zone's `transport_loop` (which does synchronous redb disk I/O
@@ -803,7 +682,7 @@ impl ZoneManager {
             use_tls,
         );
 
-        Ok(Arc::new(Self {
+        Ok(Arc::new(ZoneManager {
             registry,
             runtime,
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
@@ -819,6 +698,230 @@ impl ZoneManager {
             local_node_renewer_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
+    }
+}
+
+impl ZoneManager {
+    /// Create a new `ZoneManager`.
+    ///
+    /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted
+    /// zone from disk before the gRPC server accepts traffic (R15.e), and
+    /// materializes each on first access.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        hostname: &str,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id(
+            hostname,
+            hostname_to_node_id(hostname),
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            None,
+            None,
+        )
+    }
+
+    /// Create a `ZoneManager` with an explicit node ID.
+    ///
+    /// Used by `RaftDistributedCoordinator::init_from_env` to bind the
+    /// node ID returned by `read_or_mint_node_id` (opaque random u64
+    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` are the
+    /// operator seed addresses (`NEXUS_PEERS` / `--peers`): RPC targets for
+    /// JoinZone and for self-registration, never zone routes and never
+    /// ConfState — ConfState is mutated only by ConfChange driven by
+    /// JoinZone.
+    /// Callers that supply an explicit ID also supply its matching TLS identity.
+    /// `self_address` is this node's advertise address (e.g.,
+    /// `"http://10.0.0.3:2126"` or `"10.0.0.3:2126"`).  Carried in every
+    /// outbound `StepMessageRequest.sender_address` so peers learn
+    /// `(self.node_id -> self_address)` from inbound messages — the
+    /// runtime SSOT for transport routing under the opaque-ID contract.
+    /// `None` disables sender-address advertisement; use only for
+    /// tests / sync-only deployments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_node_id(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        // Default: the daemon contract — every hosted zone is reachable, and
+        // becomes resident when something asks for it.
+        Self::with_node_id_opts(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+        )
+    }
+
+    /// [`Self::with_node_id`] plus an explicit [`ZoneLoadPolicy`] — lets offline
+    /// tooling open only the zones it needs (e.g. `Only(["root"])`) and be
+    /// structurally unable to reach any other, instead of spinning up federated
+    /// zones as lone nodes. See [`ZoneLoadPolicy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_node_id_opts(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+        load_policy: ZoneLoadPolicy,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            load_tls_source(tls.as_ref())?,
+            self_address,
+            extra_grpc_services,
+            load_policy,
+            RuntimeProfile::Networked,
+        )
+    }
+
+    /// Host data-zone replicas alongside a root with fixed local membership.
+    /// The root uses its existing `.node_id`; `node_id` identifies the network
+    /// replica and never replaces the root's committed membership.
+    /// The existing TLS, control authorization and per-zone Raft paths apply.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            load_tls_source(tls.as_ref())?,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Host a fixed local root and admitted data zones using the credential
+    /// owner's live installation. Listener and Raft clients retain this source.
+    /// The owner validates replacements against the same peer and trust anchor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root_shared(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Validate the local-root transport and reserve its listener before the
+    /// caller opens storage. `open` consumes the same prepared transport.
+    pub fn prepare_local_root_shared(
+        hostname: &str,
+        node_id: u64,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+    ) -> Result<PreparedZoneManager> {
+        PreparedZoneManager::prepare(
+            hostname,
+            node_id,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Open one local durable root zone without a peer or control-plane listener.
+    /// The persisted node ID and ConfState retain the normal Raft restart contract.
+    pub fn isolated(base_path: &str) -> Result<Arc<Self>> {
+        let node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
+            .map_err(RaftError::Config)?;
+        Self::with_node_id_profile(
+            "user-runtime",
+            node_id,
+            base_path,
+            Vec::new(),
+            "127.0.0.1:0",
+            SharedTlsConfig::default(),
+            None,
+            None,
+            ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
+            RuntimeProfile::IsolatedRoot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_node_id_profile(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+        load_policy: ZoneLoadPolicy,
+        profile: RuntimeProfile,
+    ) -> Result<Arc<Self>> {
+        PreparedZoneManager::prepare(
+            hostname,
+            node_id,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            load_policy,
+            profile,
+        )?
+        .open(base_path, extra_grpc_services)
     }
 
     /// Hand the shared `BlobFetcher` slot back to the kernel so it

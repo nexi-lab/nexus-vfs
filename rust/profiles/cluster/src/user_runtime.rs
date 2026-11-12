@@ -153,18 +153,63 @@ fn validate_options(common: &CommonArgs) -> Result<()> {
         || common.insecure_no_auth
         || common.accept_enrollments
         || common.token.is_some()
-        || !common.peers.trim().is_empty()
         || !common.cluster_init.is_empty()
         || !common.cluster_init_mount.is_empty()
         || common.enable_rebac
         || common.http_addr.is_some()
         || !common.mount_drivers.is_empty()
         || common.identity_dir.is_some()
-        || common.advertise_addr.is_some()
     {
-        bail!("serve-user accepts a fixed owner, external credential and local durable storage; cluster authority, federation and unauthenticated listeners are unavailable");
+        bail!("serve-user requires a fixed owner, external credential and durable storage with authenticated listeners");
     }
     Ok(())
+}
+
+struct ReplicaNetwork {
+    node_id: u64,
+    hostname: String,
+    peers: Vec<String>,
+    self_address: String,
+}
+
+impl ReplicaNetwork {
+    fn from_identity(common: &CommonArgs, identity: &RuntimeIdentity) -> Result<Option<Self>> {
+        let Some(node_id) = identity.replica_id else {
+            if !common.peers.trim().is_empty() || common.advertise_addr.is_some() {
+                bail!("peer routing requires a signed replica identity");
+            }
+            return Ok(None);
+        };
+        let peers =
+            nexus_raft::transport::NodeAddress::parse_peer_list_operator(&common.peers, true)
+                .map_err(|error| anyhow::anyhow!("runtime peer address: {error}"))?;
+        let hostname = super::resolve_hostname(common.hostname.as_deref());
+        let bind: std::net::SocketAddr = common
+            .effective_bind_addr()
+            .parse()
+            .context("runtime bind address")?;
+        let has_remote_peer = peers.iter().any(|peer| {
+            super::peer_host(&peer.to_raft_peer_str())
+                .is_some_and(|host| !super::host_is_loopback(host))
+        });
+        let self_address = super::resolve_self_address(
+            common.advertise_addr.as_deref(),
+            &hostname,
+            bind.port(),
+            has_remote_peer,
+            peers.len(),
+        )?;
+        let peers = super::peers_excluding_self(&peers, &self_address)
+            .iter()
+            .map(nexus_raft::transport::NodeAddress::to_raft_peer_str)
+            .collect();
+        Ok(Some(Self {
+            node_id,
+            hostname,
+            peers,
+            self_address,
+        }))
+    }
 }
 
 pub(super) async fn serve(
@@ -181,9 +226,36 @@ pub(super) async fn serve(
     let initial = AgentCredential::load(&credential_path).map_err(anyhow::Error::msg)?;
     let verifier = FederatedClientCertVerifier::new(&initial.ca_pem).map_err(anyhow::Error::msg)?;
     let initial = validate_credential(initial, &owner, &verifier, CredentialUse::Bootstrap)?;
+    let network = ReplicaNetwork::from_identity(&common, &initial.identity)?;
     let identity = SharedTlsConfig::new(Some(initial.tls()));
-    let tls_listener = SharedTlsListener::prepare(identity.clone(), Some(Arc::clone(&verifier)))
-        .map_err(anyhow::Error::msg)?;
+    let bind = common.effective_bind_addr();
+    let self_address = network
+        .as_ref()
+        .map_or_else(|| bind.clone(), |network| network.self_address.clone());
+    let (prepared_zones, local_listener) = match network {
+        Some(network) => (
+            Some(
+                nexus_raft::zone_manager::ZoneManager::prepare_local_root_shared(
+                    &network.hostname,
+                    network.node_id,
+                    network.peers,
+                    &bind,
+                    identity.clone(),
+                    Some(network.self_address),
+                )
+                .context("prepare user runtime zones")?,
+            ),
+            None,
+        ),
+        None => {
+            let tls = SharedTlsListener::prepare(identity.clone(), Some(Arc::clone(&verifier)))
+                .map_err(anyhow::Error::msg)?;
+            let listener = tokio::net::TcpListener::bind(&bind)
+                .await
+                .with_context(|| format!("bind user runtime {bind}"))?;
+            (None, Some((tls, listener)))
+        }
+    };
     bind_owner(&common.data_dir, &owner)?;
     super::set_provider(Arc::new(super::DefaultObjectStoreProvider))
         .unwrap_or_else(|_| tracing::warn!("ObjectStoreProvider already registered"));
@@ -199,8 +271,42 @@ pub(super) async fn serve(
         .to_str()
         .context("user runtime data directory must be UTF-8")?
         .to_owned();
-    let zones = tokio::task::spawn_blocking(move || {
-        nexus_raft::zone_manager::ZoneManager::isolated(&data_dir)
+    let auth: Arc<dyn transport::auth::AuthProvider> =
+        Arc::new(auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
+            initial.bundle.server_name.clone(),
+        ));
+    super::plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
+    let verifier_slot = Arc::new(std::sync::OnceLock::new());
+    verifier_slot
+        .set(Arc::clone(&verifier))
+        .map_err(|_| anyhow::anyhow!("runtime verifier already installed"))?;
+    let scope = scope.with_server_identity(identity.clone());
+    let ready = DataPlaneReady::pending();
+    let routes = build_user_runtime_routes(
+        Arc::clone(&kernel),
+        Arc::clone(&auth),
+        scope.clone(),
+        Arc::clone(&verifier_slot),
+        Arc::clone(&ready),
+        contracts::MAX_GRPC_MESSAGE_BYTES,
+        super::daemon_version_string(),
+    );
+    let routes = super::plugin_loading::routes(
+        routes,
+        &kernel,
+        &auth,
+        verifier_slot,
+        Arc::clone(&ready),
+        Some(Arc::new(scope)),
+    );
+    let (zones, local_routes) = tokio::task::spawn_blocking(move || {
+        use nexus_raft::zone_manager::ZoneManager;
+        match prepared_zones {
+            Some(prepared) => prepared
+                .open(&data_dir, Some(routes))
+                .map(|zones| (zones, None)),
+            None => ZoneManager::isolated(&data_dir).map(|zones| (zones, Some(routes))),
+        }
     })
     .await
     .context("open user runtime zone task")?
@@ -230,16 +336,12 @@ pub(super) async fn serve(
         .install_with_kernel(
             Arc::clone(&zones),
             zones.runtime_handle(),
-            &common.effective_bind_addr(),
+            &self_address,
             &kernel,
             peer_client,
         );
+    transport::peer_blob::install_with_shared_tls(kernel.as_ref(), identity.clone());
     super::stream_observers::install_wakeup(&kernel, &zones);
-    let auth: Arc<dyn transport::auth::AuthProvider> =
-        Arc::new(auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
-            initial.bundle.server_name.clone(),
-        ));
-    super::plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
     let ctx = ServiceBootCtx {
         auth_armed: true,
         auth: Arc::clone(&auth),
@@ -250,35 +352,8 @@ pub(super) async fn serve(
         .bring_up_services(build_decls(&ctx))
         .map_err(|error| anyhow::anyhow!("bring up user runtime services: {error}"))?;
     backends.install(&kernel)?;
-    let verifier_slot = Arc::new(std::sync::OnceLock::new());
-    verifier_slot
-        .set(Arc::clone(&verifier))
-        .map_err(|_| anyhow::anyhow!("runtime verifier already installed"))?;
-    let scope = scope.with_server_identity(identity.clone());
-    let ready = DataPlaneReady::open();
-    let routes = build_user_runtime_routes(
-        Arc::clone(&kernel),
-        Arc::clone(&auth),
-        scope.clone(),
-        Arc::clone(&verifier_slot),
-        Arc::clone(&ready),
-        contracts::MAX_GRPC_MESSAGE_BYTES,
-        super::daemon_version_string(),
-    );
-    let routes = super::plugin_loading::routes(
-        routes,
-        &kernel,
-        &auth,
-        verifier_slot,
-        ready,
-        Some(Arc::new(scope)),
-    );
-    let bind = common.effective_bind_addr();
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("bind user runtime {bind}"))?;
-    tracing::info!(owner = %owner, bind = %listener.local_addr()?, "confined user runtime ready");
-    let incoming = tls_listener.incoming(listener);
+    ready.mark_ready();
+    tracing::info!(owner = %owner, bind = %bind, replica = ?initial.identity.replica_id, "confined user runtime ready");
     let reload = tokio::spawn(async move {
         let expected_identity = initial.identity;
         let mut previous = initial.bundle;
@@ -331,14 +406,29 @@ pub(super) async fn serve(
             }
         }
     });
-    let result =
-        lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
-            .timeout(Duration::from_secs(60))
-            .add_routes(routes)
-            .serve_with_incoming_shutdown(incoming, super::wait_for_shutdown())
-            .await;
+    let result = match (local_listener, local_routes) {
+        (Some((tls_listener, listener)), Some(routes)) => {
+            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
+                .timeout(Duration::from_secs(60))
+                .add_routes(routes)
+                .serve_with_incoming_shutdown(
+                    tls_listener.incoming(listener),
+                    super::wait_for_shutdown(),
+                )
+                .await
+                .context("user runtime server")
+        }
+        (None, None) => {
+            super::wait_for_shutdown().await;
+            Ok(())
+        }
+        _ => unreachable!("runtime listener and routes belong to the same transport"),
+    };
     reload.abort();
-    result.context("user runtime server")
+    tokio::task::spawn_blocking(move || zones.shutdown())
+        .await
+        .context("stop user runtime zones")?;
+    result
 }
 
 #[cfg(test)]

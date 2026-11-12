@@ -27,6 +27,53 @@ const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
 const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
+#[test]
+fn prepared_local_root_reserves_and_releases_its_original_socket() {
+    use lib::transport_primitives::{SharedTlsConfig, TlsConfig};
+    use nexus_raft::transport::{generate_user_replica_cert, generate_zone_ca};
+
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data");
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let identity = SharedTlsConfig::new(Some(TlsConfig {
+        ca_pem: ca,
+        cert_pem: cert,
+        key_pem: key,
+    }));
+    let address = common::node_bind_addr();
+    let prepare = || {
+        ZoneManager::prepare_local_root_shared(
+            "runtime",
+            31,
+            Vec::new(),
+            &address,
+            identity.clone(),
+            Some(address.clone()),
+        )
+        .unwrap()
+    };
+    let prepared = prepare();
+    assert!(!data.exists());
+    assert!(
+        std::net::TcpListener::bind(&address).is_err(),
+        "prepared listener lost its socket"
+    );
+    drop(prepared);
+    let released =
+        std::net::TcpListener::bind(&address).expect("dropping preparation releases socket");
+    drop(released);
+    let prepared = prepare();
+    let manager = prepared.open(data.to_str().unwrap(), None).unwrap();
+    assert!(data.join(".node_id").is_file());
+    assert!(
+        std::net::TcpListener::bind(&address).is_err(),
+        "opening lost its reserved socket"
+    );
+    manager.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_root_uses_the_owners_shared_credentials_on_retained_connections() {
     use lib::transport_primitives::{

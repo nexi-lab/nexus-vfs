@@ -776,10 +776,13 @@ async fn a_requested_unsigned_plugin_blocks_the_confined_server() {
     let name = format!("unsigned{}", std::env::consts::DLL_SUFFIX);
     std::fs::write(plugins.join(&name), b"unverified bytes").unwrap();
     let data = root.path().join("data");
+    let bind = format!("127.0.0.1:{}", free_port());
     let mut rejected = Daemon::spawn(
         &[
             "--data-dir",
             data.to_str().unwrap(),
+            "--bind-addr",
+            &bind,
             "--plugin-dir",
             plugins.to_str().unwrap(),
             "serve-user",
@@ -1138,14 +1141,38 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
         let mut rejected = Daemon::spawn(&args, &env);
         let log = rejected.wait_exit(BUDGET).await.unwrap();
         assert!(
-            log.contains(
-                "cluster authority, federation and unauthenticated listeners are unavailable"
-            ),
+            log.contains("serve-user requires a fixed owner, external credential and durable storage with authenticated listeners"),
             "{log}"
         );
         assert!(
             !data.exists(),
             "invalid options must not initialize durable storage"
+        );
+    }
+    for flag in ["--peers", "--advertise-addr"] {
+        let data = root.path().join(flag.trim_start_matches('-'));
+        let mut rejected = Daemon::spawn(
+            &[
+                "--data-dir",
+                data.to_str().unwrap(),
+                flag,
+                "127.0.0.1:2126",
+                "serve-user",
+                "--owner",
+                "alice",
+                "--credential",
+                credential_dir.to_str().unwrap(),
+            ],
+            &[("RUST_LOG", LOG_FILTER)],
+        );
+        let log = rejected.wait_exit(BUDGET).await.unwrap();
+        assert!(
+            log.contains("peer routing requires a signed replica identity"),
+            "{log}"
+        );
+        assert!(
+            !data.exists(),
+            "ordinary identity must refuse peer options before storage"
         );
     }
     let (cert, key) =
@@ -1163,10 +1190,33 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
 
 #[tokio::test]
 async fn restart_with_expired_identity_waits_for_renewal_without_losing_owner_data() {
+    expired_runtime_restart(false).await;
+}
+
+#[tokio::test]
+async fn replica_restart_with_expired_identity_recovers_after_renewal() {
+    expired_runtime_restart(true).await;
+}
+
+async fn expired_runtime_restart(is_replica: bool) {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
-    let (cert, key) =
-        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let runtime_certificate = |validity| {
+        if is_replica {
+            nexus_raft::transport::generate_user_replica_cert(
+                "runtime-alice",
+                "alice",
+                31,
+                validity,
+                &ca,
+                &ca_key,
+            )
+            .unwrap()
+        } else {
+            generate_user_runtime_cert("runtime-alice", "alice", validity, &ca, &ca_key).unwrap()
+        }
+    };
+    let (cert, key) = runtime_certificate(300);
     let credential_dir = root.path().join("server-credential");
     bundle(&credential_dir, "runtime-alice", "alice", &ca, &cert, &key);
     let (client_cert, client_key) =
@@ -1199,8 +1249,7 @@ async fn restart_with_expired_identity_waits_for_renewal_without_losing_owner_da
     drop(connected);
     drop(daemon);
 
-    let (expired, expired_key) =
-        generate_user_runtime_cert("runtime-alice", "alice", 1, &ca, &ca_key).unwrap();
+    let (expired, expired_key) = runtime_certificate(1);
     let expires_at = transport::peer_identity::not_after_unix_from_pem(&expired).unwrap();
     bundle(
         &credential_dir,
@@ -1227,8 +1276,7 @@ async fn restart_with_expired_identity_waits_for_renewal_without_losing_owner_da
         dial_client(port, &client).await.is_err(),
         "bootstrap must not make expired server authority usable"
     );
-    let (renewed, renewed_key) =
-        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let (renewed, renewed_key) = runtime_certificate(300);
     bundle(
         &credential_dir,
         "runtime-alice",
@@ -1477,4 +1525,224 @@ async fn rotation_preserves_the_signed_replica_identity() {
         retained.read_file("/identity.txt", "").await.unwrap(),
         b"same-replica"
     );
+}
+
+#[tokio::test]
+async fn runtime_reserves_its_listener_before_creating_owner_storage() {
+    use nexus_raft::transport::generate_user_replica_cert;
+
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (client_cert, client_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let client = bundle(
+        &root.path().join("client"),
+        "session-alice",
+        "alice",
+        &ca,
+        &client_cert,
+        &client_key,
+    );
+    for is_replica in [false, true] {
+        let profile = if is_replica { "replica" } else { "ordinary" };
+        let (cert, key) = if is_replica {
+            generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key)
+        } else {
+            generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key)
+        }
+        .unwrap();
+        let credential = root.path().join(format!("credential-{profile}"));
+        bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+        let data = root.path().join(format!("data-{profile}"));
+        let port = free_port();
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut rejected = start(&data, &credential, "alice", port);
+        let log = rejected
+            .wait_exit(BUDGET)
+            .await
+            .expect("occupied listener must refuse startup");
+        assert!(
+            log.contains("bind") && !log.contains("confined user runtime ready"),
+            "{log}"
+        );
+        assert!(
+            !data.exists(),
+            "{profile} touched owner storage before reserving its listener: {log}"
+        );
+        drop(rejected);
+        drop(occupied);
+
+        // The same identity, directory and port must work once the socket is free.
+        let mut daemon = start(&data, &credential, "alice", port);
+        daemon
+            .wait_for_log("confined user runtime ready", BUDGET)
+            .await
+            .unwrap();
+        let mut owner = Vfs::connect_as_agent(port, &client, BUDGET).await;
+        owner
+            .write_file("/listener-ready", profile.as_bytes(), "")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.read_file("/listener-ready", "").await.unwrap(),
+            profile.as_bytes()
+        );
+        drop(owner);
+        drop(daemon);
+    }
+}
+
+#[tokio::test]
+async fn replica_listener_keeps_the_owner_boundary_and_local_root_across_restart() {
+    use lib::transport_primitives::{create_peer_channel, ClientConfig, TlsConfig};
+    use nexus_raft::transport::{
+        generate_node_cert, generate_user_replica_cert,
+        proto::{
+            zone_api_service_client::ZoneApiServiceClient,
+            zone_transport_service_client::ZoneTransportServiceClient, GetClusterInfoRequest,
+            PrepareReplicaControlReaderRequest,
+        },
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("server");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let mut clients = Vec::new();
+    for owner in ["alice", "bob"] {
+        let actor = format!("session-{owner}");
+        let (cert, key) = generate_session_agent_cert(&actor, owner, 300, &ca, &ca_key).unwrap();
+        clients.push(bundle(
+            &root.path().join(owner),
+            &actor,
+            "alice",
+            &ca,
+            &cert,
+            &key,
+        ));
+    }
+    let (node_cert, node_key) = generate_node_cert(19, "root", &ca, &ca_key, &[], None).unwrap();
+    let node_client = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem: node_cert,
+            key_pem: node_key,
+        }),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let (peer_cert, peer_key) =
+        generate_user_replica_cert("runtime-bob", "bob", 32, 300, &ca, &ca_key).unwrap();
+    let replica_client = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca,
+            cert_pem: peer_cert,
+            key_pem: peer_key,
+        }),
+        ..node_client.clone()
+    };
+    let data = root.path().join("data");
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let unused_seed = format!("127.0.0.1:{}", free_port());
+    let endpoint = format!("https://{bind}");
+    let mut original_root = None;
+    for round in 0..2 {
+        let mut daemon = Daemon::spawn(
+            &[
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--bind-addr",
+                &bind,
+                "--advertise-addr",
+                &bind,
+                "--peers",
+                &unused_seed,
+                "serve-user",
+                "--owner",
+                "alice",
+                "--credential",
+                credential.to_str().unwrap(),
+            ],
+            &[("RUST_LOG", LOG_FILTER)],
+        );
+        daemon
+            .wait_for_log("confined user runtime ready", BUDGET)
+            .await
+            .unwrap();
+        let mut owner = Vfs::connect_as_agent(port, &clients[0], BUDGET).await;
+        if round == 0 {
+            owner
+                .write_file("/private.txt", b"owner-local-root", "")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            owner.read_file("/private.txt", "").await.unwrap(),
+            b"owner-local-root"
+        );
+        let mut other = dial_client(port, &clients[1]).await.unwrap();
+        let refusal = other
+            .read(ReadRequest {
+                path: "/private.txt".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_owner_refusal(refusal.is_error, &refusal.error_payload);
+        let channel = create_peer_channel(&endpoint, &node_client, 31.try_into().unwrap())
+            .await
+            .unwrap();
+        let mut api = ZoneApiServiceClient::new(channel);
+        let info = api
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(info.is_leader);
+        let local_id = std::fs::read(data.join(".node_id")).unwrap();
+        match &original_root {
+            None => original_root = Some((info.node_id, local_id)),
+            Some((node_id, bytes)) => {
+                assert_eq!(info.node_id, *node_id);
+                assert_eq!(&local_id, bytes);
+            }
+        }
+        let refusal = api
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: "unadmitted-zone".into(),
+            })
+            .await
+            .expect_err("peer traffic cannot admit a zone");
+        assert_eq!(refusal.code(), tonic::Code::NotFound);
+        assert!(!data.join("unadmitted-zone").exists());
+        let peer = create_peer_channel(&endpoint, &replica_client, 31.try_into().unwrap())
+            .await
+            .unwrap();
+        let refusal = ZoneApiServiceClient::new(peer.clone())
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .expect_err("a replica cannot read another owner's local root");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        let refusal = ZoneTransportServiceClient::new(peer)
+            .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
+                zone_id: "root".into(),
+            })
+            .await
+            .expect_err("a replica cannot acquire Node control authority");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert!(!data.join("tls/ca-key.pem").exists());
+        drop(api);
+        drop(other);
+        drop(owner);
+        drop(daemon);
+    }
 }
