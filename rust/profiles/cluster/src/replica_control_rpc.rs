@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     replica_control::{ReplicaControlError, ReplicaController},
     replica_rpc::ReplyAuthority,
-    FounderAgentMinter,
+    FounderCaIssuer,
 };
 
 fn mutation(request: &ReplicaControlRequest) -> bool {
@@ -53,7 +53,7 @@ pub(super) async fn release(
 }
 
 pub(super) async fn respond(
-    founder: FounderAgentMinter,
+    founder: FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: ReplicaControlRequest,
 ) -> ReplicaControlResponse {
@@ -102,7 +102,7 @@ fn observed<T: Serialize>(
 }
 
 pub(super) fn execute(
-    founder: &FounderAgentMinter,
+    founder: &FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: ReplicaControlRequest,
 ) -> ReplicaControlResponse {
@@ -116,7 +116,7 @@ pub(super) fn execute(
 }
 
 fn execute_inner(
-    founder: &FounderAgentMinter,
+    founder: &FounderCaIssuer,
     caller: Option<Vec<u8>>,
     request: ReplicaControlRequest,
 ) -> Result<ReplicaControlResponse, ReplicaControlError> {

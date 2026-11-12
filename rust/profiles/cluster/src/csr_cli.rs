@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use lib::transport_primitives::{create_channel, first_certificate_der, ClientConfig, TlsConfig};
 use nexus_raft::{
     agent_csr_client::{AgentCsrBinding, PendingAgentCsr},
-    agent_minter::agent_csr_request_digest,
+    ca_issuer::agent_csr_request_digest,
     transport::{
         local_node_identity,
         proto::{

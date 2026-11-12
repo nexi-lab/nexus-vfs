@@ -28,7 +28,7 @@ mod ports;
 struct Fixture {
     manager: Arc<ZoneManager>,
     store: Arc<RaftReplicaBindingStore>,
-    founder: Arc<FounderAgentMinter>,
+    founder: Arc<FounderCaIssuer>,
     binding: ReplicaBinding,
     authority: ReplicaIssuerAuthority,
     ca: Vec<u8>,
@@ -61,7 +61,7 @@ impl Fixture {
             .unwrap();
         let replica_store = new_store_slot();
         assert!(replica_store.set(store.clone()).is_ok());
-        let founder = Arc::new(FounderAgentMinter {
+        let founder = Arc::new(FounderCaIssuer {
             store: RaftAuthKeyStore::new_arc(node, manager.runtime_handle()),
             tls_dir: tls,
             data_dir: directory.path().to_path_buf(),
@@ -157,7 +157,7 @@ impl Fixture {
     ) {
         let address = format!("127.0.0.1:{}", ports::free_port());
         let (cert, key) = generate_node_cert(1, "root", &self.ca, &self.ca_key, &[], None).unwrap();
-        let slot = nexus_raft::agent_minter::new_agent_minter_slot();
+        let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
         *slot.write() = Some(self.founder.clone());
         let server = RaftGrpcServer::new(
             self.manager.registry(),
@@ -171,7 +171,7 @@ impl Fixture {
                 ..Default::default()
             },
         )
-        .with_agent_minter_slot(slot)
+        .with_ca_issuer_slot(slot)
         .with_foreign_ca_verifier(Some(self.founder.peer_verifier.get().unwrap().clone()));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {

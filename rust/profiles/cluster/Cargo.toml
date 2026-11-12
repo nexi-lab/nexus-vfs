@@ -158,6 +158,9 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+# Read the certificate a daemon presents to a new handshake (renewal e2e).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 permission = { workspace = true }
 prost = { workspace = true }

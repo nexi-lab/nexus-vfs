@@ -44,8 +44,9 @@ leaf names (`ownerNodeIdentity`, its `nexus://zone/<zone>/node/<id>` URI read
 through the same check daemon boot applies) and the cluster CA SHA-256 DER
 fingerprint, the exact HTTPS destination, the allowed workspace subtrees and a
 private client-state directory. The pins name the Node and its cluster, not one
-leaf: renewing the Node certificate (`nexusd-cluster enroll`) keeps the grant
-valid. There is no default wildcard grant. Existing files are never overwritten.
+leaf: the daemon's automatic certificate renewal, `renew-certificate` and
+`enroll` all keep the grant valid. There is no default wildcard grant. Existing
+files are never overwritten.
 Store the grant/state beneath an operator-controlled private directory, not a
 repository or a peer-writable mount. The common owner-only persistence helper
 protects new records on Unix and Windows. Possession of the Node credential is

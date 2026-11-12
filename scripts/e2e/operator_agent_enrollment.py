@@ -274,6 +274,15 @@ class Journey:
         renewed_receipt = self.request("mint-after-renewal", renewed)
         assert renewed_receipt["actor"] == renewed["actor"], renewed_receipt
 
+        self.proof["stage"] = "the daemon renews itself and keeps the grant without a restart"
+        before = (self.data / "tls" / "node.pem").read_bytes()
+        result = self.node.cli("renew-certificate", self.output, "renew-certificate")
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        assert (self.data / "tls" / "node.pem").read_bytes() != before, "the daemon renewed"
+        hot = self.claim("1", "7")
+        hot_receipt = self.request("mint-after-live-renewal", hot)
+        assert hot_receipt["actor"] == hot["actor"], hot_receipt
+
         self.proof["stage"] = "grant refuses another Node of the cluster"
         member = self.root / "member" / "data"
         self.node.enroll("enroll-member", self.output, member)
@@ -311,6 +320,7 @@ class Journey:
                           concurrentOneOperation=True, claudeActorMinted=True,
                           unreachableIssuerNotSubmitted=True, unknownNeverResubmitted=True,
                           localRefusalsDoNotReserve=True, renewedCertificateKeepsGrant=True,
+                          liveRenewalKeepsGrant=True,
                           anotherNodeRefused=True, anotherClusterCaRefused=True,
                           doctorDiagnosesNodeIdMismatch=True)
 

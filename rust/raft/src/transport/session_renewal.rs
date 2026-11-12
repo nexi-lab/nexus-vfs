@@ -1,6 +1,6 @@
 //! CA-plane proof verification for renewing a live execution controller.
 
-use crate::agent_minter::SessionRenewal;
+use crate::ca_issuer::SessionRenewal;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 

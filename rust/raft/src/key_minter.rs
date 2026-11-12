@@ -7,7 +7,7 @@
 //! the operator to stop the daemon for an offline store-open. The daemon HMACs
 //! the key with its cluster secret and writes through consensus (the write
 //! forwards to the control-zone leader), so any node can serve it. Mirrors
-//! [`crate::agent_minter`]: a late-bound slot the daemon installs at boot, and
+//! [`crate::ca_issuer`]: a late-bound slot the daemon installs at boot, and
 //! the impl (cluster profile) owns the secret + store + the node-only gate.
 
 #![cfg(all(feature = "grpc", has_protos))]
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Parameters for an `sk-` key mint — the `MintKey` request, minus transport.
 pub struct MintKeyParams {
-    /// `"user"` or `"service"` (agents use [`crate::agent_minter`] instead).
+    /// `"user"` or `"service"` (agents use [`crate::ca_issuer`] instead).
     pub subject_type: String,
     pub subject_id: String,
     /// Zone grants as `zone:perms`; may be empty when `admin`.
@@ -69,7 +69,7 @@ pub trait KeyMinter: Send + Sync {
 /// auth-off node, where `MintKey`/`RevokeKey` return success=false.
 pub type KeyMinterSlot = Arc<parking_lot::RwLock<Option<Arc<dyn KeyMinter>>>>;
 
-/// Construct an unbound slot (mirrors [`crate::agent_minter::new_agent_minter_slot`]).
+/// Construct an unbound slot (mirrors [`crate::ca_issuer::new_ca_issuer_slot`]).
 pub fn new_key_minter_slot() -> KeyMinterSlot {
     Arc::new(parking_lot::RwLock::new(None))
 }

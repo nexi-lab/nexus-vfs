@@ -25,15 +25,16 @@ use super::proto::nexus::raft::{
     PrepareReplicaControlReaderResponse, ProposeRequest, ProposeResponse, QueryRequest,
     QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
     ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
-    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
-    ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
-    RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
-    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
-    UnregisterForeignCaResponse,
+    RemoveVoterResponse, RenewLocalNodeCertificateRequest, RenewLocalNodeCertificateResponse,
+    RenewNodeCertificateRequest, RenewNodeCertificateResponse, RenewSessionAgentRequest,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
+    RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
+    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
-use crate::agent_minter::{AgentBundle, AgentMinterSlot};
 use crate::blob_fetcher::BlobFetcherSlot;
+use crate::ca_issuer::{AgentBundle, CaIssuerSlot, LocalNodeRenewerSlot, NOT_CA_HOLDER};
 use crate::foreign_ca_registrar::ForeignCaRegistrarSlot;
 use crate::key_minter::{KeyMinterSlot, MintKeyParams};
 
@@ -114,10 +115,10 @@ pub struct RaftGrpcServer {
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Slot the cluster profile binds an `AgentMinter` into on the founder
+    /// Slot the cluster profile binds an `CaIssuer` into on the founder
     /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
     /// success=false there ("not the CA holder").
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Slot the cluster profile binds a `KeyMinter` into on every auth-on
     /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
     /// success=false there (auth-off has no sk- plane).
@@ -127,6 +128,7 @@ pub struct RaftGrpcServer {
     /// return success=false there (no cross-org trust plane).
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
     session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
+    local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
     /// Federated mTLS client-cert verifier — the client-auth trust roots as a
     /// hot-swappable set (cluster CA + any runtime-registered foreign CAs), so a
     /// cross-org CA registered live is trusted without a restart. Shared with the
@@ -134,6 +136,9 @@ pub struct RaftGrpcServer {
     /// `--no-tls`) → the serve path builds a cluster-only verifier from the CA in
     /// `config.tls` (base mTLS, no foreign hot-swap).
     foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    /// The renewable Node server identity the owning `ZoneManager` replaces when
+    /// the Node certificate is renewed. `None` serves `config.tls` as is.
+    server_identity: Option<Arc<lib::transport_primitives::ReloadableServerIdentity>>,
     /// Additional gRPC services co-hosted on the same port.
     /// Constructed externally (e.g. VFS gRPC by the cluster binary)
     /// and passed in as type-erased `tonic::service::Routes` so this
@@ -160,10 +165,11 @@ impl RaftGrpcServer {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             search_capabilities_slot: self.search_capabilities_slot.clone(),
-            agent_minter_slot: self.agent_minter_slot.clone(),
+            ca_issuer_slot: self.ca_issuer_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
+            local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
         Ok((
             NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
@@ -182,11 +188,13 @@ impl RaftGrpcServer {
             registry,
             blob_fetcher_slot: None,
             search_capabilities_slot: None,
-            agent_minter_slot: None,
+            ca_issuer_slot: None,
             key_minter_slot: None,
             foreign_ca_registrar_slot: None,
             session_mint_admin_slot: None,
+            local_node_renewer_slot: None,
             foreign_ca_verifier: None,
+            server_identity: None,
             extra_services: None,
         }
     }
@@ -208,11 +216,11 @@ impl RaftGrpcServer {
         self
     }
 
-    /// Attach the late-bindable `AgentMinter` slot so `ZoneApiService::mint_agent`
+    /// Attach the late-bindable `CaIssuer` slot so `ZoneApiService::mint_agent`
     /// can sign agent certs once the founder installs an impl. Installed only on
     /// the CA holder; a joiner leaves it empty and rejects `MintAgent`.
-    pub fn with_agent_minter_slot(mut self, slot: AgentMinterSlot) -> Self {
-        self.agent_minter_slot = Some(slot);
+    pub fn with_ca_issuer_slot(mut self, slot: CaIssuerSlot) -> Self {
+        self.ca_issuer_slot = Some(slot);
         self
     }
 
@@ -245,6 +253,13 @@ impl RaftGrpcServer {
         self
     }
 
+    /// Attach the late-bindable renewer of this daemon's own Node certificate,
+    /// so `RenewLocalNodeCertificate` serves once the daemon installs it.
+    pub fn with_local_node_renewer_slot(mut self, slot: LocalNodeRenewerSlot) -> Self {
+        self.local_node_renewer_slot = Some(slot);
+        self
+    }
+
     /// Attach the shared federated client-cert verifier (from `ZoneManager`), so
     /// the serve path's mTLS client-auth roots are the same `Arc` the cross-org
     /// apply-observer hot-swaps. `None` → the serve path builds a cluster-only
@@ -254,6 +269,16 @@ impl RaftGrpcServer {
         verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
     ) -> Self {
         self.foreign_ca_verifier = verifier;
+        self
+    }
+
+    /// Present `identity` on every new mTLS connection, so a renewed Node
+    /// certificate is served without rebinding.
+    pub fn with_server_identity(
+        mut self,
+        identity: Arc<lib::transport_primitives::ReloadableServerIdentity>,
+    ) -> Self {
+        self.server_identity = Some(identity);
         self
     }
 
@@ -313,13 +338,14 @@ impl RaftGrpcServer {
         // `client_ca_root(cluster_ca)` mandatory-client-auth config.
         match &self.config.tls {
             Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
+                let identity = listener_identity(
+                    self.server_identity.as_ref(),
                     tls,
-                    self.foreign_ca_verifier.clone(),
-                )
-                .await
-                .map_err(TransportError::Connection)?;
+                    self.foreign_ca_verifier.as_ref(),
+                )?;
+                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, identity)
+                    .await
+                    .map_err(TransportError::Connection)?;
                 router
                     .serve_with_incoming(incoming)
                     .await
@@ -367,13 +393,14 @@ impl RaftGrpcServer {
         // `transport_primitives::federated_mtls_incoming`).
         match &self.config.tls {
             Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
+                let identity = listener_identity(
+                    self.server_identity.as_ref(),
                     tls,
-                    self.foreign_ca_verifier.clone(),
-                )
-                .await
-                .map_err(TransportError::Connection)?;
+                    self.foreign_ca_verifier.as_ref(),
+                )?;
+                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, identity)
+                    .await
+                    .map_err(TransportError::Connection)?;
                 router
                     .serve_with_incoming_shutdown(incoming, shutdown)
                     .await
@@ -392,6 +419,26 @@ impl RaftGrpcServer {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// The server identity a mTLS listener presents: the owner's renewable Node
+/// identity when it holds one, else a fixed identity from `tls` whose clients
+/// are gated by `verifier` (a cluster-CA-only verifier when `None`).
+fn listener_identity(
+    identity: Option<&Arc<lib::transport_primitives::ReloadableServerIdentity>>,
+    tls: &super::TlsConfig,
+    verifier: Option<&Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+) -> Result<Arc<lib::transport_primitives::ReloadableServerIdentity>> {
+    if let Some(identity) = identity {
+        return Ok(Arc::clone(identity));
+    }
+    let verifier = match verifier {
+        Some(verifier) => Arc::clone(verifier),
+        None => lib::transport_primitives::FederatedClientCertVerifier::new(&tls.ca_pem)
+            .map_err(TransportError::Connection)?,
+    };
+    lib::transport_primitives::ReloadableServerIdentity::from_tls(verifier, tls)
+        .map_err(TransportError::Connection)
+}
 
 /// Convert milliseconds to seconds using ceiling division.
 ///
@@ -899,9 +946,9 @@ struct ZoneApiServiceImpl {
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
+    /// Optional late-bound `CaIssuer` for `MintAgent`. Present only on the
     /// CA holder (founder); `None` → `mint_agent` returns success=false.
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Optional late-bound `KeyMinter` for `MintKey`/`RevokeKey`. Present on
     /// every auth-on daemon; `None` (auth-off) → both return success=false.
     key_minter_slot: Option<KeyMinterSlot>,
@@ -910,6 +957,9 @@ struct ZoneApiServiceImpl {
     /// return success=false.
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
     session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
+    /// Late-bound renewer of this daemon's own Node certificate; `None` (or
+    /// empty) → `RenewLocalNodeCertificate` refuses.
+    local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
 }
 
 impl ZoneApiServiceImpl {
@@ -951,7 +1001,7 @@ impl ZoneApiServiceImpl {
     ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
         let caller = peer_cert_der(&request);
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().clone());
         let Some(minter) = minter else {
@@ -974,10 +1024,7 @@ impl ZoneApiServiceImpl {
         query_only: bool,
     ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
         let caller = peer_cert_der(&request);
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         let Some(minter) = minter else {
             return Ok(Response::new(super::proto::AgentCsrResponse {
                 state: super::proto::AgentCsrState::NotSubmitted as i32,
@@ -1001,7 +1048,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
     ) -> std::result::Result<Response<super::proto::ReplicaControlResponse>, Status> {
         let caller = peer_cert_der(&request);
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().clone());
         let Some(minter) = minter else {
@@ -1036,10 +1083,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         _request: Request<super::proto::AgentCsrCapabilitiesRequest>,
     ) -> std::result::Result<Response<super::proto::AgentCsrCapabilitiesResponse>, Status> {
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         Ok(Response::new(
             minter.map_or_else(Default::default, |m| m.csr_capabilities()),
         ))
@@ -1860,7 +1904,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
     /// Sign an agent identity cert on the CA holder (founder) for a remote
     /// caller — the server half of a joiner's `auth mint --subject-type agent`
     /// routing to the founder. The verified mTLS client leaf cert is forwarded
-    /// to the injected `AgentMinter`, which gates it to a NODE peer (an agent
+    /// to the injected `CaIssuer`, which gates it to a NODE peer (an agent
     /// may not mint agents) before signing; raft applies no auth logic. A node
     /// with no minter installed (a joiner — not the CA holder) returns
     /// success=false so the caller can try the founder.
@@ -1880,14 +1924,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(err_resp(
-                "this node does not hold the cluster CA; mint agents against the founder"
-                    .to_string(),
-            ));
+            return Ok(err_resp(format!(
+                "{NOT_CA_HOLDER}; mint agents against the founder"
+            )));
         };
         match minter
             .mint(
@@ -1923,13 +1966,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(session_credential_response(Err(
-                "this node does not hold the cluster CA; mint against the founder".to_string(),
-            )));
+            return Ok(session_credential_response(Err(format!(
+                "{NOT_CA_HOLDER}; mint against the founder"
+            ))));
         };
         Ok(session_credential_response(
             minter
@@ -1946,7 +1989,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1955,7 +1998,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     .mint_user_runtime(caller_cert_der, &req.owner_id, req.validity_secs)
                     .await
             }
-            None => Err("this node does not hold the cluster CA; mint against the founder".into()),
+            None => Err(format!("{NOT_CA_HOLDER}; mint against the founder")),
         };
         Ok(session_credential_response(result))
     }
@@ -1968,7 +2011,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1976,7 +2019,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 minter
                     .renew_session(
                         caller_cert_der,
-                        crate::agent_minter::SessionRenewal {
+                        crate::ca_issuer::SessionRenewal {
                             cert_pem: &req.agent_cert_pem,
                             validity_secs: req.validity_secs,
                             issued_at_unix_ms: req.issued_at_unix_ms,
@@ -1985,7 +2028,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     )
                     .await
             }
-            None => Err("this node does not hold the cluster CA; renew against the founder".into()),
+            None => Err(format!("{NOT_CA_HOLDER}; renew against the founder")),
         };
         Ok(session_credential_response(result))
     }
@@ -2004,13 +2047,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(err_resp(
-                "this node does not hold the cluster CA; revoke against the founder".to_string(),
-            ));
+            return Ok(err_resp(format!(
+                "{NOT_CA_HOLDER}; revoke against the founder"
+            )));
         };
         match minter
             .revoke_cert(caller_cert_der, &req.agent_cert_pem)
@@ -2022,6 +2065,67 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })),
             Err(e) => Ok(err_resp(e)),
         }
+    }
+
+    /// Re-issue the calling Node's certificate; the CA holder alone signs.
+    async fn renew_node_certificate(
+        &self,
+        request: Request<RenewNodeCertificateRequest>,
+    ) -> std::result::Result<Response<RenewNodeCertificateResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let result = match minter {
+            Some(minter) => minter.renew_node(caller_cert_der, &req.csr_pem).await,
+            None => Err(format!("{NOT_CA_HOLDER}; renew against the founder")),
+        };
+        Ok(Response::new(match result {
+            Ok(node_cert_pem) => RenewNodeCertificateResponse {
+                success: true,
+                error: None,
+                node_cert_pem,
+            },
+            Err(error) => RenewNodeCertificateResponse {
+                success: false,
+                error: Some(error),
+                node_cert_pem: Vec::new(),
+            },
+        }))
+    }
+
+    /// Renew this daemon's own certificate now, for this same Node's operator.
+    async fn renew_local_node_certificate(
+        &self,
+        request: Request<RenewLocalNodeCertificateRequest>,
+    ) -> std::result::Result<Response<RenewLocalNodeCertificateResponse>, Status> {
+        let caller = super::node_authority::authenticated_node_id(request.extensions())?;
+        let result = if caller != Some(self.registry.node_id()) {
+            Err("only this Node may ask its daemon to renew its certificate".to_string())
+        } else {
+            let renewer = self
+                .local_node_renewer_slot
+                .as_ref()
+                .and_then(|slot| slot.read().as_ref().cloned());
+            match renewer {
+                Some(renewer) => renewer.renew_now().await,
+                None => Err("this daemon serves no renewable Node certificate".to_string()),
+            }
+        };
+        Ok(Response::new(match result {
+            Ok(not_after_unix_s) => RenewLocalNodeCertificateResponse {
+                success: true,
+                error: None,
+                not_after_unix_s,
+            },
+            Err(error) => RenewLocalNodeCertificateResponse {
+                success: false,
+                error: Some(error),
+                not_after_unix_s: 0,
+            },
+        }))
     }
 
     async fn allow_session_minter(
@@ -2380,9 +2484,9 @@ struct NodeEnrollmentServiceImpl {
 
 #[tonic::async_trait]
 impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
-    /// Provision a joining node: verify the join token, sign a node cert with
-    /// the cluster CA, return CA + cert + key. The CA private key never leaves
-    /// this process.
+    /// Provision a joining node: verify the join token, certify the key in its
+    /// CSR with the cluster CA, return CA + cert. Neither private key — the CA's
+    /// nor the joiner's — crosses this channel.
     async fn join_cluster(
         &self,
         request: Request<JoinClusterRequest>,
@@ -2394,7 +2498,6 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
                 error: Some(msg.to_string()),
                 ca_pem: Vec::new(),
                 node_cert_pem: Vec::new(),
-                node_key_pem: Vec::new(),
                 api_key_secret: None,
             })
         };
@@ -2448,7 +2551,9 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             }
         };
 
-        // --- Sign node certificate ---
+        // --- Certify the joiner's own key ---
+        // The token authorizes the requested Node ID; the CSR contributes only
+        // the proven public key. The joiner's private key never leaves it.
         let zone_id = if req.zone_id.is_empty() {
             contracts::ROOT_ZONE_ID
         } else {
@@ -2456,7 +2561,8 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         };
         let extra_hostnames = super::certgen::extract_hostnames(&req.node_address);
         let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
-        let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
+        let node_cert_pem = match super::certgen::sign_node_csr(
+            &req.csr_pem,
             req.node_id,
             zone_id,
             &ca_pem,
@@ -2464,10 +2570,10 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             &extra_hostnames,
             peer_hostname,
         ) {
-            Ok(pair) => pair,
+            Ok(cert) => cert,
             Err(e) => {
-                tracing::error!("Failed to generate node cert: {}", e);
-                return Ok(err_resp(&format!("Failed to generate node cert: {}", e)));
+                tracing::warn!(peer_node_id = req.node_id, error = %e, "JoinCluster: CSR refused");
+                return Ok(err_resp(&format!("JoinCluster CSR refused: {e}")));
             }
         };
 
@@ -2482,7 +2588,6 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             error: None,
             ca_pem,
             node_cert_pem,
-            node_key_pem,
             api_key_secret: self.api_key_secret.clone(),
         }))
     }
@@ -2984,11 +3089,11 @@ impl RaftWitnessServer {
 
         // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
         // a target for foreign agents (those write mailboxes on the broker), so
-        // it passes `None` and `federated_mtls_incoming` builds a verifier with
-        // just the cluster CA — byte-equivalent to the prior client_ca_root.
+        // its verifier trusts just the cluster CA.
         match &self.config.tls {
             Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, tls, None)
+                let identity = listener_identity(None, tls, None)?;
+                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, identity)
                     .await
                     .map_err(TransportError::Connection)?;
                 router
