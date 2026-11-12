@@ -1722,6 +1722,13 @@ fn zone_manager_error(
         nexus_raft::raft::RaftError::DataDirLocked(store_path) => {
             data_dir_locked_error(&common.data_dir, &store_path)
         }
+        nexus_raft::raft::RaftError::ListenerAddressInUse(address) => anyhow::anyhow!(
+            "cannot open runtime for data dir {}: another process holds listener {address}.\n\n\
+             If that process serves this directory, stop the daemon before running this command. \
+             A separate node requires its own reachable listener address.\n\n\
+             If you are publishing a federation zone: {HOW_TO_PUBLISH_A_ZONE}.",
+            common.data_dir.display(),
+        ),
         other => anyhow::anyhow!("{context}: {other}"),
     }
 }

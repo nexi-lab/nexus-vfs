@@ -612,7 +612,12 @@ impl ZoneManager {
                     listener.set_nonblocking(true)?;
                     Ok(listener)
                 })
-                .map_err(|e| RaftError::Config(format!("bind gRPC listener {bind_addr}: {e}")))?;
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AddrInUse => {
+                        RaftError::ListenerAddressInUse(bind_addr.to_owned())
+                    }
+                    _ => RaftError::Config(format!("bind gRPC listener {bind_addr}: {e}")),
+                })?;
             Some((prepared, listener))
         };
 
