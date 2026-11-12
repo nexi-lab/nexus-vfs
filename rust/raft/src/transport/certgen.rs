@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 /// 90 days follows the Let's Encrypt convention — short enough that an
 /// expired-cert incident drives rotation discipline, long enough that
 /// routine ops don't churn certs. The CA outlives node certs (see
-/// `CA_VALIDITY_DAYS`); operators rotate node certs by redeploying the
-/// daemon, which re-runs the Day-1 bootstrap.
+/// `CA_VALIDITY_DAYS`); operators renew a node cert with `enroll` against the
+/// CA holder, which re-issues it for the data directory's persisted Node ID.
 const NODE_CERT_VALIDITY_DAYS: i64 = 90;
 
 /// Validity window for the cluster CA. Long-lived by design — every
@@ -30,6 +30,28 @@ const NODE_CERT_VALIDITY_DAYS: i64 = 90;
 /// long-lived-root conventions (DigiCert / ISRG Root X1 / Amazon Root
 /// CA all sit at 10-20y).
 const CA_VALIDITY_DAYS: i64 = 365 * 10;
+
+/// How far before the issuer's clock a certificate's validity window opens.
+///
+/// Every verifier judges notBefore by its own clock, so a window that opens at
+/// the issuer's exact `now` is "not yet valid" on any host whose clock trails
+/// the issuer's — an enrolled Node then fails its first boot against a leader
+/// whose clock runs a few seconds ahead. One minute absorbs ordinary skew
+/// between NTP-disciplined hosts; verification itself stays exact.
+const ISSUANCE_BACKDATE: time::Duration = time::Duration::minutes(1);
+
+/// The validity window of a certificate issued now, shared by every issuance
+/// path (CA, Node, agent, owner credentials and committed CSR intents).
+///
+/// The window opens [`ISSUANCE_BACKDATE`] early, but by at most a quarter of the
+/// lifetime, so a short-lived credential keeps most of its validity ahead of
+/// it. It lasts exactly `lifetime`: lifetime bounds, renewal comparisons and
+/// committed intents see the requested validity unchanged.
+fn issuance_window(lifetime: time::Duration) -> (time::OffsetDateTime, time::OffsetDateTime) {
+    let backdate = ISSUANCE_BACKDATE.min(time::Duration::seconds(lifetime.whole_seconds() / 4));
+    let start = time::OffsetDateTime::now_utc() - backdate;
+    (start, start + lifetime)
+}
 
 /// A CSR is a public key and proof, not an unbounded certificate-policy input.
 const MAX_CSR_PEM_BYTES: usize = 16 * 1024;
@@ -178,9 +200,8 @@ fn node_certificate_params(
     // Not a CA
     params.is_ca = IsCa::NoCa;
 
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(NODE_CERT_VALIDITY_DAYS);
+    (params.not_before, params.not_after) =
+        issuance_window(time::Duration::days(NODE_CERT_VALIDITY_DAYS));
 
     Ok(params)
 }
@@ -561,9 +582,7 @@ fn agent_certificate_params(
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.is_ca = IsCa::NoCa;
 
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + validity;
+    (params.not_before, params.not_after) = issuance_window(validity);
 
     Ok(params)
 }
@@ -600,9 +619,7 @@ pub fn generate_zone_ca(zone_id: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
     ];
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(CA_VALIDITY_DAYS);
+    (params.not_before, params.not_after) = issuance_window(time::Duration::days(CA_VALIDITY_DAYS));
 
     let cert = params
         .self_signed(&key)
@@ -1370,5 +1387,103 @@ mod tests {
             read_join_token_hashes(&path),
             vec!["a".repeat(64), "b".repeat(64)]
         );
+    }
+
+    /// Every issuance path opens its window before the issuer's clock, so a
+    /// verifier whose clock trails the issuer's accepts a fresh certificate at
+    /// once; the window still spans exactly the requested lifetime and its
+    /// opening instant stays a hard bound.
+    #[test]
+    fn fresh_certificates_verify_on_a_clock_behind_the_issuer() {
+        use x509_parser::prelude::{ASN1Time, FromDer, X509Certificate};
+        const DAY: i64 = 86_400;
+        let csr = || {
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            CertificateParams::default()
+                .serialize_request(&key)
+                .unwrap()
+                .pem()
+                .unwrap()
+                .into_bytes()
+        };
+        let der = |pem: &[u8]| ::pem::parse(pem).unwrap().into_contents();
+        let issued_from = time::OffsetDateTime::now_utc().unix_timestamp();
+        let (ca, ca_key) = generate_zone_ca("root").unwrap();
+        let intent = prepare_agent_csr_intent("agent-intent", &csr(), &ca).unwrap();
+        let issued = [
+            (der(&ca), CA_VALIDITY_DAYS * DAY),
+            (
+                der(&generate_node_cert(7, "root", &ca, &ca_key, &[], None)
+                    .unwrap()
+                    .0),
+                NODE_CERT_VALIDITY_DAYS * DAY,
+            ),
+            (
+                der(&sign_node_csr(&csr(), 7, "root", &ca, &ca_key, &[], None).unwrap()),
+                NODE_CERT_VALIDITY_DAYS * DAY,
+            ),
+            (
+                der(&generate_agent_cert("agent", &ca, &ca_key).unwrap().0),
+                NODE_CERT_VALIDITY_DAYS * DAY,
+            ),
+            (
+                der(&sign_agent_csr("agent-csr", &csr(), &ca, &ca_key).unwrap()),
+                NODE_CERT_VALIDITY_DAYS * DAY,
+            ),
+            (
+                sign_committed_agent_intent(&intent, &ca, &ca_key)
+                    .unwrap()
+                    .certificate_der,
+                90 * DAY,
+            ),
+            (
+                der(
+                    &generate_session_agent_cert("session-a", "alice", 300, &ca, &ca_key)
+                        .unwrap()
+                        .0,
+                ),
+                300,
+            ),
+            (
+                der(
+                    &generate_user_runtime_cert("runtime-a", "alice", 300, &ca, &ca_key)
+                        .unwrap()
+                        .0,
+                ),
+                300,
+            ),
+            (
+                der(
+                    &generate_user_replica_cert("replica-a", "alice", 3, 300, &ca, &ca_key)
+                        .unwrap()
+                        .0,
+                ),
+                300,
+            ),
+            // Short-lived: the backdate shrinks to a quarter of the lifetime.
+            (
+                der(
+                    &generate_session_agent_cert("session-b", "alice", 8, &ca, &ca_key)
+                        .unwrap()
+                        .0,
+                ),
+                8,
+            ),
+        ];
+        let issued_until = time::OffsetDateTime::now_utc().unix_timestamp();
+        let (_, authority) = X509Certificate::from_der(&issued[0].0).unwrap();
+        for (bytes, lifetime) in &issued {
+            let (_, cert) = X509Certificate::from_der(bytes).unwrap();
+            cert.verify_signature(Some(authority.public_key())).unwrap();
+            let validity = cert.validity();
+            let start = validity.not_before.timestamp();
+            assert_eq!(validity.not_after.timestamp() - start, *lifetime);
+            let backdate = (lifetime / 4).min(ISSUANCE_BACKDATE.whole_seconds());
+            assert!((issued_from - backdate..=issued_until - backdate).contains(&start));
+            // Half the backdate behind the issuer: 30 s for any lifetime of 4 min or more.
+            let behind = issued_from - backdate / 2;
+            assert!(validity.is_valid_at(ASN1Time::from_timestamp(behind).unwrap()));
+            assert!(!validity.is_valid_at(ASN1Time::from_timestamp(start - 1).unwrap()));
+        }
     }
 }
