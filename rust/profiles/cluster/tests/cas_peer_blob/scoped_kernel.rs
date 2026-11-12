@@ -272,7 +272,18 @@ struct SegmentInstance {
 
 impl SegmentInstance {
     fn open(directory: &std::path::Path, bytes: &[u8]) -> Self {
-        let manager = ZoneManager::isolated(directory.join("raft").to_str().unwrap()).unwrap();
+        let address = format!("127.0.0.1:{}", ports::free_port());
+        let manager = ZoneManager::with_node_id(
+            "peer-segment-instance",
+            1,
+            directory.join("raft").to_str().unwrap(),
+            vec![],
+            &address,
+            None,
+            Some(format!("http://{address}")),
+            None,
+        )
+        .unwrap();
         let zone = manager.create_zone("agent-alice").unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         let store = Arc::new(ZoneMetaStore::new_with_subtree(
