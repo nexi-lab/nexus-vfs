@@ -7630,6 +7630,7 @@ mod tests {
             tls_dir,
             data_dir: dir.path().to_path_buf(),
             session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+            replica_store: crate::replica_rpc::new_store_slot(),
             peer_verifier: test_peer_verifier(&ca_pem),
         };
         let der = |p: &[u8]| ::pem::parse(p).unwrap().contents().to_vec();
