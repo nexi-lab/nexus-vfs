@@ -4,6 +4,9 @@
 #[path = "common/ports.rs"]
 mod ports;
 
+#[path = "cas_peer_blob/scoped_kernel.rs"]
+mod scoped_kernel;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -95,7 +95,7 @@ impl ColdSegmentStore for NativeCold {
         Ok(id)
     }
 
-    fn read_segment(&self, _: &str, id: &str, _: &str) -> Result<Vec<u8>, String> {
+    fn read_segment(&self, _: &str, _: u64, id: &str, _: &str) -> Result<Vec<u8>, String> {
         std::fs::read(self.directory.join(id)).map_err(|error| error.to_string())
     }
 }

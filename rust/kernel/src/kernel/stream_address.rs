@@ -14,6 +14,7 @@ pub(crate) struct StreamAddress {
 struct ResolvedIoPath {
     path: String,
     address: StreamAddress,
+    route: Option<RouteResult>,
 }
 
 /// An authorized I/O target, including the path of a not-yet-created entry.
@@ -69,6 +70,24 @@ impl Kernel {
         StreamAddress::from_route(path, zone, self.vfs_router.route(path, zone).as_ref())
     }
 
+    /// Enforce ownership in the caller's captured store before generic I/O.
+    /// The coordinator's zone store may differ after mount replacement; its
+    /// absence of an owner cannot authorize this mounted path.
+    pub(super) fn unscoped_stream_address(
+        &self,
+        path: &str,
+        zone: &str,
+    ) -> Result<StreamAddress, KernelError> {
+        let route = self
+            .vfs_router
+            .route(path, zone)
+            .map(|route| self.capture_metastore_route(route));
+        if let Some(route) = route.as_ref() {
+            self.check_unscoped_content_io(path, route)?;
+        }
+        Ok(StreamAddress::from_route(path, zone, route.as_ref()))
+    }
+
     /// Resolve links using the existing one-hop contract. The caller's gate
     /// runs on every link spelling and on the backing path in its owning zone.
     pub(super) fn resolve_stream_address(
@@ -77,8 +96,11 @@ impl Kernel {
         ctx: &OperationContext,
         gate: impl FnMut(&str, Option<&RouteResult>, &OperationContext) -> Result<(), KernelError>,
     ) -> Result<StreamAddress, KernelError> {
-        self.resolve_io_path(path, ctx, gate)
-            .map(|resolved| resolved.address)
+        let resolved = self.resolve_io_path(path, ctx, gate)?;
+        if let Some(route) = resolved.route.as_ref() {
+            self.check_unscoped_content_io(&resolved.path, route)?;
+        }
+        Ok(resolved.address)
     }
 
     /// Inspect the target of an I/O operation without reading its contents.
@@ -111,18 +133,22 @@ impl Kernel {
         let mut path = path.to_owned();
         for hops in 0..=1 {
             validate_path_fast(&path)?;
-            let route = self.vfs_router.route(&path, &ctx.zone_id);
+            let route = self
+                .vfs_router
+                .route(&path, &ctx.zone_id)
+                .map(|route| self.capture_metastore_route(route));
             gate(&path, route.as_ref(), ctx)?;
             let target = self.directory_link_target(&path, &ctx.zone_id)?;
             let target = match target {
                 Some(target) => Some(target),
                 None => {
                     let entry = match route.as_ref() {
-                        Some(route) => self
-                            .with_metastore_route(route, |ms| ms.get(&path))
-                            .transpose()
-                            .map_err(|e| KernelError::IOError(format!("path metadata: {e:?}")))?
-                            .flatten(),
+                        Some(route) => {
+                            Self::with_captured_metastore_route(route, |ms| ms.get(&path))
+                                .transpose()
+                                .map_err(|e| KernelError::IOError(format!("path metadata: {e:?}")))?
+                                .flatten()
+                        }
                         None => self.metastore_get(&path).ok().flatten(),
                     };
                     match entry {
@@ -146,7 +172,11 @@ impl Kernel {
                 target_ctx.zone_id = address.zone.clone();
                 gate(&address.path, route.as_ref(), &target_ctx)?;
             }
-            return Ok(ResolvedIoPath { path, address });
+            return Ok(ResolvedIoPath {
+                path,
+                address,
+                route,
+            });
         }
         unreachable!("link hop limit returns above")
     }
@@ -166,14 +196,20 @@ impl Kernel {
             if StreamAddress::from_route(&path, &zone, Some(&route)).key() != key {
                 continue;
             }
-            let meta = self
-                .with_metastore_route(&route, |ms| ms.get(&path))
+            // Admission belongs to the mounted inode's captured store. The
+            // coordinator can resolve another store for the same zone/key.
+            // Capture the fallback too, before inspecting either policy or inode.
+            let route = self.capture_metastore_route(route);
+            if route.metastore.is_none() {
+                continue;
+            }
+            let meta = Self::with_captured_metastore_route(&route, |ms| ms.get(&path))
                 .transpose()
                 .map_err(|e| e.to_string())?
                 .flatten();
             if let Some(meta) = meta.filter(|meta| meta.entry_type == DT_STREAM) {
                 return self
-                    .wal_backend_for(&address, meta.size)
+                    .wal_backend_for(&address, meta.size, &path, Some(&route))
                     .map_err(|e| format!("{e:?}"));
             }
         }

@@ -157,9 +157,9 @@ async fn await_collect(v: &mut Vfs, path: &str, want: &[u8]) {
             Ok(bytes) if bytes == want => return,
             other => {
                 if std::time::Instant::now() >= deadline {
-                    let got = other.map(|b| b.len()).unwrap_or(0);
+                    let got = other.as_ref().map(|b| b.len()).unwrap_or(0);
                     panic!(
-                        "collect_all({path}) never matched the full log: got {got} bytes, want {}",
+                        "collect_all({path}) never matched the full log: got {got} bytes, want {}; last result: {other:?}",
                         want.len()
                     );
                 }
