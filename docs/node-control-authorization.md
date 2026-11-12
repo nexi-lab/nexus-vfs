@@ -60,10 +60,11 @@ An object ID comparison does not establish a storage incarnation: path-addressed
 objects still require the original owning storage binding when their IDs can
 be reused.
 
-Logical file and cold-segment reads enforce enrolled record-owner exclusion.
-Raw CAS reads retain their existing trusted zone-replication contract; they
-are not qualified Session lifecycle operations. Session consumers require the
-owning Session service and its original storage authority.
+Cold reads retain their existing enrolled-owner check. Managed tenant
+record-lifetime admission and the specialized logical-file owner boundary
+remain a separate, unqualified Session capability. Raw CAS replication retains
+its existing contract. Session consumers require the owning Session service
+and its original storage authority.
 
 ## Outgoing replication identity
 

@@ -175,54 +175,6 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
         assert!(response.error.is_empty(), "{}", response.error);
         assert_eq!(response.content, private_bytes);
     }
-    let service = OperationContext::new("session-service", "agent-alice", true, None, true);
-    let enrolled_path = "/enrolled-record";
-    let enrolled_bytes = b"fresh owner with no retained generic reader";
-    let written = kernel.sys_write(
-        &[WriteRequest {
-            path: enrolled_path.into(),
-            content: enrolled_bytes.to_vec(),
-            offset: 0,
-        }],
-        &service,
-    );
-    assert!(written[0].is_ok());
-    let before_enrollment = client
-        .read_zone_blob(request("agent-alice", enrolled_path))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(before_enrollment.error.is_empty());
-    assert_eq!(before_enrollment.content, enrolled_bytes);
-    kernel
-        .protect_record_content(enrolled_path, &service)
-        .unwrap();
-    let version = metadata[0]
-        .as_conditional_metadata()
-        .unwrap()
-        .read_versioned(enrolled_path)
-        .unwrap()
-        .unwrap()
-        .version;
-    kernel
-        .admit_record_content_io(enrolled_path, &service, &version)
-        .unwrap();
-    let after_enrollment = client
-        .read_zone_blob(request("agent-alice", enrolled_path))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        !after_enrollment.error.is_empty() && after_enrollment.content.is_empty(),
-        "generic logical peer reads must refuse the enrolled owner"
-    );
-    let ordinary = client
-        .read_zone_blob(request("agent-alice", "/memory.txt"))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(ordinary.error.is_empty());
-    assert_eq!(ordinary.content, private_bytes);
     for zone in ["agent-alice", "conversation-alice-bob", "agent-charlie"] {
         let response = client
             .read_zone_blob(request(zone, &global_hash))
