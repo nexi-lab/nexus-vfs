@@ -46,6 +46,9 @@ pub enum ZoneRuntimeError {
     Conflict(String),
     /// Journal lookup miss.
     NotFound(String),
+    /// The cluster could not be reached to carry the mutation out (no leader
+    /// admitted a join). Retryable: the intent stays PENDING.
+    Unavailable(String),
     /// Execution failure underneath (raft, IO).
     Internal(String),
 }
@@ -57,6 +60,7 @@ impl std::fmt::Display for ZoneRuntimeError {
             | ZoneRuntimeError::Invalid(m)
             | ZoneRuntimeError::Conflict(m)
             | ZoneRuntimeError::NotFound(m)
+            | ZoneRuntimeError::Unavailable(m)
             | ZoneRuntimeError::Internal(m) => f.write_str(m),
         }
     }
@@ -194,9 +198,13 @@ impl ZoneRuntimeBackend {
         self.complete(&header.operation_id, &req.zone_id, receipt)
     }
 
-    /// Join an existing zone (R9/D2) — `ZoneManager::join_zone` only; there
-    /// is NO founder fallback on this path. A join that cannot reach peers
-    /// fails loudly; it can never degrade into a create.
+    /// Join an existing zone (R9/D2): host its replica, then request
+    /// membership through JoinZone against the operator seeds — the same
+    /// join loop as boot and the offline `join` CLI
+    /// ([`crate::distributed_coordinator::join_zone_via_peers`]). JOINED means
+    /// this node's applied ConfState names it as the requested learner or
+    /// voter. There is NO founder fallback: a join no leader admits fails
+    /// loudly and can never degrade into a create.
     pub fn zone_join(&self, req: &ZoneJoinRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::RemoteLearned, &req.zone_id)
@@ -219,16 +227,58 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
-        if let Err(e) = self.zm.join_zone(&req.zone_id, req.learner) {
-            return self.fail(&header.operation_id, map_raft_err(e), "join", &req.zone_id);
+        let advertise = self.zm.registry().self_address();
+        if advertise.is_empty() {
+            let refusal = ZoneRuntimeError::Conflict(
+                "this node advertises no address, so a leader could not reach it as a member"
+                    .to_string(),
+            );
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
+        }
+        let seeds =
+            crate::distributed_coordinator::peers_excluding_self(&self.zm.seed_peers(), &advertise);
+        if seeds.is_empty() {
+            let refusal = ZoneRuntimeError::Conflict(format!(
+                "no seed address to request membership of '{}' through; a join never founds \
+                 the zone",
+                req.zone_id
+            ));
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
+        }
+        if self.zm.get_zone(&req.zone_id).is_none() {
+            if let Err(e) = self.zm.join_zone(&req.zone_id, req.learner) {
+                return self.fail(&header.operation_id, map_raft_err(e), "join", &req.zone_id);
+            }
+        }
+        let node_id = self.zm.node_id();
+        if let Err(e) = crate::distributed_coordinator::join_zone_via_peers(
+            &self.zm,
+            &req.zone_id,
+            node_id,
+            &advertise,
+            &seeds,
+            Some(crate::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
+            req.learner,
+        ) {
+            return self.fail(
+                &header.operation_id,
+                ZoneRuntimeError::Unavailable(e),
+                "join",
+                &req.zone_id,
+            );
         }
         let mut facts = self.cluster_facts_caught_up(&req.zone_id);
         facts.has_store = facts.has_store && self.zm.hosts_zone(&req.zone_id);
+        let role = match self.zm.get_zone(&req.zone_id) {
+            Some(zone) if zone.consensus_node().voters().contains(&node_id) => "voter",
+            _ => "learner",
+        };
         let mut receipt = base_receipt(&header.operation_id, &req.zone_id, "join", OUTCOME_JOINED);
         receipt.cluster = Some(facts);
         receipt.evidence = vec![
             format!(
-                "join path only — no founder bootstrap fallback (learner={})",
+                "admitted through JoinZone; the applied ConfState names node {node_id} as a \
+                 {role} (requested learner={})",
                 req.learner
             ),
             format!(
@@ -820,10 +870,13 @@ impl ZoneRuntimeBackend {
         kind: &str,
         zone_id: &str,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
-        if matches!(err, ZoneRuntimeError::Internal(_)) {
-            // Storage and consensus failures do not establish a business
-            // refusal. Keep the original intent PENDING so polling and a
-            // same-operation takeover can recover it after the grace period.
+        if matches!(
+            err,
+            ZoneRuntimeError::Internal(_) | ZoneRuntimeError::Unavailable(_)
+        ) {
+            // Storage, consensus and reachability failures do not establish a
+            // business refusal. Keep the original intent PENDING so polling and
+            // a same-operation takeover can recover it after the grace period.
             tracing::error!(zone = %zone_id, kind = %kind, "zone runtime mutation outcome unknown: {err}");
             return Err(err);
         }

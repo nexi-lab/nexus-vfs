@@ -971,10 +971,10 @@ impl ZoneManager {
     /// Join an existing zone as a Voter (learner=false) or Learner (learner=true).
     ///
     /// Sets up the local Raft state machine with skip_bootstrap=true so the
-    /// leader's snapshot installs the correct ConfState. The caller is
-    /// responsible for sending a JoinZone RPC to the leader (via
-    /// PyFederationClient::request_join_zone) with the same learner flag so
-    /// the leader proposes AddNode vs AddLearnerNode accordingly.
+    /// leader's snapshot installs the correct ConfState. Membership itself is
+    /// requested with the same learner flag through
+    /// [`crate::distributed_coordinator::join_zone_via_peers`], so the leader
+    /// proposes AddNode vs AddLearnerNode accordingly.
     pub fn join_zone(&self, zone_id: &str, learner: bool) -> Result<Arc<ZoneHandle>> {
         // R12: the join path can never resurrect a deprovisioned zone —
         // a deletion epoch that outranks this replica's creation epoch

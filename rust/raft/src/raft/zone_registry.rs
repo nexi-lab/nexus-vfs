@@ -609,9 +609,9 @@ impl ZoneRaftRegistry {
     /// ConfChange commit.
     ///
     /// `learner` is informational here — the actual Voter/Learner classification is
-    /// determined by the ConfChange the leader proposes (AddNode vs AddLearnerNode).
-    /// Callers must send a JoinZone RPC to the leader with the same learner flag via
-    /// PyFederationClient::request_join_zone.
+    /// determined by the ConfChange the leader proposes (AddNode vs AddLearnerNode)
+    /// for the JoinZone request carrying the same flag
+    /// (`distributed_coordinator::join_zone_via_peers`).
     #[allow(clippy::result_large_err)]
     pub fn join_zone(
         &self,

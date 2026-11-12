@@ -10,10 +10,13 @@
 //!      moved to 1).
 //!   3. BYTES: a real typed Write/Read round-trip THROUGH the mounted zone
 //!      — the zone is a physical filesystem, not a metadata illusion.
-//!   4. JOIN on a second node: `outcome=JOINED` (never CREATED — R9), the
+//!   4. JOIN on a second node: `outcome=JOINED` (never CREATED — R9) only
+//!      once the leader committed the membership — the founder's
+//!      GetClusterInfo lists the joiner as a voter at its address — and the
 //!      joiner's status answers RESIDENT with live cluster facts.
-//!   5. JOIN of a zone that does not exist: the joiner must NOT bootstrap
-//!      it into existence (no founder fallback on the typed path).
+//!   5. JOIN of a zone no leader serves: refused UNAVAILABLE, never JOINED,
+//!      and the joiner must NOT bootstrap it into existence (no founder
+//!      fallback on the typed path).
 
 mod common;
 
@@ -21,6 +24,7 @@ use std::time::Duration;
 
 use common::{free_port, Daemon, Vfs, ZoneRuntime, LOG_FILTER};
 use kernel::kernel::vfs_proto::zone_status_response::Presence;
+use nexus_raft::transport::{ClientConfig, RaftApiClient};
 
 const ZONE: &str = "tenant-a";
 const GHOST: &str = "zone-never-existed";
@@ -124,15 +128,54 @@ async fn typed_zone_lifecycle_returns_real_receipts() {
         joined.outcome, "JOINED",
         "the receipt must say JOINED — a join may never masquerade as a create"
     );
+    assert!(
+        joined
+            .evidence
+            .iter()
+            .any(|line| line.contains("as a voter")),
+        "the receipt names the committed role: {:?}",
+        joined.evidence
+    );
+    // The leader committed it: its ConfState lists the joiner as a voter,
+    // at the address the joiner advertises.
+    let info = RaftApiClient::connect(&format!("http://{fadv}"), ClientConfig::default())
+        .await
+        .expect("raft api on the founder")
+        .with_zone_id(ZONE.into())
+        .get_cluster_info()
+        .await
+        .expect("GetClusterInfo on the founder");
+    assert!(info.is_leader, "the founder leads {ZONE}");
+    let voters: Vec<String> = info
+        .config
+        .expect("cluster config")
+        .voters
+        .into_iter()
+        .map(|node| node.address)
+        .collect();
+    assert_eq!(voters.len(), 2, "founder and joiner vote: {voters:?}");
+    assert!(
+        voters.contains(&format!("http://{jadv}")),
+        "the leader lists the joiner: {voters:?}"
+    );
     // The joiner now sees the zone as RESIDENT with live facts.
     let j_status = j_rt.zone_status(ZONE, "").await.expect("joiner status");
     assert_eq!(j_status.presence, i32::from(Presence::Resident));
 
-    // ── 5. JOIN of a nonexistent zone must NOT bootstrap it (R9) ──
+    // ── 5. JOIN of a zone no leader serves: UNAVAILABLE, never JOINED (R9) ──
     // The typed path has no founder fallback: the joiner may hold a local
     // learner runtime WAITING for a leader's snapshot, but it must never
     // SELF-FOUND — no voters, no committed log, no leader elected.
-    let _ = j_rt.zone_join(GHOST, true, "op-join-ghost-0004", "").await;
+    let refused = j_rt
+        .zone_join(GHOST, true, "op-join-ghost-0004", "")
+        .await
+        .expect_err("no leader admits a join of a zone nobody serves");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unavailable,
+        "a join no leader admitted is UNAVAILABLE: {}",
+        refused.message()
+    );
     let ghost_status = j_rt
         .zone_status(GHOST, "")
         .await
