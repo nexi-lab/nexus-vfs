@@ -115,11 +115,31 @@ fn service_retirement_drains_actual_kernel_io_while_the_process_stays_alive() {
     // second application payload that could disagree with that decision.
     let visible = fixture
         .kernel
+        .record_content_owner_state(OWNER, &service())
+        .unwrap();
+    assert_eq!(visible.version, terminal);
+    assert!(visible.is_retired);
+    assert!(fixture
+        .kernel
         .read_versioned_content(OWNER, &context())
+        .is_err());
+    let image = fixture
+        .store
+        .as_conditional_metadata()
+        .unwrap()
+        .read_versioned(OWNER)
         .unwrap()
         .unwrap();
-    assert_eq!(visible.content, b"immutable owner payload");
-    assert_eq!(visible.version, terminal);
+    assert_eq!(image.version, terminal);
+    assert_eq!(
+        fixture
+            .backend
+            .as_cas()
+            .unwrap()
+            .read_content(image.metadata.content_id.as_deref().unwrap())
+            .unwrap(),
+        b"immutable owner payload"
+    );
 }
 
 #[test]
@@ -297,10 +317,14 @@ fn terminal_readback_and_refusal_survive_restart_without_reclaiming_other_object
     // exclusion operation, which verifies the permanent retirement marker.
     let snapshot = reopened
         .kernel
-        .read_versioned_content("/alias/owner", &context())
-        .unwrap()
+        .record_content_owner_state("/alias/owner", &service())
         .unwrap();
     assert_eq!(snapshot.version, terminal);
+    assert!(snapshot.is_retired);
+    assert!(reopened
+        .kernel
+        .read_versioned_content("/alias/owner", &context())
+        .is_err());
     assert!(reopened
         .kernel
         .try_exclude_retired_content_io("/alias/owner", &service(), &snapshot.version)

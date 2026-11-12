@@ -82,9 +82,11 @@ pub trait ColdSegmentStore: Send + Sync {
 
     /// Read a sealed segment blob by `content_id`: local content store first,
     /// else a whole-blob peer fetch from `origin` (the node that sealed it).
+    /// `base` identifies the existing committed index entry on that peer.
     fn read_segment(
         &self,
         stream_id: &str,
+        base: u64,
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String>;
@@ -342,6 +344,12 @@ impl WalStreamCore {
     }
 
     fn record_io(&self) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalMetadataError> {
+        if self.record_owner.is_none() {
+            crate::extensions::guarded_records::check_unscoped_record_io(
+                self.store.as_ref(),
+                &self.stream_id,
+            )?;
+        }
         self.record_owner
             .as_ref()
             .map(|owner| {
@@ -459,7 +467,8 @@ impl WalStreamCore {
             Some(seg) => seg,
             None => return Ok(None), // trimmed by retention
         };
-        let blob = Arc::new(cold.read_segment(&self.stream_id, &seg.content_id, &seg.origin)?);
+        let blob =
+            Arc::new(cold.read_segment(&self.stream_id, seg.base, &seg.content_id, &seg.origin)?);
         let out = extract_frame(blob.as_slice(), seg.base, seq)?;
         *self.seg_cache.lock() = Some((seg.base, seg.end, blob));
         Ok(Some(out))
@@ -1126,6 +1135,7 @@ mod tests {
         fn read_segment(
             &self,
             _stream_id: &str,
+            _base: u64,
             content_id: &str,
             _origin: &str,
         ) -> Result<Vec<u8>, String> {

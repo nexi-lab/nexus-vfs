@@ -2440,7 +2440,9 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         let serials = self
             .revoked_serials_path
             .as_deref()
-            .map(super::crl::read_revoked_serials)
+            .map(super::crl::read_revoked_serials_checked)
+            .transpose()
+            .map_err(|error| Status::unavailable(format!("read current revocations: {error}")))?
             .unwrap_or_default();
         // The count grows monotonically (revocation is append-only), so it is a
         // fine crl_number: a stale CRL never carries a higher one.

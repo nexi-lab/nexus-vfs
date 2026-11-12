@@ -85,7 +85,7 @@ pub use crl::{
     add_revoked_serial, add_revoked_serial_with_expiry, crl_revoked_serials, generate_crl,
     prune_expired_serials, read_revoked_entries, read_revoked_serials,
     read_revoked_serials_checked, revoked_serials_path, serial_from_cert_pem,
-    with_unrevoked_serial, RevokedEntry,
+    with_unrevoked_serial, with_unrevoked_serials, RevokedEntry,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;

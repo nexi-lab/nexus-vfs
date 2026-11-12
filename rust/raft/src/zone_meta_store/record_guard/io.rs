@@ -40,6 +40,39 @@ fn open_lock(path: &Path) -> Result<File, ConditionalMetadataError> {
 }
 
 impl ZoneMetaStore {
+    pub(super) fn record_io_owner_state(
+        &self,
+        storage_key: &str,
+    ) -> Result<kernel::extensions::guarded_records::RecordOwnerState, ConditionalMetadataError>
+    {
+        let node = self.conditional_node()?;
+        bridge_block_on(
+            &self.runtime,
+            node.with_state_machine(|state| state.record_io_owner_state(storage_key)),
+        )
+        .map_err(map_error)
+    }
+
+    pub(super) fn check_unscoped_record_io(
+        &self,
+        storage_key: &str,
+    ) -> Result<(), ConditionalMetadataError> {
+        // Deferred provider discovery cannot decide this until the real node
+        // is resolved. Managed membership does not offer record ownership;
+        // ordinary I/O must retain the same behavior before and after resolve.
+        // Resolution failures still propagate, and scoped operations continue
+        // to require conditional_node.
+        let node = self.node().map_err(ConditionalMetadataError::Failed)?;
+        if !node.supports_conditional_metadata() {
+            return Ok(());
+        }
+        bridge_block_on(
+            &self.runtime,
+            node.with_state_machine(|state| state.check_unscoped_record_io(storage_key)),
+        )
+        .map_err(map_error)
+    }
+
     pub fn admit_record_io_owner(
         &self,
         path: &str,
@@ -99,6 +132,23 @@ impl ZoneMetaStore {
             return Err(refused("record I/O owner changed during admission".into()));
         }
         Ok(Box::new(NativeRecordIoGuard { _file: file }))
+    }
+
+    pub(super) fn check_record_owner_binding(
+        &self,
+        path: &str,
+        owner_path: &str,
+        owner_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        let key = self.to_zone_key(path);
+        let owner_key = self.to_zone_key(owner_path);
+        let (_, actual_owner) = self.live_io_domain(path, owner_version)?;
+        if key == owner_key || actual_owner != owner_key {
+            return Err(refused(
+                "record binding does not match its control owner".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn try_exclude_retired_record_io(

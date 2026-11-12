@@ -65,10 +65,16 @@ jobs:
         run: cargo --config .github/ci/functional-tests.toml test -p kernel --test cas_publication --test boot_metastore
       - name: Reject malformed content identifiers before filesystem access
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
+      - name: Cold peer reads retain their owning zone
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib federation::cold_segment::tests
+      - name: Concurrent mounts retain complete storage pairs
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib kernel::mount::tests
       - name: Batch write results and commit notifications on the native filesystem
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --test batch_write_outcomes
       - name: Durable CAS ObjectStore composition
         run: cargo --config .github/ci/functional-tests.toml test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
+      - name: Trusted Kernel WAL admission and platform refusal
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
       - name: Logical file size across CAS manifest and partial writes
         run: cargo --config .github/ci/functional-tests.toml test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
 
@@ -222,7 +228,9 @@ jobs:
         with:
           shared-key: ci-runtime-observations-${{ matrix.os }}
       - name: Real RPC instance, ownership, expiry and partial-directory journeys
-        run: cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+        run: |
+          cargo --config .github/ci/functional-tests.toml test --locked -p kernel --no-default-features core::agents::registry::runtime_observation::tests:: --lib
+          cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
 
   process-instances:
     name: Process instance lifecycle / ${{ matrix.os }}

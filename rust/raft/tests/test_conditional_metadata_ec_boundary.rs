@@ -5,6 +5,7 @@
 mod common;
 
 use nexus_raft::prelude::Command;
+use nexus_raft::raft::StateMachine;
 use nexus_raft::transport::proto::{
     zone_api_service_client::ZoneApiServiceClient, EcReplicationEntry, ProposeRequest,
 };
@@ -60,14 +61,29 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
     )
     .unwrap();
     let zone = manager.create_zone(ZONE).unwrap();
+    let node = zone.consensus_node();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !zone.is_leader() {
+        loop {
+            // Self-registration appends the member address after election.
+            // Observe that committed startup write before measuring refusal.
+            if zone.is_leader()
+                && node
+                    .with_state_machine(|state| {
+                        state
+                            .member_addresses()
+                            .expect("member addresses must be readable")
+                            .iter()
+                            .any(|(id, address)| *id == 1 && *address == bind)
+                    })
+                    .await
+            {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("isolated one-voter fixture must elect itself");
-    let node = zone.consensus_node();
+    .expect("isolated one-voter fixture must elect and register itself");
     node.read_linearizable(|_| ()).await.unwrap();
     let log_before = node.last_index();
     // Deferred lookup offers the operation without materializing a zone. Each

@@ -9,6 +9,14 @@ use crate::extensions::conditional_metadata::{
 /// work that continues after its request future has been cancelled.
 pub trait RecordIoGuard: Send + Sync {}
 
+/// The committed lifetime decision, read independently of data-plane I/O.
+/// A terminal revision revokes operations but does not prove that I/O drained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordOwnerState {
+    pub version: Vec<u8>,
+    pub is_retired: bool,
+}
+
 /// The caller qualifies immutable content or a durable WAL before binding it.
 /// I/O enrollment is explicit; physical reclamation remains a separate control.
 /// All paths resolve in one owning store; versions are opaque storage tokens.
@@ -16,6 +24,20 @@ pub trait GuardedRecords: Send + Sync {
     /// Map this store view's caller path to its canonical storage key.
     /// This uses the owning store's existing path mapping, not a new authority.
     fn record_storage_key(&self, path: &str) -> String;
+
+    /// Refuse generic I/O on an explicitly I/O-enrolled owner or its child.
+    /// The input is already this store's canonical key, as used by the WAL.
+    /// Check existing ownership state on every operation, including retained
+    /// unowned handles; an earlier unprotected result cannot be cached.
+    fn check_unscoped_io(&self, storage_key: &str) -> Result<(), ConditionalMetadataError>;
+
+    /// Read one actual owner's revision and retirement marker in one snapshot.
+    /// Bound children cannot impersonate their owner. The canonical key is
+    /// resolved by the owning service; this grants no content read or cleanup.
+    fn record_owner_state(
+        &self,
+        storage_key: &str,
+    ) -> Result<RecordOwnerState, ConditionalMetadataError>;
 
     /// Enroll a fresh/quiescent owner before admitting content I/O. This upgrades
     /// the reader requirement and preserves its revision. The owning service
@@ -35,6 +57,18 @@ pub trait GuardedRecords: Send + Sync {
         path: &str,
         guard_version: &[u8],
     ) -> Result<Box<dyn RecordIoGuard>, ConditionalMetadataError>;
+
+    /// Verify an existing child's permanent binding to this exact live owner.
+    /// Matching opaque revisions alone cannot pair a data handle with control.
+    /// This reads existing authority; it never enrolls or reassigns a record.
+    fn check_record_owner_binding(
+        &self,
+        _path: &str,
+        _owner_path: &str,
+        _owner_version: &[u8],
+    ) -> Result<(), ConditionalMetadataError> {
+        Err(ConditionalMetadataError::Unsupported)
+    }
 
     /// Return exclusive retirement coverage after every admitted I/O has ended.
     /// None means an actual operation still holds its lifetime guard.
@@ -96,4 +130,16 @@ pub trait GuardedRecords: Send + Sync {
         terminal_image: FileMetadata,
         expected_version: &[u8],
     ) -> Result<ConditionalMetadataResult, ConditionalMetadataError>;
+}
+
+/// Generic WAL handles already carry a canonical storage key. Stores without
+/// this optional capability cannot enroll an owner and retain ordinary I/O.
+pub(crate) fn check_unscoped_record_io(
+    store: &dyn crate::abc::meta_store::MetaStore,
+    storage_key: &str,
+) -> Result<(), ConditionalMetadataError> {
+    if let Some(records) = store.as_guarded_records() {
+        records.check_unscoped_io(storage_key)?;
+    }
+    Ok(())
 }
