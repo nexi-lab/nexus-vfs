@@ -35,6 +35,7 @@ mod auth_posture;
 mod authorization;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod csr_cli;
+mod doctor;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr;
 #[cfg(feature = "experimental-managed-agent-csr")]
@@ -844,13 +845,15 @@ enum Cmd {
         #[command(subcommand)]
         action: ForeignCaCmd,
     },
-    /// Per-zone health audit of a stopped daemon's data directory.
+    /// Health audit of a stopped daemon's data directory.
     ///
-    /// Reads each zone's persisted RaftState (ConfState + HardState)
-    /// and last log index directly from disk, then prints a one-screen
-    /// summary plus per-zone alarms for the failure modes that have
-    /// historically wedged operators (e.g. half-installed state after
-    /// a crashed `nexusd-cluster join`).  Read-only — but redb requires
+    /// Checks the Node certificate the way boot does — the Node it names
+    /// against the persisted Node ID, its validity window and its CA — then
+    /// reads each zone's persisted RaftState (ConfState + HardState) and last
+    /// log index directly from disk. Prints a one-screen summary plus alarms
+    /// for the failure modes that have historically wedged operators (e.g. a
+    /// certificate naming another Node, or half-installed state after a
+    /// crashed `nexusd-cluster join`).  Read-only — but redb requires
     /// exclusive access, so the daemon must be stopped first.
     ///
     /// Typical use:
@@ -1303,7 +1306,7 @@ where
                 }
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
                 Some(Cmd::ForeignCa { action }) => run_foreign_ca(args.common, action).await,
-                Some(Cmd::Doctor { data_dir, zone }) => run_doctor(&data_dir, zone.as_deref()),
+                Some(Cmd::Doctor { data_dir, zone }) => doctor::run(&data_dir, zone.as_deref()),
                 Some(Cmd::Reset {
                     data_dir,
                     identity_dir,
@@ -4655,23 +4658,6 @@ async fn run_join(
     Ok(())
 }
 
-/// One-shot federation-state health audit of a stopped daemon's data
-/// directory.  Reads each zone's persisted ConfState + HardState +
-/// last_log_index directly from redb (no driver, no async runtime,
-/// no kernel attachment) and prints a single-screen summary with
-/// per-zone alarms that name the historical operator failure modes:
-///
-///   * `STALE_LOG` — log_last_index = 0 but ConfState non-empty.
-///     The half-installed state that wedged the Mac↔Win L1 smoke
-///     for 8 h.  Use the same `check_zone_resumable_from_indices`
-///     invariant `bootstrap_or_join_zone` Branch 1 uses, so doctor
-///     and daemon-boot stay aligned by construction.
-///
-/// `--data-dir` is the same path passed to `nexusd-cluster
-/// --data-dir`.  Subdirectories that contain a `raft/raft.redb` file
-/// are treated as zones; others are skipped.  redb's exclusive lock
-/// means the daemon must be stopped first — the failure mode
-/// otherwise is a clear "could not open zone storage" error per zone.
 /// Handler for `nexusd-cluster reset` — make a truly-fresh node by clearing
 /// BOTH the data-dir and the identity file. The data-dir holds regenerable
 /// raft/metastore state; `identity.json` (at the platform path unless
@@ -4767,135 +4753,6 @@ mod reset_tests {
         // test failure.
         drop(fs::remove_dir_all(&base));
     }
-}
-
-fn run_doctor(data_dir: &std::path::Path, zone_filter: Option<&str>) -> Result<()> {
-    use nexus_raft::raft::RaftStorage;
-
-    if !data_dir.exists() {
-        return Err(anyhow::anyhow!(
-            "doctor: --data-dir {} does not exist",
-            data_dir.display()
-        ));
-    }
-
-    // Discover candidate zones — any subdir whose `raft/raft.redb`
-    // file exists.  Same shape `ZoneRaftRegistry::enumerate_*` uses
-    // at boot, just without instantiating the live state machine.
-    let mut zones: Vec<(String, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(data_dir)
-        .with_context(|| format!("doctor: read_dir({})", data_dir.display()))?
-    {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let raft_dir = entry.path().join("raft");
-        if !raft_dir.join("raft.redb").exists() {
-            continue;
-        }
-        if let Some(filter) = zone_filter {
-            if name != filter {
-                continue;
-            }
-        }
-        zones.push((name, raft_dir));
-    }
-    zones.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if zones.is_empty() {
-        if let Some(filter) = zone_filter {
-            println!(
-                "doctor: no zone '{filter}' found under {}",
-                data_dir.display()
-            );
-        } else {
-            println!(
-                "doctor: no zones found under {} (looking for <zone>/raft/raft.redb)",
-                data_dir.display()
-            );
-        }
-        return Ok(());
-    }
-
-    let total = zones.len();
-    let mut alarmed = 0usize;
-    println!("# Doctor — {} zone(s) under {}", total, data_dir.display());
-    println!();
-    for (zone_id, raft_dir) in zones {
-        let storage = match RaftStorage::open(&raft_dir) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("## zone '{zone_id}'");
-                println!("  ALARM  STORAGE_LOCKED: could not open raft storage at {} — is the daemon still running?  {e}", raft_dir.display());
-                println!();
-                alarmed += 1;
-                continue;
-            }
-        };
-        // RaftStorage exposes the storage state via inherent _impl
-        // methods (the raft-rs `Storage` trait methods all delegate
-        // to these); using them directly keeps the trait out of
-        // scope here.
-        let state = storage
-            .initial_state_impl()
-            .map_err(|e| anyhow::anyhow!("zone '{zone_id}': initial_state: {e:?}"))?;
-        let last_log_index = storage
-            .last_index_impl()
-            .map_err(|e| anyhow::anyhow!("zone '{zone_id}': last_index: {e:?}"))?;
-        let first_log_index = storage
-            .first_index_impl()
-            .map_err(|e| anyhow::anyhow!("zone '{zone_id}': first_index: {e:?}"))?;
-
-        println!("## zone '{zone_id}'");
-        println!(
-            "  voters     = {:?}",
-            state.conf_state.voters.iter().collect::<Vec<_>>()
-        );
-        println!(
-            "  learners   = {:?}",
-            state.conf_state.learners.iter().collect::<Vec<_>>()
-        );
-        println!("  term       = {}", state.hard_state.term);
-        println!("  commit     = {}", state.hard_state.commit);
-        println!("  log_first  = {first_log_index}");
-        println!("  log_last   = {last_log_index}");
-
-        // Cross-check against the same invariant `bootstrap_or_join_zone`
-        // Branch 1 uses — single SSOT for "resumable state".
-        if let Err(reason) =
-            nexus_raft::distributed_coordinator::check_zone_resumable_from_indices(last_log_index)
-        {
-            alarmed += 1;
-            println!(
-                "  ALARM  STALE_LOG: {reason}\n  \
-                 RECOVERY: stop the daemon, then either\n  \
-                 (a) run `nexusd-cluster join <leader_node_id>@<leader_addr> {zone_id} \
-                 /<mount> --data-dir <data_dir> --no-tls` against the leader, then restart, or\n  \
-                 (b) `rm -rf {raft_dir_parent}` (this zone only) and restart in static mode.",
-                raft_dir_parent = raft_dir
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| zone_id.clone()),
-            );
-        } else {
-            println!("  OK");
-        }
-        println!();
-    }
-    println!(
-        "Summary: {alarmed} alarmed / {total} total zone(s).  {}",
-        if alarmed == 0 {
-            "All zones look healthy."
-        } else {
-            "See per-zone RECOVERY hints above."
-        }
-    );
-    if alarmed > 0 {
-        // Non-zero exit for scripted use (CI alarms, watch loops).
-        std::process::exit(2);
-    }
-    Ok(())
 }
 
 /// Install the global tracing subscriber with a non-blocking stdout
@@ -6447,6 +6304,17 @@ fn load_node_tls(data_dir: &std::path::Path) -> Result<nexus_raft::transport::Tl
         key_pem: read(tls_dir.join("node-key.pem"))?,
         ca_pem: read(tls_dir.join("ca.pem"))?,
     })
+}
+
+/// Lowercase-hex SHA-256 over a PEM bundle's first certificate (DER): the
+/// cluster CA fingerprint operator grants pin and `doctor` reports.
+fn certificate_sha256_hex(pem: &[u8]) -> Result<String> {
+    let der = lib::transport_primitives::first_certificate_der(pem, "certificate")
+        .map_err(anyhow::Error::msg)?;
+    Ok(lib::transport_primitives::cert_fingerprint(&der)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// This node's own daemon loopback endpoint + its node-cert mTLS identity — the

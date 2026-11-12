@@ -40,7 +40,9 @@
 //! ```
 
 mod node_authority;
-pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
+pub use node_authority::{
+    current_local_node_certificate, local_node_identity, LocalNodeCertificate,
+};
 
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;

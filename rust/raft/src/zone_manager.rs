@@ -519,11 +519,7 @@ impl ZoneManager {
                     e
                 ))
             })?;
-            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "Node")
-                .map_err(RaftError::Config)?;
-            let ca_der = lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
-                .map_err(RaftError::Config)?;
-            let identity = crate::transport::current_local_node_certificate(&cert_der, &ca_der)
+            let identity = crate::transport::local_node_identity(&cert_pem, &ca_pem)
                 .map_err(RaftError::Config)?;
             if identity.node_id != node_id {
                 return Err(RaftError::Config(format!(
