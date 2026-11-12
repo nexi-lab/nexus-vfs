@@ -1561,8 +1561,15 @@ async fn runtime_reserves_its_listener_before_creating_owner_storage() {
             .wait_exit(BUDGET)
             .await
             .expect("occupied listener must refuse startup");
+        let expected = if is_replica {
+            "listener address already in use"
+        } else {
+            "bind user runtime"
+        };
         assert!(
-            log.contains("bind") && !log.contains("confined user runtime ready"),
+            log.contains(expected)
+                && log.contains(&port.to_string())
+                && !log.contains("confined user runtime ready"),
             "{log}"
         );
         assert!(

@@ -398,10 +398,15 @@ fn local_root_prepares_key_validity_and_socket_before_storage() {
             None,
             None,
         );
-        assert!(matches!(
-            result,
-            Err(nexus_raft::raft::RaftError::Config(_))
-        ));
+        if name == "taken-port" {
+            assert!(matches!(result,
+                Err(nexus_raft::raft::RaftError::ListenerAddressInUse(ref actual)) if actual == bind));
+        } else {
+            assert!(matches!(
+                result,
+                Err(nexus_raft::raft::RaftError::Config(_))
+            ));
+        }
         assert!(!data.exists(), "{name} opened storage before preparation");
     }
 }
