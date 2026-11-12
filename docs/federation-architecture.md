@@ -184,9 +184,16 @@ that daemon startup loads from the data directory. Restart retains the issued
 certificate and Raft membership. Startup verifies the certificate's Node ID
 before opening zone storage. The operator renews a mismatched certificate with
 `enroll <founder-address> <join-token>` using the existing data directory; the
-persisted Node ID and consensus state remain authoritative.
-For a rolling upgrade, renew mismatched certificates on the sending nodes before
-updating receivers that enforce the certificate-to-sender binding.
+persisted Node ID and consensus state remain authoritative. Node certificates
+live 90 days, so renewal is routine; an operator grant binds the Node identity
+the certificate names, never one leaf. Every certificate opens its validity
+window up to one minute before the issuer's clock (at most a quarter of its
+lifetime), so a node whose clock trails its issuer's boots on a fresh
+certificate while verification stays exact. `nexusd-cluster doctor --data-dir
+<dir>` reports the certificate's Node identity against the persisted Node ID,
+its validity window and its CA, and names `enroll` as the remedy. For a rolling
+upgrade, renew mismatched certificates on the sending nodes before updating
+receivers that enforce the certificate-to-sender binding.
 
 - **Identity** — `node_id` is an opaque random `u64` minted at first daemon boot, persisted as 8 bytes BE u64 to `<NEXUS_DATA_DIR>/.node_id`.  Decoupling identity from hostname lets a wiped follower rejoin under a fresh ID; the leader's `Progress[new_id]` is created with `matched=0` by `AddNode`, so the first heartbeat carries `m.commit=0` — within `RaftLog::commit_to`'s safe range on a fresh follower (`last_index=0`).  Pinned by [`test_handle_heartbeat_on_empty_follower_with_stale_commit_panics`](../../rust/raft/src/raft/storage.rs).  `<NEXUS_DATA_DIR>` wipe MUST rotate `node_id` — reusing the old id against a leader that still remembers `Progress[old_id].matched > 0` trips exactly this panic (heartbeat commit lands above the fresh follower's `last_index=0`).
 - **Seed addresses** — `NEXUS_PEERS` (or `--peers`) lists `"host:port"` addresses of OTHER nodes.  Seeds are RPC targets: JoinZone, DiscoverZones and member-address self-registration dial them.  Peer `node_id` is opaque, random per boot, and never carried in a seed.  Seeds persist at node-bound `identity.json` (Windows `%LOCALAPPDATA%\Nexus\identity.json`, macOS `~/Library/Application Support/Nexus/identity.json`, Linux `$XDG_DATA_HOME/nexus/identity.json`) so a cache-cleaner removing `<NEXUS_DATA_DIR>` does not force the operator to re-specify `--peers` on next boot.  Boot merges CLI/env peers with identity's persisted `peers[]` and rewrites identity monotonically when the CLI set widens.  Self joins the cluster through `create_zone(self)` (founder) or `AddNode(self)` on the leader (joiner).  A self-entry in the merged list is excluded with a warning.  `ConfState` lives in raft storage and is mutated only by `ConfChange` (AddNode / RemoveNode) driven by JoinZone.
