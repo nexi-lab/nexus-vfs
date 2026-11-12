@@ -1360,3 +1360,121 @@ async fn rotation_keeps_existing_connections_and_expiry_refuses_them_until_a_val
         b"original-bytes"
     );
 }
+
+#[tokio::test]
+async fn rotation_preserves_the_signed_replica_identity() {
+    use lib::transport_primitives::{create_peer_channel, ClientConfig, TlsConfig};
+    use nexus_raft::transport::generate_user_replica_cert;
+
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let credential_dir = root.path().join("server");
+    bundle(&credential_dir, "runtime-alice", "alice", &ca, &cert, &key);
+    let (client_cert, client_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let client = bundle(
+        &root.path().join("client"),
+        "session-alice",
+        "alice",
+        &ca,
+        &client_cert,
+        &client_key,
+    );
+    let config = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem: client_cert,
+            key_pem: client_key,
+        }),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let port = free_port();
+    let endpoint = format!("https://127.0.0.1:{port}");
+    let mut daemon = start(&root.path().join("data"), &credential_dir, "alice", port);
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut retained = Vfs::connect_as_agent(port, &client, BUDGET).await;
+    retained
+        .write_file("/identity.txt", b"same-replica", "")
+        .await
+        .unwrap();
+    let channel = create_peer_channel(&endpoint, &config, 31.try_into().unwrap())
+        .await
+        .unwrap();
+    drop(channel);
+
+    let (wrong, wrong_key) =
+        generate_user_replica_cert("runtime-alice", "alice", 32, 300, &ca, &ca_key).unwrap();
+    bundle(
+        &credential_dir,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &wrong,
+        &wrong_key,
+    );
+    tokio::time::timeout(BUDGET, async {
+        while !daemon.log_contains("runtime credential replacement refused")
+            && !daemon.log_contains("runtime server identity rotated")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime must process the projected replacement");
+    let channel = create_peer_channel(&endpoint, &config, 31.try_into().unwrap())
+        .await
+        .expect("replacement must preserve the original signed replica on the wire");
+    let reply = NexusVfsServiceClient::new(channel)
+        .read(ReadRequest {
+            path: "/identity.txt".into(),
+            timeout_ms: 5000,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reply.is_error);
+    assert_eq!(reply.content, b"same-replica");
+    assert!(daemon.log_contains("runtime credential replacement refused"));
+    assert!(!daemon.log_contains("runtime server identity rotated"));
+
+    let (renewed, renewed_key) =
+        generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key).unwrap();
+    bundle(
+        &credential_dir,
+        "runtime-alice",
+        "alice",
+        &ca,
+        &renewed,
+        &renewed_key,
+    );
+    daemon
+        .wait_for_log("runtime server identity rotated", BUDGET)
+        .await
+        .unwrap();
+    let channel = create_peer_channel(&endpoint, &config, 31.try_into().unwrap())
+        .await
+        .unwrap();
+    let reply = NexusVfsServiceClient::new(channel)
+        .read(ReadRequest {
+            path: "/identity.txt".into(),
+            timeout_ms: 5000,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reply.is_error);
+    assert_eq!(reply.content, b"same-replica");
+    assert_eq!(
+        retained.read_file("/identity.txt", "").await.unwrap(),
+        b"same-replica"
+    );
+}
