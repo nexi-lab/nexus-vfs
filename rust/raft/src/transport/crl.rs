@@ -155,11 +155,18 @@ fn parse_revoked_entry(line: &str) -> Result<RevokedEntry, String> {
 /// Authoritative revocation read for issuance: unreadable or malformed state
 /// refuses renewal. A missing file means no revocations have been recorded.
 pub fn read_revoked_serials_checked(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    Ok(read_revoked_entries_checked(path)?
+        .into_iter()
+        .map(|entry| entry.serial)
+        .collect())
+}
+
+fn read_revoked_entries_checked(path: &Path) -> Result<Vec<RevokedEntry>, String> {
     revoked_file_contents(path)?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| parse_revoked_entry(line).map(|entry| entry.serial))
+        .map(parse_revoked_entry)
         .collect()
 }
 
@@ -170,12 +177,26 @@ pub fn with_unrevoked_serial<T>(
     serial: &[u8],
     issue: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    with_unrevoked_serials(path, &[serial], issue)
+}
+
+/// Check every signing principal in one current revocation snapshot and hold
+/// the existing writer lock through issuance. Controller and predecessor
+/// checks therefore share the same boundary as revocation and pruning.
+pub fn with_unrevoked_serials<T>(
+    path: &Path,
+    serials: &[&[u8]],
+    issue: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if serials.is_empty() || serials.iter().any(|serial| serial.is_empty()) {
+        return Err("issuance requires nonempty certificate serials".into());
+    }
     let _guard = SERIALS_WRITE_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if read_revoked_serials_checked(path)?
         .iter()
-        .any(|entry| entry == serial)
+        .any(|entry| serials.contains(&entry.as_slice()))
     {
         return Err("session renewal refused for a revoked certificate".into());
     }
@@ -252,7 +273,7 @@ pub fn add_revoked_serial_with_expiry(
     // the guard either way rather than failing a revocation on someone else's
     // panic.
     let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut entries = read_revoked_entries(path);
+    let mut entries = read_revoked_entries_checked(path)?;
     if let Some(existing) = entries.iter_mut().find(|e| e.serial == serial) {
         // Re-revoking is a no-op except that a caller who knows the expiry
         // teaches it to an entry that did not have one.
@@ -300,7 +321,7 @@ pub fn prune_expired_serials(
     skew_margin_secs: i64,
 ) -> Result<usize, String> {
     let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let entries = read_revoked_entries(path);
+    let entries = read_revoked_entries_checked(path)?;
     let before = entries.len();
     let kept: Vec<RevokedEntry> = entries
         .into_iter()
@@ -315,6 +336,9 @@ pub fn prune_expired_serials(
     }
     Ok(dropped)
 }
+
+#[cfg(test)]
+mod issuance_tests;
 
 #[cfg(test)]
 mod tests {
