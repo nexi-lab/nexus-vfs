@@ -40,7 +40,9 @@
 //! ```
 
 mod node_authority;
-pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
+pub use node_authority::{
+    current_local_node_certificate, local_node_identity, LocalNodeCertificate,
+};
 
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;
@@ -48,11 +50,11 @@ pub(crate) mod certgen;
 pub(crate) use certgen::verified_csr_key;
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
-    generate_node_cert, generate_session_agent_cert, generate_user_replica_cert,
-    generate_user_runtime_cert, generate_zone_ca, join_token_hash_path, node_identity_uri,
-    parse_node_identity_uri, prepare_agent_csr_intent, prepare_replica_csr_intent,
-    read_join_token_hashes, sign_agent_csr, sign_committed_agent_intent,
-    sign_committed_replica_intent, sign_node_csr, BootstrapTls,
+    generate_node_cert, generate_node_key_request, generate_session_agent_cert,
+    generate_user_replica_cert, generate_user_runtime_cert, generate_zone_ca, join_token_hash_path,
+    node_identity_uri, parse_node_identity_uri, persist_node_identity, prepare_agent_csr_intent,
+    prepare_replica_csr_intent, read_join_token_hashes, sign_agent_csr,
+    sign_committed_agent_intent, sign_committed_replica_intent, sign_node_csr, BootstrapTls,
 };
 /// Re-exported so a caller that already depends on this crate can name a
 /// session subject without taking a direct dependency on `lib` — the cluster
@@ -100,10 +102,11 @@ pub use client::{
     call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
     call_list_foreign_cas_rpc, call_list_keys_rpc, call_list_session_minters_rpc,
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
-    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_session_agent_rpc,
-    call_revoke_agent_cert_rpc, call_revoke_key_rpc, call_unregister_foreign_ca_rpc,
-    join_zone_round, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound,
-    JoinZoneResult, MintAgentResult, MintKeyArgs, MintSessionAgentResult, ProposeResult,
+    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_local_node_certificate_rpc,
+    call_renew_node_certificate_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
+    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, join_zone_round, ClientConfig,
+    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound, JoinZoneResult,
+    MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult, ProposeResult,
     QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]

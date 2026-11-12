@@ -100,8 +100,7 @@ async fn empty_durable_reader_reply_cannot_qualify_transport_on_the_same_node_ch
     let address = common::node_bind_addr();
     let incoming = lib::transport_primitives::federated_mtls_incoming(
         address.parse().unwrap(),
-        &node_tls(&ca, &key, 7),
-        None,
+        common::cluster_server_identity(&node_tls(&ca, &key, 7)),
     )
     .await
     .unwrap();
@@ -167,8 +166,7 @@ async fn all_member_preparation_refuses_an_old_member_even_when_the_quorum_is_cu
     let address = common::node_bind_addr();
     let incoming = lib::transport_primitives::federated_mtls_incoming(
         address.parse().unwrap(),
-        &node_tls(&ca, &key, 7),
-        None,
+        common::cluster_server_identity(&node_tls(&ca, &key, 7)),
     )
     .await
     .unwrap();

@@ -8,9 +8,9 @@ use anyhow::{Context, Result};
 use lib::transport_primitives::{create_channel, first_certificate_der, ClientConfig, TlsConfig};
 use nexus_raft::{
     agent_csr_client::{AgentCsrBinding, PendingAgentCsr},
-    agent_minter::agent_csr_request_digest,
+    ca_issuer::agent_csr_request_digest,
     transport::{
-        current_local_node_certificate,
+        local_node_identity,
         proto::{
             zone_api_service_client::ZoneApiServiceClient, AgentCsrCapabilitiesRequest,
             AgentCsrState,
@@ -126,10 +126,7 @@ fn node_tls(common: &CommonArgs, endpoint: &str) -> Result<TlsConfig> {
             .context("read local Node certificate")?,
         key_pem: std::fs::read(directory.join("node-key.pem")).context("read local Node key")?,
     };
-    let ca = first_certificate_der(&tls.ca_pem, "local issuer CA").map_err(anyhow::Error::msg)?;
-    let leaf = first_certificate_der(&tls.cert_pem, "local Node certificate")
-        .map_err(anyhow::Error::msg)?;
-    current_local_node_certificate(&leaf, &ca).map_err(anyhow::Error::msg)?;
+    local_node_identity(&tls.cert_pem, &tls.ca_pem).map_err(anyhow::Error::msg)?;
     Ok(tls)
 }
 

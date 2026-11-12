@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
-use lib::transport_primitives::{cert_fingerprint, create_secret, first_certificate_der};
+use lib::transport_primitives::create_secret;
+use nexus_raft::transport::{MintAgentChannel, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -61,7 +62,7 @@ struct Grant {
     endpoint: String,
     node_data_directory: PathBuf,
     state_directory: PathBuf,
-    owner_certificate_sha256: String,
+    owner_node_identity: String,
     ca_certificate_sha256: String,
     workspace_roots: Vec<PathBuf>,
 }
@@ -90,8 +91,8 @@ pub(super) fn initialize(
         endpoint: endpoint.into(),
         node_data_directory: data_directory.canonicalize()?,
         state_directory: parent.join("node-enrollment-operations"),
-        owner_certificate_sha256: fingerprint(&tls.cert_pem)?,
-        ca_certificate_sha256: fingerprint(&tls.ca_pem)?,
+        owner_node_identity: node_identity(&tls)?,
+        ca_certificate_sha256: super::certificate_sha256_hex(&tls.ca_pem)?,
         workspace_roots,
     };
     // The same validator used at issuance checks URI/TLS/root inputs before a
@@ -109,7 +110,7 @@ pub(super) fn initialize(
         "{}",
         serde_json::json!({"prepared":true,"grantFile":file,"issued":false,
         "endpoint":grant.endpoint,"workspaceRoots":grant.workspace_roots,
-        "ownerCertificateSha256":grant.owner_certificate_sha256})
+        "ownerNodeIdentity":grant.owner_node_identity})
     );
     Ok(())
 }
@@ -130,7 +131,7 @@ struct Attempt {
     claim: Claim,
     canonical_workspace: PathBuf,
     endpoint: String,
-    owner_certificate_sha256: String,
+    owner_node_identity: String,
     ca_certificate_sha256: String,
 }
 
@@ -155,13 +156,13 @@ fn uuid(value: &str) -> bool {
         })
 }
 
+/// The Node a TLS bundle names, through the same check boot applies. A grant
+/// binds this durable identity; the leaf naming it is renewed routinely.
 #[inline]
-fn fingerprint(pem: &[u8]) -> Result<String> {
-    let der = first_certificate_der(pem, "operator identity").map_err(anyhow::Error::msg)?;
-    Ok(cert_fingerprint(&der)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+fn node_identity(tls: &TlsConfig) -> Result<String> {
+    nexus_raft::transport::local_node_identity(&tls.cert_pem, &tls.ca_pem)
+        .map(|node| node.identity_uri())
+        .map_err(|error| anyhow::anyhow!("operator Node certificate: {error}"))
 }
 
 #[inline]
@@ -179,10 +180,7 @@ fn read_json<T: serde::de::DeserializeOwned>(file: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&raw)?)
 }
 
-fn prepare(
-    grant_file: &Path,
-    claim: Claim,
-) -> Result<(Grant, Attempt, nexus_raft::transport::TlsConfig)> {
+fn prepare(grant_file: &Path, claim: Claim) -> Result<(Grant, Attempt, TlsConfig)> {
     ensure!(
         grant_file.is_absolute(),
         "an absolute operator grant is required"
@@ -230,14 +228,14 @@ fn prepare(
         claim,
         canonical_workspace: canonical,
         endpoint: grant.endpoint.clone(),
-        owner_certificate_sha256: grant.owner_certificate_sha256.clone(),
+        owner_node_identity: grant.owner_node_identity.clone(),
         ca_certificate_sha256: grant.ca_certificate_sha256.clone(),
     };
     Ok((grant, attempt, tls))
 }
 
 #[inline]
-fn validate_target(grant: &Grant) -> Result<nexus_raft::transport::TlsConfig> {
+fn validate_target(grant: &Grant) -> Result<TlsConfig> {
     // There is exactly one destination; no peer selection or offline fallback.
     let endpoint = tonic::transport::Endpoint::from_shared(grant.endpoint.clone())?;
     ensure!(
@@ -249,57 +247,104 @@ fn validate_target(grant: &Grant) -> Result<nexus_raft::transport::TlsConfig> {
         "grant requires one exact HTTPS endpoint without credentials/query/path"
     );
     let tls = super::load_node_tls(&grant.node_data_directory)?;
+    // The pinned CA first: the identity check then verifies the current leaf
+    // chains to exactly that cluster before reading which Node it names.
     ensure!(
-        fingerprint(&tls.cert_pem)? == grant.owner_certificate_sha256,
-        "operator Node identity changed"
-    );
-    ensure!(
-        fingerprint(&tls.ca_pem)? == grant.ca_certificate_sha256,
+        super::certificate_sha256_hex(&tls.ca_pem)? == grant.ca_certificate_sha256,
         "operator cluster CA changed"
     );
+    ensure!(
+        node_identity(&tls)? == grant.owner_node_identity,
+        "operator Node identity changed"
+    );
     Ok(tls)
+}
+
+/// Why an invocation returned no receipt.
+enum Failure {
+    /// Nothing was reserved or sent: the same operation may run again.
+    NotSubmitted(anyhow::Error),
+    /// The reserved request may have committed: it is never resubmitted.
+    Unknown(anyhow::Error),
 }
 
 async fn issue(
     grant: Grant,
     attempt: Attempt,
-    tls: nexus_raft::transport::TlsConfig,
-) -> Result<Receipt> {
-    std::fs::create_dir_all(&grant.state_directory)?;
+    tls: TlsConfig,
+) -> std::result::Result<Receipt, Failure> {
     let actor = &attempt.claim.actor;
     let attempt_file = grant.state_directory.join(format!("{actor}.attempt.json"));
     let result_file = grant.state_directory.join(format!("{actor}.result.json"));
-    let bytes = serde_json::to_vec(&attempt)?;
-    match create_secret(&attempt_file, &bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let previous: Attempt = read_json(&attempt_file)?;
-            ensure!(
-                previous == attempt,
-                "actor is reserved by another operation or target; operator recovery required"
-            );
-            let receipt: Receipt = read_json(&result_file).context(
-                "original issuance may have committed; no RPC retry; operator recovery required",
-            )?;
-            ensure!(
-                receipt.version == 1
-                    && receipt.actor == *actor
-                    && receipt.operation_id == attempt.claim.operation_id
-                    && receipt.credential_directory
-                        == grant.node_data_directory.join("agents").join(actor),
-                "original receipt binding differs"
-            );
-            let loaded =
-                nexus_raft::transport::AgentCredential::load(&receipt.credential_directory)
-                    .map_err(anyhow::Error::msg)?;
-            ensure!(loaded.agent == *actor, "persisted credential actor changed");
-            return Ok(receipt);
-        }
-        Err(error) => return Err(error.into()),
+    let reservation =
+        serde_json::to_vec(&attempt).map_err(|error| Failure::NotSubmitted(error.into()))?;
+    std::fs::create_dir_all(&grant.state_directory)
+        .map_err(|error| Failure::NotSubmitted(error.into()))?;
+    let replay =
+        || recover(&grant, &attempt, &attempt_file, &result_file).map_err(Failure::Unknown);
+    // A reserved operation only replays its local receipt; it opens no channel.
+    if !matches!(
+        std::fs::symlink_metadata(&attempt_file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return replay();
     }
-    // Persisted BEFORE opening a channel. Every error from here is Unknown,
+    // Opening the channel sends no request, so a failure here leaves the
+    // operation unreserved and the same operation may run again later.
+    let channel = MintAgentChannel::connect(&grant.endpoint, Some(tls), 10)
+        .await
+        .map_err(|error| Failure::NotSubmitted(error.into()))?;
+    match create_secret(&attempt_file, &reservation) {
+        Ok(()) => {}
+        // Another invocation reserved this actor while this one connected.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return replay(),
+        Err(error) => return Err(Failure::Unknown(error.into())),
+    }
+    // Persisted BEFORE the request leaves. Every error from here is Unknown,
     // including a crash, a refusal whose server semantics may differ, and loss
     // of the public reply after the credential was written. Never resubmit.
+    submit(&grant, &attempt, channel, &result_file)
+        .await
+        .map_err(Failure::Unknown)
+}
+
+/// Replay a reserved operation from its local receipt; never sends a request.
+fn recover(
+    grant: &Grant,
+    attempt: &Attempt,
+    attempt_file: &Path,
+    result_file: &Path,
+) -> Result<Receipt> {
+    let actor = &attempt.claim.actor;
+    let previous: Attempt = read_json(attempt_file)?;
+    ensure!(
+        previous == *attempt,
+        "actor is reserved by another operation or target; operator recovery required"
+    );
+    let receipt: Receipt = read_json(result_file).context(
+        "original issuance may have committed; no RPC retry; operator recovery required",
+    )?;
+    ensure!(
+        receipt.version == 1
+            && receipt.actor == *actor
+            && receipt.operation_id == attempt.claim.operation_id
+            && receipt.credential_directory == grant.node_data_directory.join("agents").join(actor),
+        "original receipt binding differs"
+    );
+    let loaded = nexus_raft::transport::AgentCredential::load(&receipt.credential_directory)
+        .map_err(anyhow::Error::msg)?;
+    ensure!(loaded.agent == *actor, "persisted credential actor changed");
+    Ok(receipt)
+}
+
+/// Send the reserved request exactly once and persist its outcome.
+async fn submit(
+    grant: &Grant,
+    attempt: &Attempt,
+    channel: MintAgentChannel,
+    result_file: &Path,
+) -> Result<Receipt> {
+    let actor = &attempt.claim.actor;
     ensure!(
         !grant
             .node_data_directory
@@ -308,22 +353,14 @@ async fn issue(
             .exists(),
         "credential path already exists; operator recovery required"
     );
-    let response = nexus_raft::transport::call_mint_agent_rpc(
-        &grant.endpoint,
-        actor,
-        actor,
-        false,
-        Some(tls),
-        10,
-    )
-    .await?;
+    let response = channel.mint(actor, actor, false).await?;
     ensure!(
         response.success,
         "MintAgent returned a refusal: {}",
         response.error.as_deref().unwrap_or("unspecified")
     );
     ensure!(
-        fingerprint(&response.ca_pem)? == grant.ca_certificate_sha256,
+        super::certificate_sha256_hex(&response.ca_pem)? == grant.ca_certificate_sha256,
         "MintAgent returned another CA"
     );
     ensure!(
@@ -340,10 +377,10 @@ async fn issue(
     let receipt = Receipt {
         version: 1,
         actor: actor.clone(),
-        operation_id: attempt.claim.operation_id,
+        operation_id: attempt.claim.operation_id.clone(),
         credential_directory: directory,
     };
-    create_secret(&result_file, &serde_json::to_vec(&receipt)?)?;
+    create_secret(result_file, &serde_json::to_vec(&receipt)?)?;
     Ok(receipt)
 }
 
@@ -357,13 +394,105 @@ pub(super) async fn run(grant: &Path) -> Result<()> {
         }
         prepare(grant, serde_json::from_slice(&input)?)
     })();
-    let result = match prepared {
-        Err(error) => serde_json::json!({"outcome":"not_submitted","detail":error.to_string()}),
-        Ok((grant, attempt, tls)) => match issue(grant, attempt, tls).await {
-            Ok(receipt) => serde_json::to_value(receipt)?,
-            Err(error) => serde_json::json!({"outcome":"unknown","detail":error.to_string()}),
-        },
+    let outcome = match prepared {
+        Ok((grant, attempt, tls)) => issue(grant, attempt, tls).await,
+        Err(error) => Err(Failure::NotSubmitted(error)),
+    };
+    let result = match outcome {
+        Ok(receipt) => serde_json::to_value(receipt)?,
+        Err(Failure::NotSubmitted(error)) => {
+            serde_json::json!({"outcome":"not_submitted","detail":error.to_string()})
+        }
+        Err(Failure::Unknown(error)) => {
+            serde_json::json!({"outcome":"unknown","detail":error.to_string()})
+        }
     };
     println!("{result}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_raft::transport::{generate_node_cert, generate_zone_ca};
+
+    /// Write the TLS bundle a Node data directory presents for `node_id`. The
+    /// display CN names the host when given (founder bootstrap) and the Node
+    /// ID otherwise (enrollment); the identity URI SAN is the same either way.
+    fn certify(data: &Path, node_id: u64, host: Option<&str>, ca: &[u8], ca_key: &[u8]) {
+        let (cert, key) = generate_node_cert(node_id, "root", ca, ca_key, &[], host).unwrap();
+        let tls = data.join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        std::fs::write(tls.join("ca.pem"), ca).unwrap();
+        std::fs::write(tls.join("node.pem"), cert).unwrap();
+        std::fs::write(tls.join("node-key.pem"), key).unwrap();
+    }
+
+    /// An initialized grant for Node 7 plus its granted workspace.
+    fn grant_for_node(root: &Path, endpoint: &str) -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
+        let (data, workspace) = (root.join("data"), root.join("project"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (ca, ca_key) = generate_zone_ca("root").unwrap();
+        certify(&data, 7, Some("DESKTOP-K2PHFNR"), &ca, &ca_key);
+        let file = root.join("private").join("grant.json");
+        initialize(&file, &data, endpoint, vec![workspace.clone()]).unwrap();
+        (file, workspace, ca, ca_key)
+    }
+
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        (directory, root)
+    }
+
+    #[test]
+    fn a_grant_binds_the_node_and_cluster_rather_than_one_certificate() {
+        let (_directory, root) = scratch();
+        let (file, _, ca, ca_key) = grant_for_node(&root, "https://127.0.0.1:2");
+        let grant: Grant = read_json(&file).unwrap();
+        assert_eq!(grant.owner_node_identity, "nexus://zone/root/node/7");
+        validate_target(&grant).unwrap();
+
+        // `enroll` renews the hostname-CN founder leaf as a numeric-CN leaf
+        // with a new key and serial for the same Node.
+        certify(&grant.node_data_directory, 7, None, &ca, &ca_key);
+        validate_target(&grant).unwrap();
+
+        certify(&grant.node_data_directory, 8, None, &ca, &ca_key);
+        let error = validate_target(&grant).unwrap_err().to_string();
+        assert_eq!(error, "operator Node identity changed");
+
+        let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
+        certify(&grant.node_data_directory, 7, None, &foreign, &foreign_key);
+        let error = validate_target(&grant).unwrap_err().to_string();
+        assert_eq!(error, "operator cluster CA changed");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_issuer_is_not_submitted_and_reserves_nothing() {
+        let (_directory, root) = scratch();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("https://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (file, workspace, _, _) = grant_for_node(&root, &endpoint);
+        let claim = Claim {
+            version: 1,
+            actor: format!("codex-{}", "a".repeat(32)),
+            operation_id: "00000000-0000-4000-8000-000000000001".into(),
+            thread_id: "10000000-0000-4000-8000-000000000001".into(),
+            workspace,
+        };
+        // The same operation stays runnable: neither attempt leaves a record.
+        for _ in 0..2 {
+            let (grant, attempt, tls) = prepare(&file, claim.clone()).unwrap();
+            let reservation = grant
+                .state_directory
+                .join(format!("{}.attempt.json", claim.actor));
+            let Err(Failure::NotSubmitted(error)) = issue(grant, attempt, tls).await else {
+                panic!("a refused connection must be reported as not submitted");
+            };
+            assert!(error.to_string().contains("connect"), "{error}");
+            assert!(!reservation.exists(), "nothing was reserved");
+        }
+    }
 }

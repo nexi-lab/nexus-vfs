@@ -248,7 +248,10 @@ async fn tls_bootstrap_loop(
     tls_dir: &std::path::Path,
     password: &str,
 ) {
-    use nexus_raft::transport::call_join_cluster;
+    use nexus_raft::transport::{call_join_cluster, generate_node_key_request};
+
+    // The witness's key never leaves it: the leader certifies this CSR.
+    let (csr_pem, key_pem) = generate_node_key_request().expect("generate witness key");
 
     // Wait a bit for leader election
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -274,6 +277,7 @@ async fn tls_bootstrap_loop(
                 node_address,
                 contracts::ROOT_ZONE_ID,
                 password,
+                &csr_pem,
                 10, // timeout
             )
             .await
@@ -282,14 +286,12 @@ async fn tls_bootstrap_loop(
                     // Save certs to disk
                     std::fs::create_dir_all(tls_dir).expect("create tls dir");
                     std::fs::write(tls_dir.join("ca.pem"), &result.ca_pem).expect("write CA");
-                    std::fs::write(tls_dir.join("node.pem"), &result.node_cert_pem)
-                        .expect("write cert");
-
-                    lib::transport_primitives::write_secret(
-                        &tls_dir.join("node-key.pem"),
-                        &result.node_key_pem,
+                    nexus_raft::transport::persist_node_identity(
+                        tls_dir,
+                        &result.node_cert_pem,
+                        &key_pem,
                     )
-                    .expect("write node key (owner-only)");
+                    .expect("write node certificate and owner-only key");
 
                     tracing::info!(
                         "TLS bootstrap: received signed cert from peer {} — restart to enable mTLS",

@@ -417,7 +417,7 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
     );
     let proof =
         lib::transport_primitives::authorship::sign(&message, &minted.agent_key_pem).unwrap();
-    let renewal = || nexus_raft::agent_minter::SessionRenewal {
+    let renewal = || nexus_raft::ca_issuer::SessionRenewal {
         cert_pem: &minted.agent_cert_pem,
         validity_secs: 300,
         issued_at_unix_ms: issued_at,
@@ -448,7 +448,7 @@ async fn a_front_door_agent_mints_a_session_identity_for_a_person_and_can_revoke
     let original_process: serde_json::Value = serde_json::from_str(&original_process).unwrap();
     assert_eq!(original_process["session_id"], session_id);
     assert_eq!(original_process["owner_id"], "alice");
-    let bad_proof = nexus_raft::agent_minter::SessionRenewal {
+    let bad_proof = nexus_raft::ca_issuer::SessionRenewal {
         cert_pem: &minted.agent_cert_pem,
         validity_secs: 300,
         issued_at_unix_ms: issued_at,
