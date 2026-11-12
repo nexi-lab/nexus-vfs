@@ -25,6 +25,8 @@ on:
       - 'rust/transport/src/federation.rs'
       - 'rust/transport/src/federation/**'
       - 'rust/transport/src/test_peer.rs'
+      - 'rust/transport/src/runtime_scope.rs'
+      - 'rust/transport/tests/user_runtime_scope.rs'
       - 'rust/profiles/cluster/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
@@ -91,8 +93,11 @@ jobs:
       - name: Content peer TLS configuration and connection rotation
         run: |
           cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls_server::tests
           cargo test --locked -p transport --lib peer_blob::
           cargo test --locked -p transport --lib federation::
+      - name: Retained user connection observes credential withdrawal
+        run: cargo test --locked -p transport --test user_runtime_scope retained_user_connection_obeys_the_shared_credential_source -- --exact
       - name: Forwarded proposal credentials and pending TLS dials
         run: cargo test --locked -p raft@0.1.0 --lib transport::proposal_client_tests -- --test-threads=1
       - name: Shared executor bridge across runtime flavors

@@ -14,6 +14,8 @@ import zipfile
 NATIVE_CASES = [
     ('availability', 'user_runtime', ['--exact', 'required_durable_backend_obeys_build_and_platform_at_startup']),
     ('owner', 'user_runtime', ['--exact', 'durable_cas_mount_reopens_immutable_content_with_the_owner_boundary']),
+    ('expired-runtime', 'user_runtime', ['--exact', 'restart_with_expired_identity_waits_for_renewal_without_losing_owner_data']),
+    ('runtime-rotation', 'user_runtime', ['--exact', 'rotation_keeps_existing_connections_and_expiry_refuses_them_until_a_valid_replacement']),
     ('peer', 'cas_peer_blob', []),
     ('zone-content', 'zone_content_blob', []),
     ('content', 'conditional_content', []),

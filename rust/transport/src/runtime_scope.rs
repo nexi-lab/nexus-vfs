@@ -77,7 +77,7 @@ impl RuntimeDelegation {
 pub struct RuntimeScope {
     user_id: String,
     gateway_nodes: HashSet<u64>,
-    server_identity: Option<std::sync::Arc<lib::transport_primitives::ReloadableServerIdentity>>,
+    server_identity: Option<lib::transport_primitives::SharedTlsConfig>,
 }
 
 impl RuntimeScope {
@@ -97,7 +97,7 @@ impl RuntimeScope {
     #[must_use]
     pub fn with_server_identity(
         mut self,
-        identity: std::sync::Arc<lib::transport_primitives::ReloadableServerIdentity>,
+        identity: lib::transport_primitives::SharedTlsConfig,
     ) -> Self {
         self.server_identity = Some(identity);
         self
@@ -111,11 +111,9 @@ impl RuntimeScope {
         token: &str,
         metadata: &MetadataMap,
     ) -> Result<OperationContext, Status> {
-        if self
-            .server_identity
-            .as_ref()
-            .is_some_and(|identity| !identity.is_live())
-        {
+        if self.server_identity.as_ref().is_some_and(|identity| {
+            identity.read(|current| !matches!(current.config(), Ok(Some(_))))
+        }) {
             return Err(Status::unavailable(
                 "user runtime server credential expired",
             ));
