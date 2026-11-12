@@ -148,13 +148,18 @@ type GuardedRaftService =
 type GuardedApiService =
     super::node_authority::NodeControlService<ZoneApiServiceServer<ZoneApiServiceImpl>>;
 
+pub(crate) struct PreparedRaftListener {
+    policy: super::node_authority::NodeControlPolicy,
+    tls: Option<lib::transport_primitives::SharedTlsListener>,
+}
+
 fn listener_credentials(
     source: lib::transport_primitives::SharedTlsConfig,
     configured: Option<&super::TlsConfig>,
 ) -> Result<lib::transport_primitives::SharedTlsConfig> {
     let snapshot = source.snapshot();
     let current = snapshot
-        .config()
+        .configured_material()
         .map_err(|e| TransportError::Connection(e.into()))?;
     if current != configured {
         return Err(TransportError::Connection(
@@ -165,12 +170,34 @@ fn listener_credentials(
 }
 
 impl RaftGrpcServer {
-    fn guarded_services(&self) -> Result<(GuardedRaftService, GuardedApiService)> {
-        use super::node_authority::{
-            NodeControlPolicy, NodeControlService, AGENT_CREDENTIAL_METHODS,
-        };
-        let policy = NodeControlPolicy::from_shared_tls(self.registry.shared_tls())
+    pub(crate) fn prepare_listener(
+        credentials: lib::transport_primitives::SharedTlsConfig,
+        configured: Option<&super::TlsConfig>,
+        verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    ) -> Result<PreparedRaftListener> {
+        let original = credentials.snapshot();
+        listener_credentials(credentials.clone(), configured)?;
+        let policy = super::node_authority::NodeControlPolicy::from_shared_tls(credentials.clone())
             .map_err(TransportError::Connection)?;
+        let tls = configured
+            .map(|_| {
+                lib::transport_primitives::SharedTlsListener::prepare(credentials.clone(), verifier)
+                    .map_err(TransportError::Connection)
+            })
+            .transpose()?;
+        if !credentials.snapshot().same_installation(&original) {
+            return Err(TransportError::Connection(
+                "listener credentials changed during preparation".into(),
+            ));
+        }
+        Ok(PreparedRaftListener { policy, tls })
+    }
+
+    fn guarded_services(
+        &self,
+        policy: super::node_authority::NodeControlPolicy,
+    ) -> (GuardedRaftService, GuardedApiService) {
+        use super::node_authority::{NodeControlService, AGENT_CREDENTIAL_METHODS};
         let raft = ZoneTransportServiceImpl {
             registry: self.registry.clone(),
         };
@@ -184,7 +211,7 @@ impl RaftGrpcServer {
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
             local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
-        Ok((
+        (
             NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
                 .with_owner_replica_data(),
             NodeControlService::new(
@@ -193,7 +220,7 @@ impl RaftGrpcServer {
                 AGENT_CREDENTIAL_METHODS,
             )
             .with_owner_replica_data(),
-        ))
+        )
     }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
         Self {
@@ -311,54 +338,71 @@ impl RaftGrpcServer {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        let addr = self.config.bind_address;
-        let prepared = (|| {
-            let credentials =
-                listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
-            let services = self.guarded_services()?;
-            let incoming = self.config.tls.is_some().then(|| {
-                lib::transport_primitives::shared_mtls_incoming(
-                    addr,
-                    credentials,
-                    self.foreign_ca_verifier.clone(),
-                )
-            });
-            Ok::<_, TransportError>((services, incoming))
-        })();
+        let prepared = Self::prepare_listener(
+            self.registry.shared_tls(),
+            self.config.tls.as_ref(),
+            self.foreign_ca_verifier.clone(),
+        );
         async move {
-            let ((raft_service, client_service), incoming) = prepared?;
-            tracing::info!(
-                "Starting Raft gRPC server on {} (zones={}, tls={})",
-                addr,
-                self.registry.list_zones().len(),
-                incoming.is_some(),
-            );
-            let mut builder =
-                lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-            let router = if let Some(extra) = self.extra_services {
-                builder
-                    .add_routes(extra)
-                    .add_service(raft_service)
-                    .add_service(client_service)
-            } else {
-                builder
-                    .add_service(raft_service)
-                    .add_service(client_service)
-            };
-            if let Some(incoming) = incoming {
-                let incoming = incoming.await.map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming_shutdown(incoming, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            } else {
-                router
-                    .serve_with_shutdown(addr, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            Ok(())
+            let prepared = prepared?;
+            let listener = tokio::net::TcpListener::bind(self.config.bind_address)
+                .await
+                .map_err(|e| TransportError::Connection(e.to_string()))?;
+            self.serve_listener(prepared, listener, shutdown).await
         }
+    }
+
+    /// Serve a socket and trust policy prepared before opening runtime storage.
+    pub(crate) async fn serve_prepared(
+        self,
+        prepared: PreparedRaftListener,
+        listener: std::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| TransportError::Connection(e.to_string()))?;
+        self.serve_listener(prepared, listener, shutdown).await
+    }
+
+    async fn serve_listener(
+        self,
+        prepared: PreparedRaftListener,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let (raft_service, client_service) = self.guarded_services(prepared.policy);
+        tracing::info!(
+            "Starting Raft gRPC server on {} (zones={}, tls={})",
+            self.config.bind_address,
+            self.registry.list_zones().len(),
+            prepared.tls.is_some(),
+        );
+        let mut builder =
+            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
+        let router = if let Some(extra) = self.extra_services {
+            builder
+                .add_routes(extra)
+                .add_service(raft_service)
+                .add_service(client_service)
+        } else {
+            builder
+                .add_service(raft_service)
+                .add_service(client_service)
+        };
+        if let Some(tls) = prepared.tls {
+            router
+                .serve_with_incoming_shutdown(tls.incoming(listener), shutdown)
+                .await
+                .map_err(TransportError::Tonic)?;
+        } else {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await
+                .map_err(TransportError::Tonic)?;
+        }
+        Ok(())
     }
 }
 

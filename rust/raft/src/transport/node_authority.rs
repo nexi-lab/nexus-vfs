@@ -159,10 +159,22 @@ pub fn current_local_node_certificate(
     node_certificate_identity(&leaf)
 }
 
-/// Read the signed peer identity for a local-root replication runtime. This
-/// verifies the current local issuer and profile; TLS proves key possession.
-pub(crate) fn current_local_replication_id(der: &[u8], local_ca_der: &[u8]) -> Result<u64, String> {
-    current_local_peer_certificate(der, local_ca_der).map(AuthenticatedPeer::node_id)
+/// Validate a local-root replica's signed bootstrap identity. An expired leaf
+/// can wait for renewal; request and handshake admission still require validity.
+pub(crate) fn prepared_local_replication_id(
+    der: &[u8],
+    local_ca_der: &[u8],
+) -> Result<u64, String> {
+    let leaf = locally_signed_leaf(der, local_ca_der)?;
+    if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&leaf)? {
+        if leaf.validity().not_before > x509_parser::time::ASN1Time::now()
+            || leaf.validity().not_after <= leaf.validity().not_before
+        {
+            return Err("replica certificate has an invalid bootstrap validity window".into());
+        }
+        return Ok(id);
+    }
+    current_local_node_certificate(der, local_ca_der).map(|node| node.node_id)
 }
 
 fn current_local_peer_certificate(
@@ -190,8 +202,19 @@ fn current_local_leaf<'a>(
     der: &'a [u8],
     local_ca_der: &[u8],
 ) -> Result<X509Certificate<'a>, String> {
+    let leaf = locally_signed_leaf(der, local_ca_der)?;
+    if !leaf.validity().is_valid() {
+        return Err("Node certificate is malformed or outside its validity window".into());
+    }
+    Ok(leaf)
+}
+
+fn locally_signed_leaf<'a>(
+    der: &'a [u8],
+    local_ca_der: &[u8],
+) -> Result<X509Certificate<'a>, String> {
     let (rest, leaf) = X509Certificate::from_der(der).map_err(|_| "invalid Node certificate")?;
-    if !rest.is_empty() || !leaf.validity().is_valid() {
+    if !rest.is_empty() {
         return Err("Node certificate is malformed or outside its validity window".into());
     }
     let (rest, ca) =
@@ -236,7 +259,7 @@ impl NodeControlPolicy {
         source: lib::transport_primitives::SharedTlsConfig,
     ) -> Result<Self, String> {
         let initial = source.snapshot();
-        let tls = initial.config()?;
+        let tls = initial.configured_material()?;
         let mut policy = Self::from_tls(tls)?;
         policy.local_credentials = Some((source, tls.map(|tls| tls.ca_pem.clone())));
         Ok(policy)

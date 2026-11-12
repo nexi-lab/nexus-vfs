@@ -27,6 +27,338 @@ const LINK: &str = "/agents/alice/sessions/sid-a";
 const STREAM: &str = "__wal_stream__/sessions/sid-a/transcript.jsonl/";
 const ROOT_PRIVATE: &str = "/__managed_content_v1__/private-root";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_root_uses_the_owners_shared_credentials_on_retained_connections() {
+    use lib::transport_primitives::{
+        create_peer_channel, ClientConfig, SharedTlsConfig, TlsConfig, TlsPolicy,
+    };
+    use nexus_raft::transport::{generate_node_cert, generate_user_replica_cert, generate_zone_ca};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let material = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: cert,
+        key_pem: key,
+    };
+    let source = SharedTlsConfig::new(Some(material.clone()));
+    let address = common::node_bind_addr();
+    let manager = ZoneManager::with_local_root_shared(
+        "owner-runtime",
+        31,
+        directory.path().to_str().unwrap(),
+        Vec::new(),
+        &address,
+        source.clone(),
+        Some(format!("https://{address}")),
+        None,
+    )
+    .unwrap();
+    found(&manager, "root").await;
+    let root_id = manager.cluster_status("root").node_id;
+
+    let (node_cert, node_key) = generate_node_cert(19, "root", &ca, &ca_key, &[], None).unwrap();
+    let client_config = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca,
+            cert_pem: node_cert,
+            key_pem: node_key,
+        }),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tokio::net::TcpStream::connect(&address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shared local-root listener must bind");
+    let endpoint = format!("https://{address}");
+    let channel = create_peer_channel(&endpoint, &client_config, 31.try_into().unwrap())
+        .await
+        .unwrap();
+    let mut api = ZoneApiServiceClient::new(channel);
+    let query = || GetClusterInfoRequest {
+        zone_id: "root".into(),
+    };
+    assert_eq!(
+        api.get_cluster_info(query())
+            .await
+            .unwrap()
+            .into_inner()
+            .node_id,
+        root_id
+    );
+
+    let original = source.snapshot();
+    source.replace(TlsPolicy::Rejected("replica binding withdrawn"));
+    let refusal = api.get_cluster_info(query()).await.unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::Unavailable);
+    assert_eq!(refusal.message(), "replica binding withdrawn");
+    assert_eq!(manager.node_tls().unwrap_err(), "replica binding withdrawn");
+    assert!(!manager.registry().shared_tls().is_current(&original));
+    assert_eq!(
+        manager.get_zone("root").unwrap().consensus_node().voters(),
+        vec![root_id]
+    );
+
+    source.replace(TlsPolicy::Configured(material));
+    assert!(manager
+        .registry()
+        .shared_tls()
+        .is_current(&source.snapshot()));
+    assert!(!manager.registry().shared_tls().is_current(&original));
+    assert_eq!(
+        api.get_cluster_info(query())
+            .await
+            .unwrap()
+            .into_inner()
+            .node_id,
+        root_id
+    );
+    let fresh = create_peer_channel(&endpoint, &client_config, 31.try_into().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        ZoneApiServiceClient::new(fresh)
+            .get_cluster_info(query())
+            .await
+            .unwrap()
+            .into_inner()
+            .node_id,
+        root_id
+    );
+    tokio::task::spawn_blocking(move || manager.shutdown())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn shared_local_root_refuses_unavailable_or_wrong_identity_before_storage() {
+    use lib::transport_primitives::{SharedTlsConfig, TlsConfig, TlsPolicy};
+    use nexus_raft::transport::{generate_user_replica_cert, generate_zone_ca};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_replica_cert("runtime", "alice", 32, 300, &ca, &ca_key).unwrap();
+    let wrong_identity = SharedTlsConfig::new(Some(TlsConfig {
+        ca_pem: ca,
+        cert_pem: cert,
+        key_pem: key,
+    }));
+    let withdrawn = SharedTlsConfig::default();
+    withdrawn.replace(TlsPolicy::Rejected("replica binding withdrawn"));
+    for (name, source) in [("wrong-identity", wrong_identity), ("withdrawn", withdrawn)] {
+        let data = directory.path().join(name);
+        let result = ZoneManager::with_local_root_shared(
+            "owner-runtime",
+            31,
+            data.to_str().unwrap(),
+            Vec::new(),
+            "127.0.0.1:0",
+            source,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(nexus_raft::raft::RaftError::Config(_))
+        ));
+        assert!(
+            !data.exists(),
+            "{name} opened storage before credential validation"
+        );
+    }
+}
+
+fn dated_replica(
+    material: &lib::transport_primitives::TlsConfig,
+    ca_key: &[u8],
+    future: bool,
+) -> lib::transport_primitives::TlsConfig {
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+    let der =
+        lib::transport_primitives::first_certificate_der(&material.cert_pem, "fixture").unwrap();
+    let (_, certificate) = X509Certificate::from_der(&der).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = certificate
+        .subject_alternative_name()
+        .unwrap()
+        .unwrap()
+        .value
+        .general_names
+        .iter()
+        .map(|name| match name {
+            GeneralName::DNSName(name) => rcgen::SanType::DnsName((*name).try_into().unwrap()),
+            GeneralName::URI(name) => rcgen::SanType::URI((*name).try_into().unwrap()),
+            _ => panic!("unexpected replica fixture SAN"),
+        })
+        .collect();
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    let year = if future { 2100 } else { 2000 };
+    params.not_before = rcgen::date_time_ymd(year, 1, 1);
+    params.not_after = params.not_before + time::Duration::seconds(120);
+    let issuer = rcgen::Issuer::from_ca_cert_pem(
+        std::str::from_utf8(&material.ca_pem).unwrap(),
+        rcgen::KeyPair::from_pem(std::str::from_utf8(ca_key).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let key = rcgen::KeyPair::from_pem(std::str::from_utf8(&material.key_pem).unwrap()).unwrap();
+    lib::transport_primitives::TlsConfig {
+        cert_pem: params.signed_by(&key, &issuer).unwrap().pem().into_bytes(),
+        ..material.clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_replica_boot_keeps_local_data_and_waits_for_shared_renewal() {
+    use lib::transport_primitives::{
+        create_peer_channel, ClientConfig, SharedTlsConfig, TlsConfig, TlsPolicy,
+    };
+    use nexus_raft::transport::{generate_node_cert, generate_user_replica_cert, generate_zone_ca};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) =
+        generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let material = TlsConfig {
+        cert_pem,
+        key_pem,
+        ca_pem: ca.clone(),
+    };
+    let source = SharedTlsConfig::new(Some(dated_replica(&material, &ca_key, false)));
+    let address = common::node_bind_addr();
+    let manager = ZoneManager::with_local_root_shared(
+        "owner-runtime",
+        31,
+        directory.path().to_str().unwrap(),
+        Vec::new(),
+        &address,
+        source.clone(),
+        None,
+        None,
+    )
+    .expect("expired signed replica must prepare while awaiting renewal");
+    found(&manager, "root").await;
+    let root_id = manager.cluster_status("root").node_id;
+    let retained = Arc::clone(&manager);
+    tokio::task::spawn_blocking(move || {
+        store(&retained, "root", "/")
+            .put("/private", metadata("/private", 0, "root", "alice"))
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let (node_cert, node_key) = generate_node_cert(19, "root", &ca, &ca_key, &[], None).unwrap();
+    let config = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca,
+            cert_pem: node_cert,
+            key_pem: node_key,
+        }),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let endpoint = format!("https://{address}");
+    assert!(manager.node_tls().is_err());
+    assert!(
+        create_peer_channel(&endpoint, &config, 31.try_into().unwrap())
+            .await
+            .is_err(),
+        "expired replica must not accept a TLS connection"
+    );
+    source.replace(TlsPolicy::Configured(material));
+    let channel = create_peer_channel(&endpoint, &config, 31.try_into().unwrap())
+        .await
+        .expect("same listener must accept an authorized renewal");
+    let info = ZoneApiServiceClient::new(channel)
+        .get_cluster_info(GetClusterInfoRequest {
+            zone_id: "root".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.node_id, root_id);
+    let retained = Arc::clone(&manager);
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(
+            store(&retained, "root", "/")
+                .get("/private")
+                .unwrap()
+                .unwrap()
+                .owner_id
+                .as_deref(),
+            Some("alice")
+        );
+    })
+    .await
+    .unwrap();
+    tokio::task::spawn_blocking(move || manager.shutdown())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn local_root_prepares_key_validity_and_socket_before_storage() {
+    use lib::transport_primitives::{SharedTlsConfig, TlsConfig};
+    use nexus_raft::transport::{generate_user_replica_cert, generate_zone_ca};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) =
+        generate_user_replica_cert("runtime", "alice", 31, 300, &ca, &ca_key).unwrap();
+    let material = TlsConfig {
+        cert_pem,
+        key_pem,
+        ca_pem: ca,
+    };
+    let mut wrong_key = material.clone();
+    wrong_key.key_pem = rcgen::KeyPair::generate()
+        .unwrap()
+        .serialize_pem()
+        .into_bytes();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap().to_string();
+    for (name, tls, bind) in [
+        ("wrong-key", wrong_key, "127.0.0.1:0"),
+        (
+            "future",
+            dated_replica(&material, &ca_key, true),
+            "127.0.0.1:0",
+        ),
+        ("taken-port", material, address.as_str()),
+    ] {
+        let data = directory.path().join(name);
+        let result = ZoneManager::with_local_root_shared(
+            "owner-runtime",
+            31,
+            data.to_str().unwrap(),
+            Vec::new(),
+            bind,
+            SharedTlsConfig::new(Some(tls)),
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(nexus_raft::raft::RaftError::Config(_))
+        ));
+        assert!(!data.exists(), "{name} opened storage before preparation");
+    }
+}
+
 fn tls_files(
     directory: &std::path::Path,
     ca: &[u8],

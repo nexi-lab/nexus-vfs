@@ -40,7 +40,7 @@
 //! ```
 
 mod node_authority;
-pub(crate) use node_authority::current_local_replication_id;
+pub(crate) use node_authority::prepared_local_replication_id;
 pub use node_authority::{
     current_local_node_certificate, local_node_identity, LocalNodeCertificate,
 };

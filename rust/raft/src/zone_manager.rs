@@ -23,6 +23,7 @@ use crate::transport::{
 use crate::zone_handle::ZoneHandle;
 use lib::rt::block_on_via as bridge_block_on;
 use lib::rt::OwnedRuntime;
+use lib::transport_primitives::SharedTlsConfig;
 
 /// Preserve storage admission failures across eager, lazy and join opens.
 fn zone_open_error(
@@ -256,6 +257,28 @@ pub struct TlsFiles {
     pub join_token_hash: Option<String>,
 }
 
+impl TlsFiles {
+    fn load(&self) -> Result<TlsConfig> {
+        let read = |path: &std::path::Path, kind| {
+            std::fs::read(path).map_err(|error| {
+                RaftError::Config(format!(
+                    "Failed to read TLS {kind} '{}': {error}",
+                    path.display()
+                ))
+            })
+        };
+        Ok(TlsConfig {
+            cert_pem: read(&self.cert_path, "cert")?,
+            key_pem: read(&self.key_path, "key")?,
+            ca_pem: read(&self.ca_path, "CA")?,
+        })
+    }
+}
+
+fn load_tls_source(files: Option<&TlsFiles>) -> Result<SharedTlsConfig> {
+    Ok(SharedTlsConfig::new(files.map(TlsFiles::load).transpose()?))
+}
+
 /// Is this bind failure "somebody else already has the address"?
 ///
 /// Walks the source chain to an `io::Error` and reads its `kind`, rather than matching
@@ -425,7 +448,7 @@ impl ZoneManager {
             base_path,
             peers,
             bind_addr,
-            tls,
+            load_tls_source(tls.as_ref())?,
             self_address,
             extra_grpc_services,
             load_policy,
@@ -454,6 +477,34 @@ impl ZoneManager {
             base_path,
             peers,
             bind_addr,
+            load_tls_source(tls.as_ref())?,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Host a fixed local root and admitted data zones using the credential
+    /// owner's live installation. Listener and Raft clients retain this source.
+    /// The owner validates replacements against the same peer and trust anchor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root_shared(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
             tls,
             self_address,
             extra_grpc_services,
@@ -473,7 +524,7 @@ impl ZoneManager {
             base_path,
             Vec::new(),
             "127.0.0.1:0",
-            None,
+            SharedTlsConfig::default(),
             None,
             None,
             ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
@@ -488,7 +539,7 @@ impl ZoneManager {
         base_path: &str,
         peers: Vec<String>,
         bind_addr: &str,
-        tls: Option<TlsFiles>,
+        tls: SharedTlsConfig,
         self_address: Option<String>,
         extra_grpc_services: Option<tonic::service::Routes>,
         load_policy: ZoneLoadPolicy,
@@ -505,40 +556,26 @@ impl ZoneManager {
                 .try_init();
         });
 
-        let tls_config = if let Some(ref t) = tls {
-            let cert_pem = std::fs::read(&t.cert_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS cert '{}': {}",
-                    t.cert_path.display(),
-                    e
-                ))
-            })?;
-            let key_pem = std::fs::read(&t.key_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS key '{}': {}",
-                    t.key_path.display(),
-                    e
-                ))
-            })?;
-            let ca_pem = std::fs::read(&t.ca_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS CA '{}': {}",
-                    t.ca_path.display(),
-                    e
-                ))
-            })?;
+        let initial = tls.snapshot();
+        let tls_config = match profile {
+            RuntimeProfile::NetworkedLocalRoot => initial.configured_material(),
+            RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => initial.config(),
+        }
+        .map_err(|e| RaftError::Config(e.into()))?
+        .cloned();
+        if let Some(t) = &tls_config {
             let certificate_id = match profile {
                 RuntimeProfile::NetworkedLocalRoot => {
                     let cert_der =
-                        lib::transport_primitives::first_certificate_der(&cert_pem, "peer")
+                        lib::transport_primitives::first_certificate_der(&t.cert_pem, "peer")
                             .map_err(RaftError::Config)?;
                     let ca_der =
-                        lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
+                        lib::transport_primitives::first_certificate_der(&t.ca_pem, "cluster CA")
                             .map_err(RaftError::Config)?;
-                    crate::transport::current_local_replication_id(&cert_der, &ca_der)
+                    crate::transport::prepared_local_replication_id(&cert_der, &ca_der)
                 }
                 RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => {
-                    crate::transport::local_node_identity(&cert_pem, &ca_pem)
+                    crate::transport::local_node_identity(&t.cert_pem, &t.ca_pem)
                         .map(|identity| identity.node_id)
                 }
             }
@@ -548,18 +585,36 @@ impl ZoneManager {
                     "peer certificate identifies {certificate_id}, but the configured Raft Node ID is {node_id}"
                 )));
             }
-            Some(TlsConfig {
-                cert_pem,
-                key_pem,
-                ca_pem,
-            })
-        } else {
-            None
-        };
+        }
 
         let bind_socket: std::net::SocketAddr = bind_addr.parse().map_err(|e| {
             RaftError::Config(format!("Invalid bind address '{}': {}", bind_addr, e))
         })?;
+
+        // Prepare one trust snapshot and reserve the socket before storage opens.
+        // Withdrawal after preparation is enforced by handshake and RPC admission.
+        let foreign_ca_verifier = tls_config
+            .as_ref()
+            .map(|t| lib::transport_primitives::FederatedClientCertVerifier::new(&t.ca_pem))
+            .transpose()
+            .map_err(|e| RaftError::Config(format!("build client-cert verifier: {e}")))?;
+        let prepared_listener = if matches!(profile, RuntimeProfile::IsolatedRoot) {
+            None
+        } else {
+            let prepared = RaftGrpcServer::prepare_listener(
+                tls.clone(),
+                tls_config.as_ref(),
+                foreign_ca_verifier.clone(),
+            )
+            .map_err(|e| RaftError::Config(format!("prepare gRPC listener: {e}")))?;
+            let listener = std::net::TcpListener::bind(bind_socket)
+                .and_then(|listener| {
+                    listener.set_nonblocking(true)?;
+                    Ok(listener)
+                })
+                .map_err(|e| RaftError::Config(format!("bind gRPC listener {bind_addr}: {e}")))?;
+            Some((prepared, listener))
+        };
 
         // This runtime hosts BOTH the tonic gRPC server (accept loop +
         // per-connection HTTP/2 handshakes for raft and VFS) and every
@@ -588,7 +643,7 @@ impl ZoneManager {
 
         let registry = Arc::new(match profile {
             RuntimeProfile::Networked => {
-                ZoneRaftRegistry::with_tls(PathBuf::from(base_path), node_id, tls_config.clone())
+                ZoneRaftRegistry::with_shared_tls(PathBuf::from(base_path), node_id, tls.clone())
             }
             RuntimeProfile::NetworkedLocalRoot => {
                 let root_node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
@@ -597,7 +652,7 @@ impl ZoneManager {
                     PathBuf::from(base_path),
                     node_id,
                     root_node_id,
-                    tls_config.clone(),
+                    tls.clone(),
                 )
             }
             RuntimeProfile::IsolatedRoot => {
@@ -665,19 +720,6 @@ impl ZoneManager {
         let foreign_ca_registrar_slot =
             crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
         let session_mint_admin_slot = crate::session_mint_admin::new_session_mint_admin_slot();
-        // Build the federated client-cert verifier eagerly from the cluster CA
-        // when TLS is on, so the serve path (below) and the cross-org
-        // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
-        // Arc — the observer's `set_foreign_cas` then reaches the live serving
-        // verifier with no restart. Empty roots beyond the cluster CA until then,
-        // so this is byte-equivalent to the old `client_ca_root(cluster_ca)`.
-        let foreign_ca_verifier = match &tls_config {
-            Some(t) => Some(
-                lib::transport_primitives::FederatedClientCertVerifier::new(&t.ca_pem)
-                    .map_err(|e| RaftError::Config(format!("build client-cert verifier: {e}")))?,
-            ),
-            None => None,
-        };
         let local_node_renewer_slot = crate::ca_issuer::new_local_node_renewer_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
@@ -699,15 +741,12 @@ impl ZoneManager {
         // Owned: the failure message below names the address, and the task outlives
         // this borrow.
         let bind_for_error = bind_addr.to_string();
-        if !matches!(profile, RuntimeProfile::IsolatedRoot) {
+        if let Some((prepared, listener)) = prepared_listener {
             let shutdown = async move {
                 let mut rx = shutdown_rx_server;
                 let _ = rx.changed().await;
             };
-            // Prepare trust before the manager exposes its credential owner.
-            // A withdrawal before the first poll then denies handshakes while
-            // preserving the listener for a later authorized replacement.
-            let serving = server.serve_with_shutdown(shutdown);
+            let serving = server.serve_prepared(prepared, listener, shutdown);
             runtime.spawn(async move {
                 if let Err(e) = serving.await {
                     // gRPC bind failure (port in use, IP not assigned to any
