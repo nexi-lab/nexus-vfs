@@ -2607,8 +2607,6 @@ impl WitnessZoneRegistry {
         timeout_secs: u64,
         retry_interval: std::time::Duration,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use super::call_join_zone_rpc;
-
         // A zone this witness already holds resumes from its own raft
         // storage before the JoinZone below re-asserts its voter role: its
         // vote can be what elects the leader that answers, and the resumed
@@ -2617,8 +2615,13 @@ impl WitnessZoneRegistry {
             self.auto_join_zone(zone_id, &tokio::runtime::Handle::current())?;
         }
 
-        let peers = self.peers.clone();
-        let self_address = self.self_address.clone();
+        // Its own entry in NEXUS_PEERS (a hostname-derived id) is never a target.
+        let endpoints: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|peer| peer.id != self.node_id)
+            .map(|peer| peer.endpoint.clone())
+            .collect();
         // Snapshot the TLS config once (owned) — a live read guard must not
         // be held across the `.await` below (RwLockReadGuard is not Send).
         let tls = self.tls.read().unwrap().clone();
@@ -2628,64 +2631,24 @@ impl WitnessZoneRegistry {
                     "witness shut down before zone '{zone_id}' joined"
                 )));
             }
-            for peer in &peers {
-                if peer.id == self.node_id {
-                    continue;
-                }
-                let mut endpoint = peer.endpoint.clone();
-                let mut redirected_once = false;
-                loop {
-                    match call_join_zone_rpc(
-                        &endpoint,
-                        zone_id,
-                        self.node_id,
-                        &self_address,
-                        as_learner,
-                        tls.clone(),
-                        timeout_secs,
-                    )
-                    .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                zone = %zone_id,
-                                endpoint = %endpoint,
-                                witness_id = self.node_id,
-                                "Witness joined zone via leader",
-                            );
-                            return self
-                                .auto_join_zone(zone_id, &tokio::runtime::Handle::current());
-                        }
-                        Ok(result) => {
-                            if let Some(addr) = result.leader_address.as_ref() {
-                                if !redirected_once && !addr.is_empty() && addr != &endpoint {
-                                    tracing::info!(
-                                        from = %endpoint,
-                                        to = %addr,
-                                        "Witness JoinZone redirect to leader",
-                                    );
-                                    endpoint = addr.clone();
-                                    redirected_once = true;
-                                    continue;
-                                }
-                            }
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = ?result.error,
-                                "Witness JoinZone non-success; trying next peer",
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = %e,
-                                "Witness JoinZone RPC error; trying next peer",
-                            );
-                            break;
-                        }
-                    }
-                }
+            if let super::JoinRound::Admitted { endpoint } = super::join_zone_round(
+                endpoints.iter().cloned(),
+                zone_id,
+                self.node_id,
+                &self.self_address,
+                as_learner,
+                tls.clone(),
+                timeout_secs,
+            )
+            .await
+            {
+                tracing::info!(
+                    zone = %zone_id,
+                    endpoint = %endpoint,
+                    witness_id = self.node_id,
+                    "Witness joined zone via leader",
+                );
+                return self.auto_join_zone(zone_id, &tokio::runtime::Handle::current());
             }
             tokio::time::sleep(retry_interval).await;
         }
