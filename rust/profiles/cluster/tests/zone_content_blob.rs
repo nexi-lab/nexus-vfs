@@ -263,7 +263,7 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
                 0,
                 2,
                 &segment_hash,
-                address,
+                &address,
                 segment_bytes.len() as u64,
             )
             .unwrap();
