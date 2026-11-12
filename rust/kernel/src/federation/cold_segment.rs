@@ -23,7 +23,7 @@
 use std::sync::{Arc, Weak};
 
 mod address;
-pub use address::ColdSegmentAddress;
+pub use address::{ColdSegmentAddress, ColdSegmentRead};
 
 use crate::abc::object_store::ObjectStore;
 use crate::core::stream::wal::{ColdSegmentStore, SealPolicy};
@@ -192,7 +192,7 @@ impl Kernel {
                     .fetch_in_zone(
                         origin,
                         zone_id,
-                        &ColdSegmentAddress { stream_path, base }.key(zone_id),
+                        &ColdSegmentAddress { stream_path, base }.read_key(zone_id, content_id)?,
                     )
                     .map_err(|e| {
                         format!("peer fetch cold segment {content_id} from {origin}: {e}")

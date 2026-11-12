@@ -16,10 +16,9 @@ impl Kernel {
     pub fn read_local_zone_content(&self, zone: &str, content: &str) -> Result<Vec<u8>, String> {
         contracts::validate_zone_id_for(contracts::ZoneIdUse::ExistingRef, zone)
             .map_err(|_| UNAVAILABLE)?;
-        let segment = ColdSegmentAddress::parse(zone, content)?;
-        let path = segment
-            .as_ref()
-            .map_or(content, |address| address.stream_path);
+        let segment_read = ColdSegmentAddress::parse_read(zone, content)?;
+        let segment = segment_read.as_ref().map(|read| &read.address);
+        let path = segment.map_or(content, |address| address.stream_path);
         contracts::validate_zone_path(path).map_err(|_| UNAVAILABLE)?;
 
         let mut projections = self.vfs_router.project_zone_path(zone, path);
@@ -46,7 +45,7 @@ impl Kernel {
             let mut local_origin = metadata
                 .as_ref()
                 .and_then(|entry| entry.last_writer_address.clone());
-            let object = if let Some(segment) = &segment {
+            let object = if let Some(segment) = segment {
                 if metadata
                     .as_ref()
                     .is_none_or(|entry| entry.entry_type != DT_STREAM)
@@ -56,7 +55,12 @@ impl Kernel {
                 let entry = store
                     .find_stream_segment(&wal_stream_prefix(path), segment.base)
                     .map_err(|_| UNAVAILABLE)?
-                    .filter(|entry| entry.base == segment.base)
+                    .filter(|entry| {
+                        entry.base == segment.base
+                            && segment_read
+                                .as_ref()
+                                .is_some_and(|read| read.matches_content_id(&entry.content_id))
+                    })
                     .ok_or(UNAVAILABLE)?;
                 local_origin = Some(entry.origin);
                 entry.content_id
