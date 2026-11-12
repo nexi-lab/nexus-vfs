@@ -106,6 +106,17 @@ impl SharedTlsConfig {
         *self.0.write() = replacement;
     }
 
+    /// Publish validated credentials only while their original installation is current.
+    pub fn replace_if_current(&self, expected: &TlsSnapshot, policy: TlsPolicy) -> bool {
+        let replacement = TlsSnapshot(Arc::new(InstalledTls::new(policy)));
+        let mut current = self.0.write();
+        if !current.same_installation(expected) || current.config().is_err() {
+            return false;
+        }
+        *current = replacement;
+        true
+    }
+
     pub fn snapshot(&self) -> TlsSnapshot {
         self.read(Clone::clone)
     }
@@ -162,6 +173,21 @@ mod tests {
         let second = SharedTlsConfig::default();
         assert!(!second.is_current(&first.snapshot()));
         assert_eq!(first.with_current(&first.snapshot(), || 7), Some(7));
+    }
+
+    #[test]
+    fn conditional_replacement_preserves_intervening_installations() {
+        let source = SharedTlsConfig::default();
+        let original = source.snapshot();
+        source.replace(TlsPolicy::Plaintext);
+        let reinstalled = source.snapshot();
+        assert!(!source.replace_if_current(&original, TlsPolicy::Rejected("stale")));
+        assert!(source.is_current(&reinstalled));
+        assert!(source.replace_if_current(&reinstalled, TlsPolicy::Rejected("revoked")));
+        let rejected = source.snapshot();
+        assert!(!source.replace_if_current(&reinstalled, TlsPolicy::Plaintext));
+        assert!(!source.replace_if_current(&rejected, TlsPolicy::Plaintext));
+        assert_eq!(source.snapshot().config(), Err("revoked"));
     }
 
     #[test]

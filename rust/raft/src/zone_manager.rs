@@ -835,7 +835,16 @@ impl ZoneManager {
     /// registered [`NodeIdentityHolder`]. The bundle must name this Node and
     /// chain to the cluster CA it already uses, whose verifier is unchanged.
     pub fn install_node_identity(&self, tls: TlsConfig) -> std::result::Result<(), String> {
-        self.check_node_identity(&tls)?;
+        let original = self.registry.shared_tls().snapshot();
+        self.install_node_identity_from(&original, tls)
+    }
+
+    fn install_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: TlsConfig,
+    ) -> std::result::Result<(), String> {
+        self.check_node_identity_from(original, &tls)?;
         let verifier = self
             .foreign_ca_verifier
             .as_ref()
@@ -846,7 +855,12 @@ impl ZoneManager {
             &tls.cert_pem,
             &tls.key_pem,
         )?;
-        self.registry.install_tls(tls.clone());
+        if !self.registry.shared_tls().replace_if_current(
+            original,
+            lib::transport_primitives::TlsPolicy::Configured(tls.clone()),
+        ) {
+            return Err("Node credential installation changed during renewal validation".into());
+        }
         for holder in self.node_identity_holders.lock().iter() {
             holder(&tls);
         }
@@ -860,9 +874,16 @@ impl ZoneManager {
     /// Whether `tls` may replace this Node's identity: a current leaf naming
     /// this Node, chained to the cluster CA it already uses.
     pub fn check_node_identity(&self, tls: &TlsConfig) -> std::result::Result<(), String> {
-        let current = self
-            .registry
-            .tls_config()?
+        self.check_node_identity_from(&self.registry.shared_tls().snapshot(), tls)
+    }
+
+    fn check_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: &TlsConfig,
+    ) -> std::result::Result<(), String> {
+        let current = original
+            .config()?
             .ok_or("a plaintext node has no TLS identity to replace")?;
         if tls.ca_pem != current.ca_pem {
             return Err("a renewed Node identity must chain to the same cluster CA".into());
@@ -2382,8 +2403,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn renewal_publishes_one_shared_installation_after_key_validation() {
+    fn renewal_fixture() -> (TempDir, Arc<ZoneManager>, TlsConfig, TlsConfig) {
         let directory = TempDir::new().unwrap();
         let (ca, ca_key) = crate::transport::generate_zone_ca("root").unwrap();
         let identity = || {
@@ -2417,9 +2437,14 @@ mod tests {
             None,
         )
         .unwrap();
+        (directory, manager, initial, identity())
+    }
+
+    #[test]
+    fn renewal_publishes_one_shared_installation_after_key_validation() {
+        let (_directory, manager, initial, next) = renewal_fixture();
         let credentials = manager.registry().shared_tls();
         let original = credentials.snapshot();
-        let next = identity();
         let mut wrong_key = next.clone();
         wrong_key.key_pem = initial.key_pem;
         assert!(manager.install_node_identity(wrong_key).is_err());
@@ -2433,6 +2458,42 @@ mod tests {
         assert_eq!(manager.node_tls(), Err("revoked".into()));
         assert!(manager.install_node_identity(next).is_err());
         assert_eq!(manager.node_tls(), Err("revoked".into()));
+    }
+
+    #[test]
+    fn renewal_preserves_rejection_or_replacement_during_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_directory, manager, initial, next) = renewal_fixture();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        manager.on_node_identity(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let credentials = manager.registry().shared_tls();
+        let original = credentials.snapshot();
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(
+            initial.clone(),
+        ));
+        let reinstalled = credentials.snapshot();
+        assert_eq!(
+            manager.install_node_identity_from(&original, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert!(credentials.is_current(&reinstalled));
+        assert_eq!(manager.node_tls().unwrap(), Some(initial.clone()));
+        credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
+        assert_eq!(
+            manager.install_node_identity_from(&reinstalled, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(initial));
+        manager.install_node_identity(next.clone()).unwrap();
+        assert_eq!(manager.node_tls().unwrap(), Some(next));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
     }
 
     #[test]
