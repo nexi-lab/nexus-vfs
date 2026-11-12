@@ -41,7 +41,9 @@
 
 mod node_authority;
 pub(crate) use node_authority::current_local_replication_id;
-pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
+pub use node_authority::{
+    current_local_node_certificate, local_node_identity, LocalNodeCertificate,
+};
 
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;
@@ -103,9 +105,9 @@ pub use client::{
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
     call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_session_agent_rpc,
     call_revoke_agent_cert_rpc, call_revoke_key_rpc, call_unregister_foreign_ca_rpc, ClientConfig,
-    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinZoneResult, MintAgentResult,
-    MintKeyArgs, MintSessionAgentResult, ProposeResult, QueryResult, RaftApiClient, RaftClient,
-    RaftClientPool, RemoveVoterResult,
+    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinZoneResult, MintAgentChannel,
+    MintAgentResult, MintKeyArgs, MintSessionAgentResult, ProposeResult, QueryResult,
+    RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{

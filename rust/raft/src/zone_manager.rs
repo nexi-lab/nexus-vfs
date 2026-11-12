@@ -519,16 +519,18 @@ impl ZoneManager {
                     e
                 ))
             })?;
-            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "peer")
-                .map_err(RaftError::Config)?;
-            let ca_der = lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
-                .map_err(RaftError::Config)?;
             let certificate_id = match profile {
                 RuntimeProfile::NetworkedLocalRoot => {
+                    let cert_der =
+                        lib::transport_primitives::first_certificate_der(&cert_pem, "peer")
+                            .map_err(RaftError::Config)?;
+                    let ca_der =
+                        lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
+                            .map_err(RaftError::Config)?;
                     crate::transport::current_local_replication_id(&cert_der, &ca_der)
                 }
                 RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => {
-                    crate::transport::current_local_node_certificate(&cert_der, &ca_der)
+                    crate::transport::local_node_identity(&cert_pem, &ca_pem)
                         .map(|identity| identity.node_id)
                 }
             }
