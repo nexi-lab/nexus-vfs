@@ -286,9 +286,13 @@ impl AgentRegistry {
                 entry.runtime_last_seen,
             )
         };
+        let live_facts = match &source {
+            Some(RuntimeObservationSource::Live(read)) => read(),
+            _ => None,
+        };
         let observed_at = now();
         let (mut availability, mut age, mut update) = match &source {
-            Some(RuntimeObservationSource::Live(read)) => match read() {
+            Some(RuntimeObservationSource::Live(_)) => match live_facts {
                 Some(facts) => (
                     RuntimeAvailability::Fresh,
                     Some(Duration::ZERO),
@@ -531,5 +535,33 @@ mod tests {
             .runtime_observation_with_clock(&instance, || heartbeat)
             .unwrap();
         assert_eq!(replay, online);
+    }
+
+    #[test]
+    fn observation_time_follows_the_live_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (registry, instance, _) = external_runtime();
+        let last_seen = {
+            let mut entry = registry.agents.get_mut(&instance.pid).unwrap();
+            entry.runtime = None;
+            entry.runtime_last_seen.unwrap()
+        };
+        let returned = Arc::new(AtomicBool::new(false));
+        let reader_returned = Arc::clone(&returned);
+        let reader: RuntimeStatusSource = Arc::new(move || {
+            reader_returned.store(true, Ordering::SeqCst);
+            None
+        });
+        assert!(registry.bind_runtime_status(&instance, reader));
+        let observation = registry
+            .runtime_observation_with_clock(&instance, || {
+                assert!(returned.load(Ordering::SeqCst));
+                last_seen + EXTERNAL_FRESHNESS + Duration::from_nanos(1)
+            })
+            .unwrap();
+        assert_eq!(observation.availability, RuntimeAvailability::Unavailable);
+        assert_eq!(observation.presence, RuntimePresence::Unknown);
+        assert!(observation.update.is_none());
     }
 }
