@@ -13,7 +13,8 @@ use super::proto::nexus::raft::{
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
     MintSessionAgentRequest, PrepareReplicaControlReaderRequest,
     PrepareReplicaControlReaderResponse, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
-    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
+    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest,
+    RenewLocalNodeCertificateRequest, RenewNodeCertificateRequest, RenewSessionAgentRequest,
     ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
     StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
@@ -1473,6 +1474,62 @@ impl MintAgentChannel {
             ca_pem: response.ca_pem,
         })
     }
+}
+
+/// Ask `peer_addr` to re-issue this Node's certificate for the key in
+/// `csr_pem`, authenticating with the current Node identity in `tls`. A
+/// refusal (`Ok(Err(..))`) carries the server's reason — a node that is not the
+/// CA holder says so, and the caller asks the next candidate.
+pub async fn call_renew_node_certificate_rpc(
+    peer_addr: &str,
+    csr_pem: &[u8],
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    let mut client =
+        connect_zone_api(peer_addr, Some(tls), timeout_secs, "RenewNodeCertificate").await?;
+    let response = client
+        .renew_node_certificate(RenewNodeCertificateRequest {
+            csr_pem: csr_pem.to_vec(),
+        })
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewNodeCertificate RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.node_cert_pem)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
+    })
+}
+
+/// Ask this Node's own daemon at `peer_addr` to renew its certificate now.
+/// Returns the notAfter (Unix seconds) of the certificate it then serves.
+pub async fn call_renew_local_node_certificate_rpc(
+    peer_addr: &str,
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<i64, String>> {
+    let mut client = connect_zone_api(
+        peer_addr,
+        Some(tls),
+        timeout_secs,
+        "RenewLocalNodeCertificate",
+    )
+    .await?;
+    let response = client
+        .renew_local_node_certificate(RenewLocalNodeCertificateRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewLocalNodeCertificate RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.not_after_unix_s)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
+    })
 }
 
 /// Params for [`call_mint_key_rpc`] — mirrors the CLI's `auth mint` sk- flags.

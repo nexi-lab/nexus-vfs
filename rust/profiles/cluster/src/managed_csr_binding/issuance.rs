@@ -10,7 +10,8 @@ use nexus_raft::{
 
 pub(crate) struct NativeIssuer {
     slot: AgentMinterSlot,
-    node_der: Vec<u8>,
+    /// This daemon's current Node leaf, replaced on each renewal.
+    node_der: Arc<std::sync::RwLock<Vec<u8>>>,
     issuer_der: Vec<u8>,
     runtime: tokio::runtime::Handle,
 }
@@ -42,17 +43,35 @@ impl NativeIssuer {
         current_local_node_certificate(&node_der, &issuer_der).map_err(anyhow::Error::msg)?;
         Ok(Self {
             slot,
-            node_der,
+            node_der: Arc::new(std::sync::RwLock::new(node_der)),
             issuer_der,
             runtime,
         })
+    }
+
+    /// Follow this daemon's renewed Node identity.
+    pub(crate) fn node_identity_holder(&self) -> nexus_raft::zone_manager::NodeIdentityHolder {
+        let node_der = Arc::clone(&self.node_der);
+        Box::new(
+            move |tls| match first_certificate_der(&tls.cert_pem, "native Node") {
+                Ok(der) => *node_der.write().unwrap_or_else(|e| e.into_inner()) = der,
+                Err(error) => tracing::warn!(%error, "native issuer kept its Node identity"),
+            },
+        )
+    }
+
+    fn node_der(&self) -> Vec<u8> {
+        self.node_der
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(super) fn minter(&self, ca: &[u8]) -> Result<Arc<dyn AgentMinter>, String> {
         if first_certificate_der(ca, "prepared issuer")? != self.issuer_der {
             return Err("prepared issuer differs from the daemon's native TLS authority".into());
         }
-        current_local_node_certificate(&self.node_der, &self.issuer_der)?;
+        current_local_node_certificate(&self.node_der(), &self.issuer_der)?;
         let minter = self
             .slot
             .read()
@@ -109,7 +128,7 @@ impl PreparationService {
             let observed = lib::rt::block_on_via(
                 &issuer.runtime,
                 minter.agent_csr_v1(
-                    Some(issuer.node_der.clone()),
+                    Some(issuer.node_der()),
                     pending.request().clone(),
                     verb != "issue_v1",
                 ),

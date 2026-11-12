@@ -150,6 +150,21 @@ service ZoneApiService {
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 
+  // RenewNodeCertificate re-issues the CALLING Node's certificate for a key it
+  // generated, before the current one expires. The only renewal path that needs
+  // no join token: the caller's current leaf (local CA, unexpired, unrevoked) is
+  // the admission, and it alone decides the Node ID and zone; the CSR
+  // contributes only the proven public key. Node-only like MintAgent; served by
+  // the CA holder — any other node answers that it does not hold the cluster CA,
+  // so a renewing node asks the same candidates MintAgent's caller does.
+  rpc RenewNodeCertificate(RenewNodeCertificateRequest) returns (RenewNodeCertificateResponse);
+
+  // RenewLocalNodeCertificate asks the receiving daemon to renew its OWN Node
+  // certificate now, through the same renewal its schedule runs, and to serve
+  // the result without a restart. The operator's trigger (`renew-certificate`):
+  // the daemon stays the only writer of its identity files and its key never
+  // leaves it. Callable only by that same Node (its operator CLI).
+  rpc RenewLocalNodeCertificate(RenewLocalNodeCertificateRequest) returns (RenewLocalNodeCertificateResponse);
 
   // Versioned, Node-only caller-owned key issuance. These methods use the same
   // CA-holder slot and immutable I/F records, never MintAgent's generated key
@@ -593,6 +608,27 @@ message MintAgentResponse {
   bytes agent_cert_pem = 3;
   bytes agent_key_pem = 4;
   bytes ca_pem = 5;
+}
+
+message RenewNodeCertificateRequest {
+  // PKCS#10 request for the caller's new P-256 key.
+  bytes csr_pem = 1;
+}
+
+message RenewNodeCertificateResponse {
+  bool success = 1;
+  optional string error = 2;
+  // The re-issued Node certificate (PEM) for the request's key.
+  bytes node_cert_pem = 3;
+}
+
+message RenewLocalNodeCertificateRequest {}
+
+message RenewLocalNodeCertificateResponse {
+  bool success = 1;
+  optional string error = 2;
+  // notAfter of the certificate the daemon now serves, Unix seconds.
+  int64 not_after_unix_s = 3;
 }
 
 // MintKeyRequest asks the daemon to mint an `sk-` user/service credential.

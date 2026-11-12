@@ -312,12 +312,23 @@ pub struct ZoneManager {
     /// cross-org apply-observer calls `set_foreign_cas`); the SAME `Arc` is
     /// shared with the gRPC serve path and that observer. `None` under `--no-tls`.
     foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    /// The Node identity the gRPC server presents to new connections; replaced
+    /// by [`Self::install_node_identity`]. `None` under `--no-tls`.
+    server_identity: Option<Arc<lib::transport_primitives::ReloadableServerIdentity>>,
+    /// Holders outside this manager that present the Node identity, told of
+    /// every installed replacement.
+    node_identity_holders: parking_lot::Mutex<Vec<NodeIdentityHolder>>,
+    local_node_renewer_slot: crate::agent_minter::LocalNodeRenewerSlot,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
     /// Empty when no static topology is configured.
     pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
 }
+
+/// A holder of this Node's TLS identity outside the `ZoneManager` (an outbound
+/// client with its own channel cache), handed each renewed identity.
+pub type NodeIdentityHolder = Box<dyn Fn(&TlsConfig) + Send + Sync>;
 
 #[derive(Clone, Copy)]
 enum RuntimeProfile {
@@ -658,6 +669,17 @@ impl ZoneManager {
             ),
             None => None,
         };
+        let server_identity = match (&tls_config, &foreign_ca_verifier) {
+            (Some(tls), Some(verifier)) => Some(
+                lib::transport_primitives::ReloadableServerIdentity::from_tls(
+                    Arc::clone(verifier),
+                    tls,
+                )
+                .map_err(|e| RaftError::Config(format!("Node server identity: {e}")))?,
+            ),
+            _ => None,
+        };
+        let local_node_renewer_slot = crate::agent_minter::new_local_node_renewer_slot();
         let mut server = RaftGrpcServer::new(registry.clone(), config)
             .with_blob_fetcher_slot(blob_fetcher_slot.clone())
             .with_search_capabilities_slot(search_capabilities_slot.clone())
@@ -665,7 +687,11 @@ impl ZoneManager {
             .with_key_minter_slot(key_minter_slot.clone())
             .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
             .with_session_mint_admin_slot(session_mint_admin_slot.clone())
+            .with_local_node_renewer_slot(local_node_renewer_slot.clone())
             .with_foreign_ca_verifier(foreign_ca_verifier.clone());
+        if let Some(identity) = &server_identity {
+            server = server.with_server_identity(Arc::clone(identity));
+        }
         // Node enrollment (JoinCluster cert provisioning) is NOT served here —
         // this bind is strict mTLS, which a certless joiner cannot reach. The
         // cluster daemon runs it on a separate plaintext listener via
@@ -750,6 +776,9 @@ impl ZoneManager {
             foreign_ca_registrar_slot,
             session_mint_admin_slot,
             foreign_ca_verifier,
+            server_identity,
+            node_identity_holders: parking_lot::Mutex::new(Vec::new()),
+            local_node_renewer_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
         }))
     }
@@ -799,6 +828,67 @@ impl ZoneManager {
         &self,
     ) -> Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>> {
         self.foreign_ca_verifier.clone()
+    }
+
+    /// This Node's current TLS identity (`None` under `--no-tls`).
+    pub fn node_tls(&self) -> Option<TlsConfig> {
+        self.registry.tls_config()
+    }
+
+    /// Serve and present a renewed Node identity everywhere, without a restart:
+    /// the gRPC server's new connections, every pooled Raft client, then each
+    /// registered [`NodeIdentityHolder`]. The bundle must name this Node and
+    /// chain to the cluster CA it already uses, whose verifier is unchanged.
+    pub fn install_node_identity(&self, tls: TlsConfig) -> std::result::Result<(), String> {
+        self.check_node_identity(&tls)?;
+        let (Some(identity), Some(verifier)) = (
+            self.server_identity.as_ref(),
+            self.foreign_ca_verifier.as_ref(),
+        ) else {
+            return Err("a plaintext node has no TLS identity to replace".into());
+        };
+        identity.replace_tls(Arc::clone(verifier), &tls)?;
+        self.registry.install_tls(tls.clone());
+        for holder in self.node_identity_holders.lock().iter() {
+            holder(&tls);
+        }
+        tracing::info!(
+            local_node_id = self.node_id,
+            "renewed Node identity installed"
+        );
+        Ok(())
+    }
+
+    /// Whether `tls` may replace this Node's identity: a current leaf naming
+    /// this Node, chained to the cluster CA it already uses.
+    pub fn check_node_identity(&self, tls: &TlsConfig) -> std::result::Result<(), String> {
+        let current = self
+            .registry
+            .tls_config()
+            .ok_or("a plaintext node has no TLS identity to replace")?;
+        if tls.ca_pem != current.ca_pem {
+            return Err("a renewed Node identity must chain to the same cluster CA".into());
+        }
+        let named = crate::transport::local_node_identity(&tls.cert_pem, &tls.ca_pem)?;
+        if named.node_id != self.node_id {
+            return Err(format!(
+                "the renewed certificate names Node {}, not this Node {}",
+                named.node_id, self.node_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Register a holder outside this manager that presents the Node identity
+    /// (an outbound client with its own channels); it receives each identity
+    /// [`Self::install_node_identity`] installs.
+    pub fn on_node_identity(&self, holder: NodeIdentityHolder) {
+        self.node_identity_holders.lock().push(holder);
+    }
+
+    /// Hand back the slot the daemon binds its own Node certificate renewer into.
+    pub fn local_node_renewer_slot(&self) -> crate::agent_minter::LocalNodeRenewerSlot {
+        self.local_node_renewer_slot.clone()
     }
 
     /// The operator seed addresses this node was started with, parsed with

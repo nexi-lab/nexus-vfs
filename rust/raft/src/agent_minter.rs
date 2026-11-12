@@ -177,6 +177,39 @@ pub trait AgentMinter: Send + Sync {
         caller_cert_der: Option<Vec<u8>>,
         agent_cert_pem: &[u8],
     ) -> Result<(), String>;
+
+    /// Re-issue the calling Node's certificate for the key `csr_pem` proves.
+    ///
+    /// The impl MUST take the Node ID and zone from `caller_cert_der` — a
+    /// current leaf of this cluster's CA that is not revoked — and nothing from
+    /// the CSR but its verified public key. Returns the new certificate (PEM).
+    async fn renew_node(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        csr_pem: &[u8],
+    ) -> Result<Vec<u8>, String>;
+}
+
+/// The refusal every CA-holder operation returns on a node that does not hold
+/// the cluster CA. Callers looking for the CA holder ask their next candidate
+/// on seeing it; every other refusal is authoritative.
+pub const NOT_CA_HOLDER: &str = "this node does not hold the cluster CA";
+
+/// Renews this daemon's own Node certificate on request — the operator's
+/// trigger for the same renewal the daemon schedules. The cluster profile
+/// binds it; the raft server only routes the caller to it.
+#[tonic::async_trait]
+pub trait LocalNodeRenewer: Send + Sync {
+    /// Renew now and serve the result; returns the new leaf's notAfter (Unix
+    /// seconds).
+    async fn renew_now(&self) -> Result<i64, String>;
+}
+
+/// Late-bindable slot for [`LocalNodeRenewer`]; empty under `--no-tls`.
+pub type LocalNodeRenewerSlot = Arc<parking_lot::RwLock<Option<Arc<dyn LocalNodeRenewer>>>>;
+
+pub fn new_local_node_renewer_slot() -> LocalNodeRenewerSlot {
+    Arc::new(parking_lot::RwLock::new(None))
 }
 
 /// Late-bindable slot. Installed ONLY on the CA holder (founder); left empty on
