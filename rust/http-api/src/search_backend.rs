@@ -1,10 +1,10 @@
 //! Cached SearchService transport, shared by local and remote HTTP query legs.
 use crate::search_proto::search_service_client::SearchServiceClient;
 use crate::upstream::GrpcEndpoint;
+use nexus_search_common::transport::CredentialChannel;
 use nexus_search_common::transport::PeerChannelCache;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::Channel;
 
 pub use nexus_search_common::transport::DialError as BackendError;
 
@@ -36,7 +36,7 @@ impl SearchBackend {
         }
     }
 
-    pub async fn client(&self) -> Result<SearchServiceClient<Channel>, BackendError> {
+    pub async fn client(&self) -> Result<SearchServiceClient<CredentialChannel>, BackendError> {
         let channel = self.endpoint.channel().await?;
         Ok(SearchServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024))
     }

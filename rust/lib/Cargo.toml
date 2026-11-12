@@ -17,6 +17,7 @@ required-features = ["runtime-bridge"]
 # store, PeerBlobClient trait). Enabled by every peer crate that speaks
 # raft or VFS gRPC. WASM / pure-algo callers skip it.
 transport = [
+    "dep:http-body",
     "dep:tonic",
     "dep:tokio",
     "dep:dashmap",
@@ -69,6 +70,7 @@ tempfile = { version = "3", optional = true }
 
 # Transport-primitives module deps (gated by the `transport` feature).
 tonic = { workspace = true, optional = true }
+http-body = { version = "1", optional = true }
 # Pin the process-level rustls crypto provider explicitly (ring, matching
 # tonic's `tls-ring`). rustls 0.23's auto-selecting config builder panics
 # when zero OR multiple provider features are compiled in, and on Linux the

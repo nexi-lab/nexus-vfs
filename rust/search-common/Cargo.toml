@@ -31,10 +31,11 @@ thiserror = "1"
 # only) never links tonic.
 tonic = { workspace = true, optional = true }
 dashmap = { version = "6.1", optional = true }
+lib = { path = "../lib", features = ["transport"], optional = true }
 
 [features]
 default = []
-transport = ["dep:tonic", "dep:dashmap", "dep:tokio"]
+transport = ["dep:tonic", "dep:dashmap", "dep:tokio", "dep:lib"]
 
 [dev-dependencies]
 # The `transport` module's dial-error tests spin a single-threaded
