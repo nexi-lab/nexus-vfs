@@ -905,7 +905,8 @@ async fn recorded_endpoints(
     let records = node
         .with_state_machine(|sm| sm.member_addresses())
         .await
-        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?;
+        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?
+        .unwrap_or_default();
     Ok(records
         .into_iter()
         .filter_map(|(id, address)| {
@@ -2667,6 +2668,7 @@ struct WitnessZoneEntry {
     peers: SharedPeerMap,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     _transport_handle: JoinHandle<()>,
+    _registration_handle: Option<JoinHandle<()>>,
 }
 
 /// Multi-zone registry for witness nodes.
@@ -2731,26 +2733,19 @@ impl WitnessZoneRegistry {
     }
 
     /// Record a peer's advertise address observed on an inbound
-    /// `StepMessage` — mirrors `ZoneRaftRegistry::learn_peer_address`.
+    /// `StepMessage`, as `ZoneRaftRegistry::learn_peer_address` does.
     /// A witness holds no member-address records, so these observations
     /// are its routes.  Returns `true` if the route changed.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
-        if endpoint.is_empty() || peer_id == 0 {
-            return false;
-        }
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        let use_tls = endpoint.starts_with("https://");
-        let parsed = match NodeAddress::parse(endpoint, use_tls) {
-            Ok(mut p) => {
-                p.id = peer_id;
-                p
-            }
-            Err(_) => return false,
-        };
-        let changed = entry.peers.write().unwrap().observe(peer_id, parsed);
-        changed
+        super::observe_sender(
+            &entry.peers,
+            peer_id,
+            endpoint,
+            self.tls.read().unwrap().is_some(),
+        )
     }
 
     /// Create a witness Raft group for a zone (static bootstrap).
@@ -2781,12 +2776,12 @@ impl WitnessZoneRegistry {
     }
 
     /// Bootstrap or join a zone at boot time under the opaque-ID
-    /// contract.  Sends `JoinZone` RPC against each configured peer
-    /// until one succeeds, then locally registers the zone with
-    /// `skip_bootstrap=true` so the leader's snapshot installs the
-    /// authoritative ConfState.  Looping is indefinite — misconfig
-    /// (no reachable peer) surfaces as "witness stays up retrying"
-    /// rather than a silent exit.
+    /// contract.  A zone this witness holds on disk resumes first (see
+    /// [`Self::auto_join_zone`]).  Then sends `JoinZone` RPC against each
+    /// configured peer until one succeeds, and registers the zone locally
+    /// if it is not yet.  Looping is indefinite — misconfig (no reachable
+    /// peer) surfaces as "witness stays up retrying" rather than a silent
+    /// exit.
     ///
     /// Witness joins as a **voter** (`as_learner=false`) by default,
     /// matching TiKV's witness-as-voter pattern: votes in elections
@@ -2805,8 +2800,12 @@ impl WitnessZoneRegistry {
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
         use super::call_join_zone_rpc;
 
-        if let Some(existing) = self.zones.get(zone_id) {
-            return Ok(existing.node.clone());
+        // A zone this witness already holds resumes from its own raft
+        // storage before the JoinZone below re-asserts its voter role: its
+        // vote can be what elects the leader that answers, and the resumed
+        // zone registers this witness's member address.
+        if self.holds_zone(zone_id) {
+            self.auto_join_zone(zone_id, &tokio::runtime::Handle::current())?;
         }
 
         let peers = self.peers.clone();
@@ -2880,9 +2879,11 @@ impl WitnessZoneRegistry {
 
     /// Auto-join a zone when receiving Raft messages for an unknown zone.
     ///
-    /// Creates a witness Raft group with `skip_bootstrap=true` (empty ConfState).
-    /// The leader will send a snapshot with the correct ConfState — this is the
-    /// standard raft-rs contract for late-joining nodes.
+    /// A zone this witness holds on disk resumes its stored raft state, whose
+    /// ConfState is the authority. A fresh zone with no known roster starts
+    /// with `skip_bootstrap=true` (empty ConfState) and the leader's snapshot
+    /// brings the correct one — the standard raft-rs contract for
+    /// late-joining nodes.
     ///
     /// Used by step_message() handler for dynamic zone support.
     #[allow(clippy::result_large_err)]
@@ -2914,11 +2915,17 @@ impl WitnessZoneRegistry {
             return Ok(existing.node.clone());
         }
 
-        let peers = self.current_auto_join_peers();
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
+        let peer_ids: Vec<u64> = if self.holds_zone(zone_id) {
+            Vec::new()
+        } else {
+            self.current_auto_join_peers()
+                .iter()
+                .map(|p| p.id)
+                .collect()
+        };
         let config = if peer_ids.is_empty() {
-            // No known roster yet: start uninitialized and wait for a
-            // snapshot to carry ConfState.
+            // Resuming, or no known roster yet: never bootstrap; the stored
+            // or the leader's snapshot ConfState is the membership.
             RaftConfig {
                 id: self.node_id,
                 peers: vec![],
@@ -2937,6 +2944,11 @@ impl WitnessZoneRegistry {
         self.setup_witness_zone(zone_id, config, runtime_handle)
     }
 
+    /// Whether this witness holds `zone_id`'s raft state on disk.
+    fn holds_zone(&self, zone_id: &str) -> bool {
+        self.base_path.join(zone_id).join("raft").exists()
+    }
+
     fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
         if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
             let peers = root.peers.read().unwrap();
@@ -2947,7 +2959,8 @@ impl WitnessZoneRegistry {
         self.peers.clone()
     }
 
-    /// Internal: open storage, create ZoneConsensus + driver, spawn transport loop, register zone.
+    /// Internal: open storage, create ZoneConsensus + driver, start the zone
+    /// (transport loop and member-address registration), register it.
     ///
     /// Shared by `create_zone()` (static bootstrap) and `auto_join_zone()` (dynamic federation).
     #[allow(clippy::result_large_err)]
@@ -2958,7 +2971,6 @@ impl WitnessZoneRegistry {
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
         use crate::raft::RaftStorage;
-        use crate::transport::{ClientConfig, RaftClientPool, TransportLoop};
 
         // Zone-specific storage
         let zone_path = self.base_path.join(zone_id);
@@ -2970,30 +2982,25 @@ impl WitnessZoneRegistry {
             TransportError::Connection(format!("Failed to create witness state machine: {}", e))
         })?;
 
-        let (handle, mut driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
+        let (mut handle, driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
             .map_err(|e| {
                 TransportError::Connection(format!("Failed to create witness ZoneConsensus: {}", e))
             })?;
 
-        let shared_peers: super::SharedPeerMap =
-            Arc::new(RwLock::new(super::PeerMap::new(self.node_id)));
-        driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
-
-        // Spawn transport loop with zone_id routing
-        let client_config = ClientConfig {
-            tls: self.tls.clone(),
-            ..Default::default()
-        };
-        let transport_loop = TransportLoop::new(
+        let super::StartedZone {
+            peers: shared_peers,
+            shutdown_tx,
+            transport_handle,
+            registration_handle,
+        } = super::start_zone(
+            &mut handle,
             driver,
-            shared_peers.clone(),
-            RaftClientPool::with_config(client_config),
-        )
-        .with_zone_id(zone_id.to_string())
-        .with_self_address(self.self_address.clone());
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+            zone_id,
+            &self.tls,
+            self.self_address.clone(),
+            self.peers.clone(),
+            runtime_handle,
+        );
 
         tracing::info!(
             "Witness zone '{}' registered (node_id={})",
@@ -3008,6 +3015,7 @@ impl WitnessZoneRegistry {
                 peers: shared_peers,
                 shutdown_tx,
                 _transport_handle: transport_handle,
+                _registration_handle: registration_handle,
             },
         );
 
