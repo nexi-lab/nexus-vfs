@@ -1,7 +1,7 @@
 //! Compose unresolved Managed metadata with the actual CAS backend and Kernel.
 
 use kernel::kernel::syscall::KernelSyscall;
-use kernel::meta_store::{FileMetadata, MetaStore};
+use kernel::meta_store::{ConditionalMetadataError, FileMetadata, MetaStore};
 use nexus_raft::zone_meta_store::ZoneMetaStore;
 use nexus_raft::ZoneManager;
 use std::sync::Arc;
