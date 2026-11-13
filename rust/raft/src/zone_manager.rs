@@ -226,6 +226,9 @@ pub struct ClusterStatus {
     /// Milliseconds since this node last heard from its current leader —
     /// 0 on the leader, `None` before the first contact. Memory only.
     pub leader_contact_age_ms: Option<u64>,
+    /// Replication progress: per-peer on the leader, the leader's commit
+    /// index and this replica's stall on a follower. Memory only.
+    pub replication: crate::raft::ReplicationStatus,
 }
 
 /// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
@@ -285,6 +288,9 @@ pub struct ZoneManager {
     /// paths, which drop it before there is a `ZoneManager` to have a `Drop` impl.
     runtime: OwnedRuntime,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// The gRPC server task, joined by [`Self::shutdown`]: its in-flight
+    /// handlers hold zone handles, and its listener holds the bind address.
+    server_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     node_id: u64,
     /// Late-bindable slot the kernel populates with a `BlobFetcher`
     /// once its root mount backend is ready. Shared with the gRPC
@@ -703,7 +709,7 @@ impl ZoneManager {
         // Owned: the failure message below names the address, and the task outlives
         // this borrow.
         let bind_for_error = bind_addr.to_string();
-        if !matches!(profile, RuntimeProfile::IsolatedRoot) {
+        let server_task = (!matches!(profile, RuntimeProfile::IsolatedRoot)).then(|| {
             runtime.spawn(async move {
                 let shutdown = async move {
                     let mut rx = shutdown_rx_server;
@@ -753,8 +759,8 @@ impl ZoneManager {
                     }
                     std::process::exit(1);
                 }
-            });
-        }
+            })
+        });
 
         tracing::info!(
             "ZoneManager local_node_id={} hostname={} started (bind={}, tls={})",
@@ -768,6 +774,7 @@ impl ZoneManager {
             registry,
             runtime,
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
+            server_task: parking_lot::Mutex::new(server_task),
             node_id,
             blob_fetcher_slot,
             search_capabilities_slot,
@@ -1053,10 +1060,10 @@ impl ZoneManager {
     /// Join an existing zone as a Voter (learner=false) or Learner (learner=true).
     ///
     /// Sets up the local Raft state machine with skip_bootstrap=true so the
-    /// leader's snapshot installs the correct ConfState. The caller is
-    /// responsible for sending a JoinZone RPC to the leader (via
-    /// PyFederationClient::request_join_zone) with the same learner flag so
-    /// the leader proposes AddNode vs AddLearnerNode accordingly.
+    /// leader's snapshot installs the correct ConfState. Membership itself is
+    /// requested with the same learner flag through
+    /// [`crate::distributed_coordinator::join_zone_via_peers`], so the leader
+    /// proposes AddNode vs AddLearnerNode accordingly.
     pub fn join_zone(&self, zone_id: &str, learner: bool) -> Result<Arc<ZoneHandle>> {
         // R12: the join path can never resurrect a deprovisioned zone —
         // a deletion epoch that outranks this replica's creation epoch
@@ -1486,10 +1493,9 @@ impl ZoneManager {
 
     /// Linearizable twin of [`Self::get_links_count`]: the ReadIndex barrier
     /// guarantees the value observes every write committed cluster-wide
-    /// before the call (a plain local read on a FOLLOWER host lags the
-    /// leader's apply by a raft tick — the same lag `poll_until_visible`
-    /// exists for), so a guard decision made on it cannot miss an
-    /// already-committed mount. One leader heartbeat round-trip, no log
+    /// before the call, including writes submitted through OTHER nodes that
+    /// a local read on a follower may not have applied yet, so a guard
+    /// decision made on it cannot miss an already-committed mount. One leader heartbeat round-trip, no log
     /// write — the same primitive `ControlStateStore::read_barrier` uses.
     pub fn get_links_count_linearizable(&self, zone_id: &str) -> Result<Option<i64>> {
         let Some(node) = self.registry.get_node(zone_id) else {
@@ -1632,6 +1638,7 @@ impl ZoneManager {
                 voter_count: 0,
                 witness_count: 0,
                 leader_contact_age_ms: None,
+                replication: Default::default(),
             };
         };
         // Membership SSOT is raft's ConfState (the authoritative voter set),
@@ -1667,6 +1674,7 @@ impl ZoneManager {
             voter_count,
             witness_count,
             leader_contact_age_ms: node.leader_contact_age().map(|age| age.as_millis() as u64),
+            replication: node.replication(),
         }
     }
 
@@ -2122,12 +2130,21 @@ impl ZoneManager {
 
     /// Gracefully shut down all zones and the gRPC server.
     pub fn shutdown(&self) {
-        self.registry.shutdown_all();
-        if let Some(tx) = bridge_block_on(self.rt().handle(), async {
-            self.shutdown_tx.lock().await.take()
-        }) {
-            let _ = tx.send(true);
-        }
+        // Zones first: an in-flight handler of a stopped zone fails at once
+        // instead of holding the server's drain open on a live proposal.
+        let stopped = self.registry.shutdown();
+        let server = self.server_task.lock().take();
+        bridge_block_on(self.rt().handle(), async {
+            stopped.released().await;
+            if let Some(tx) = self.shutdown_tx.lock().await.take() {
+                let _ = tx.send(true);
+            }
+            if let Some(server) = server {
+                if let Err(error) = server.await {
+                    tracing::warn!(%error, "gRPC server task did not finish cleanly");
+                }
+            }
+        });
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
@@ -2258,7 +2275,8 @@ impl ZoneManager {
 
 impl Drop for ZoneManager {
     fn drop(&mut self) {
-        self.registry.shutdown_all();
+        // Signal only: the owned runtime's own drop ends the zones' tasks.
+        let _ = self.registry.shutdown();
         // Best-effort shutdown signal.
         if let Ok(mut guard) = self.shutdown_tx.try_lock() {
             if let Some(tx) = guard.take() {

@@ -71,7 +71,12 @@ mod member_registration;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use member_registration::MemberRegistration;
 mod read_index;
-use read_index::{PendingRead, ReadContext, ReadRequestIds};
+use read_index::{PendingRead, ReadContext, ReadReply, ReadRequestIds};
+mod replication;
+use replication::{CommitProbe, ReplicationView};
+pub use replication::{
+    LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus, REPLICATION_STALL,
+};
 mod storage_activation;
 pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
 #[cfg(all(feature = "grpc", has_protos))]
@@ -93,6 +98,10 @@ const DRIVER_CHANNEL_CAPACITY: usize = 256;
 /// zones effectively never compact and keep their exact pre-P2 behaviour.
 /// Overridable via `NEXUS_SC_SNAPSHOT_THRESHOLD` (`0` disables compaction).
 const DEFAULT_SC_SNAPSHOT_THRESHOLD: u64 = 8192;
+
+/// How long a read on a replica waits for this node's own earlier writes to
+/// apply before it reports the replica's lag instead of answering stale.
+pub(crate) const OWN_WRITES_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// Convert a bounded channel `TrySendError` to a `RaftError`.
 fn channel_try_send_err<T>(e: mpsc::error::TrySendError<T>) -> RaftError {
@@ -117,20 +126,6 @@ pub struct RaftConfig {
     /// Unique node ID within the cluster.
     pub id: u64,
 
-    /// IDs of **OTHER** peer nodes in the cluster (MUST NOT include `self.id`).
-    ///
-    /// raft-rs builds the voter set as `{self.id} ∪ config.peers`. Including
-    /// `self.id` here produces duplicate voter IDs in ConfState, which
-    /// raft-rs's quorum math counts as distinct members and skews the
-    /// required majority (e.g. a 3-voter cluster persisted as
-    /// `[self, self, v2, v3]` would need 3/4 to commit instead of 2/3).
-    ///
-    /// Callers MUST filter out `self.id` before constructing `RaftConfig`.
-    /// As a defense-in-depth, `ZoneConsensus::new` de-duplicates and logs
-    /// a warning when duplicates are detected — treat that warning as a
-    /// caller bug, not a runtime fix.
-    pub peers: Vec<u64>,
-
     /// Number of ticks before triggering election.
     /// An election tick is typically 100-500ms.
     pub election_tick: usize,
@@ -139,7 +134,9 @@ pub struct RaftConfig {
     /// Should be much smaller than election_tick (e.g., election_tick / 3).
     pub heartbeat_tick: usize,
 
-    /// Maximum size of entries in a single append message.
+    /// Entry bytes raft-rs batches into one append message — a soft cap it
+    /// exceeds only to send one entry alone. Derived from the transport's
+    /// message bound ([`super::message_bound::APPEND_BYTES`]).
     pub max_size_per_msg: u64,
 
     /// Maximum number of in-flight append messages.
@@ -166,10 +163,9 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             id: 1,
-            peers: vec![],
             election_tick: 10,
             heartbeat_tick: 3,
-            max_size_per_msg: 1024 * 1024, // 1MB
+            max_size_per_msg: super::message_bound::APPEND_BYTES,
             max_inflight_msgs: 256,
             is_witness: false,
             tick_interval: Duration::from_millis(10),
@@ -189,14 +185,15 @@ impl Default for RaftConfig {
 const WITNESS_ELECTION_TICK: usize = 10_000_000;
 
 impl RaftConfig {
-    /// Create a configuration for a witness node.
-    pub fn witness(id: u64, peers: Vec<u64>) -> Self {
-        let peers = peers.into_iter().filter(|peer_id| *peer_id != id).collect();
+    /// Create a configuration for a witness node. A witness never founds a
+    /// zone, so it never bootstraps a ConfState: its membership is what its
+    /// storage holds, else what the leader's log or snapshot brings.
+    pub fn witness(id: u64) -> Self {
         Self {
             id,
-            peers,
             is_witness: true,
             election_tick: WITNESS_ELECTION_TICK,
+            skip_bootstrap: true,
             ..Default::default()
         }
     }
@@ -387,9 +384,20 @@ pub enum RaftMsg {
     /// quorum), the driver matches the request context back to the
     /// tx and either resolves immediately (if the local state
     /// machine's `last_applied` already covers `ReadState.index`)
-    /// or parks it in `pending_reads_by_index` until a later
+    /// or parks it in `applied_waiters` until a later
     /// `apply_entries` catches up.
     ReadIndex { tx: oneshot::Sender<Result<()>> },
+    /// ReadIndex without the apply wait: resolve `tx` with the leader's
+    /// commit index once raft-rs confirms it.
+    LeaderCommit { tx: oneshot::Sender<Result<u64>> },
+    /// Resolve `tx` once the local state machine has applied through
+    /// `index`. The second half of ReadIndex, offered on its own to callers
+    /// that already know the index they need: a write forwarded to the
+    /// leader, and a read that must observe this node's own writes.
+    AwaitApplied {
+        index: u64,
+        tx: oneshot::Sender<Result<()>>,
+    },
     /// Read the current raft membership — voters, learners, and which
     /// learners have caught up ([`Membership`]) — from the
     /// `ProgressTracker`.  A cheap point read used by the JoinZone handler
@@ -462,6 +470,15 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
     /// Last contact from the current leader, written by the driver.
     leader_contact: Arc<LeaderContact>,
+    /// Replication observations published by the driver (memory only).
+    replication: Arc<parking_lot::RwLock<ReplicationView>>,
+    /// The highest index a write submitted through this node is known to
+    /// have committed at, over the life of this process — the session
+    /// token for read-your-writes. A forwarded write records the index the
+    /// leader applied it at; a local read waits until the state machine has
+    /// applied through it ([`Self::own_writes_visible`]). Memory only: the
+    /// write itself is durable in the log.
+    own_write_floor: Arc<AtomicU64>,
     /// Shared clone of the state machine's ``last_applied`` atomic — not
     /// a second cache, the state machine IS the SSOT for applied index.
     /// ``commit_index`` reflects ``raft_log.committed`` which raft-rs
@@ -516,6 +533,8 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
             cached_last_index: self.cached_last_index.clone(),
             cached_membership: self.cached_membership.clone(),
             leader_contact: self.leader_contact.clone(),
+            replication: self.replication.clone(),
+            own_write_floor: self.own_write_floor.clone(),
             applied_index_atom: self.applied_index_atom.clone(),
             replication_log: self.replication_log.clone(),
             #[cfg(all(feature = "grpc", has_protos))]
@@ -565,10 +584,15 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// `ReadState`, keyed by the opaque request context we passed to
     /// `RawNode::read_index`.
     pending_reads_by_ctx: HashMap<ReadContext, PendingRead>,
-    /// Pending linearizable reads that have their `read_index`
-    /// assigned but are waiting for `state_machine.last_applied`
-    /// to catch up. Drained after every `apply_entries` pass.
-    pending_reads_by_index: Vec<(u64, oneshot::Sender<Result<()>>)>,
+    /// Callers waiting for the local state machine to apply through an
+    /// index: ReadIndex reads once their `ReadState` names it, and
+    /// [`RaftMsg::AwaitApplied`]. Released after every apply and every
+    /// snapshot install.
+    applied_waiters: Vec<(u64, oneshot::Sender<Result<()>>)>,
+    /// The state machine's own `last_applied` atomic (shared with the
+    /// handle), so a waiter is checked at admission without the async
+    /// state-machine lock.
+    applied_index_atom: Arc<AtomicU64>,
     /// Node, driver incarnation and monotonic request sequence.
     read_request_ids: ReadRequestIds,
     /// Proposal ID counter (shared with handle for ID generation).
@@ -591,6 +615,10 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     cached_membership: Arc<parking_lot::RwLock<MembershipSnapshot>>,
     /// Last contact from the current leader, shared with the handle.
     leader_contact: Arc<LeaderContact>,
+    /// Replication observations, shared with the handle.
+    replication: Arc<parking_lot::RwLock<ReplicationView>>,
+    /// A follower's outstanding ReadIndex for the leader's commit index.
+    commit_probe: CommitProbe,
     /// Shared peer map whose registered layer this driver derives from the
     /// applied member-address records. Set by `set_peer_map()` before the
     /// transport loop starts.
@@ -871,6 +899,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let cached_last_index = Arc::new(AtomicU64::new(0));
         let cached_membership = Arc::new(parking_lot::RwLock::new(MembershipSnapshot::default()));
         let leader_contact = Arc::new(LeaderContact::new());
+        let replication = Arc::new(parking_lot::RwLock::new(ReplicationView::default()));
         refresh_cached_status_from_raw_node(
             &raw_node,
             &cached_leader_id,
@@ -893,7 +922,9 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_last_index: cached_last_index.clone(),
             cached_membership: cached_membership.clone(),
             leader_contact: leader_contact.clone(),
-            applied_index_atom,
+            replication: replication.clone(),
+            own_write_floor: Arc::new(AtomicU64::new(0)),
+            applied_index_atom: applied_index_atom.clone(),
             replication_log,
             #[cfg(all(feature = "grpc", has_protos))]
             forward_ctx: None,
@@ -922,7 +953,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             pending: HashMap::new(),
             pending_conf_changes: HashMap::new(),
             pending_reads_by_ctx: HashMap::new(),
-            pending_reads_by_index: Vec::new(),
+            applied_waiters: Vec::new(),
+            applied_index_atom,
             read_request_ids,
             proposal_id,
             last_tick: Instant::now(),
@@ -934,6 +966,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             cached_last_index,
             cached_membership,
             leader_contact,
+            replication,
+            commit_probe: CommitProbe::default(),
             #[cfg(all(feature = "grpc", has_protos))]
             peer_map: None,
             #[cfg(all(feature = "grpc", has_protos))]
@@ -1151,38 +1185,73 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         self.applied_index_atom.load(Ordering::Acquire)
     }
 
-    /// Block (sync, tight loop with 5 ms sleep) until `predicate()`
-    /// returns `true`, or `timeout_ms` elapses. Returns `true` on
-    /// predicate match, `false` on timeout.
+    /// Wait until the local state machine has applied through `index`, or
+    /// `deadline` passes. `Err` carries the applied index reached.
     ///
-    /// Read-your-writes barrier for follower forward-to-leader paths:
-    /// the raft LEADER's `propose` commits on majority and replies to
-    /// the follower before the follower's own apply pass has run, so
-    /// a same-thread read immediately after `propose` on a follower
-    /// can see stale state. Callers that need "my specific write is
-    /// visible from this node" pass a predicate that checks the live
-    /// state-machine view for the row they wrote; the poll exits as
-    /// soon as the row shows up, regardless of which raft index it
-    /// landed at. Using an index target instead would be wrong here:
-    /// on a follower, `commit_index()` right after propose is still
-    /// stale (the leader hasn't sent AppendEntries yet), so a "wait
-    /// for applied >= commit_index" snapshot can succeed
-    /// immediately and still read stale state.
-    ///
-    /// Sleep interval 5 ms = ½ raft tick; typical convergence is a
-    /// single iteration once replication + apply lands.
-    pub fn wait_until<F: FnMut() -> bool>(&self, mut predicate: F, timeout_ms: u64) -> bool {
-        use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            if predicate() {
-                return true;
+    /// The applied index is the SSOT for "visible on this node"; the commit
+    /// index is not — raft-rs can advance it in `step` before the entries are
+    /// applied. Waiting is served by the driver's applied-waiter list, the
+    /// same one a ReadIndex read waits in, so it costs no polling.
+    pub async fn await_applied(
+        &self,
+        index: u64,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), u64> {
+        if self.applied_index() < index {
+            let (tx, rx) = oneshot::channel();
+            let registered = tokio::time::timeout_at(
+                deadline,
+                self.msg_tx.send(RaftMsg::AwaitApplied { index, tx }),
+            )
+            .await;
+            if matches!(registered, Ok(Ok(()))) {
+                let _ = tokio::time::timeout_at(deadline, rx).await;
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
         }
+        let applied = self.applied_index();
+        if applied >= index {
+            Ok(())
+        } else {
+            Err(applied)
+        }
+    }
+
+    /// Whether this replica has applied every write submitted through this
+    /// node so far. Two atomic loads: the fast path of
+    /// [`Self::own_writes_visible`].
+    #[inline]
+    pub fn own_writes_applied(&self) -> bool {
+        self.applied_index() >= self.own_write_floor.load(Ordering::Acquire)
+    }
+
+    /// Read-your-writes barrier for a read served from this replica.
+    ///
+    /// A write submitted through this node records the index it committed at
+    /// (`own_write_floor`); a read that follows waits here, bounded by
+    /// [`OWN_WRITES_READ_BUDGET`], until the state machine has applied through
+    /// it, and otherwise fails with [`RaftError::ReplicaBehind`] rather than
+    /// answering from state that predates the caller's own write. A replica
+    /// that has applied them answers immediately, with no network round trip
+    /// — unlike ReadIndex ([`Self::read_linearizable`]), which asks the leader
+    /// on every read and also orders reads after OTHER nodes' writes.
+    pub async fn own_writes_visible(&self) -> Result<()> {
+        if self.own_writes_applied() {
+            return Ok(());
+        }
+        let required = self.own_write_floor.load(Ordering::Acquire);
+        self.await_applied(
+            required,
+            tokio::time::Instant::now() + OWN_WRITES_READ_BUDGET,
+        )
+        .await
+        .map_err(|applied| RaftError::ReplicaBehind { required, applied })
+    }
+
+    /// What this node observes about replication: per-peer progress on the
+    /// leader, the leader's commit index and this replica's stall on a
+    /// follower. Memory only.
+    pub fn replication(&self) -> ReplicationStatus {
+        self.replication.read().status(Instant::now())
     }
 
     /// Clone the state-machine's unified apply-side observer slot so a
@@ -1325,6 +1394,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         rx.await.map_err(|_| RaftError::ChannelClosed)??;
         let sm = self.state_machine.read().await;
         Ok(f(&*sm))
+    }
+
+    /// The leader's commit index, confirmed through ReadIndex — the first
+    /// half of [`Self::read_linearizable`], without its wait for the local
+    /// apply. Every entry the leader had applied before this call is covered.
+    pub async fn leader_commit_index(&self) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::LeaderCommit { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
     /// Execute a mutable closure against the state machine.
@@ -1536,37 +1616,76 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
 
     /// Propose a command for replication (Strong Consistency).
     ///
-    /// If this node is the leader, proposes locally and waits for commit.
-    /// If this node is a follower with a forwarding context, transparently
-    /// forwards the proposal to the leader via gRPC Propose RPC.
-    /// If no forwarding context (embedded mode), returns `NotLeader`.
+    /// `Ok` means the command COMMITTED and this node's state machine has
+    /// applied it, so a read here observes it. On the leader both happen
+    /// before the proposal resolves. A follower with a forwarding context
+    /// forwards the proposal to the leader via the gRPC Propose RPC, then
+    /// waits for its own replica to apply through the index the leader
+    /// reports; if that does not happen in time the answer is
+    /// [`RaftError::CommittedNotVisible`], which carries the leader's result
+    /// and the replica's lag — the write is not undone and must not be
+    /// re-issued as if it had failed. Without a forwarding context (embedded
+    /// mode) a follower returns `NotLeader`.
     ///
     /// # Timeout
-    /// Proposals time out after 10 seconds.
+    /// Commit and local visibility share one 10-second deadline.
     pub async fn propose(&self, command: Command) -> Result<CommandResult> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
         match self.submit_to_channel(&command) {
             Ok(rx) => {
                 // Leader path: wait for commit
-                match super::proposal::wait_for_commit(
-                    rx,
-                    tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS),
-                )
-                .await
-                {
+                match super::proposal::wait_for_commit(rx, deadline).await {
                     // The actor may process a leadership change after the handle
                     // checked its cached role. A definite pre-submit refusal can
                     // use the normal leader-forwarding path without replaying a
                     // command that may already have committed.
-                    Err(RaftError::NotLeader { .. }) => self.forward_to_leader(command).await,
+                    Err(RaftError::NotLeader { .. }) => {
+                        self.forward_to_leader(command, deadline).await
+                    }
                     result => result,
                 }
             }
             Err(RaftError::NotLeader { .. }) => {
                 // Follower: forward to leader if transport is available
-                self.forward_to_leader(command).await
+                self.forward_to_leader(command, deadline).await
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Report a forwarded command once this replica can see it: record the
+    /// index that covers it as this node's read-your-writes floor, then wait
+    /// for the local apply until `deadline`.
+    ///
+    /// A leader that predates `ProposeResponse.applied_index` does not say
+    /// which index that is. Its commit index, read after it applied the
+    /// command, covers the command too, so it is learned through ReadIndex —
+    /// never assumed to be 0, which would report a write visible that this
+    /// replica has not applied.
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn applied_here(
+        &self,
+        committed: super::proposal::Committed,
+        deadline: tokio::time::Instant,
+    ) -> Result<CommandResult> {
+        let index = match committed.index {
+            Some(index) => Some(index),
+            None => tokio::time::timeout_at(deadline, self.leader_commit_index())
+                .await
+                .ok()
+                .and_then(Result::ok),
+        };
+        if let Some(index) = index {
+            self.own_write_floor.fetch_max(index, Ordering::AcqRel);
+            if self.await_applied(index, deadline).await.is_ok() {
+                return Ok(committed.result);
+            }
+        }
+        Err(RaftError::CommittedNotVisible {
+            index,
+            applied: self.applied_index(),
+            result: Box::new(committed.result),
+        })
     }
 
     /// Forward a proposal to the current leader via gRPC.
@@ -1586,10 +1705,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// ``election_tick=10 * tick_interval=10ms = 100ms`` + jitter); 5s
     /// covers >10 election rounds which is enough to conclude the
     /// cluster is actually down rather than still electing.
-    async fn forward_to_leader(&self, command: Command) -> Result<CommandResult> {
+    async fn forward_to_leader(
+        &self,
+        command: Command,
+        deadline: tokio::time::Instant,
+    ) -> Result<CommandResult> {
         #[cfg(all(feature = "grpc", has_protos))]
         if let Some(ctx) = &self.forward_ctx {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
+            // Refused here rather than by the leader: a forward the bound
+            // cannot carry would fail in transit, reading as an unknown outcome.
+            super::message_bound::admit_entry(8 + bincode::serialized_size(&command)? as usize)?;
             let election_deadline =
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
             while self.leader_id().is_none() {
@@ -1598,13 +1723,14 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            return super::proposal::retry_leader_refusals(deadline, || {
+            let committed = super::proposal::retry_leader_refusals(deadline, || {
                 self.forward_to_leader_once(ctx, &command, deadline)
             })
-            .await;
+            .await?;
+            return self.applied_here(committed, deadline).await;
         }
         #[cfg(not(all(feature = "grpc", has_protos)))]
-        let _ = command;
+        let _ = (command, deadline);
         Err(RaftError::NotLeader {
             leader_hint: self.leader_hint_addr(),
         })
@@ -1616,7 +1742,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         ctx: &ForwardContext,
         command: &Command,
         deadline: tokio::time::Instant,
-    ) -> Result<CommandResult> {
+    ) -> Result<super::proposal::Committed> {
         let leader_id = self
             .leader_id()
             .ok_or(RaftError::NotLeader { leader_hint: None })?;
@@ -1646,7 +1772,11 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 }
                 match self.submit_to_channel(command) {
                     Ok(rx) => {
-                        return super::proposal::wait_for_commit(rx, deadline).await;
+                        let result = super::proposal::wait_for_commit(rx, deadline).await?;
+                        return Ok(super::proposal::Committed {
+                            result,
+                            index: Some(self.applied_index()),
+                        });
                     }
                     Err(RaftError::NotLeader { .. }) => continue,
                     Err(e) => return Err(e),
@@ -1673,7 +1803,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             "Forwarding propose to leader"
         );
 
-        // A transport failure retains its unknown proposal outcome.
+        // Each failure is propagated as what it is, never rewritten to `NotLeader`.
         match crate::transport::forward_propose(
             &ctx.client_pool,
             &leader_addr,
@@ -1685,7 +1815,22 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         .await
         {
             Ok(result) => Ok(result),
-            // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
+            // The connection to the leader never came up, so the proposal never
+            // left this node: nothing was applied and a retry is safe. It is not
+            // `NotLeader` either — no node answered, so nothing is known about
+            // leadership, and `NotLeader` would send the retry loop back to the
+            // same unreachable address as though a leader had redirected it.
+            Err(error @ RaftError::NotSubmitted { .. }) => {
+                tracing::warn!(
+                    leader_node_id = leader_id,
+                    leader_addr = %leader_addr.to_operator_str(),
+                    zone = %ctx.zone_id,
+                    "Forward to leader NOT SENT — the connection was never established, \
+                     nothing was submitted, safe to retry: {}",
+                    error,
+                );
+                Err(error)
+            }
             // The request was sent; what is missing is the answer. The leader may
             // have appended and committed it before the connection broke, so the
             // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
@@ -1701,8 +1846,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     leader_node_id = leader_id,
                     leader_addr = %leader_addr.to_operator_str(),
                     zone = %ctx.zone_id,
-                    "Forward to leader failed after the proposal was sent — the \
-                     outcome is UNKNOWN, it may have committed: {}",
+                    "Forward to leader SENT with no answer — the outcome is UNKNOWN, \
+                     it may have committed; read back before retrying: {}",
                     e,
                 );
                 Err(RaftError::Transport(e))
@@ -1985,6 +2130,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.dial_uses_tls = dial_uses_tls;
     }
 
+    /// Compact after `threshold` applied entries, for tests that need a
+    /// compacted log without thousands of writes.
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_threshold(&mut self, threshold: u64) {
+        self.snapshot_threshold = threshold;
+    }
+
     /// Get the EC replication log (if present).
     /// Used by the transport loop for EC background replication.
     pub fn replication_log(&self) -> Option<&Arc<ReplicationLog>> {
@@ -2105,6 +2257,23 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// already in a non-Replicate state).
     pub fn report_unreachable(&mut self, peer_id: u64) {
         self.raw_node.report_unreachable(peer_id);
+    }
+
+    /// Record one send to `peer_id` for replication status: `failure` is its
+    /// `(kind, description)`, `None` that it arrived; `carries_log` marks
+    /// appends and snapshots, whose runs are kept apart from control
+    /// messages'. Returns the run of failures it extends, or the run a
+    /// delivered send ends.
+    pub fn record_send(
+        &self,
+        peer_id: u64,
+        carries_log: bool,
+        failure: Option<(&'static str, &str)>,
+        now: Instant,
+    ) -> u64 {
+        self.replication
+            .write()
+            .record_send(peer_id, carries_log, failure, now)
     }
 
     /// Tell raft-rs whether a snapshot send to ``peer_id`` succeeded.
@@ -2233,21 +2402,39 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 self.update_cached_status();
                 let _ = tx.send(result);
             }
-            RaftMsg::ReadIndex { tx } => {
-                // Keep the request until Raft can accept it. A newly elected
-                // leader drops ReadIndex until it commits its first entry.
-                let Some(id) = self.read_request_ids.allocate() else {
-                    let _ = tx.send(Err(RaftError::Config(
-                        "ReadIndex request sequence exhausted".into(),
-                    )));
-                    return;
-                };
-                self.pending_reads_by_ctx.insert(id, PendingRead::new(tx));
+            RaftMsg::ReadIndex { tx } => self.queue_read(ReadReply::Applied(tx)),
+            RaftMsg::LeaderCommit { tx } => self.queue_read(ReadReply::Index(tx)),
+            RaftMsg::AwaitApplied { index, tx } => {
+                // Apply runs only on this task, so the check cannot race it.
+                if self.applied_index_atom.load(Ordering::Acquire) >= index {
+                    let _ = tx.send(Ok(()));
+                } else {
+                    self.applied_waiters.push((index, tx));
+                }
             }
             RaftMsg::Membership { tx } => {
                 let _ = tx.send(read_membership(&self.raw_node));
             }
         }
+    }
+
+    /// Keep a ReadIndex request until Raft can accept it. A newly elected
+    /// leader drops ReadIndex until it commits its first entry.
+    fn queue_read(&mut self, reply: ReadReply) {
+        let Some(id) = self.read_request_ids.allocate() else {
+            let exhausted = || RaftError::Config("ReadIndex request sequence exhausted".into());
+            match reply {
+                ReadReply::Applied(tx) => {
+                    let _ = tx.send(Err(exhausted()));
+                }
+                ReadReply::Index(tx) => {
+                    let _ = tx.send(Err(exhausted()));
+                }
+            }
+            return;
+        };
+        self.pending_reads_by_ctx
+            .insert(id, PendingRead::new(reply));
     }
 
     fn step_message(&mut self, msg: Message, protocol: RaftMessageProtocol) -> Result<()> {
@@ -2292,6 +2479,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 "leadership changed before local proposal; nothing submitted"
             );
             let _ = tx.send(Err(RaftError::NotLeader { leader_hint }));
+            return;
+        }
+        // Every path into the log passes here: data no append can carry is
+        // refused before it can wedge replication.
+        if let Err(error) = super::message_bound::admit_entry(8 + data.len()) {
+            let _ = tx.send(Err(error));
             return;
         }
         // Generate the real proposal ID here in the driver
@@ -2340,7 +2533,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             self.pending.clear();
             self.pending_conf_changes.clear();
             self.pending_reads_by_ctx.clear();
-            self.pending_reads_by_index.clear();
+            self.applied_waiters.clear();
             self.cached_leader_id.store(0, Ordering::Release);
         }
         result
@@ -2388,10 +2581,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
 
         self.submit_ready_reads();
+        self.submit_commit_probe();
 
         // Process ready state
         if !self.raw_node.has_ready() {
             self.update_cached_status();
+            self.observe_replication();
             return Ok(messages);
         }
 
@@ -2408,7 +2603,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
 
         // Promote any freshly-confirmed ReadIndex requests to
-        // `pending_reads_by_index` (or resolve immediately if the
+        // `applied_waiters` (or resolve immediately if the
         // local apply pointer already covers the returned index).
         if !ready.read_states().is_empty() {
             let states = ready.take_read_states();
@@ -2461,6 +2656,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             {
                 self.routes_stale = true;
             }
+            // The install moved the applied index as far as an apply would.
+            self.release_applied_waiters().await;
         }
 
         // 2. Persist entries and hard state
@@ -2485,7 +2682,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         if !committed.is_empty() {
             tracing::debug!(count = committed.len(), "raft.apply");
             self.apply_entries(committed).await?;
-            self.resolve_ready_reads().await;
+            self.release_applied_waiters().await;
         }
 
         // Advance the ready — NO TOCTOU: we never dropped ownership
@@ -2506,7 +2703,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         if !light_rd.committed_entries().is_empty() {
             let committed = light_rd.take_committed_entries();
             self.apply_entries(committed).await?;
-            self.resolve_ready_reads().await;
+            self.release_applied_waiters().await;
         }
 
         self.raw_node.advance_apply();
@@ -2517,6 +2714,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
         // Update cached status for handle reads
         self.update_cached_status();
+        self.observe_replication();
 
         // Compaction follows successful apply. A failed compaction retains the
         // log and can be retried without acknowledging additional application.
@@ -2861,9 +3059,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// `pending_reads_by_ctx` entry. If the local state machine's
     /// `last_applied` is already at or beyond the confirmed
     /// `read_index`, resolve the caller's oneshot immediately;
-    /// otherwise park it in `pending_reads_by_index` and let the
-    /// next `apply_entries` / `resolve_ready_reads` cycle release
-    /// it.
+    /// otherwise park it in `applied_waiters` and let the
+    /// next `apply_entries` / `release_applied_waiters` cycle release
+    /// it. The answer to this node's commit probe is recorded as the
+    /// leader's commit index instead.
     async fn promote_read_states(&mut self, states: Vec<raft::ReadState>) {
         if states.is_empty() {
             return;
@@ -2877,33 +3076,41 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 );
                 continue;
             };
+            if self.commit_probe.answers(&id) {
+                self.replication
+                    .write()
+                    .record_leader_commit(state.index, Instant::now());
+                continue;
+            }
             let Some(request) = self.pending_reads_by_ctx.remove(&id) else {
                 // Unknown context — likely a ReadIndex issued by a
                 // previous driver instance or a stale ctx; drop.
                 continue;
             };
-            let tx = request.tx;
-            if applied >= state.index {
-                let _ = tx.send(Ok(()));
-            } else {
-                self.pending_reads_by_index.push((state.index, tx));
+            match request.reply {
+                ReadReply::Index(tx) => {
+                    let _ = tx.send(Ok(state.index));
+                }
+                ReadReply::Applied(tx) if applied >= state.index => {
+                    let _ = tx.send(Ok(()));
+                }
+                ReadReply::Applied(tx) => self.applied_waiters.push((state.index, tx)),
             }
         }
     }
 
-    /// Release any parked linearizable reads whose
-    /// `read_index` is now covered by the state machine's
-    /// `last_applied`. Called after every successful
-    /// `apply_entries` pass.
-    async fn resolve_ready_reads(&mut self) {
-        if self.pending_reads_by_index.is_empty() {
+    /// Release every waiter whose index the state machine's
+    /// `last_applied` now covers. Called after every successful
+    /// `apply_entries` pass and snapshot install.
+    async fn release_applied_waiters(&mut self) {
+        if self.applied_waiters.is_empty() {
             return;
         }
         let applied = self.state_machine.read().await.last_applied_index();
         let mut i = 0;
-        while i < self.pending_reads_by_index.len() {
-            if self.pending_reads_by_index[i].0 <= applied {
-                let (_, tx) = self.pending_reads_by_index.swap_remove(i);
+        while i < self.applied_waiters.len() {
+            if self.applied_waiters[i].0 <= applied {
+                let (_, tx) = self.applied_waiters.swap_remove(i);
                 let _ = tx.send(Ok(()));
             } else {
                 i += 1;
@@ -2927,6 +3134,60 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             &self.cached_last_index,
             &self.cached_membership,
         );
+    }
+
+    /// Publish what this node can observe about replication: the leader
+    /// times every other member's `Progress`; a follower times its own
+    /// applied index. Runs after every ready; a few map updates per member.
+    fn observe_replication(&self) {
+        let now = Instant::now();
+        let raft = &self.raw_node.raft;
+        let mut view = self.replication.write();
+        if raft.state == raft::StateRole::Leader {
+            let learners = raft.prs().conf().learners();
+            view.observe_leader(
+                raft.raft_log.committed,
+                raft.prs()
+                    .iter()
+                    .filter(|(id, _)| **id != self.config.id)
+                    .map(|(id, pr)| {
+                        (
+                            *id,
+                            pr.state,
+                            pr.matched,
+                            pr.next_idx,
+                            learners.contains(id),
+                        )
+                    }),
+                now,
+            );
+        } else {
+            view.observe_follower(self.applied_index_atom.load(Ordering::Acquire), now);
+        }
+    }
+
+    /// A follower or learner cannot see its own lag in raft-rs's messages:
+    /// heartbeats carry `min(leader commit, matched)`. Ask the leader for its
+    /// commit index with a paced ReadIndex; the answer arrives as a
+    /// `ReadState` and is recorded by [`Self::promote_read_states`]. raft-rs
+    /// forwards it to the leader, which answers from its commit index once
+    /// leadership is confirmed — no log write. A witness keeps no state to
+    /// lag, and the leader is its own answer.
+    fn submit_commit_probe(&mut self) {
+        let raft = &self.raw_node.raft;
+        if self.config.is_witness || raft.state == raft::StateRole::Leader || raft.leader_id == 0 {
+            self.commit_probe.reset();
+            return;
+        }
+        let now = Instant::now();
+        if !self.commit_probe.due(now) {
+            return;
+        }
+        let Some(context) = self.read_request_ids.allocate() else {
+            return;
+        };
+        self.raw_node.read_index(context.to_vec());
+        self.commit_probe.sent(context, now);
     }
 }
 
@@ -3142,7 +3403,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 
@@ -3192,10 +3452,14 @@ mod tests {
         let store = RedbStore::open(dir.path().join("witness")).unwrap();
         let state_machine = WitnessStateMachine::new(&store).unwrap();
 
-        let config = RaftConfig::witness(1, vec![2, 3]);
+        let config = RaftConfig::witness(1);
         let (handle, _driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
 
         assert!(handle.is_witness());
+        assert!(
+            handle.voters().is_empty() && handle.last_index() == 0,
+            "a witness never bootstraps a ConfState of its own"
+        );
     }
 
     #[tokio::test]
@@ -3207,7 +3471,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![2, 3],
             ..Default::default()
         };
 
@@ -3244,7 +3507,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3330,7 +3592,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
         let (handle, mut driver) =
@@ -3424,7 +3685,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
         let (handle, mut driver) =
@@ -3490,8 +3750,8 @@ mod tests {
     /// `ZoneApiService::GetClusterInfo`) reads from raft-rs ConfState,
     /// NOT the transport peer_addrs union that made the leader appear
     /// twice.  Contract: fresh 1-voter bootstrap ⇒ `voters() == [self.id]`;
-    /// handle and driver mirrors agree; no duplicates; `config.peers`
-    /// (the transport address book) does NOT bleed into the voter set.
+    /// handle and driver mirrors agree; no duplicates; the transport
+    /// address book does NOT bleed into the voter set.
     #[tokio::test]
     async fn test_voters_ssot_matches_confstate_not_peer_addrs() {
         let dir = TempDir::new().unwrap();
@@ -3499,15 +3759,12 @@ mod tests {
         let store = RedbStore::open(dir.path().join("sm")).unwrap();
         let state_machine = FullStateMachine::new(&store).unwrap();
 
-        // `peers` is intentionally non-empty: it is the transport
-        // address book, NOT a ConfState seed.  The bug (#7) was that
-        // this list bled into `GetClusterInfo.config.voters`; the fix
-        // pins voters to `cached_membership` populated from raft-rs's
-        // `ProgressTracker`, which for a fresh 1-voter bootstrap
-        // holds exactly `[self.id]`.
+        // The bug (#7) was that the transport address book bled into
+        // `GetClusterInfo.config.voters`; voters come from
+        // `cached_membership` populated from raft-rs's `ProgressTracker`,
+        // which for a fresh 1-voter bootstrap holds exactly `[self.id]`.
         let config = RaftConfig {
             id: 42,
-            peers: vec![7, 99, 42],
             ..Default::default()
         };
         let (handle, driver) = ZoneConsensus::new(config, storage, state_machine, None).unwrap();
@@ -3564,7 +3821,6 @@ mod tests {
         let state_machine = FullStateMachine::new(&store).unwrap();
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3803,7 +4059,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 
@@ -3836,7 +4091,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             skip_bootstrap: true,
             tick_interval: Duration::from_millis(10),
             ..Default::default()
@@ -3964,7 +4218,6 @@ mod tests {
             let config = RaftConfig {
                 id,
                 // Address book — no ConfState role anymore.
-                peers: vec![],
                 skip_bootstrap: true,
                 tick_interval: Duration::from_millis(10),
                 ..Default::default()
@@ -4084,13 +4337,9 @@ mod tests {
 
     /// Regression test: single-node ConfState must include self as voter.
     ///
-    /// Before the fix, empty `config.peers` skipped ConfState bootstrap,
-    /// leaving the voter set empty.  This violated raft-rs's contract:
-    /// `RawNode` expects the node to be in the voter set before `campaign()`.
-    /// The result was a panic at `raft.rs:1225` (`unwrap()` on `None`).
-    ///
-    /// The fix: bootstrap ConfState with `voters=[self.id]` even when
-    /// `config.peers` is empty (single-node cluster).
+    /// raft-rs's `RawNode` expects the node to be in the voter set before
+    /// `campaign()`; an empty voter set panics at `raft.rs:1225`. A founder's
+    /// bootstrap writes ConfState `voters=[self.id]`.
     ///
     /// This test is deterministic: no async, no timers, no polling.
     /// It verifies the persisted ConfState directly after ZoneConsensus::new().
@@ -4106,7 +4355,6 @@ mod tests {
 
             let config = RaftConfig {
                 id: 1,
-                peers: vec![], // single-node: no peers
                 ..Default::default()
             };
 
@@ -4123,43 +4371,6 @@ mod tests {
             state.conf_state.voters,
             vec![1],
             "Single-node ConfState must include self as voter"
-        );
-    }
-
-    /// Pin the opaque-ID contract: bootstrap (`skip_bootstrap=false`)
-    /// produces a 1-voter ConfState consisting of `config.id` only,
-    /// regardless of `config.peers`.  Multi-voter ConfState only forms
-    /// via ConfChangeV2 AddNode driven by JoinZone, never via boot-
-    /// time peer-list seeding.  See
-    /// `docs/rfcs/adr-raft-node-id-opaque.md`.
-    #[test]
-    fn test_bootstrap_produces_single_voter_conf_state() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let storage = RaftStorage::open(dir.path()).unwrap();
-            let store = RedbStore::open(dir.path().join("sm")).unwrap();
-            let state_machine = FullStateMachine::new(&store).unwrap();
-
-            let config = RaftConfig {
-                id: 1,
-                // Peers in this slot are an *address book* under the
-                // new contract, not ConfState seeds — bootstrap must
-                // still produce voters=[1].
-                peers: vec![2, 3],
-                ..Default::default()
-            };
-
-            let (_handle, _driver) =
-                ZoneConsensus::new(config, storage, state_machine, None).unwrap();
-        }
-
-        let storage = RaftStorage::open(dir.path()).unwrap();
-        let state = Storage::initial_state(&storage).unwrap();
-        assert_eq!(
-            state.conf_state.voters,
-            vec![1],
-            "bootstrap must produce a 1-voter ConfState (self only)",
         );
     }
 
@@ -4196,7 +4407,6 @@ mod tests {
 
         let config = RaftConfig {
             id: 1,
-            peers: vec![],
             ..Default::default()
         };
 

@@ -23,8 +23,12 @@ service ZoneRuntimeService {
   // request replays the original receipt, a different one is refused.
   rpc ZoneCreate(ZoneCreateRequest) returns (ZoneReceipt);
 
-  // Join an existing zone. NEVER bootstraps a founder — a join that cannot
-  // reach a peer fails loudly instead of degrading into a create (R9).
+  // Join an existing zone: request membership through the node's seed
+  // addresses. JOINED means this node's applied ConfState names it as the
+  // requested learner or voter. No leader admitting it is UNAVAILABLE: the
+  // operation stays PENDING with no replica left behind, and a retry of the
+  // same operation_id drives it again. NEVER bootstraps a founder — a join
+  // can never degrade into a create (R9).
   rpc ZoneJoin(ZoneJoinRequest) returns (ZoneReceipt);
 
   // Hosted/resident/local-not-found presence + raft facts (R10).
@@ -132,6 +136,57 @@ message ClusterFacts {
   // leader, measured in memory: 0 on the leader, absent before the first
   // contact since the zone became resident.
   optional uint64 leader_contact_age_ms = 8;
+  // Replication progress below is observed in memory and never persisted.
+  //
+  // On the leader: one entry per other member of the zone.
+  repeated PeerReplication peers = 9;
+  // On a follower or learner: the leader's commit index, as this node's
+  // periodic commit probe (a Raft ReadIndex) last reported it. A replica's
+  // heartbeats carry min(leader commit, its matched index), so its own
+  // commit_index cannot show that the leader stopped feeding it; its lag is
+  // leader_commit_index - applied_index. Absent on the leader and before the
+  // first answer.
+  optional uint64 leader_commit_index = 10;
+  // Milliseconds since the leader answered that probe.
+  optional uint64 leader_commit_age_ms = 11;
+  // Milliseconds applied_index has stood still while behind
+  // leader_commit_index; 0 when caught up.
+  uint64 stalled_ms = 12;
+}
+
+// The leader's view of one other member's replication.
+message PeerReplication {
+  // The leader's flow-control state for the member.
+  enum State {
+    STATE_UNKNOWN = 0;
+    // Probing for the member's last matching index; one append in flight.
+    PROBE = 1;
+    // Steady state: appends are pipelined.
+    REPLICATE = 2;
+    // A snapshot was sent; nothing else is sent until its delivery is
+    // reported or the member answers it.
+    SNAPSHOT = 3;
+  }
+  uint64 node_id = 1;
+  bool learner = 2;
+  State state = 3;
+  // Highest index known to be replicated on the member.
+  uint64 matched = 4;
+  // Next index the leader will send.
+  uint64 next_index = 5;
+  // Milliseconds the member has held `state`.
+  uint64 state_age_ms = 6;
+  // Milliseconds `matched` has stood still while behind the leader's
+  // commit_index; 0 when caught up.
+  uint64 stalled_ms = 7;
+  // Consecutive messages to the member that did not reach it; 0 once one
+  // does.
+  uint64 send_failures = 8;
+  // Milliseconds those failures have run.
+  uint64 send_failing_ms = 9;
+  // Why the latest of them failed (e.g. "message too large: ..."); empty
+  // when sends arrive.
+  string last_send_error = 10;
 }
 
 // Mount facts re-read from the parent zone's state machine post-mount.

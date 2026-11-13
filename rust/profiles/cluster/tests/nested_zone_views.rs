@@ -379,25 +379,17 @@ fn legacy_alias_wal_is_reported_instead_of_opening_an_empty_stream() {
 }
 
 fn node(id: u64, dir: &Path, addr: &str) -> Arc<ZoneManager> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match ZoneManager::with_node_id(
-            "nested-zone-views",
-            id,
-            dir.to_str().unwrap(),
-            vec![],
-            addr,
-            None,
-            Some(format!("http://{addr}")),
-            None,
-        ) {
-            Ok(manager) => return manager,
-            Err(nexus_raft::raft::RaftError::DataDirLocked(_)) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => panic!("open node: {error}"),
-        }
-    }
+    ZoneManager::with_node_id(
+        "nested-zone-views",
+        id,
+        dir.to_str().unwrap(),
+        vec![],
+        addr,
+        None,
+        Some(format!("http://{addr}")),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("open node: {error}"))
 }
 
 fn store(manager: &ZoneManager, zone: &str) -> ZoneMetaStore {

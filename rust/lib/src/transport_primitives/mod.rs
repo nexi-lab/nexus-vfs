@@ -24,13 +24,14 @@ mod replica_credential;
 mod runtime_credential;
 mod secret_file;
 mod server_limits;
+mod tls_incoming;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 pub use channel::{
     create_channel, create_node_channel, create_peer_channel, ensure_crypto_provider,
 };
-pub use config::{ClientConfig, ServerConfig, TlsConfig};
+pub use config::{ClientConfig, TlsConfig};
 pub use crl::{
     ca_spki_sha256, canonical_certificate_serial, verify_signed_crl, VerifiedCrl,
     CRL_MAXIMUM_AGE_SECS,
