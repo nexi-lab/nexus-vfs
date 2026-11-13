@@ -232,9 +232,10 @@ impl DriverLifecycleCoordinator {
                         zone = zone_id,
                         "DT_MOUNT metadata write failed; refusing to install unpersisted mount: {e:?}",
                     );
-                    return Err(KernelError::IOError(format!(
-                        "DT_MOUNT metadata persist failed for {mount_point}: {e:?}"
-                    )));
+                    return Err(KernelError::from_metastore(
+                        &e,
+                        format!("DT_MOUNT metadata persist failed for {mount_point}: {e:?}"),
+                    ));
                 }
                 // `with_metastore` falls back to the kernel global metastore,
                 // so None means no per-mount AND no global store (possible
@@ -320,9 +321,10 @@ impl DriverLifecycleCoordinator {
                         zone = zone_id,
                         "DT_MOUNT metadata delete failed; refusing to remove live route while the durable row persists: {e:?}",
                     );
-                    return Err(KernelError::IOError(format!(
-                        "DT_MOUNT metadata delete failed for {mount_point}: {e:?}"
-                    )));
+                    return Err(KernelError::from_metastore(
+                        &e,
+                        format!("DT_MOUNT metadata delete failed for {mount_point}: {e:?}"),
+                    ));
                 }
                 // No metastore anywhere (only possible between
                 // release_metastores and re-wiring): there is no durable
