@@ -76,9 +76,21 @@ pub enum RaftError {
     #[error("raft actor channel full (capacity {0}), driver overloaded")]
     ChannelFull(usize),
 
-    /// Transport error (gRPC forwarding failed).
+    /// A request failed after its connection was established. It may have been
+    /// delivered, so a proposal that fails this way has an unknown outcome. A
+    /// connection that could not be established at all is [`Self::NotSubmitted`].
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// No connection to `endpoint` could be established, so the request never
+    /// left this node: nothing was submitted, and nothing can have been applied.
+    /// A retry is safe.
+    ///
+    /// Only a failed explicit connect is this, because an explicit connect sends
+    /// no request. A failure on a channel that was already established stays
+    /// [`Self::Transport`], even one that looks like an unreachable peer.
+    #[error("could not connect to {endpoint}, so nothing was sent: {reason}")]
+    NotSubmitted { endpoint: String, reason: String },
 
     /// The proposal COMMITTED — the leader applied it and answered with
     /// `result` — but this replica had applied only through `applied` when the
@@ -147,6 +159,9 @@ impl RaftError {
     /// leader hint: None" whose value was readable immediately afterwards, because the
     /// forward had reached the leader and only the reply was lost.
     ///
+    /// `NotSubmitted` is precise in the same direction without anyone answering: the
+    /// connection was never established, so the request did not leave this node.
+    ///
     /// A caller that cannot tolerate a duplicate must READ BACK before retrying when
     /// this is true. One that is idempotent can simply retry.
     #[must_use]
@@ -157,6 +172,8 @@ impl RaftError {
             // raft-rs discards a proposal on a leadership change, and whether the
             // previous leader had already replicated it is not knowable from here.
             Self::ProposalDropped => true,
+            // Never sent: no connection was established, so no node received it.
+            Self::NotSubmitted { .. } => false,
             // Answered, and the answer was "not me" or an explicit rejection: nothing
             // was applied by anyone on this path.
             Self::NotLeader { .. } | Self::ProposalRejected(_) | Self::EntryTooLarge { .. } => {
@@ -372,5 +389,28 @@ mod outcome_tests {
         assert!(!RaftError::Storage("redb closed".into()).proposal_outcome_unknown());
         assert!(!RaftError::Config("bad peer".into()).proposal_outcome_unknown());
         assert!(!RaftError::Serialization("bincode".into()).proposal_outcome_unknown());
+    }
+
+    /// A connection that never came up carried no request: the outcome is known
+    /// without anyone answering, and the message says both what failed and that
+    /// nothing was sent.
+    #[test]
+    fn a_connection_that_never_came_up_sent_nothing() {
+        let never_sent = RaftError::NotSubmitted {
+            endpoint: "https://100.64.0.27:2126".into(),
+            reason: "connect to https://100.64.0.27:2126 did not complete within 2s".into(),
+        };
+        assert!(!never_sent.proposal_outcome_unknown());
+        let message = never_sent.to_string();
+        assert!(
+            message.starts_with("could not connect to https://100.64.0.27:2126"),
+            "{message}"
+        );
+        assert!(message.contains("nothing was sent"), "{message}");
+        assert!(message.contains("did not complete within 2s"), "{message}");
+
+        // The same peer failing on an established channel is not this: the
+        // request may have been delivered before the failure.
+        assert!(RaftError::Transport("status: Unavailable".into()).proposal_outcome_unknown());
     }
 }
