@@ -139,6 +139,10 @@ pub use transport_loop::TransportLoop;
 /// concurrent forward: a tonic channel multiplexes calls and reconnects on
 /// its own. Only a broken channel (`Unavailable`) is dropped; an answer the
 /// leader refused, or a call that ran out of time, leaves it in place.
+///
+/// What a failure says about the proposal follows from where it happened. A
+/// failed dial is [`RaftError::NotSubmitted`]: the dial sends no request. Any
+/// failure of the call itself is [`RaftError::Transport`], an unknown outcome.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) async fn forward_propose(
     client_pool: &RaftClientPool,
@@ -167,6 +171,11 @@ pub(crate) async fn forward_propose(
     match api_client.inner_mut().propose(request).await {
         Ok(response) => decode_propose_response(response.into_inner()),
         Err(status) => {
+            // `Unavailable` here is not proof that nothing was sent. The channel
+            // reconnects on its own, and the same code reports a reconnect that
+            // failed before this request was written and a connection that broke
+            // (an HTTP/2 keep-alive timeout, a reset) after it was. Only the
+            // explicit dial above can prove the leader received nothing.
             if status.code() == tonic::Code::Unavailable {
                 let mut cached = cached_client.lock().await;
                 if cached
@@ -184,7 +193,9 @@ pub(crate) async fn forward_propose(
 /// Submit `command` to the node at `endpoint` as an original request
 /// (`forwarded=false`): that node admits it as coming from this node and may
 /// forward it to its own leader. One connection per call — for rare control
-/// writes such as a member's self-registration.
+/// writes such as a member's self-registration. A failed dial is
+/// [`crate::raft::RaftError::NotSubmitted`]; a failed call is an unknown
+/// outcome.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) async fn propose_to(
     config: &ClientConfig,
@@ -257,6 +268,11 @@ pub(crate) async fn member_addresses_at(
 
 /// Connect an API client with short timeouts — fail fast on an unreachable
 /// node.
+///
+/// The connect is explicit: it completes the TCP, TLS and HTTP/2 handshakes
+/// before returning and writes no request. Every way it fails — an unusable
+/// address, a refused or silent peer, a failed handshake — therefore leaves the
+/// request unsent, and is reported as [`crate::raft::RaftError::NotSubmitted`].
 #[cfg(all(feature = "grpc", has_protos))]
 async fn connect_api_client(
     config: &ClientConfig,
@@ -265,9 +281,12 @@ async fn connect_api_client(
     let mut config = config.clone();
     config.connect_timeout = std::time::Duration::from_secs(2);
     config.request_timeout = std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
-    RaftApiClient::connect(endpoint, config)
-        .await
-        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))
+    RaftApiClient::connect(endpoint, config).await.map_err(|e| {
+        crate::raft::RaftError::NotSubmitted {
+            endpoint: endpoint.to_string(),
+            reason: e.to_string(),
+        }
+    })
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
@@ -890,5 +909,78 @@ mod decode_tests {
             assert!(!matches!(error, RaftError::NotLeader { .. }));
             assert!(error.proposal_outcome_unknown());
         }
+    }
+}
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod connect_failure_tests {
+    use super::{forward_propose, propose_to, NodeAddress, RaftClientPool};
+    use crate::raft::{Command, RaftError};
+    use std::time::Duration;
+
+    /// An endpoint nothing listens on: bound to learn a free port, then closed.
+    fn closed_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    fn command() -> Command {
+        Command::SetMetadata {
+            key: "/never-sent".into(),
+            value: b"value".to_vec(),
+        }
+    }
+
+    /// A leader whose port refuses the connection received nothing: the forward
+    /// is not submitted, not an unknown outcome, and not a leadership answer.
+    /// Nothing is cached for the next forward to reuse.
+    #[tokio::test]
+    async fn a_forward_whose_connection_never_came_up_was_not_submitted() {
+        let endpoint = closed_endpoint();
+        let leader = NodeAddress::new(2, endpoint.clone());
+        let cached = tokio::sync::Mutex::new(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = forward_propose(
+            &RaftClientPool::new(),
+            &leader,
+            &command(),
+            "zone",
+            deadline,
+            &cached,
+        )
+        .await
+        .unwrap_err();
+        match &error {
+            RaftError::NotSubmitted {
+                endpoint: dialed, ..
+            } => assert_eq!(*dialed, endpoint),
+            other => panic!("a refused connection must be not submitted, got {other:?}"),
+        }
+        assert!(!error.proposal_outcome_unknown(), "{error}");
+        assert!(error.to_string().contains("nothing was sent"), "{error}");
+        assert!(cached.lock().await.is_none(), "no channel was established");
+    }
+
+    /// The control-write path dials the same way and reports the same fact.
+    #[tokio::test]
+    async fn a_direct_proposal_whose_connection_never_came_up_was_not_submitted() {
+        let endpoint = closed_endpoint();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = propose_to(
+            &super::ClientConfig::default(),
+            &endpoint,
+            &command(),
+            "zone",
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RaftError::NotSubmitted { .. }),
+            "a refused connection must be not submitted, got {error:?}"
+        );
+        assert!(!error.proposal_outcome_unknown(), "{error}");
     }
 }
