@@ -616,7 +616,7 @@ impl MetaStore for ZoneMetaStore {
             value: kernel_to_proto(&metadata),
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
+            .map_err(|e| proposal_error(format_args!("ZoneMetaStore.put({path})"), &e))?;
         require_metadata_success(result, "put", path)
     }
 
@@ -626,7 +626,7 @@ impl MetaStore for ZoneMetaStore {
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
+            .map_err(|e| proposal_error(format_args!("ZoneMetaStore.delete({path})"), &e))?;
         require_metadata_success(result, "delete", path)?;
         Ok(true)
     }
@@ -649,7 +649,7 @@ impl MetaStore for ZoneMetaStore {
                 is_pas,
             ),
         )
-        .map_err(|error| MetaStoreError::IOError(format!("ZoneMetaStore.rename_path: {error}")))?;
+        .map_err(|error| proposal_error("ZoneMetaStore.rename_path", &error))?;
         require_metadata_success(result, "rename", old_path)
     }
 
@@ -710,7 +710,12 @@ impl MetaStore for ZoneMetaStore {
             // so the lag needs no error — and an error here would read as a
             // refusal and append the entry twice on retry.
             Err(RaftError::CommittedNotVisible { result, .. }) => *result,
-            Err(error) => return Err(append_error(stream_prefix, &error)),
+            Err(error) => {
+                return Err(proposal_error(
+                    format_args!("ZoneMetaStore.append_stream_entry({stream_prefix})"),
+                    &error,
+                ))
+            }
         };
         append_offset(stream_prefix, result)
     }
@@ -757,9 +762,10 @@ impl MetaStore for ZoneMetaStore {
             size,
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.seal_stream_segment({stream_prefix}): {e}"
-            ))
+            proposal_error(
+                format_args!("ZoneMetaStore.seal_stream_segment({stream_prefix})"),
+                &e,
+            )
         })?;
         match result {
             crate::prelude::CommandResult::Success => Ok(()),
@@ -862,9 +868,10 @@ impl MetaStore for ZoneMetaStore {
             trimmed,
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.trim_stream_segments({stream_prefix}): {e}"
-            ))
+            proposal_error(
+                format_args!("ZoneMetaStore.trim_stream_segments({stream_prefix})"),
+                &e,
+            )
         })?;
         match result {
             crate::prelude::CommandResult::Success => Ok(()),
@@ -904,12 +911,17 @@ fn append_offset(stream_prefix: &str, result: CommandResult) -> Result<u64, Meta
     }
 }
 
-/// A failed append proposal, typed by what the raft layer knows about it: sent
-/// with no answer (it may have committed) or refused (nothing was applied).
-/// The two need different handling, a read-back versus a plain retry, and
+/// A failed proposal, typed by what the raft layer knows about it. Sent with no
+/// answer, it may have committed: `OutcomeUnknown`. Otherwise the outcome is
+/// known and the message states it — refused or never sent, so nothing was
+/// applied, or committed but not yet applied on this replica: `IOError`. The
+/// two need different handling, a read-back versus a plain retry, and
 /// `RaftError::proposal_outcome_unknown` is the one place that decides which.
-fn append_error(stream_prefix: &str, e: &crate::prelude::RaftError) -> MetaStoreError {
-    let message = format!("ZoneMetaStore.append_stream_entry({stream_prefix}): {e}");
+///
+/// Every proposing method reports its failures through here, `operation`
+/// naming the call (`ZoneMetaStore.put(/a)`) at the head of the message.
+fn proposal_error(operation: impl std::fmt::Display, e: &RaftError) -> MetaStoreError {
+    let message = format!("{operation}: {e}");
     if e.proposal_outcome_unknown() {
         MetaStoreError::OutcomeUnknown(message)
     } else {
@@ -923,30 +935,84 @@ mod tests {
     use crate::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
 
-    /// A proposal that was sent without an answer may have committed; one the
-    /// cluster refused applied nothing. The append error keeps them apart.
-    #[test]
-    fn append_errors_say_whether_the_entry_may_have_committed() {
-        use crate::prelude::RaftError;
-        for unknown in [
+    /// Failures whose proposal may have committed: sent, with no answer.
+    fn unanswered() -> [RaftError; 4] {
+        [
             RaftError::Transport("connection reset".into()),
             RaftError::Timeout(10),
             RaftError::ProposalDropped,
             RaftError::ProposalOutcomeUnknown("lost".into()),
-        ] {
+        ]
+    }
+
+    /// Failures that applied nothing: answered with a refusal, or never sent.
+    fn applied_nothing() -> [RaftError; 4] {
+        [
+            RaftError::NotLeader { leader_hint: None },
+            RaftError::ProposalRejected("configuration changed".into()),
+            RaftError::EntryTooLarge { bytes: 2, limit: 1 },
+            RaftError::NotSubmitted {
+                endpoint: "https://100.64.0.27:2126".into(),
+                reason: "connection refused".into(),
+            },
+        ]
+    }
+
+    /// A proposal that was sent without an answer may have committed; one the
+    /// cluster refused applied nothing. The append error keeps them apart.
+    #[test]
+    fn append_errors_say_whether_the_entry_may_have_committed() {
+        let append = |e: &RaftError| {
+            proposal_error(format_args!("ZoneMetaStore.append_stream_entry(p/)"), e)
+        };
+        for unknown in unanswered() {
             assert!(
-                matches!(
-                    append_error("p/", &unknown),
-                    MetaStoreError::OutcomeUnknown(_)
-                ),
+                matches!(append(&unknown), MetaStoreError::OutcomeUnknown(_)),
                 "{unknown}"
             );
         }
-        let refused = RaftError::NotLeader { leader_hint: None };
-        assert!(matches!(
-            append_error("p/", &refused),
-            MetaStoreError::IOError(_)
-        ));
+        for refused in applied_nothing() {
+            assert!(
+                matches!(append(&refused), MetaStoreError::IOError(_)),
+                "{refused}"
+            );
+        }
+    }
+
+    /// `put` and `delete` classify through the same helper as appends, so a
+    /// caller can tell a write that may have landed from one that did not by
+    /// the variant alone. Each keeps its own message prefix.
+    #[test]
+    fn put_and_delete_errors_say_whether_the_write_may_have_committed() {
+        for operation in ["ZoneMetaStore.put(/a)", "ZoneMetaStore.delete(/a)"] {
+            for unknown in unanswered() {
+                match proposal_error(operation, &unknown) {
+                    MetaStoreError::OutcomeUnknown(why) => {
+                        assert_eq!(why, format!("{operation}: {unknown}"))
+                    }
+                    other => panic!("{operation} after {unknown} must not read as {other:?}"),
+                }
+            }
+            for refused in applied_nothing() {
+                match proposal_error(operation, &refused) {
+                    MetaStoreError::IOError(why) => {
+                        assert_eq!(why, format!("{operation}: {refused}"))
+                    }
+                    other => panic!("{operation} after {refused} must not read as {other:?}"),
+                }
+            }
+            // Committed, only not applied here yet: the outcome is known, and the
+            // message says the write is not undone.
+            let committed = RaftError::CommittedNotVisible {
+                index: Some(9),
+                applied: 7,
+                result: Box::new(CommandResult::Success),
+            };
+            match proposal_error(operation, &committed) {
+                MetaStoreError::IOError(why) => assert!(why.contains("committed"), "{why}"),
+                other => panic!("a committed {operation} must not read as {other:?}"),
+            }
+        }
     }
 
     /// Once `propose` returns the entry is committed, so an answer without a
