@@ -397,7 +397,9 @@ fn audit_zones(
 /// node. Alarms (exit 2), each held for at least `stall`:
 ///
 ///   * `PEER_STUCK_IN_SNAPSHOT` / `PEER_STUCK_IN_PROBE` — on the leader, a
-///     member's flow-control state has not returned to `Replicate`.
+///     member behind the commit index holds that flow-control state without
+///     progress. A caught-up member may stay in `Probe` indefinitely in an idle
+///     zone: raft-rs returns it to `Replicate` only on an acknowledged append.
 ///   * `PEER_REPLICATION_STALLED` — on the leader, a member's matched index
 ///     stands still behind the commit index.
 ///   * `PEER_SEND_FAILING` — on the leader, every message to a member has
@@ -536,18 +538,24 @@ fn audit_replication(
             State::Probe => Some("PEER_STUCK_IN_PROBE"),
             State::Replicate | State::Unknown => None,
         }
-        .filter(|_| peer.state_age_ms >= stall_ms);
+        .filter(|_| peer.state_age_ms >= stall_ms && peer.stalled_ms >= stall_ms);
         if let Some(code) = stuck_state {
+            let cause = if peer.send_failures > 0 {
+                "the leader's log names why each attempt fails (`Raft message send failed` / \
+                 `timeout`)"
+            } else {
+                "no send to it has failed, so the leader is not sending; its log around the \
+                 state change names why"
+            };
             report.alarms.push(format!(
-                "{code}: peer {} ({role}) has held {:?} for {}s at matched {} of commit {}. \
-                 RECOVERY: every snapshot the leader sends is reported delivered or failed \
-                 and re-sent; a peer held here means each attempt fails — the leader's log \
-                 names why (`Raft message send failed` / `timeout`, snapshot=true).",
+                "{code}: peer {} ({role}) has held {:?} for {}s at matched {} of commit {} \
+                 (lag {lag}, matched still for {}s). RECOVERY: {cause}.",
                 peer.node_id,
                 peer.state(),
                 secs(peer.state_age_ms),
                 peer.matched,
                 facts.commit_index,
+                secs(peer.stalled_ms),
             ));
         } else if peer.stalled_ms >= stall_ms {
             report.alarms.push(format!(
@@ -703,6 +711,45 @@ mod replication_tests {
         assert_eq!(
             alarm_codes(&audit_replication(&learner, stall)),
             ["REPLICA_LAGGING"]
+        );
+    }
+
+    /// Production evidence (Windows root, `__control__`, after its restart): an
+    /// idle zone leaves a caught-up member in Probe, because raft-rs moves it to
+    /// Replicate only on an acknowledged append. Nothing is stuck.
+    #[test]
+    fn a_caught_up_member_idling_in_probe_does_not_alarm() {
+        let stall = Duration::from_secs(30);
+        let probe = |matched, stalled_ms| {
+            resident(ClusterFacts {
+                commit_index: 51,
+                applied_index: 51,
+                leader_id: 1,
+                leader_contact_age_ms: Some(0),
+                peers: vec![PeerReplication {
+                    node_id: 2,
+                    learner: true,
+                    state: State::Probe.into(),
+                    matched,
+                    next_index: matched + 1,
+                    state_age_ms: 948_000,
+                    stalled_ms,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        assert!(audit_replication(&probe(51, 0), stall).alarms.is_empty());
+
+        // The same Probe hold behind the commit index is stuck, and with no
+        // failed send the recovery points at the leader, not the transport.
+        let stuck = audit_replication(&probe(40, 948_000), stall);
+        assert_eq!(alarm_codes(&stuck), ["PEER_STUCK_IN_PROBE"]);
+        assert!(stuck.alarms[0].contains("lag 11"), "{}", stuck.alarms[0]);
+        assert!(
+            stuck.alarms[0].contains("no send to it has failed"),
+            "{}",
+            stuck.alarms[0]
         );
     }
 
