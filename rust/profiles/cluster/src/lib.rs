@@ -880,7 +880,7 @@ enum Cmd {
         live: bool,
         /// With `--live`: how long a peer may hold Snapshot/Probe, or an
         /// index stand still behind the commit index, before it alarms.
-        #[arg(long, default_value_t = 30, requires = "live")]
+        #[arg(long, default_value_t = nexus_raft::raft::REPLICATION_STALL.as_secs(), requires = "live")]
         stall_secs: u64,
     },
     /// Reset this node to a truly-fresh state: remove BOTH the data-dir and the
