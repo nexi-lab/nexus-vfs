@@ -25,6 +25,15 @@ import {
 export { NexusConditionalContentError } from './conditionalContent.js'
 export type { NexusConditionalWriteResult, NexusConditionalFailureKind, NexusVersionedContent } from './conditionalContent.js'
 
+import {
+  copyReplicaControlRequest, copyReplicaCsrRequest, decodeReplicaControlResponse, decodeReplicaCsrResponse,
+  type NexusReplicaControlRequest, type NexusReplicaControlResponse, type NexusReplicaCsrRequest, type NexusReplicaCsrResponse,
+} from './replica.js'
+export type {
+  NexusReplicaControlRequest, NexusReplicaControlResponse, NexusReplicaControlState,
+  NexusReplicaCsrRequest, NexusReplicaCsrResponse, NexusReplicaCsrState,
+} from './replica.js'
+
 export { userRuntimeServerName, createUserRuntimeCredentialBundle } from './credentials.js'
 export type { SessionCredential, UserRuntimeCredentialBundle } from './credentials.js'
 
@@ -1294,6 +1303,9 @@ export class NexusZoneApiClient {
 interface SessionMinterResult { success: boolean; error?: string }
 interface SessionMinterList extends SessionMinterResult { agent_ids: string[] }
 interface NodeOperatorMethods {
+  ControlReplicaV1: GrpcMethod<NexusReplicaControlRequest, unknown>
+  IssueReplicaCsrV1: GrpcMethod<NexusReplicaCsrRequest, unknown>
+  QueryReplicaCsrV1: GrpcMethod<NexusReplicaCsrRequest, unknown>
   AllowSessionMinter: GrpcMethod<{ agent_id: string }, SessionMinterResult>
   DenySessionMinter: GrpcMethod<{ agent_id: string }, SessionMinterResult & { was_present: boolean }>
   ListSessionMinters: GrpcMethod<Record<string, never>, SessionMinterList>
@@ -1330,6 +1342,38 @@ export class NexusNodeOperatorClient {
 
   private open(): void {
     if (this.closed) throw new Error('nexus node operator client is closed')
+  }
+
+  /** Submit exactly one native control request with its original JSON bytes.
+   * Unknown, Refused and NotObserved remain native outcomes. The controller
+   * retains the original request and chooses its corresponding readback.
+   */
+  async controlReplica(request: NexusReplicaControlRequest): Promise<NexusReplicaControlResponse> {
+    this.open()
+    const original = copyReplicaControlRequest(request)
+    const response = await invoke(this.client, this.client.ControlReplicaV1, 'control replica', original,
+      this.timeout, this.calls)
+    return decodeReplicaControlResponse(response)
+  }
+
+  /** One CSR issuance attempt. Preserve this request for queryReplicaCsr when
+   * the response is uncertain, including its holder proof and operation IDs.
+   */
+  async issueReplicaCsr(request: NexusReplicaCsrRequest): Promise<NexusReplicaCsrResponse> {
+    this.open()
+    const original = copyReplicaCsrRequest(request)
+    const response = await invoke(this.client, this.client.IssueReplicaCsrV1, 'issue replica CSR', original,
+      this.timeout, this.calls)
+    return decodeReplicaCsrResponse(response)
+  }
+
+  /** Read back the original CSR operation through current native authorization. */
+  async queryReplicaCsr(request: NexusReplicaCsrRequest): Promise<NexusReplicaCsrResponse> {
+    this.open()
+    const original = copyReplicaCsrRequest(request)
+    const response = await invoke(this.client, this.client.QueryReplicaCsrV1, 'query replica CSR', original,
+      this.timeout, this.calls)
+    return decodeReplicaCsrResponse(response)
   }
 
   async listSessionMinters(): Promise<string[]> {
