@@ -81,7 +81,7 @@ pub(crate) use node::MemberRegistration;
 pub use node::{
     LeaderCommit, PeerReplication, RaftConfig, RaftMessageProtocol, RaftMsg, ReplicationState,
     ReplicationStatus, StorageActivationView, StorageSubmission, ZoneConsensus,
-    ZoneConsensusDriver,
+    ZoneConsensusDriver, REPLICATION_STALL,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use node::{PreparedReplicaControl, ReplicaPreparationError};
