@@ -11,10 +11,8 @@ use nexus_raft::{
     ca_issuer::agent_csr_request_digest,
     transport::{
         local_node_identity,
-        proto::{
-            zone_api_service_client::ZoneApiServiceClient, AgentCsrCapabilitiesRequest,
-            AgentCsrState,
-        },
+        proto::{AgentCsrCapabilitiesRequest, AgentCsrState},
+        zone_api_client,
     },
 };
 use serde_json::{json, Value};
@@ -177,7 +175,7 @@ async fn execute(
     let channel = create_channel(&args.endpoint, &config)
         .await
         .map_err(Failure::preflight)?;
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = zone_api_client(channel);
     // Read-only preflight is not permission or authoritative-store readiness.
     // A later refusal/Unknown never causes another issue or another key.
     let caps = client

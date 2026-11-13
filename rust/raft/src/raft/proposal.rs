@@ -3,6 +3,16 @@
 /// Commit budget shared by local proposals, forwarding and forwarded RPCs.
 pub(crate) const PROPOSAL_TIMEOUT_SECS: u64 = 10;
 
+/// A command the leader applied: its result, and the index the leader had
+/// applied when it answered. Every entry through that index is committed,
+/// the command's own included, so a replica that has applied through it
+/// observes the command.
+#[derive(Debug)]
+pub(crate) struct Committed {
+    pub(crate) result: super::CommandResult,
+    pub(crate) index: u64,
+}
+
 pub(super) async fn wait_for_commit(
     receiver: tokio::sync::oneshot::Receiver<super::Result<super::CommandResult>>,
     deadline: tokio::time::Instant,

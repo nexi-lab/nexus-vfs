@@ -125,6 +125,15 @@ mod tests {
         ZoneConsensus::new(config, storage, state_machine, None).unwrap()
     }
 
+    /// Whether `context` is a linearizable read `driver` still holds — as
+    /// opposed to its commit probe, which shares the ReadIndex wire.
+    fn is_pending_read(driver: &Driver, context: &[u8]) -> bool {
+        driver
+            .pending_reads_by_ctx
+            .keys()
+            .any(|pending| pending[..] == *context)
+    }
+
     fn campaign(handle: &ZoneConsensus<FullStateMachine>, driver: &mut Driver) {
         let mut request = Box::pin(handle.campaign());
         assert!(poll(&mut request).is_pending());
@@ -157,7 +166,7 @@ mod tests {
         driver.advance().await.unwrap();
         assert!(matches!(poll(&mut read), Poll::Ready(Ok(index)) if index >= 2));
         assert!(driver.pending_reads_by_ctx.is_empty());
-        assert!(driver.pending_reads_by_index.is_empty());
+        assert!(driver.applied_waiters.is_empty());
     }
 
     #[tokio::test]
@@ -287,18 +296,23 @@ mod tests {
         let follower = cluster.handles[2].clone();
         let mut read = Box::pin(follower.read_linearizable(|_| ()));
         assert!(poll(&mut read).is_pending());
-        let mut original_context = None;
+        let mut forwarded = Vec::new();
         cluster
             .round(|message| {
                 if message.get_msg_type() == MessageType::MsgReadIndex {
-                    original_context = Some(message.entries[0].data.clone());
+                    forwarded.push(message.entries[0].data.clone());
                     false
                 } else {
                     true
                 }
             })
             .await;
-        let context = original_context.expect("read was forwarded to the original leader");
+        // Followers' commit probes are ReadIndex traffic too; the read is the
+        // one its node still holds pending.
+        let context = forwarded
+            .into_iter()
+            .find(|context| is_pending_read(&cluster.drivers[2], context))
+            .expect("read was forwarded to the original leader");
         assert!(poll(&mut read).is_pending());
         let term = cluster.drivers[2].raw_node.raft.term;
         campaign(&cluster.handles[1], &mut cluster.drivers[1]);
@@ -306,9 +320,10 @@ mod tests {
         for _ in 0..12 {
             cluster
                 .round(|message| {
-                    if message.get_msg_type() == MessageType::MsgReadIndex {
+                    if message.get_msg_type() == MessageType::MsgReadIndex
+                        && message.entries[0].data == context
+                    {
                         assert_eq!(message.to, 2);
-                        assert_eq!(message.entries[0].data, context);
                         resubmitted = true;
                     }
                     true
@@ -355,12 +370,12 @@ mod tests {
         let old_handle = cluster.handles[2].clone();
         let mut old_read = Box::pin(old_handle.read_linearizable(|_| ()));
         assert!(poll(&mut old_read).is_pending());
-        let mut response = None;
+        let mut responses = Vec::new();
         for _ in 0..8 {
             cluster
                 .round(|message| {
                     if message.to == 3 && message.get_msg_type() == MessageType::MsgReadIndexResp {
-                        assert!(response.replace(message.clone()).is_none());
+                        responses.push(message.clone());
                         false
                     } else {
                         true
@@ -368,7 +383,11 @@ mod tests {
                 })
                 .await;
         }
-        let response = response.expect("leader confirmed the original read");
+        let mut answers = responses
+            .into_iter()
+            .filter(|message| is_pending_read(&cluster.drivers[2], &message.entries[0].data));
+        let response = answers.next().expect("leader confirmed the original read");
+        assert!(answers.next().is_none(), "the read is confirmed once");
         let original_term = response.term;
         assert!(poll(&mut old_read).is_pending());
         drop(old_read);

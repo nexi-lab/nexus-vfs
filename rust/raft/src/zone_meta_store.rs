@@ -6,6 +6,17 @@
 //! ``propose`` (Raft consensus); reads hit the local state machine
 //! directly.
 //!
+//! ## What a replica reports
+//!
+//! A write returns ``Ok`` only once THIS replica has applied it
+//! (``ZoneConsensus::propose``); a write that committed but is not applied
+//! here in time fails with the replica's lag rather than reporting a success
+//! no read on this node would confirm. A metadata read waits for every write
+//! this node submitted to be applied here, and otherwise reports the lag
+//! instead of a stale answer (``ZoneConsensus::own_writes_visible``). Stream
+//! reads are exempt: an offset this replica has not applied yet reads as
+//! not-yet-written, which a stream reader already waits on.
+//!
 //! ## Write consistency
 //!
 //! ``put`` / ``delete`` / CAS / ``append_stream_entry`` all go through
@@ -53,7 +64,9 @@
 
 use std::sync::Arc;
 
-use crate::prelude::{AppliedEntry, Command, CommandResult, FullStateMachine, ZoneConsensus};
+use crate::prelude::{
+    AppliedEntry, Command, CommandResult, FullStateMachine, RaftError, ZoneConsensus,
+};
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use lib::rt::block_on_via as bridge_block_on;
@@ -114,8 +127,8 @@ pub struct ZoneMetaStore {
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
     /// `to_global_path` rewrite done on read so callers see consistent
-    /// keys). `get` consults the cache first; `put` fills it from an
-    /// authoritative committed image; `delete` invalidates pre-propose.
+    /// keys). `get` consults the cache first and fills it from the state
+    /// machine; `delete` invalidates pre-propose.
     ///
     /// Apply-side coherence on follower nodes (and on crosslink
     /// surfaces of the same zone on the leader): every ZoneMetaStore
@@ -379,6 +392,18 @@ impl ZoneMetaStore {
         metadata.path = self.to_global_path(&metadata.path);
         Ok(metadata)
     }
+
+    /// Read-your-writes for a metadata read on this replica: every write this
+    /// node submitted must be applied here first, or the read reports the
+    /// replica's lag. Two atomic loads when it already is.
+    fn own_writes_visible(&self, operation: &str, path: &str) -> Result<(), MetaStoreError> {
+        let node = self.node()?;
+        if node.own_writes_applied() {
+            return Ok(());
+        }
+        bridge_block_on(&self.runtime, node.own_writes_visible())
+            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.{operation}({path}): {e}")))
+    }
 }
 
 /// A wire/proto `target_subtree` as the domain value: empty means the whole
@@ -567,6 +592,9 @@ impl MetaStore for ZoneMetaStore {
     }
 
     fn get(&self, path: &str) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
+        // Before the cache: a row cached before this node's own write may
+        // still be there until the replica applies the write and evicts it.
+        self.own_writes_visible("get", path)?;
         self.cache.get_or_load(path, || {
             self.read_metadata_image(path)?
                 .as_deref()
@@ -583,36 +611,13 @@ impl MetaStore for ZoneMetaStore {
         // travels through a different mount point would see the
         // originating mount's global path, not its own.
         metadata.path = zone_key.clone();
-        let value = kernel_to_proto(&metadata);
-        let value_snapshot = value.clone();
         let cmd = Command::SetMetadata {
-            key: zone_key.clone(),
-            value,
+            key: zone_key,
+            value: kernel_to_proto(&metadata),
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
-        require_metadata_success(result, "put", path)?;
-        // Read-your-writes: poll local state machine until the exact
-        // bytes we just wrote show up. Propose returns on leader commit;
-        // on a follower, local apply lags by up to one raft tick.
-        // SSOT = raft state machine.
-        let _ = self.node()?.wait_until(
-            || {
-                matches!(
-                    self.cache.load_uncached(path, || {
-                        match self.read_metadata_image(path)? {
-                            Some(bytes) if bytes == value_snapshot => {
-                                self.decode_metadata(&bytes).map(Some)
-                            }
-                            _ => Ok(None),
-                        }
-                    }),
-                    Ok(Some(_))
-                )
-            },
-            500,
-        );
-        Ok(())
+        require_metadata_success(result, "put", path)
     }
 
     fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
@@ -649,6 +654,7 @@ impl MetaStore for ZoneMetaStore {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {
+        self.own_writes_visible("list", prefix)?;
         let zone_prefix = self.to_zone_key(prefix);
         let key = zone_prefix.clone();
         let fut = self
@@ -697,8 +703,15 @@ impl MetaStore for ZoneMetaStore {
             stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
-        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| append_error(stream_prefix, &e))?;
+        let result = match bridge_block_on(&self.runtime, self.node()?.propose(cmd)) {
+            Ok(result) => result,
+            // Committed at its offset. A stream reader on this replica reads
+            // an offset it has not applied yet as not-yet-written and waits,
+            // so the lag needs no error — and an error here would read as a
+            // refusal and append the entry twice on retry.
+            Err(RaftError::CommittedNotVisible { result, .. }) => *result,
+            Err(error) => return Err(append_error(stream_prefix, &error)),
+        };
         append_offset(stream_prefix, result)
     }
 

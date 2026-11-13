@@ -80,6 +80,39 @@ pub enum RaftError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// The proposal COMMITTED — the leader applied it at or before `index` and
+    /// answered with `result` — but this replica had applied only through
+    /// `applied` when the deadline passed, so a read here would not observe
+    /// it yet. The write is not undone: re-issuing it applies it twice.
+    #[error(
+        "committed through index {index}, but this node has applied only through {applied} \
+         (replica lag {lag}); the write is not yet visible here",
+        lag = .index.saturating_sub(*.applied)
+    )]
+    CommittedNotVisible {
+        index: u64,
+        applied: u64,
+        result: Box<super::CommandResult>,
+    },
+
+    /// A read on this replica must observe the writes this node submitted,
+    /// which committed through `required`; the replica had applied only
+    /// through `applied` within the read's budget.
+    #[error(
+        "this node's writes committed through index {required}, but it has applied only \
+         through {applied} (replica lag {lag}); a read here would be stale",
+        lag = .required.saturating_sub(*.applied)
+    )]
+    ReplicaBehind { required: u64, applied: u64 },
+
+    /// The proposal's log entry would exceed the bound every append must fit
+    /// (`message_bound::MAX_ENTRY_BYTES`); nothing was submitted. Data this
+    /// large could never be replicated to any peer.
+    #[error(
+        "proposal of {bytes} bytes exceeds the {limit}-byte raft entry bound; nothing was submitted"
+    )]
+    EntryTooLarge { bytes: usize, limit: usize },
+
     /// A zone's on-disk store is held by another process — the payload is the store
     /// path. Mirrors [`crate::transport::TransportError::DataDirLocked`] so the fact
     /// survives the hop into this vocabulary; see that variant for why it is typed.
@@ -114,7 +147,11 @@ impl RaftError {
             Self::ProposalDropped => true,
             // Answered, and the answer was "not me" or an explicit rejection: nothing
             // was applied by anyone on this path.
-            Self::NotLeader { .. } | Self::ProposalRejected(_) => false,
+            Self::NotLeader { .. } | Self::ProposalRejected(_) | Self::EntryTooLarge { .. } => {
+                false
+            }
+            // Answered, and the answer was "committed": the outcome is known.
+            Self::CommittedNotVisible { .. } => false,
             // Local faults that never reached consensus.
             Self::Storage(_) | Self::Serialization(_) | Self::Config(_) => false,
             // Everything else is a definite answer from the raft layer.

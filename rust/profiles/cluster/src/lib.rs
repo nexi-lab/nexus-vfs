@@ -860,6 +860,10 @@ enum Cmd {
     /// Typical use:
     ///   pkill -f nexusd-cluster
     ///   nexusd-cluster doctor --data-dir /tmp/nexus-fed-data
+    ///
+    /// `--live` audits the RUNNING daemon instead: replication progress and
+    /// replica lag exist only in its memory, so each zone is read through its
+    /// `ZoneStatus` (run in the daemon's environment, as this node).
     Doctor {
         /// Path to the daemon's data directory (the one passed to
         /// `--data-dir` at boot).  The doctor walks its subdirectories
@@ -870,6 +874,14 @@ enum Cmd {
         /// zones found on disk.
         #[arg(long)]
         zone: Option<String>,
+        /// Audit the running daemon's replication (peer progress, replica
+        /// lag) instead of the stopped daemon's on-disk state.
+        #[arg(long)]
+        live: bool,
+        /// With `--live`: how long a peer may hold Snapshot/Probe, or an
+        /// index stand still behind the commit index, before it alarms.
+        #[arg(long, default_value_t = 30, requires = "live")]
+        stall_secs: u64,
     },
     /// Reset this node to a truly-fresh state: remove BOTH the data-dir and the
     /// identity file. A `rm -rf <data-dir>` alone is NOT a fresh node —
@@ -1315,7 +1327,28 @@ where
                 }
                 Some(Cmd::Auth { action }) => run_auth(args.common, action).await,
                 Some(Cmd::ForeignCa { action }) => run_foreign_ca(args.common, action).await,
-                Some(Cmd::Doctor { data_dir, zone }) => doctor::run(&data_dir, zone.as_deref()),
+                Some(Cmd::Doctor {
+                    data_dir,
+                    zone,
+                    live: false,
+                    ..
+                }) => doctor::run(&data_dir, zone.as_deref()),
+                Some(Cmd::Doctor {
+                    data_dir,
+                    zone,
+                    live: true,
+                    stall_secs,
+                }) => {
+                    let (endpoint, tls) = local_daemon_dial(&args.common, &data_dir)?;
+                    doctor::run_live(
+                        &endpoint,
+                        tls,
+                        &data_dir,
+                        zone.as_deref(),
+                        Duration::from_secs(stall_secs),
+                    )
+                    .await
+                }
                 Some(Cmd::Reset {
                     data_dir,
                     identity_dir,
@@ -1957,13 +1990,6 @@ fn open_zone_manager(
     })
 }
 
-/// How long boot waits for the epoch zone's restarted learner replica to
-/// catch up with its leader before running the anti-resurrection sweep
-/// (R12). The wait ends the moment the boot marker is VISIBLE in the local
-/// state machine (one propose round-trip + local apply on the common
-/// path), so healthy boots never spend the whole budget.
-const EPOCH_CATCHUP_BUDGET_SECS: u64 = 15;
-
 /// Which zone carries the R12 deletion epochs: the control zone under
 /// TLS, the per-node root otherwise. The single source for
 /// [`wire_deletion_registry`] and the CLI catch-up call sites.
@@ -2000,62 +2026,37 @@ fn wire_deletion_registry(
 }
 
 /// Prove the epoch zone's local replica is current: commit a fresh boot
-/// marker through the leader and wait until THIS replica's state machine
-/// shows it (value visibility). Marker visibility ⇒ every earlier entry —
-/// any deletion record included — has applied locally (raft replicates
-/// contiguously). An index comparison (`applied >= commit`) cannot prove
-/// this on a follower: right after a propose, the local `commit_index` is
-/// still stale, so an index check passes immediately on OLD state (the
-/// trap node.rs documents). Degradation on propose failure / visibility
-/// timeout is a WARN — boot continues and the sweep runs on the local
-/// replica's current state (same contract as before).
+/// marker through the leader. The put succeeds only once THIS replica has
+/// applied the marker, which implies every earlier entry — any deletion
+/// record included — has applied locally (raft replicates contiguously). An
+/// index comparison (`applied >= commit`) cannot prove this on a follower:
+/// right after a propose, the local `commit_index` is still stale, so an
+/// index check passes immediately on OLD state. Degradation on a failed or
+/// not-yet-visible put is a WARN — boot continues and the sweep runs on the
+/// local replica's current state.
 fn catch_up_epoch_zone(zm: &nexus_raft::ZoneManager, epoch_zone: &str, node_id: u64) {
     let Some(z) = zm.get_zone(epoch_zone) else {
         return;
     };
-    let node = z.consensus_node();
     let store = nexus_raft::control_state_store::ControlStateStore::new(
-        node.clone(),
+        z.consensus_node(),
         z.runtime_handle(),
         contracts::CONTROL_NS_BOOT_SYNC,
     );
-    // Fixed key + fresh value: `put` is an upsert, so the namespace does
-    // not grow per boot (a unique key per boot would accumulate forever).
-    // The value mixes pid + a sub-nanos salt into the millisecond stamp, so
-    // two boots of one node can never produce the SAME value — kill -9
-    // right after the put plus a supervisor instant restart would
-    // otherwise leave the new boot's equality wait satisfied by the OLD
-    // marker within the same millisecond (a false "caught up").
+    // Fixed key, upserted: the namespace does not grow per boot (a unique key
+    // per boot would accumulate forever). The value records the boot time.
     let marker_key = format!("boot/{node_id}");
-    let marker_value = {
-        let d = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        format!(
-            "{}-{}-{}",
-            d.as_millis(),
-            std::process::id(),
-            d.subsec_nanos()
-        )
-    };
+    let marker_value = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
     if let Err(e) = store.put(&marker_key, marker_value.as_bytes()) {
         tracing::warn!(
             zone = %epoch_zone,
             error = %e,
-            "boot-sync marker propose failed; the anti-resurrection sweep runs on \
-             the local replica's current state",
-        );
-        return;
-    }
-    let visible = node.wait_until(
-        || matches!(&store.get(&marker_key), Ok(Some(bytes)) if bytes == marker_value.as_bytes()),
-        EPOCH_CATCHUP_BUDGET_SECS * 1000,
-    );
-    if !visible {
-        tracing::warn!(
-            zone = %epoch_zone,
-            "boot-sync marker not visible within {EPOCH_CATCHUP_BUDGET_SECS}s; the \
-             anti-resurrection sweep runs on the local replica's current state",
+            "boot-sync marker not applied on this replica; the anti-resurrection \
+             sweep runs on the local replica's current state",
         );
     }
 }
@@ -2556,8 +2557,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             let solo = zm.zone_peers(epoch_zone).is_empty();
             if !solo {
                 // Off the async worker (the run_enroll/sweep pattern): the
-                // catch-up parks the calling thread in a 5 ms poll loop for
-                // up to EPOCH_CATCHUP_BUDGET_SECS.
+                // catch-up blocks the calling thread for up to one proposal
+                // deadline.
                 let zm_catchup = std::sync::Arc::clone(&zm);
                 tokio::task::spawn_blocking(move || {
                     catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id)
@@ -4088,8 +4089,8 @@ async fn run_share(
     // catches up, so prove the replica current BEFORE the guard reads it
     // (same call the daemon's own boot makes). A no-op when the epoch zone
     // is not hosted here. Off the async worker, the same wrap the daemon's
-    // boot uses: the catch-up parks the calling thread in a 5 ms poll loop
-    // for up to EPOCH_CATCHUP_BUDGET_SECS.
+    // boot uses: the catch-up blocks the calling thread for up to one
+    // proposal deadline.
     let epoch_zone = epoch_zone_id(common.no_tls);
     let zm_catchup = std::sync::Arc::clone(&zm);
     tokio::task::spawn_blocking(move || catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id))
@@ -4565,8 +4566,8 @@ async fn run_join(
     // founder recorded while this node was down stays invisible and the
     // joiner would re-found the deleted zone (same call the daemon's boot
     // makes; no-op when the epoch zone is not hosted here). Off the async
-    // worker, the same wrap the daemon's boot uses: the catch-up parks the
-    // calling thread in a 5 ms poll loop for up to EPOCH_CATCHUP_BUDGET_SECS.
+    // worker, the same wrap the daemon's boot uses: the catch-up blocks the
+    // calling thread for up to one proposal deadline.
     let epoch_zone = epoch_zone_id(common.no_tls);
     let zm_catchup = std::sync::Arc::clone(&zm);
     tokio::task::spawn_blocking(move || catch_up_epoch_zone(&zm_catchup, epoch_zone, node_id))
@@ -6412,6 +6413,21 @@ fn certificate_sha256_hex(pem: &[u8]) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+/// This node's own daemon loopback endpoint and how to dial it as this node:
+/// the node certificate under `data_dir` under mTLS, plaintext under
+/// `--no-tls`.
+fn local_daemon_dial(
+    common: &CommonArgs,
+    data_dir: &std::path::Path,
+) -> Result<(String, Option<nexus_raft::transport::TlsConfig>)> {
+    let endpoint = self_daemon_endpoint(common)
+        .ok_or_else(|| anyhow::anyhow!("cannot derive the local daemon endpoint from bind addr"))?;
+    if common.no_tls {
+        return Ok((endpoint.replacen("https://", "http://", 1), None));
+    }
+    Ok((endpoint, Some(load_node_tls(data_dir)?)))
 }
 
 /// This node's own daemon loopback endpoint + its node-cert mTLS identity — the

@@ -39,6 +39,19 @@
 //! nexus_raft = { version = "0.1", features = ["grpc"] }
 //! ```
 
+/// Bound a generated tonic server or client by the raft message bound
+/// ([`crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES`]) in both
+/// directions. Every endpoint applies the same bound, so whatever one peer
+/// may send, every other accepts. Defined ahead of the submodules, which see
+/// it in textual scope.
+macro_rules! bounded {
+    ($endpoint:expr) => {
+        $endpoint
+            .max_decoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+    };
+}
+
 mod node_authority;
 pub use node_authority::{
     current_local_node_certificate, local_node_identity, LocalNodeCertificate,
@@ -104,10 +117,10 @@ pub use client::{
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
     call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_local_node_certificate_rpc,
     call_renew_node_certificate_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
-    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, join_zone_round, ClientConfig,
-    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound, JoinZoneResult,
-    MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult, ProposeResult,
-    QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
+    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, call_zone_status_rpc, join_zone_round,
+    zone_api_client, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound,
+    JoinZoneResult, MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult,
+    ProposeResult, QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
@@ -122,10 +135,10 @@ pub use transport_loop::TransportLoop;
 /// Serializes the command with bincode and sends as `raw_command` bytes
 /// in `ProposeRequest` — avoids double serialization (bincode→proto→bincode).
 ///
-/// `cached_client` provides a reusable `RaftApiClient` across calls.
-/// On first use (or after eviction), a new connection is established and
-/// cached. On transport error, the cached client is evicted so the next
-/// call reconnects.
+/// `cached_client` holds ONE client per leader endpoint, shared by every
+/// concurrent forward: a tonic channel multiplexes calls and reconnects on
+/// its own. Only a broken channel (`Unavailable`) is dropped; an answer the
+/// leader refused, or a call that ran out of time, leaves it in place.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) async fn forward_propose(
     client_pool: &RaftClientPool,
@@ -134,38 +147,36 @@ pub(crate) async fn forward_propose(
     zone_id: &str,
     deadline: tokio::time::Instant,
     cached_client: &tokio::sync::Mutex<Option<(String, RaftApiClient)>>,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
     let request = propose_request(command, zone_id, true, deadline)?;
-
-    // Get or create a cached API client. Evict if the leader endpoint changed.
     let mut api_client = {
-        let mut guard = cached_client.lock().await;
-        match guard.take() {
-            Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
-            _ => connect_api_client(client_pool.config(), &leader_addr.endpoint).await?,
+        let mut cached = cached_client.lock().await;
+        match cached.as_ref() {
+            Some((endpoint, client)) if *endpoint == leader_addr.endpoint => client.clone(),
+            // Dialed under the lock: overlapping forwards share the one dial.
+            _ => {
+                let client =
+                    connect_api_client(client_pool.config(), &leader_addr.endpoint).await?;
+                *cached = Some((leader_addr.endpoint.clone(), client.clone()));
+                client
+            }
         }
     };
-
-    let result = api_client
-        .inner_mut()
-        .propose(request)
-        .await
-        .map_err(|e| RaftError::Transport(e.to_string()));
-
-    match result {
-        Ok(response) => {
-            // Success — cache the client for reuse.
-            let mut guard = cached_client.lock().await;
-            *guard = Some((leader_addr.endpoint.clone(), api_client));
-
-            decode_propose_response(response.into_inner())
-        }
-        Err(e) => {
-            // Transport error — evict cached client (already taken above).
-            // Next call will reconnect.
-            Err(e)
+    match api_client.inner_mut().propose(request).await {
+        Ok(response) => decode_propose_response(response.into_inner()),
+        Err(status) => {
+            if status.code() == tonic::Code::Unavailable {
+                let mut cached = cached_client.lock().await;
+                if cached
+                    .as_ref()
+                    .is_some_and(|(endpoint, _)| *endpoint == leader_addr.endpoint)
+                {
+                    *cached = None;
+                }
+            }
+            Err(RaftError::Transport(status.to_string()))
         }
     }
 }
@@ -181,7 +192,7 @@ pub(crate) async fn propose_to(
     command: &crate::raft::Command,
     zone_id: &str,
     deadline: tokio::time::Instant,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     let request = propose_request(command, zone_id, false, deadline)?;
     let mut client = connect_api_client(config, endpoint).await?;
     let response = client
@@ -265,11 +276,14 @@ pub(super) const NOT_LEADER_ERROR: &str = "Not the leader";
 #[cfg(all(feature = "grpc", has_protos))]
 fn decode_propose_response(
     response: proto::nexus::raft::ProposeResponse,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
     if response.success {
-        return Ok(proto_result_to_command_result(response.result));
+        return Ok(crate::raft::proposal::Committed {
+            result: proto_result_to_command_result(response.result),
+            index: response.applied_index,
+        });
     }
     match response.error {
         Some(error)
