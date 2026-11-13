@@ -205,7 +205,7 @@ mod tests {
             .expect("re-revoke grant"));
         assert_eq!(store.list().expect("list after revoke").len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Tuples are a kernel-internal control-plane record, not files:
@@ -252,7 +252,7 @@ mod tests {
             "rebac tuple leaked into a file-metadata listing"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Two typed views over the same consensus reach two disjoint
@@ -304,7 +304,7 @@ mod tests {
             "deleting from rebac namespace must not touch auth namespace",
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// A warm graph is reused, then a committed revoke invalidates it. Snapshot
@@ -383,6 +383,6 @@ mod tests {
             &restored,
             &cache.graph_for_zone("root").unwrap()
         ));
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

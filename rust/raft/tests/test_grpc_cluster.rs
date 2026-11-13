@@ -260,7 +260,10 @@ mod grpc_cluster {
             .expect("Propose should succeed");
 
         assert!(result.success, "Propose should succeed: {:?}", result.error);
-        tracing::info!("Metadata proposed, applied_index={}", result.applied_index);
+        tracing::info!(
+            "Metadata proposed, applied_index={:?}",
+            result.applied_index
+        );
 
         // Wait for replication and verify all nodes have the metadata
         for (i, endpoint) in endpoints.iter().enumerate() {
@@ -528,7 +531,7 @@ mod grpc_cluster {
 
         assert!(result.success, "Propose failed: {:?}", result.error);
         tracing::info!(
-            "Metadata proposed on Docker cluster, applied_index={}",
+            "Metadata proposed on Docker cluster, applied_index={:?}",
             result.applied_index
         );
 

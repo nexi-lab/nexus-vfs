@@ -61,27 +61,3 @@ impl Default for ClientConfig {
         }
     }
 }
-
-/// Server-side configuration.
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    /// Bind address (e.g. "0.0.0.0:2126").
-    pub bind_address: String,
-    /// Maximum concurrent connections.
-    pub max_connections: Option<usize>,
-    /// Maximum message size in bytes (default 64MB).
-    pub max_message_size: usize,
-    /// TLS config (None = plaintext).
-    pub tls: Option<TlsConfig>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "0.0.0.0:2126".to_string(),
-            max_connections: None,
-            max_message_size: 64 * 1024 * 1024, // 64MB
-            tls: None,
-        }
-    }
-}

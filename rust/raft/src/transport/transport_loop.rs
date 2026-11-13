@@ -28,6 +28,7 @@
 use super::client::RaftClientPool;
 use super::proto::nexus::raft::EcReplicationEntry;
 use super::{NodeAddress, SharedPeerMap};
+use crate::raft::message_bound::MAX_RAFT_PAYLOAD_BYTES;
 use crate::raft::{RaftMessageProtocol, StateMachine, ZoneConsensusDriver};
 use protobuf::Message as ProtobufV2Message;
 use raft::eraftpb::MessageType;
@@ -38,19 +39,136 @@ use tokio::sync::{mpsc, watch};
 
 use std::time::Duration as StdDuration;
 
-/// A transport send that failed — surfaced back from a spawned send task
-/// to the driver loop so raft-rs can be told and the affected peer's
-/// `Progress` tracker can leave its stuck state.
+/// The outcome of one outbound Raft message, owed to raft-rs by the loop that
+/// owns the driver.
 ///
-/// `is_snapshot` distinguishes a `MsgSnapshot` failure (needs
-/// `report_snapshot(peer, Failure)`) from any other message-type
-/// failure (needs `report_unreachable(peer)`).  Both are required
-/// to keep raft-rs's state machine honest under flaky transports.
-#[derive(Debug, Clone, Copy)]
-struct TransportFailure {
+/// raft-rs's transport contract has two parts, and a peer's `Progress` stalls
+/// if either is skipped:
+///
+/// * every message that did not reach its peer is answered with
+///   `report_unreachable`, so a `Replicate` peer falls back to probing;
+/// * every `MsgSnapshot` is answered with exactly one `report_snapshot` —
+///   `Finish` once the receiver accepted it, `Failure` otherwise. Sending a
+///   snapshot moves the peer to `Snapshot`, where `Progress::is_paused` is
+///   unconditionally true: heartbeats keep flowing but no append or snapshot
+///   is generated again until the report (or the receiver's own append
+///   response) arrives. A `Finish` moves it to `Probe`, so the next heartbeat
+///   response probes the receiver's log and a snapshot that was accepted but
+///   never installed is detected and re-sent.
+#[derive(Debug)]
+struct SendReport {
     peer_id: u64,
-    is_snapshot: bool,
+    payload: Payload,
+    /// `None` when the message was held back without being sent (see
+    /// [`HeldBack`]): raft-rs is still told, the peer's send health is not.
+    outcome: Option<Result<(), SendFailure>>,
 }
+
+/// Why a message did not reach its peer — each kind is handled differently.
+#[derive(Debug)]
+enum SendFailure {
+    /// The message exceeds a message bound: ours, checked before sending, or
+    /// the receiver's, which answered `OutOfRange` / `ResourceExhausted`.
+    /// Re-sent unchanged it fails the same way, so it is held back
+    /// ([`HeldBack`]). The channel is healthy.
+    Oversized(String),
+    /// The channel is broken, or the call outlasted its deadline: the pooled
+    /// client is dropped and re-dialed on the next send.
+    Connection(String),
+    /// The receiver answered and refused. The channel is healthy.
+    Refused(String),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Oversized(why) | Self::Connection(why) | Self::Refused(why)) = self;
+        write!(f, "{}: {why}", self.kind())
+    }
+}
+
+impl SendFailure {
+    /// The failure's class, as reported: a run of failures is one problem
+    /// only while its class stays the same.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Oversized(_) => "message too large",
+            Self::Connection(_) => "connection",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    fn of(error: super::TransportError) -> Self {
+        use super::TransportError;
+        match error {
+            TransportError::Status(status) => match status.code() {
+                tonic::Code::OutOfRange | tonic::Code::ResourceExhausted => {
+                    Self::Oversized(status.to_string())
+                }
+                tonic::Code::Unavailable => Self::Connection(status.to_string()),
+                _ => Self::Refused(status.to_string()),
+            },
+            TransportError::Rpc(why) => Self::Refused(why),
+            other => Self::Connection(other.to_string()),
+        }
+    }
+}
+
+/// What raft-rs is sending a peer, as far as re-sending it is concerned: the
+/// same append regenerated after a failure has the same type and index range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Payload {
+    msg_type: MessageType,
+    /// The append's previous index; zero for other types.
+    index: u64,
+    /// The last index carried: the append's last entry, or the snapshot's.
+    last: u64,
+}
+
+impl Payload {
+    fn of(message: &raft::eraftpb::Message) -> Self {
+        let last = match message.get_msg_type() {
+            MessageType::MsgSnapshot => message.get_snapshot().get_metadata().index,
+            _ => message.get_entries().last().map_or(0, |entry| entry.index),
+        };
+        Self {
+            msg_type: message.get_msg_type(),
+            index: message.index,
+            last,
+        }
+    }
+
+    fn snapshot(&self) -> bool {
+        self.msg_type == MessageType::MsgSnapshot
+    }
+
+    /// Whether the message feeds the peer's log, as opposed to a control
+    /// message (heartbeat, vote, response) that may keep arriving while
+    /// every append is refused.
+    fn carries_log(&self) -> bool {
+        matches!(
+            self.msg_type,
+            MessageType::MsgAppend | MessageType::MsgSnapshot
+        )
+    }
+}
+
+/// A peer's message that was too large, held back from being re-sent.
+///
+/// raft-rs regenerates an undelivered append on every heartbeat response —
+/// tens of times a second — and an oversized one fails identically each
+/// time, burning the link on a transfer the receiver discards. Until
+/// `retry_at` the same payload is reported undelivered without being sent;
+/// heartbeats and every other message still flow. The retry backs off so a
+/// receiver that is upgraded (raising its bound) is found again.
+struct HeldBack {
+    payload: Payload,
+    retry_at: Instant,
+    backoff: StdDuration,
+}
+
+/// First hold-back of an oversized payload; doubles per failed retry.
+const OVERSIZED_RETRY_FIRST: StdDuration = StdDuration::from_secs(1);
+const OVERSIZED_RETRY_MAX: StdDuration = StdDuration::from_secs(60);
 
 /// How long a voter must be continuously unreachable before the quorum-at-risk
 /// WARN fires — short enough to catch a stuck bring-up fast, long enough to
@@ -146,7 +264,7 @@ impl QuorumHealth {
 /// Outcome of an EC replication attempt — surfaced back from a spawned
 /// send task to the driver loop so `ec_peer_state` can be updated
 /// without taking a lock across `await` points.  Mirrors the
-/// `TransportFailure` pattern: per-peer state lives only on the
+/// `SendReport` pattern: per-peer state lives only on the
 /// run-loop side and is mutated only via drained channel events.
 #[derive(Debug)]
 enum EcCompletion {
@@ -200,6 +318,22 @@ const EC_BACKOFF_CAP: Duration = Duration::from_secs(10);
 /// state managed via `report_unreachable` (PR #4230) handle it on
 /// their own time scales without depending on this per-call cap.
 const RAFT_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// The slowest link a message up to the raft message bound is still
+/// expected to cross.
+///
+/// A fixed deadline makes every message larger than `deadline × bandwidth`
+/// undeliverable: each attempt is cancelled, reported as a failure and
+/// re-sent from the first byte, forever. An entry may be as large as
+/// `message_bound::MAX_ENTRY_BYTES`, so the deadline grows with the encoded
+/// message at this rate (1 Mbit/s, below a relayed WAN path). A dead
+/// connection still fails early through the HTTP/2 keep-alive.
+const SEND_FLOOR_BYTES_PER_SEC: u64 = 128 * 1024;
+
+/// Deadline for one outbound Raft message of `bytes` encoded bytes.
+fn send_deadline(bytes: usize) -> StdDuration {
+    RAFT_SEND_TIMEOUT + StdDuration::from_secs((bytes as u64).div_ceil(SEND_FLOOR_BYTES_PER_SEC))
+}
 
 /// Timeout for a single EC replication send.
 ///
@@ -357,22 +491,19 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// deployments (a smaller window bounds the WAL tighter at the cost of
     /// more anti-entropy snapshots for slow peers).  Read once at construction.
     ec_wal_retention: u64,
-    /// Sender half of the transport-failure channel.  Cloned into each
-    /// `send_messages_fire_and_forget` task so a transport-level send
-    /// error (network down, HTTP/2 keepalive timeout, tonic transport
-    /// error) can be reported back to this loop without holding a
+    /// Sender half of the send-report channel. Cloned into each
+    /// `send_messages_fire_and_forget` task, which reports a failed send and
+    /// the outcome of every `MsgSnapshot` back to this loop without holding a
     /// reference to the driver across `await` points.
-    failure_tx: mpsc::UnboundedSender<TransportFailure>,
-    /// Receiver half of the transport-failure channel.  Drained at the
-    /// top of each [`Self::run`] iteration and translated into
-    /// `driver.report_unreachable` / `driver.report_snapshot(_, Failure)`
-    /// calls — without those, raft-rs's `Progress` tracker stays in
-    /// `Replicate` / `Snapshot` state forever after a single failure.
-    failure_rx: mpsc::UnboundedReceiver<TransportFailure>,
+    report_tx: mpsc::UnboundedSender<SendReport>,
+    /// Receiver half of the send-report channel. Drained at the top of each
+    /// [`Self::run`] iteration into `driver.report_unreachable` /
+    /// `driver.report_snapshot` — see [`SendReport`].
+    report_rx: mpsc::UnboundedReceiver<SendReport>,
     /// Sender half of the EC-completion channel.  Cloned into each
     /// `spawn_ec_replications` task so success/failure can be reported
     /// back without taking a lock on `ec_peer_state` across `await`
-    /// points.  Mirrors `failure_tx` — same fire-and-forget pattern.
+    /// points.  Mirrors `report_tx` — same fire-and-forget pattern.
     ec_completion_tx: mpsc::UnboundedSender<EcCompletion>,
     /// Receiver half of the EC-completion channel.  Drained at the top
     /// of each [`Self::run`] iteration; ack updates land before the
@@ -385,6 +516,12 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// leaves the set when it routes again, so losing a route warns once per
     /// loss rather than once per message. Ephemeral diagnostic state.
     unrouted: HashSet<u64>,
+    /// Per peer, the oversized payload being held back — see [`HeldBack`].
+    held_back: HashMap<u64, HeldBack>,
+    /// EC anti-entropy snapshot tasks. Each reads the state machine, so it
+    /// holds the zone's store: the loop joins them before it returns, and the
+    /// zone's storage is released when [`Self::run`] ends.
+    snapshot_readers: tokio::task::JoinSet<()>,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -398,7 +535,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
         client_pool: RaftClientPool,
     ) -> Self {
         let node_id = driver.config().id;
-        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let (report_tx, report_rx) = mpsc::unbounded_channel();
         let (ec_completion_tx, ec_completion_rx) = mpsc::unbounded_channel();
         Self {
             driver,
@@ -413,12 +550,14 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&r| r > 0)
                 .unwrap_or(EC_WAL_RETENTION),
-            failure_tx,
-            failure_rx,
+            report_tx,
+            report_rx,
             ec_completion_tx,
             ec_completion_rx,
             quorum_health: QuorumHealth::default(),
             unrouted: HashSet::new(),
+            held_back: HashMap::new(),
+            snapshot_readers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -463,7 +602,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
     ///   of its own) the correct wait is "until someone calls", which is what
     ///   parking expresses.  Idle zone count stops being a CPU variable.
     ///
-    /// The loop does NOT select on the transport-failure or EC-completion
+    /// The loop does NOT select on the send-report or EC-completion
     /// channels: both are fed only by sends to peers, and a zone with any peer
     /// never parks — it keeps the `tick_interval` cadence, which drains those
     /// channels at least as promptly as before.
@@ -526,26 +665,14 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                 Woken::Message | Woken::Deadline => {}
             }
 
-            // 0a. Drain any transport send failures reported by previously
-            //     spawned send tasks and forward them to raft-rs.  Must
+            // 0a. Hand raft-rs the outcome of previously spawned sends. Must
             //     run before `process_messages` / `advance` so the next
             //     tick's outgoing-message set reflects the updated
-            //     `Progress` state (peer in Probe rather than stuck in
-            //     Replicate / Snapshot).  Cheap: non-blocking try_recv
-            //     drain, returns immediately when the channel is empty
-            //     (the steady-state happy path).
+            //     `Progress` state. Cheap: non-blocking try_recv drain,
+            //     returns immediately when the channel is empty.
             let failure_scan_now = Instant::now();
-            while let Ok(failure) = self.failure_rx.try_recv() {
-                self.driver.report_unreachable(failure.peer_id);
-                if failure.is_snapshot {
-                    self.driver
-                        .report_snapshot(failure.peer_id, raft::SnapshotStatus::Failure);
-                }
-                // Track the failure episode so a voter that stays unreachable
-                // long enough to block quorum surfaces ONE loud, actionable
-                // WARN instead of a silent commit stall.
-                self.quorum_health
-                    .note_failure(failure.peer_id, failure_scan_now);
+            while let Ok(report) = self.report_rx.try_recv() {
+                self.apply_send_report(report, failure_scan_now);
             }
             // Fail-loud when a VOTER (read from `driver.voter_ids()` — the
             // ProgressTracker SSOT) has been unreachable past the threshold and
@@ -644,7 +771,11 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             //    EC send — raft heartbeats and elections are not held
             //    behind a slow EC handshake.
             self.spawn_ec_replications();
+            while self.snapshot_readers.try_join_next().is_some() {}
         }
+        // The driver — owner of the raft storage and the state machine — drops
+        // with `self`; a snapshot reader still running is the last other holder.
+        self.snapshot_readers.shutdown().await;
     }
 
     /// Select routes for this zone's current Raft members. Learned or retained
@@ -659,22 +790,108 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             .collect()
     }
 
-    /// Send Raft messages to peers concurrently using JoinSet.
-    ///
-    /// Each peer send gets its own task with an independent timeout.
-    /// Slow peers don't block fast peers. If a send fails or times out,
-    /// the error is logged and the client is evicted from the pool.
+    /// Hand raft-rs one send outcome — see [`SendReport`] for the contract —
+    /// and record the peer's send health.
+    fn apply_send_report(&mut self, report: SendReport, now: Instant) {
+        let SendReport {
+            peer_id,
+            payload,
+            outcome,
+        } = report;
+        let delivered = matches!(outcome, Some(Ok(())));
+        if !delivered {
+            self.driver.report_unreachable(peer_id);
+            // Track the failure episode so a voter that stays unreachable
+            // long enough to block quorum surfaces ONE loud, actionable
+            // WARN instead of a silent commit stall.
+            self.quorum_health.note_failure(peer_id, now);
+        }
+        if payload.snapshot() {
+            let status = if delivered {
+                raft::SnapshotStatus::Finish
+            } else {
+                raft::SnapshotStatus::Failure
+            };
+            self.driver.report_snapshot(peer_id, status);
+        }
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let carries_log = payload.carries_log();
+        match &outcome {
+            // Only a delivered append or snapshot shows the peer accepts what
+            // it is fed; a heartbeat arriving says nothing about that.
+            Ok(()) if carries_log => {
+                self.held_back.remove(&peer_id);
+            }
+            Ok(()) => {}
+            Err(SendFailure::Oversized(_)) => {
+                let backoff = match self.held_back.get(&peer_id) {
+                    Some(held) if held.payload == payload => {
+                        (held.backoff * 2).min(OVERSIZED_RETRY_MAX)
+                    }
+                    _ => OVERSIZED_RETRY_FIRST,
+                };
+                self.held_back.insert(
+                    peer_id,
+                    HeldBack {
+                        payload,
+                        retry_at: now + backoff,
+                        backoff,
+                    },
+                );
+            }
+            Err(_) => {}
+        }
+        let error = outcome
+            .as_ref()
+            .err()
+            .map(|failure| (failure.kind(), failure.to_string()));
+        let streak = self.driver.record_send(
+            peer_id,
+            carries_log,
+            error.as_ref().map(|(kind, text)| (*kind, text.as_str())),
+            now,
+        );
+        match (&outcome, streak) {
+            // A streak's first failure and every doubling: a peer failing on
+            // every heartbeat is named a dozen times an hour, not ten times
+            // a second.
+            (Err(failure), failures) if failures.is_power_of_two() => tracing::warn!(
+                zone = %self.zone_id,
+                peer_node_id = peer_id,
+                msg_type = ?payload.msg_type,
+                consecutive_failures = failures,
+                "Raft message send failed: {failure}",
+            ),
+            (Err(failure), failures) => tracing::debug!(
+                zone = %self.zone_id,
+                peer_node_id = peer_id,
+                consecutive_failures = failures,
+                "Raft message send failed: {failure}",
+            ),
+            (Ok(()), ended) if ended > 0 => tracing::info!(
+                zone = %self.zone_id,
+                peer_node_id = peer_id,
+                failed_sends = ended,
+                "Raft sends to peer recovered",
+            ),
+            (Ok(()), _) => {}
+        }
+    }
+
     /// Send Raft messages to peers — fire and forget.
     ///
-    /// Each message is spawned as an independent task with its own timeout.
-    /// The transport loop does NOT await results — this ensures tick() is
-    /// never blocked by slow/unreachable peers.  Raft handles retransmission
-    /// via its own heartbeat/election timeout mechanism.
-    ///
-    /// Failed sends log a warning and evict the client from the pool
-    /// (reconnected on next attempt).
+    /// Each message is spawned as an independent task with its own deadline,
+    /// so slow or unreachable peers never block `tick()` or each other. The
+    /// outcome raft-rs needs (see [`SendReport`]) comes back through
+    /// `report_tx`; a message that is not sent — no route, beyond the raft
+    /// message bound, or a held-back oversized payload — is reported here,
+    /// synchronously.
     fn send_messages_fire_and_forget(&mut self, messages: Vec<raft::eraftpb::Message>) {
         let protocol = self.driver.raft_message_protocol();
+        let now = Instant::now();
+        let mut unsent = Vec::new();
         // One shared lock resolves the whole batch; only the routes the batch
         // uses are cloned out.
         let routed: Vec<(NodeAddress, raft::eraftpb::Message)> = {
@@ -700,6 +917,13 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
                                  or reaches this node",
                             );
                         }
+                        unsent.push(SendReport {
+                            peer_id: msg.to,
+                            payload: Payload::of(&msg),
+                            outcome: Some(Err(SendFailure::Connection(
+                                "no registered or observed address".into(),
+                            ))),
+                        });
                         None
                     }
                 })
@@ -708,62 +932,67 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
 
         for (addr, msg) in routed {
             let target_id = msg.to;
-
-            // Capture the message type *before* the move into the spawned
-            // task so we can report a `MsgSnapshot` failure correctly.
-            // A failed snapshot send needs both `report_unreachable` and
-            // `report_snapshot(_, Failure)` — without the latter, the
-            // peer's Progress stays in the `Snapshot` state and raft-rs
-            // never retries.
-            let is_snapshot = msg.get_msg_type() == MessageType::MsgSnapshot;
-
+            let payload = Payload::of(&msg);
+            if self
+                .held_back
+                .get(&target_id)
+                .is_some_and(|held| held.payload == payload && now < held.retry_at)
+            {
+                unsent.push(SendReport {
+                    peer_id: target_id,
+                    payload,
+                    outcome: None,
+                });
+                continue;
+            }
+            let bytes = msg.compute_size() as usize;
+            if bytes > MAX_RAFT_PAYLOAD_BYTES {
+                unsent.push(SendReport {
+                    peer_id: target_id,
+                    payload,
+                    outcome: Some(Err(SendFailure::Oversized(format!(
+                        "{bytes}-byte {:?} exceeds the {MAX_RAFT_PAYLOAD_BYTES}-byte raft \
+                         message bound",
+                        payload.msg_type
+                    )))),
+                });
+                continue;
+            }
+            let deadline = send_deadline(bytes);
             let client_pool = self.client_pool.clone();
             let zone_id = self.zone_id.clone();
             let self_address = self.self_address.clone();
-            let failure_tx = self.failure_tx.clone();
+            let report_tx = self.report_tx.clone();
 
             tokio::spawn(async move {
-                let result = tokio::time::timeout(
-                    RAFT_SEND_TIMEOUT,
+                let outcome = match tokio::time::timeout(
+                    deadline,
                     send_raft_message(&client_pool, &addr, msg, zone_id, self_address, protocol),
                 )
-                .await;
-
-                let send_failed = match result {
-                    Ok(Ok(())) => false,
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            peer_node_id = target_id,
-                            peer_addr = %addr.to_operator_str(),
-                            "Raft message send failed: {}",
-                            e,
-                        );
-                        client_pool.remove(target_id).await;
-                        true
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            peer_node_id = target_id,
-                            peer_addr = %addr.to_operator_str(),
-                            "Raft message send timeout after {:?}",
-                            RAFT_SEND_TIMEOUT,
-                        );
-                        client_pool.remove(target_id).await;
-                        true
-                    }
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => Err(SendFailure::Connection(format!(
+                        "no answer within {deadline:?}"
+                    ))),
                 };
-
-                if send_failed {
-                    // Best-effort signal back to the driver loop.  If the
-                    // receiver was dropped (loop is shutting down) the
-                    // send is a no-op; that is fine because the driver
-                    // is on its way out anyway.
-                    let _ = failure_tx.send(TransportFailure {
-                        peer_id: target_id,
-                        is_snapshot,
-                    });
+                // Only a broken channel is re-dialed: a refusal or an
+                // oversized message says nothing about the connection, and
+                // dropping it there turned every failed send into a dial.
+                if matches!(outcome, Err(SendFailure::Connection(_))) {
+                    client_pool.remove(target_id).await;
                 }
+                // A closed receiver means the loop is shutting down and the
+                // driver goes with it; nothing is owed then.
+                let _ = report_tx.send(SendReport {
+                    peer_id: target_id,
+                    payload,
+                    outcome: Some(outcome),
+                });
             });
+        }
+        for report in unsent {
+            self.apply_send_report(report, now);
         }
     }
 
@@ -1007,9 +1236,10 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             });
         }
 
-        // Fire-and-forget anti-entropy snapshots for peers that fell behind the
-        // compacted WAL.  Same `in_flight` discipline as the incremental sends:
-        // mark before spawning so the next tick skips a duplicate.  The state
+        // Anti-entropy snapshots for peers that fell behind the compacted WAL,
+        // run as `snapshot_readers` tasks.  Same `in_flight` discipline as the
+        // incremental sends: mark before spawning so the next tick skips a
+        // duplicate.  The state
         // read + entry materialization run INSIDE the task because the state
         // machine's `RwLock` read is async; it is a shared read (the apply loop
         // takes the write lock) and never touches the driver's exclusive
@@ -1032,7 +1262,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             // under LWW).
             let covering_seq = repl_log.max_seq().saturating_sub(1);
 
-            tokio::spawn(async move {
+            self.snapshot_readers.spawn(async move {
                 // Materialization and serialization participate in the same
                 // completion path as transmission. Failed reads cannot become
                 // an acknowledged empty snapshot and advance the peer's floor.
@@ -1119,18 +1349,15 @@ async fn send_raft_message(
     zone_id: String,
     self_address: String,
     protocol: RaftMessageProtocol,
-) -> std::result::Result<(), String> {
-    let target_id = addr.id;
+) -> std::result::Result<(), SendFailure> {
     let bytes = msg
         .write_to_bytes()
-        .map_err(|e| format!("serialize error for node {}: {}", target_id, e))?;
-
+        .map_err(|e| SendFailure::Refused(format!("serialize: {e}")))?;
     let mut client = match protocol {
         RaftMessageProtocol::Legacy => client_pool.get(addr).await,
         RaftMessageProtocol::ReplicaControlV1 => client_pool.get_node(addr).await,
     }
-    .map_err(|e| format!("connect to node {} ({}): {}", target_id, addr.endpoint, e))?;
-
+    .map_err(|e| SendFailure::Connection(format!("connect to {}: {e}", addr.endpoint)))?;
     match protocol {
         RaftMessageProtocol::Legacy => client.step_message(bytes, zone_id, self_address).await,
         RaftMessageProtocol::ReplicaControlV1 => {
@@ -1139,7 +1366,7 @@ async fn send_raft_message(
                 .await
         }
     }
-    .map_err(|e| format!("send to node {} ({}): {}", target_id, addr.endpoint, e))
+    .map_err(SendFailure::of)
 }
 
 /// Await an EC send future under `timeout` and report the outcome back on the
@@ -1451,6 +1678,213 @@ mod tests {
         assert_eq!(
             transport.unrouted.iter().copied().collect::<Vec<_>>(),
             vec![7]
+        );
+    }
+
+    /// A snapshot raft-rs generated for a member with no route is reported as
+    /// failed, so the member's `Progress` leaves `Snapshot` and the snapshot is
+    /// generated again once the member is reachable. Dropping it silently
+    /// held the member in `Snapshot` — heartbeats only — for good.
+    #[tokio::test]
+    async fn an_undeliverable_snapshot_is_reported_failed() {
+        use crate::raft::{Command, ReplicationState};
+
+        let (_directory, handle, mut transport) = membership_fixture(ConfState {
+            voters: vec![1],
+            learners: vec![9],
+            ..Default::default()
+        });
+        transport.driver.set_snapshot_threshold(4);
+        async fn drive(transport: &mut TransportLoop<FullStateMachine>) -> Vec<Message> {
+            transport.driver.process_messages();
+            let messages = transport.driver.advance().await.unwrap();
+            transport.send_messages_fire_and_forget(messages.clone());
+            tokio::task::yield_now().await;
+            messages
+        }
+        type Message = raft::eraftpb::Message;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_leader() {
+                drive(&mut transport).await;
+            }
+        })
+        .await
+        .expect("single voter becomes leader");
+        for i in 0..12 {
+            handle
+                .propose_ec(Command::SetMetadata {
+                    key: format!("/k/{i}"),
+                    value: vec![1],
+                })
+                .await
+                .unwrap();
+            drive(&mut transport).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.applied_index() < 12 {
+                drive(&mut transport).await;
+            }
+        })
+        .await
+        .expect("entries apply and the log compacts");
+
+        // The learner answers a heartbeat: raft-rs resumes it and, its next
+        // index being compacted away, sends it a snapshot it cannot route.
+        let mut answer = Message::default();
+        answer.set_msg_type(MessageType::MsgHeartbeatResponse);
+        answer.from = 9;
+        answer.to = 1;
+        answer.term = handle.term();
+        handle.step(answer).await.unwrap();
+        let sent = drive(&mut transport).await;
+        assert!(
+            sent.iter()
+                .any(|m| m.to == 9 && m.get_msg_type() == MessageType::MsgSnapshot),
+            "the compacted log forces a snapshot: {sent:?}"
+        );
+        drive(&mut transport).await;
+        let learner = handle
+            .replication()
+            .peers
+            .into_iter()
+            .find(|peer| peer.node_id == 9)
+            .expect("learner progress");
+        assert_eq!(
+            learner.state,
+            ReplicationState::Probe,
+            "a failed snapshot returns the learner to Probe, to be re-sent"
+        );
+    }
+
+    #[test]
+    fn a_send_deadline_grows_with_the_message() {
+        assert_eq!(send_deadline(0), RAFT_SEND_TIMEOUT);
+        let production = 18 * 1024 * 1024;
+        assert_eq!(
+            send_deadline(production),
+            RAFT_SEND_TIMEOUT + StdDuration::from_secs(144),
+            "18 MiB at the 1 Mbit/s floor"
+        );
+    }
+
+    /// A size refusal from either end is told apart from a broken channel and
+    /// from any other refusal: only a broken channel is re-dialed, and only an
+    /// oversized message is held back.
+    #[test]
+    fn send_failures_are_classified_by_what_retrying_can_change() {
+        use crate::transport::TransportError;
+        let of = |status: tonic::Status| SendFailure::of(TransportError::Status(status));
+        assert!(matches!(
+            of(tonic::Status::out_of_range(
+                "Error, decoded message length too large: found 5726623 bytes, the limit is: \
+                 4194304 bytes"
+            )),
+            SendFailure::Oversized(_)
+        ));
+        assert!(matches!(
+            of(tonic::Status::resource_exhausted(
+                "grpc: received message larger than max"
+            )),
+            SendFailure::Oversized(_)
+        ));
+        assert!(matches!(
+            of(tonic::Status::unavailable("connection reset")),
+            SendFailure::Connection(_)
+        ));
+        assert!(matches!(
+            of(tonic::Status::not_found("zone")),
+            SendFailure::Refused(_)
+        ));
+        assert!(matches!(
+            SendFailure::of(TransportError::Rpc("step refused".into())),
+            SendFailure::Refused(_)
+        ));
+        assert!(matches!(
+            SendFailure::of(TransportError::Connection("refused".into())),
+            SendFailure::Connection(_)
+        ));
+    }
+
+    /// An oversized append is not re-sent each time raft-rs regenerates it:
+    /// the same payload is held back with a doubling backoff, while a
+    /// different payload is sent and a delivered send releases the hold.
+    #[tokio::test]
+    async fn an_oversized_payload_is_held_back_and_retried_with_backoff() {
+        let (_directory, _handle, mut transport) = membership_fixture(ConfState {
+            voters: vec![1, 2],
+            ..Default::default()
+        });
+        let append = |index: u64| {
+            let mut message = raft::eraftpb::Message::default();
+            message.set_msg_type(MessageType::MsgAppend);
+            message.to = 2;
+            message.index = index;
+            message.set_entries(
+                vec![raft::eraftpb::Entry {
+                    index: index + 1,
+                    ..Default::default()
+                }]
+                .into(),
+            );
+            message
+        };
+        let oversized = |index: u64| SendReport {
+            peer_id: 2,
+            payload: Payload::of(&append(index)),
+            outcome: Some(Err(SendFailure::Oversized("too large".into()))),
+        };
+        let now = Instant::now();
+        transport.apply_send_report(oversized(7), now);
+        let held = transport.held_back.get(&2).expect("held back");
+        assert_eq!(held.backoff, OVERSIZED_RETRY_FIRST);
+        let retry_at = held.retry_at;
+
+        transport.send_messages_fire_and_forget(vec![append(7)]);
+        tokio::task::yield_now().await;
+        assert!(
+            transport.report_rx.try_recv().is_err(),
+            "the same payload was not sent again"
+        );
+        assert_eq!(transport.held_back[&2].retry_at, retry_at);
+
+        transport.apply_send_report(oversized(7), now);
+        assert_eq!(transport.held_back[&2].backoff, OVERSIZED_RETRY_FIRST * 2);
+
+        // Another payload is sent (and here fails on the unserved address).
+        transport.send_messages_fire_and_forget(vec![append(9)]);
+        let report = tokio::time::timeout(Duration::from_secs(10), transport.report_rx.recv())
+            .await
+            .expect("the other payload was sent")
+            .unwrap();
+        assert_eq!(report.payload, Payload::of(&append(9)));
+
+        let mut heartbeat = raft::eraftpb::Message::default();
+        heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+        heartbeat.to = 2;
+        transport.apply_send_report(
+            SendReport {
+                peer_id: 2,
+                payload: Payload::of(&heartbeat),
+                outcome: Some(Ok(())),
+            },
+            now,
+        );
+        assert!(
+            transport.held_back.contains_key(&2),
+            "heartbeats arriving do not show the peer accepts the append"
+        );
+
+        transport.apply_send_report(
+            SendReport {
+                peer_id: 2,
+                payload: Payload::of(&append(7)),
+                outcome: Some(Ok(())),
+            },
+            now,
+        );
+        assert!(
+            transport.held_back.is_empty(),
+            "a delivered append releases it"
         );
     }
 

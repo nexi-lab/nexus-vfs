@@ -51,9 +51,11 @@ pub mod zone_persistence;
 
 mod membership_policy;
 #[cfg(feature = "consensus")]
+pub mod message_bound;
+#[cfg(feature = "consensus")]
 mod node;
 #[cfg(feature = "consensus")]
-mod proposal;
+pub(crate) mod proposal;
 #[cfg(feature = "consensus")]
 mod storage;
 #[cfg(all(feature = "grpc", has_protos))]
@@ -75,13 +77,14 @@ pub use state_machine::{
 pub use membership_policy::MembershipPolicy;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use node::MemberRegistration;
-#[cfg(all(feature = "grpc", has_protos))]
-pub use node::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(feature = "consensus")]
 pub use node::{
-    RaftConfig, RaftMessageProtocol, RaftMsg, StorageActivationView, StorageSubmission,
-    ZoneConsensus, ZoneConsensusDriver,
+    LeaderCommit, PeerReplication, RaftConfig, RaftMessageProtocol, RaftMsg, ReplicationState,
+    ReplicationStatus, StorageActivationView, StorageSubmission, ZoneConsensus,
+    ZoneConsensusDriver, REPLICATION_STALL,
 };
+#[cfg(all(feature = "grpc", has_protos))]
+pub use node::{PreparedReplicaControl, ReplicaPreparationError};
 #[cfg(feature = "consensus")]
 pub(crate) use proposal::PROPOSAL_TIMEOUT_SECS;
 #[cfg(feature = "consensus")]

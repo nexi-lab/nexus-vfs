@@ -40,9 +40,13 @@ defaults:
     shell: bash
 
 jobs:
-  node-boundary:
+  # One job per OS: the three suites share one build of raft and nexus-cluster,
+  # and a run queues one macOS runner instead of three (macOS capacity is the
+  # scarce resource; see ci.yml native-suites).
+  node-control:
+    name: Node control / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -100,36 +104,12 @@ jobs:
             ${{ runner.temp }}/replica-storage-compatibility/*.log
             ${{ runner.temp }}/replica-storage-compatibility/receipt.json
           if-no-files-found: warn
-
-  runtime-enrollment:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-tests
-        with:
-          cache-key: node-control-${{ matrix.os }}
-      - run: cargo test --locked -p nexus-cluster --lib
-      - name: Enroll, replicate credentials and restore the same Node identity
+      - name: 'Runtime enrollment: nexus-cluster unit suites'
+        run: cargo test --locked -p nexus-cluster --lib
+      - name: 'Runtime enrollment: enroll, replicate credentials and restore the same Node identity'
         run: cargo test --locked -p nexus-cluster --test node_enrollment --test cross_node_sk_replication -- --test-threads=1
-
-  managed-credentials:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-tests
-        with:
-          cache-key: node-control-${{ matrix.os }}
-      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
+      - name: 'Managed credentials: CSR'
+        run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
       - run: cargo test --locked -p managed-agent --lib credential_binding::tests
       - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator

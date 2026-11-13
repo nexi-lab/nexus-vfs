@@ -792,8 +792,7 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
         drop(registry);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

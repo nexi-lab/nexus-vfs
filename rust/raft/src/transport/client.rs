@@ -380,7 +380,7 @@ impl RaftClient {
             }
             None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
         };
-        let inner = ZoneTransportServiceClient::new(channel);
+        let inner = bounded!(ZoneTransportServiceClient::new(channel));
 
         Ok(Self {
             endpoint: endpoint.to_string(),
@@ -600,7 +600,7 @@ impl RaftApiClient {
             &channel_config(&config, tls_snapshot),
         )
         .await?;
-        let inner = ZoneApiServiceClient::new(channel);
+        let inner = zone_api_client(channel);
 
         tracing::info!("Connected to Raft API at {}", endpoint);
 
@@ -839,8 +839,9 @@ pub struct ProposeResult {
     pub error: Option<String>,
     /// Leader address if this node is not the leader.
     pub leader_address: Option<String>,
-    /// Log index where the command was applied.
-    pub applied_index: u64,
+    /// On success, the index the answering node had applied when the command
+    /// resolved; `None` when it did not say (a refusal, or an older node).
+    pub applied_index: Option<u64>,
 }
 
 /// Result of a Query operation.
@@ -919,9 +920,38 @@ async fn connect_zone_api(
     timeout_secs: u64,
     what: &str,
 ) -> Result<ZoneApiServiceClient<Channel>> {
-    Ok(ZoneApiServiceClient::new(
-        connect_rpc_channel(peer_addr, tls, timeout_secs, what).await?,
-    ))
+    connect_rpc_channel(peer_addr, tls, timeout_secs, what)
+        .await
+        .map(zone_api_client)
+}
+
+/// A `ZoneApiService` client over `channel`, within the raft message bound.
+pub fn zone_api_client(channel: Channel) -> ZoneApiServiceClient<Channel> {
+    bounded!(ZoneApiServiceClient::new(channel))
+}
+
+/// A zone's presence and raft facts (`ZoneStatus`) from the daemon at
+/// `peer_addr`, asked as this node: its certificate under mTLS, no bearer
+/// token — the identity under which the facts are not redacted.
+pub async fn call_zone_status_rpc(
+    peer_addr: &str,
+    zone_id: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<kernel::kernel::vfs_proto::ZoneStatusResponse> {
+    let channel = connect_rpc_channel(peer_addr, tls, timeout_secs, "ZoneStatus").await?;
+    bounded!(
+        kernel::kernel::vfs_proto::zone_runtime_service_client::ZoneRuntimeServiceClient::new(
+            channel
+        )
+    )
+    .zone_status(kernel::kernel::vfs_proto::ZoneStatusRequest {
+        auth_token: String::new(),
+        zone_id: zone_id.to_string(),
+    })
+    .await
+    .map(tonic::Response::into_inner)
+    .map_err(|e| TransportError::Rpc(format!("ZoneStatus RPC failed: {e}")))
 }
 
 /// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
@@ -946,7 +976,7 @@ pub async fn call_join_cluster(
 ) -> Result<JoinClusterResult> {
     let channel = connect_rpc_channel(leader_addr, None, timeout_secs, "JoinCluster").await?;
 
-    let mut client = NodeEnrollmentServiceClient::new(channel);
+    let mut client = bounded!(NodeEnrollmentServiceClient::new(channel));
     let request = JoinClusterRequest {
         password: password.to_string(),
         node_id,
@@ -991,7 +1021,7 @@ pub async fn call_get_crl(enroll_addr: &str, timeout_secs: u64) -> Result<Vec<u8
     };
     let channel = connect_rpc_channel(&uri, None, timeout_secs, "GetCrl").await?;
 
-    let response = NodeEnrollmentServiceClient::new(channel)
+    let response = bounded!(NodeEnrollmentServiceClient::new(channel))
         .get_crl(GetCrlRequest {})
         .await
         .map_err(|e| TransportError::Rpc(format!("GetCrl RPC failed: {e}")))?
@@ -1069,6 +1099,85 @@ pub async fn call_join_zone_rpc(
         commit_index: response.commit_index,
         applied_index: response.applied_index,
     })
+}
+
+/// What one [`join_zone_round`] came to.
+#[derive(Debug, Clone)]
+pub enum JoinRound {
+    /// The leader at `endpoint` admitted this node: its membership change
+    /// committed there.
+    Admitted { endpoint: String },
+    /// No endpoint admitted this node. `catching_up` is the
+    /// `(commit_index, applied_index)` a leader reported while still
+    /// replicating to it as a learner.
+    Refused {
+        last_error: String,
+        catching_up: Option<(u64, u64)>,
+    },
+}
+
+/// One JoinZone round: ask each of `endpoints` in turn, following a
+/// follower's redirect to its leader once, until a leader admits
+/// `node_id` (advertising `node_address`). The one round data nodes and
+/// witnesses run; the replica they host and the retry policy around the
+/// round are theirs.
+pub async fn join_zone_round(
+    endpoints: impl IntoIterator<Item = String>,
+    zone_id: &str,
+    node_id: u64,
+    node_address: &str,
+    as_learner: bool,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> JoinRound {
+    let mut last_error = String::from("no endpoint to request membership from");
+    let mut catching_up = None;
+    for seed in endpoints {
+        let mut endpoint = seed;
+        let mut redirected = false;
+        loop {
+            match call_join_zone_rpc(
+                &endpoint,
+                zone_id,
+                node_id,
+                node_address,
+                as_learner,
+                tls.clone(),
+                timeout_secs,
+            )
+            .await
+            {
+                Ok(result) if result.success => return JoinRound::Admitted { endpoint },
+                Ok(result) => {
+                    if let Some(leader) = result
+                        .leader_address
+                        .filter(|leader| !redirected && !leader.is_empty() && *leader != endpoint)
+                    {
+                        tracing::info!(
+                            from = %endpoint,
+                            to = %leader,
+                            zone = %zone_id,
+                            "JoinZone redirect to leader",
+                        );
+                        endpoint = leader;
+                        redirected = true;
+                        continue;
+                    }
+                    if result.catching_up {
+                        catching_up = Some((result.commit_index, result.applied_index));
+                    }
+                    last_error = format!("{endpoint}: {}", result.error.unwrap_or_default());
+                }
+                Err(error) => last_error = format!("{endpoint}: {error}"),
+            }
+            tracing::debug!(zone = %zone_id, error = %last_error, "JoinZone not admitted; next endpoint");
+            break;
+        }
+    }
+    JoinRound::Refused {
+        last_error,
+        catching_up,
+    }
 }
 
 /// One federation zone reported by [`call_discover_zones_rpc`] —
@@ -1837,7 +1946,7 @@ mod tests {
         RaftClient {
             endpoint: "http://[::1]:1".to_string(),
             config: ClientConfig::default(),
-            inner: ZoneTransportServiceClient::new(channel),
+            inner: bounded!(ZoneTransportServiceClient::new(channel)),
             is_node_channel: false,
         }
     }

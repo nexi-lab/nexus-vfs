@@ -33,15 +33,34 @@ impl ReadRequestIds {
     }
 }
 
+/// What a ReadIndex request answers once the leader confirms it.
+pub(super) enum ReadReply {
+    /// Resolve once the local state machine has applied through the read
+    /// index: a linearizable read.
+    Applied(oneshot::Sender<Result<()>>),
+    /// Resolve with the read index itself — the leader's commit index,
+    /// confirmed — for a caller that waits for its own target.
+    Index(oneshot::Sender<Result<u64>>),
+}
+
+impl ReadReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Applied(tx) => tx.is_closed(),
+            Self::Index(tx) => tx.is_closed(),
+        }
+    }
+}
+
 pub(super) struct PendingRead {
-    pub(super) tx: oneshot::Sender<Result<()>>,
+    pub(super) reply: ReadReply,
     submitted_term: Option<u64>,
 }
 
 impl PendingRead {
-    pub(super) fn new(tx: oneshot::Sender<Result<()>>) -> Self {
+    pub(super) fn new(reply: ReadReply) -> Self {
         Self {
-            tx,
+            reply,
             submitted_term: None,
         }
     }
@@ -50,7 +69,7 @@ impl PendingRead {
 impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     pub(super) fn submit_ready_reads(&mut self) {
         self.pending_reads_by_ctx
-            .retain(|_, request| !request.tx.is_closed());
+            .retain(|_, request| !request.reply.is_closed());
         if self.pending_reads_by_ctx.is_empty()
             || self.raw_node.raft.leader_id == 0
             || !self.raw_node.raft.commit_to_current_term()
@@ -125,6 +144,15 @@ mod tests {
         ZoneConsensus::new(config, storage, state_machine, None).unwrap()
     }
 
+    /// Whether `context` is a linearizable read `driver` still holds — as
+    /// opposed to its commit probe, which shares the ReadIndex wire.
+    fn is_pending_read(driver: &Driver, context: &[u8]) -> bool {
+        driver
+            .pending_reads_by_ctx
+            .keys()
+            .any(|pending| pending[..] == *context)
+    }
+
     fn campaign(handle: &ZoneConsensus<FullStateMachine>, driver: &mut Driver) {
         let mut request = Box::pin(handle.campaign());
         assert!(poll(&mut request).is_pending());
@@ -157,7 +185,7 @@ mod tests {
         driver.advance().await.unwrap();
         assert!(matches!(poll(&mut read), Poll::Ready(Ok(index)) if index >= 2));
         assert!(driver.pending_reads_by_ctx.is_empty());
-        assert!(driver.pending_reads_by_index.is_empty());
+        assert!(driver.applied_waiters.is_empty());
     }
 
     #[tokio::test]
@@ -287,18 +315,23 @@ mod tests {
         let follower = cluster.handles[2].clone();
         let mut read = Box::pin(follower.read_linearizable(|_| ()));
         assert!(poll(&mut read).is_pending());
-        let mut original_context = None;
+        let mut forwarded = Vec::new();
         cluster
             .round(|message| {
                 if message.get_msg_type() == MessageType::MsgReadIndex {
-                    original_context = Some(message.entries[0].data.clone());
+                    forwarded.push(message.entries[0].data.clone());
                     false
                 } else {
                     true
                 }
             })
             .await;
-        let context = original_context.expect("read was forwarded to the original leader");
+        // Followers' commit probes are ReadIndex traffic too; the read is the
+        // one its node still holds pending.
+        let context = forwarded
+            .into_iter()
+            .find(|context| is_pending_read(&cluster.drivers[2], context))
+            .expect("read was forwarded to the original leader");
         assert!(poll(&mut read).is_pending());
         let term = cluster.drivers[2].raw_node.raft.term;
         campaign(&cluster.handles[1], &mut cluster.drivers[1]);
@@ -306,9 +339,10 @@ mod tests {
         for _ in 0..12 {
             cluster
                 .round(|message| {
-                    if message.get_msg_type() == MessageType::MsgReadIndex {
+                    if message.get_msg_type() == MessageType::MsgReadIndex
+                        && message.entries[0].data == context
+                    {
                         assert_eq!(message.to, 2);
-                        assert_eq!(message.entries[0].data, context);
                         resubmitted = true;
                     }
                     true
@@ -355,12 +389,12 @@ mod tests {
         let old_handle = cluster.handles[2].clone();
         let mut old_read = Box::pin(old_handle.read_linearizable(|_| ()));
         assert!(poll(&mut old_read).is_pending());
-        let mut response = None;
+        let mut responses = Vec::new();
         for _ in 0..8 {
             cluster
                 .round(|message| {
                     if message.to == 3 && message.get_msg_type() == MessageType::MsgReadIndexResp {
-                        assert!(response.replace(message.clone()).is_none());
+                        responses.push(message.clone());
                         false
                     } else {
                         true
@@ -368,7 +402,11 @@ mod tests {
                 })
                 .await;
         }
-        let response = response.expect("leader confirmed the original read");
+        let mut answers = responses
+            .into_iter()
+            .filter(|message| is_pending_read(&cluster.drivers[2], &message.entries[0].data));
+        let response = answers.next().expect("leader confirmed the original read");
+        assert!(answers.next().is_none(), "the read is confirmed once");
         let original_term = response.term;
         assert!(poll(&mut old_read).is_pending());
         drop(old_read);
@@ -402,6 +440,140 @@ mod tests {
         }
         assert_eq!(cluster.drivers[2].raw_node.raft.term, original_term);
         assert!(matches!(poll(&mut new_read), Poll::Ready(Ok(()))));
+    }
+
+    /// The leader commits and applies `/forwarded` while node 3 hears
+    /// nothing — what a follower holds once the leader answered its forward.
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn commit_unseen_by_node_3(cluster: &mut Cluster) -> crate::raft::CommandResult {
+        let leader = cluster.handles[0].clone();
+        let mut write = Box::pin(leader.propose(crate::raft::Command::SetMetadata {
+            key: "/forwarded".into(),
+            value: b"v".to_vec(),
+        }));
+        for _ in 0..12 {
+            cluster.round(|message| message.to != 3).await;
+            if let Poll::Ready(result) = poll(&mut write) {
+                return result.expect("the leader commits with node 2");
+            }
+        }
+        panic!("the leader commits with node 2");
+    }
+
+    /// Drive the cluster, a heartbeat per round standing in for the ticks the
+    /// harness does not run, until `visible` resolves.
+    #[cfg(all(feature = "grpc", has_protos))]
+    async fn settle<F>(
+        cluster: &mut Cluster,
+        visible: &mut Pin<Box<F>>,
+        deliver: impl Fn(&Message) -> bool,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        let give_up = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < give_up {
+            cluster.drivers[0].raw_node.ping();
+            cluster.round(&deliver).await;
+            if let Poll::Ready(output) = poll(visible) {
+                return output;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the follower's answer never came");
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    fn has_forwarded_write(driver: &Driver) -> bool {
+        driver
+            .state_machine
+            .try_read()
+            .expect("state machine idle between rounds")
+            .get_metadata("/forwarded")
+            .unwrap()
+            .is_some()
+    }
+
+    /// A forwarded write is reported only once the follower's own replica has
+    /// applied it — whether the leader named the index covering it (this
+    /// build) or left `ProposeResponse.applied_index` off the wire (a leader
+    /// that predates it), in which case the follower learns the leader's
+    /// commit index through ReadIndex rather than taking the absent field
+    /// as index 0.
+    #[cfg(all(feature = "grpc", has_protos))]
+    #[tokio::test]
+    async fn a_forwarded_write_is_reported_once_visible_here_whether_or_not_the_leader_names_its_index(
+    ) {
+        for reported in [true, false] {
+            let mut cluster = Cluster::new();
+            cluster.elect(0).await;
+            let result = commit_unseen_by_node_3(&mut cluster).await;
+            let index = cluster.handles[0].applied_index();
+            let follower = cluster.handles[2].clone();
+            assert!(follower.applied_index() < index);
+            let mut visible = Box::pin(follower.applied_here(
+                crate::raft::proposal::Committed {
+                    result,
+                    index: reported.then_some(index),
+                },
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ));
+            assert!(
+                poll(&mut visible).is_pending(),
+                "not reported while this replica lacks the write (index reported: {reported})"
+            );
+            settle(&mut cluster, &mut visible, |_| true)
+                .await
+                .expect("the write becomes visible here");
+            assert!(
+                has_forwarded_write(&cluster.drivers[2]),
+                "reported: {reported}"
+            );
+            assert!(follower.applied_index() >= index);
+            assert!(follower.own_writes_applied());
+        }
+    }
+
+    /// A follower that learns the covering index but cannot apply through it
+    /// in time says so — with the index — and keeps it as the floor its reads
+    /// wait for.
+    #[cfg(all(feature = "grpc", has_protos))]
+    #[tokio::test]
+    async fn an_unreported_index_learned_but_not_applied_in_time_is_committed_not_visible() {
+        let mut cluster = Cluster::new();
+        cluster.elect(0).await;
+        let result = commit_unseen_by_node_3(&mut cluster).await;
+        let entry = cluster.handles[0].applied_index();
+        let follower = cluster.handles[2].clone();
+        let mut visible = Box::pin(follower.applied_here(
+            crate::raft::proposal::Committed {
+                result,
+                index: None,
+            },
+            // Room for the ReadIndex round trip on a loaded host; the apply
+            // can never happen, since node 3 receives no appends.
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        ));
+        let starved = |message: &Message| {
+            message.to != 3
+                || !matches!(
+                    message.get_msg_type(),
+                    MessageType::MsgAppend | MessageType::MsgSnapshot
+                )
+        };
+        match settle(&mut cluster, &mut visible, starved).await {
+            Err(crate::raft::RaftError::CommittedNotVisible {
+                index: Some(index),
+                applied,
+                ..
+            }) => {
+                assert!(index >= entry, "the leader's commit covers the write");
+                assert!(applied < entry);
+            }
+            other => panic!("expected CommittedNotVisible with the learned index, got {other:?}"),
+        }
+        assert!(!has_forwarded_write(&cluster.drivers[2]));
+        assert!(!follower.own_writes_applied(), "reads here wait for it");
     }
 
     #[test]
