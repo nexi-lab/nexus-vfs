@@ -78,6 +78,7 @@ jobs:
       - name: Owner replica identity and renewal boundaries
         run: |
           cargo test --locked -p lib --features transport --lib transport_primitives::authorship::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::federated_tls::tests
           cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
@@ -113,3 +114,5 @@ jobs:
       - run: cargo test --locked -p managed-agent --lib credential_binding::tests
       - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator
+      - name: Allocation-bound replica issuer and original-operation readback
+        run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test replica_issuer -- --test-threads=1

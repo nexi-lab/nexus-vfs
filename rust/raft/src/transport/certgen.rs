@@ -593,7 +593,7 @@ mod csr_tests;
 mod csr_intent;
 pub use csr_intent::{
     prepare_agent_csr_intent, prepare_replica_csr_intent, sign_committed_agent_intent,
-    sign_committed_replica_intent,
+    sign_committed_replica_intent, verify_replica_csr_intent,
 };
 
 /// Generate a self-signed root CA certificate for a zone.
