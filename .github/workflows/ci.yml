@@ -9,10 +9,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  database-bootstrap:
-    name: Database crash bootstrap / ${{ matrix.os }}
+  # Every native-filesystem suite runs in one job per OS. Hosted runners are the
+  # scarce resource: a job waits far longer for a runner than it runs, so the
+  # suites share one runner and one build cache per platform. Linux covers the
+  # process-instance suites in the full workspace test job.
+  native-suites:
+    name: Native functional suites / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -21,62 +25,56 @@ jobs:
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: ./.github/actions/setup-protoc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-database-bootstrap-${{ matrix.os }}
-      - run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage redb_storage --lib
-      - run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage file_durability::tests --lib
-      - run: 'cargo --config .github/ci/functional-tests.toml test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests raft::zone_persistence::tests'
-      - name: Record I/O lifetime on the native filesystem
+          shared-key: ci-native-suites-${{ matrix.os }}
+      - name: "Database bootstrap: cargo test -p lib --features redb-storage redb_storage --lib"
+        run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage redb_storage --lib
+      - name: "Database bootstrap: cargo test -p lib --features redb-storage file_durability::tests --lib"
+        run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage file_durability::tests --lib
+      - name: "Database bootstrap: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests r"
+        run: 'cargo --config .github/ci/functional-tests.toml test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage:: raft::replication_log::tests raft::zone_persistence::tests'
+      - name: "Database bootstrap: Record I/O lifetime on the native filesystem"
         run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
-      - name: Committed record notifications on the native filesystem
+      - name: "Database bootstrap: Committed record notifications on the native filesystem"
         run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
-      - name: Owned WAL I/O and background retirement on the native filesystem
+      - name: "Database bootstrap: Owned WAL I/O and background retirement on the native filesystem"
         run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
-
-  # CAS has a different kernel feature/build graph. On Windows, compiling it
-  # after both completed bootstrap suites exhausted the 25-minute job budget
-  # before its tests ran. Keep the same command, platforms and budget in an
-  # independent job; no test deadline or assertion changes.
-  cas-publication:
-    name: CAS complete publication / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-protoc
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-cas-publication-${{ matrix.os }}
-      - name: Kernel boot and CAS publication on the native filesystem
+      - name: "CAS publication: Kernel boot and CAS publication on the native filesystem"
         run: cargo --config .github/ci/functional-tests.toml test -p kernel --test cas_publication --test boot_metastore
-      - name: Reject malformed content identifiers before filesystem access
+      - name: "CAS publication: Reject malformed content identifiers before filesystem access"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
-      - name: Cold peer reads retain their owning zone
+      - name: "CAS publication: Cold peer reads retain their owning zone"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib federation::cold_segment::tests
-      - name: Concurrent mounts retain complete storage pairs
+      - name: "CAS publication: Concurrent mounts retain complete storage pairs"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib kernel::mount::tests
-      - name: Batch write results and commit notifications on the native filesystem
+      - name: "CAS publication: Batch write results and commit notifications on the native filesystem"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --test batch_write_outcomes
-      - name: Durable CAS ObjectStore composition
+      - name: "CAS publication: Durable CAS ObjectStore composition"
         run: cargo --config .github/ci/functional-tests.toml test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
-      - name: Trusted Kernel WAL admission and platform refusal
+      - name: "CAS publication: Trusted Kernel WAL admission and platform refusal"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
-      - name: Logical file size across CAS manifest and partial writes
+      - name: "CAS publication: Logical file size across CAS manifest and partial writes"
         run: cargo --config .github/ci/functional-tests.toml test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
+      - name: "Secret file permissions: cargo test -p lib --features transport transport_primitives::secret_file --lib"
+        run: cargo test -p lib --features transport transport_primitives::secret_file --lib
+      - name: "Runtime observations: Real RPC instance, ownership, expiry and partial-directory journeys"
+        run: |
+          cargo --config .github/ci/functional-tests.toml test --locked -p kernel --no-default-features core::agents::registry::runtime_observation::tests:: --lib
+          cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+      - name: "Process instances: cargo test -p kernel --no-default-features core::agents::registry --lib"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p kernel --no-default-features core::agents::registry --lib
+      - name: "Process instances: cargo test -p managed-agent --all-features --test session_mailbox --test session_resume"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --test session_mailbox --test session_resume
 
   durable-runtime-build:
     name: Durable runtime executables / Linux
@@ -187,75 +185,6 @@ jobs:
             ${{ runner.temp }}/durable-runtime-bundle/native-receipt.json
             ${{ runner.temp }}/durable-runtime-bundle/native-*.log
           if-no-files-found: warn
-
-  secret-file-permissions:
-    name: Secret file permissions / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-secret-file-permissions-${{ matrix.os }}
-      - run: cargo test -p lib --features transport transport_primitives::secret_file --lib
-
-  runtime-observations:
-    name: Runtime observations / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    env:
-      CARGO_BUILD_JOBS: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-protoc
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-runtime-observations-${{ matrix.os }}
-      - name: Real RPC instance, ownership, expiry and partial-directory journeys
-        run: |
-          cargo --config .github/ci/functional-tests.toml test --locked -p kernel --no-default-features core::agents::registry::runtime_observation::tests:: --lib
-          cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
-
-  process-instances:
-    name: Process instance lifecycle / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      CARGO_BUILD_JOBS: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-process-instances-${{ matrix.os }}
-      # Linux exercises these in the full workspace test job below.
-      - run: cargo --config .github/ci/functional-tests.toml test -p kernel --no-default-features core::agents::registry --lib
-      - run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --test session_mailbox --test session_resume
 
   search-windows:
     name: Search FTS / Windows
