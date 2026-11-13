@@ -31,6 +31,9 @@ use crate::zone_op_journal::{BeginOutcome, JournalError, JournalRecord, ZoneOpJo
 /// prost flattens the nested `ZoneStatusResponse.Presence` enum into a
 /// sibling module — re-exported here so the ladder reads as one type.
 use kernel::kernel::vfs_proto::zone_status_response::Presence;
+use kernel::kernel::vfs_proto::{
+    peer_replication::State as PeerState, PeerReplication as PeerReplicationFact,
+};
 
 /// Refusal taxonomy for the typed surface. The transport layer maps each
 /// variant onto a tonic `Status` code; the journal stores the message.
@@ -404,52 +407,41 @@ impl ZoneRuntimeBackend {
             );
         }
         // Physical read-back: the parent's state machine must now hold a
-        // DT_MOUNT at mount_path pointing at the target, and the target's
-        // i_links must have moved. A FOLLOWER's propose returns once the
-        // leader commits — the local apply lags by a raft tick (node.rs
-        // documents this), so POLL for the value to become visible instead
-        // of snapshotting once: a one-shot read on a follower observes
-        // stale state and would journal a permanent REJECTED for a mount
-        // that actually committed.
+        // DT_MOUNT at mount_path pointing at the target. `zm.mount` returned
+        // only after THIS replica applied both of its writes (the parent's
+        // DT_MOUNT and the target's i_links counter), so one read observes
+        // them; a write still lagging here failed the mount above instead.
         let parent = self
             .zm
             .get_zone(&req.parent_zone_id)
             .ok_or_else(|| ZoneRuntimeError::Internal("parent zone vanished after mount".into()))?;
-        let mounted_entry = poll_until_visible(CATCHUP_BUDGET, || {
-            parent
-                .get_metadata(&req.mount_path)
-                .ok()
-                .flatten()
-                .and_then(|bytes| decode_file_metadata(&bytes).ok())
-                .filter(|meta| {
-                    // The subtree is part of the mount's identity: this RPC
-                    // mounts the WHOLE zone (mount_subtree with VFS_ROOT),
-                    // so a same-target subtree mount left by join/CLI must
-                    // not satisfy the read-back as if it were this one.
-                    meta.entry_type == DT_MOUNT
-                        && meta.target_zone_id == req.target_zone_id
-                        && meta.target_subtree == contracts::VFS_ROOT
-                })
-        });
+        let mounted_entry = parent
+            .get_metadata(&req.mount_path)
+            .ok()
+            .flatten()
+            .and_then(|bytes| decode_file_metadata(&bytes).ok())
+            .filter(|meta| {
+                // The subtree is part of the mount's identity: this RPC
+                // mounts the WHOLE zone (mount_subtree with VFS_ROOT), so a
+                // same-target subtree mount left by join/CLI must not
+                // satisfy the read-back as if it were this one.
+                meta.entry_type == DT_MOUNT
+                    && meta.target_zone_id == req.target_zone_id
+                    && meta.target_subtree == contracts::VFS_ROOT
+            });
         if mounted_entry.is_none() {
-            // The mount may still have committed cluster-wide (a follower's
-            // local apply can lag past the budget): the outcome is UNKNOWN,
-            // so do NOT journal REJECTED — the record stays PENDING and the
-            // caller is told to query or retry under a fresh operation id
-            // (mount is idempotent).
+            // A concurrent unmount may have replaced the entry after this
+            // mount committed: the outcome is not a refusal, so do NOT journal
+            // REJECTED — the record stays PENDING and the caller is told to
+            // query or retry under a fresh operation id (mount is idempotent).
             let e = ZoneRuntimeError::Internal(format!(
-                "mount read-back: no DT_MOUNT → {} at '{}' in '{}' within {:?} — the \
-                 mount may have committed; query GetZoneOperation or retry with a new \
-                 operation_id",
-                req.target_zone_id, req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
+                "mount read-back: no DT_MOUNT → {} at '{}' in '{}' after the mount \
+                 committed; query GetZoneOperation or retry with a new operation_id",
+                req.target_zone_id, req.mount_path, req.parent_zone_id
             ));
             tracing::error!(zone = %req.target_zone_id, "zone runtime mount read-back: {e}");
             return Err(e);
         }
-        // Best-effort snapshot: `zm.mount` writes the parent's DT_MOUNT and
-        // the target's i_links counter on TWO independent raft groups — on
-        // a follower their local applies lag independently, so this count
-        // can read one behind right after the mount becomes visible.
         let links = self.zm.get_links_count(&req.target_zone_id).unwrap_or(None);
         let mut receipt = base_receipt(
             &header.operation_id,
@@ -497,34 +489,27 @@ impl ZoneRuntimeBackend {
                 )
             }
         };
-        // Physical read-back (same follower-lag reasoning as `zone_mount`):
-        // poll until the mount point is no longer a DT_MOUNT in the parent.
-        // i_links is a counter with no predictable expected value, so it is
-        // read once the physical fact is visible — best-effort, same
-        // snapshot semantics as the mount receipt.
+        // Physical read-back (see `zone_mount`): the mount point is no longer
+        // a DT_MOUNT in the parent, and the target's i_links has moved —
+        // both applied here before `zm.unmount` returned.
         if former_target.is_some() {
             let parent = self.zm.get_zone(&req.parent_zone_id);
             let gone = parent.is_some_and(|parent| {
-                poll_until_visible(CATCHUP_BUDGET, || {
-                    let still_mount = parent
-                        .get_metadata(&req.mount_path)
-                        .ok()
-                        .flatten()
-                        .and_then(|bytes| decode_file_metadata(&bytes).ok())
-                        .is_some_and(|meta| meta.entry_type == DT_MOUNT);
-                    (!still_mount).then_some(())
-                })
-                .is_some()
+                !parent
+                    .get_metadata(&req.mount_path)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| decode_file_metadata(&bytes).ok())
+                    .is_some_and(|meta| meta.entry_type == DT_MOUNT)
             });
             if !gone {
-                // The unmount may still have committed cluster-wide: the
-                // outcome is UNKNOWN — no REJECTED, the record stays
-                // PENDING (mirrors the mount read-back semantics).
+                // A concurrent mount may have replaced the entry after this
+                // unmount committed: not a refusal — no REJECTED, the record
+                // stays PENDING (mirrors the mount read-back semantics).
                 let e = ZoneRuntimeError::Internal(format!(
-                    "unmount read-back: '{}' in '{}' still a DT_MOUNT within {:?} — the \
-                     unmount may have committed; query GetZoneOperation or retry with a \
-                     new operation_id",
-                    req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
+                    "unmount read-back: '{}' in '{}' is a DT_MOUNT again after the unmount \
+                     committed; query GetZoneOperation or retry with a new operation_id",
+                    req.mount_path, req.parent_zone_id
                 ));
                 tracing::error!(zone = %req.parent_zone_id, "zone runtime unmount read-back: {e}");
                 return Err(e);
@@ -934,6 +919,7 @@ impl ZoneRuntimeBackend {
             wait_until_caught_up(&node, zone_id, CATCHUP_BUDGET);
         }
         let status = self.zm.cluster_status(zone_id);
+        let replication = status.replication;
         ClusterFacts {
             has_store: status.has_store,
             term: status.term,
@@ -943,6 +929,16 @@ impl ZoneRuntimeBackend {
             voter_count: status.voter_count as u32,
             witness_count: status.witness_count as u32,
             leader_contact_age_ms: status.leader_contact_age_ms,
+            peers: replication
+                .peers
+                .iter()
+                .map(peer_replication_fact)
+                .collect(),
+            leader_commit_index: replication.leader_commit.map(|commit| commit.index),
+            leader_commit_age_ms: replication
+                .leader_commit
+                .map(|commit| millis(commit.observed_ago)),
+            stalled_ms: millis(replication.stalled_for),
         }
     }
 }
@@ -962,23 +958,28 @@ fn require_header(
     Ok(header)
 }
 
-/// Poll `probe` until it yields a value or `budget` expires — the
-/// value-visibility pattern `ControlStateStore::wait_visible` established.
-/// A proposal returns once the LEADER commits, but on a follower the local
-/// apply lags by a raft tick (node.rs documents this), so a one-shot
-/// snapshot right after a successful propose can observe stale state. A
-/// transient read error counts as "not visible yet" — only the budget
-/// running out gives up.
-fn poll_until_visible<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if let Some(value) = probe() {
-            return Some(value);
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn peer_replication_fact(peer: &crate::raft::PeerReplication) -> PeerReplicationFact {
+    use crate::raft::ReplicationState;
+    PeerReplicationFact {
+        node_id: peer.node_id,
+        learner: peer.learner,
+        state: match peer.state {
+            ReplicationState::Probe => PeerState::Probe,
+            ReplicationState::Replicate => PeerState::Replicate,
+            ReplicationState::Snapshot => PeerState::Snapshot,
         }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        .into(),
+        matched: peer.matched,
+        next_index: peer.next_index,
+        state_age_ms: millis(peer.in_state_for),
+        stalled_ms: millis(peer.stalled_for),
+        send_failures: peer.send_failures,
+        send_failing_ms: millis(peer.send_failing_for),
+        last_send_error: peer.last_send_error.clone().unwrap_or_default(),
     }
 }
 

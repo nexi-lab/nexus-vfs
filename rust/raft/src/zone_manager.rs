@@ -226,6 +226,9 @@ pub struct ClusterStatus {
     /// Milliseconds since this node last heard from its current leader —
     /// 0 on the leader, `None` before the first contact. Memory only.
     pub leader_contact_age_ms: Option<u64>,
+    /// Replication progress: per-peer on the leader, the leader's commit
+    /// index and this replica's stall on a follower. Memory only.
+    pub replication: crate::raft::ReplicationStatus,
 }
 
 /// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
@@ -1490,10 +1493,9 @@ impl ZoneManager {
 
     /// Linearizable twin of [`Self::get_links_count`]: the ReadIndex barrier
     /// guarantees the value observes every write committed cluster-wide
-    /// before the call (a plain local read on a FOLLOWER host lags the
-    /// leader's apply by a raft tick — the same lag `poll_until_visible`
-    /// exists for), so a guard decision made on it cannot miss an
-    /// already-committed mount. One leader heartbeat round-trip, no log
+    /// before the call, including writes submitted through OTHER nodes that
+    /// a local read on a follower may not have applied yet, so a guard
+    /// decision made on it cannot miss an already-committed mount. One leader heartbeat round-trip, no log
     /// write — the same primitive `ControlStateStore::read_barrier` uses.
     pub fn get_links_count_linearizable(&self, zone_id: &str) -> Result<Option<i64>> {
         let Some(node) = self.registry.get_node(zone_id) else {
@@ -1636,6 +1638,7 @@ impl ZoneManager {
                 voter_count: 0,
                 witness_count: 0,
                 leader_contact_age_ms: None,
+                replication: Default::default(),
             };
         };
         // Membership SSOT is raft's ConfState (the authoritative voter set),
@@ -1671,6 +1674,7 @@ impl ZoneManager {
             voter_count,
             witness_count,
             leader_contact_age_ms: node.leader_contact_age().map(|age| age.as_millis() as u64),
+            replication: node.replication(),
         }
     }
 

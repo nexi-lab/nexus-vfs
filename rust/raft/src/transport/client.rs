@@ -380,7 +380,7 @@ impl RaftClient {
             }
             None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
         };
-        let inner = ZoneTransportServiceClient::new(channel);
+        let inner = bounded!(ZoneTransportServiceClient::new(channel));
 
         Ok(Self {
             endpoint: endpoint.to_string(),
@@ -600,7 +600,7 @@ impl RaftApiClient {
             &channel_config(&config, tls_snapshot),
         )
         .await?;
-        let inner = ZoneApiServiceClient::new(channel);
+        let inner = zone_api_client(channel);
 
         tracing::info!("Connected to Raft API at {}", endpoint);
 
@@ -839,8 +839,9 @@ pub struct ProposeResult {
     pub error: Option<String>,
     /// Leader address if this node is not the leader.
     pub leader_address: Option<String>,
-    /// Log index where the command was applied.
-    pub applied_index: u64,
+    /// On success, the index the answering node had applied when the command
+    /// resolved; `None` when it did not say (a refusal, or an older node).
+    pub applied_index: Option<u64>,
 }
 
 /// Result of a Query operation.
@@ -911,6 +912,24 @@ async fn connect_zone_api(
     timeout_secs: u64,
     what: &str,
 ) -> Result<ZoneApiServiceClient<Channel>> {
+    connect_one_shot(peer_addr, tls, timeout_secs, what)
+        .await
+        .map(zone_api_client)
+}
+
+/// A `ZoneApiService` client over `channel`, within the raft message bound.
+pub fn zone_api_client(channel: Channel) -> ZoneApiServiceClient<Channel> {
+    bounded!(ZoneApiServiceClient::new(channel))
+}
+
+/// The channel [`connect_zone_api`] and the other one-shot helpers dial:
+/// the node's client identity under mTLS, plaintext under `--no-tls`.
+async fn connect_one_shot(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+    what: &str,
+) -> Result<Channel> {
     let config = lib::transport_primitives::ClientConfig {
         connect_timeout: Duration::from_secs(timeout_secs),
         request_timeout: Duration::from_secs(timeout_secs),
@@ -919,12 +938,35 @@ async fn connect_zone_api(
         http2_keepalive_timeout: None,
         tls,
     };
-    let channel = lib::transport_primitives::create_channel(peer_addr, &config)
+    lib::transport_primitives::create_channel(peer_addr, &config)
         .await
         .map_err(|e| {
             TransportError::Connection(format!("{what} connect to {peer_addr} failed: {e}"))
-        })?;
-    Ok(ZoneApiServiceClient::new(channel))
+        })
+}
+
+/// A zone's presence and raft facts (`ZoneStatus`) from the daemon at
+/// `peer_addr`, asked as this node: its certificate under mTLS, no bearer
+/// token — the identity under which the facts are not redacted.
+pub async fn call_zone_status_rpc(
+    peer_addr: &str,
+    zone_id: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<kernel::kernel::vfs_proto::ZoneStatusResponse> {
+    let channel = connect_one_shot(peer_addr, tls, timeout_secs, "ZoneStatus").await?;
+    bounded!(
+        kernel::kernel::vfs_proto::zone_runtime_service_client::ZoneRuntimeServiceClient::new(
+            channel
+        )
+    )
+    .zone_status(kernel::kernel::vfs_proto::ZoneStatusRequest {
+        auth_token: String::new(),
+        zone_id: zone_id.to_string(),
+    })
+    .await
+    .map(tonic::Response::into_inner)
+    .map_err(|e| TransportError::Rpc(format!("ZoneStatus RPC failed: {e}")))
 }
 
 /// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
@@ -957,7 +999,7 @@ pub async fn call_join_cluster(
         .await
         .map_err(|e| TransportError::Connection(format!("JoinCluster connect failed: {}", e)))?;
 
-    let mut client = NodeEnrollmentServiceClient::new(channel);
+    let mut client = bounded!(NodeEnrollmentServiceClient::new(channel));
     let request = JoinClusterRequest {
         password: password.to_string(),
         node_id,
@@ -1010,7 +1052,7 @@ pub async fn call_get_crl(enroll_addr: &str, timeout_secs: u64) -> Result<Vec<u8
         .await
         .map_err(|e| TransportError::Connection(format!("GetCrl connect failed: {e}")))?;
 
-    let response = NodeEnrollmentServiceClient::new(channel)
+    let response = bounded!(NodeEnrollmentServiceClient::new(channel))
         .get_crl(GetCrlRequest {})
         .await
         .map_err(|e| TransportError::Rpc(format!("GetCrl RPC failed: {e}")))?
@@ -1935,7 +1977,7 @@ mod tests {
         RaftClient {
             endpoint: "http://[::1]:1".to_string(),
             config: ClientConfig::default(),
-            inner: ZoneTransportServiceClient::new(channel),
+            inner: bounded!(ZoneTransportServiceClient::new(channel)),
             is_node_channel: false,
         }
     }

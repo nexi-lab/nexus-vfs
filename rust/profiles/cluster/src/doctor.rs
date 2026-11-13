@@ -42,6 +42,7 @@ const CERTIFICATE_EXPIRY_WARNING_DAYS: i64 = 14;
 /// are treated as zones; others are skipped.  redb's exclusive lock
 /// means the daemon must be stopped first — the failure mode
 /// otherwise is a clear "could not open zone storage" error per zone.
+/// Replication health is not on disk; [`run_live`] asks the running daemon.
 pub(super) fn run(data_dir: &Path, zone_filter: Option<&str>) -> Result<()> {
     if !data_dir.exists() {
         return Err(anyhow::anyhow!(
@@ -386,6 +387,369 @@ fn audit_zones(
         println!();
     }
     Ok(alarmed)
+}
+
+/// `doctor --live`: replication health of the RUNNING daemon at `endpoint`.
+///
+/// Per-peer progress and replica lag are observations the daemon keeps in
+/// memory and never persists, so the on-disk audit cannot see them; each zone
+/// found under `data_dir` is read through the daemon's `ZoneStatus`, as this
+/// node. Alarms (exit 2), each held for at least `stall`:
+///
+///   * `PEER_STUCK_IN_SNAPSHOT` / `PEER_STUCK_IN_PROBE` — on the leader, a
+///     member's flow-control state has not returned to `Replicate`.
+///   * `PEER_REPLICATION_STALLED` — on the leader, a member's matched index
+///     stands still behind the commit index.
+///   * `PEER_SEND_FAILING` — on the leader, every message to a member has
+///     failed, with the reason (a message beyond the member's size bound
+///     among them).
+///   * `REPLICA_LAGGING` — on a follower or learner, the applied index stands
+///     still behind the leader's commit index (from the commit probe; a
+///     replica's own commit index cannot show this).
+///   * `LEADER_COMMIT_UNKNOWN` — the commit probe has gone unanswered, so the
+///     replica's lag cannot be measured.
+///   * `LEADER_UNREACHABLE` — no message from the leader.
+pub(super) async fn run_live(
+    endpoint: &str,
+    tls: Option<nexus_raft::transport::TlsConfig>,
+    data_dir: &Path,
+    zone_filter: Option<&str>,
+    stall: std::time::Duration,
+) -> Result<()> {
+    let zones = discover_zones(data_dir, zone_filter)?;
+    println!(
+        "# Doctor (live) — {} zone(s) under {}, via {endpoint}",
+        zones.len(),
+        data_dir.display()
+    );
+    println!();
+    let mut alarmed = 0usize;
+    for (zone_id, _) in &zones {
+        println!("## zone '{zone_id}'");
+        let report =
+            match nexus_raft::transport::call_zone_status_rpc(endpoint, zone_id, tls.clone(), 10)
+                .await
+            {
+                Ok(status) => audit_replication(&status, stall),
+                Err(error) => ReplicationReport {
+                    lines: Vec::new(),
+                    alarms: vec![format!(
+                        "DAEMON_UNREACHABLE: ZoneStatus({zone_id}) via {endpoint} failed — is the \
+                     daemon running in this environment?  {error}"
+                    )],
+                },
+            };
+        for line in &report.lines {
+            println!("  {line}");
+        }
+        for alarm in &report.alarms {
+            println!("  ALARM  {alarm}");
+        }
+        if report.alarms.is_empty() {
+            println!("  OK");
+        } else {
+            alarmed += 1;
+        }
+        println!();
+    }
+    println!(
+        "Summary: {alarmed} alarmed / {} total zone(s).  {}",
+        zones.len(),
+        if alarmed == 0 {
+            "Replication looks healthy."
+        } else {
+            "A replica that is not fed converges only once the alarm clears."
+        }
+    );
+    if alarmed > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// What one zone's `ZoneStatus` says about replication.
+#[derive(Debug, Default)]
+struct ReplicationReport {
+    lines: Vec<String>,
+    alarms: Vec<String>,
+}
+
+/// Judge one zone's replication facts against `stall`. Pure, so the alarm
+/// rules are tested without a daemon.
+fn audit_replication(
+    status: &kernel::kernel::vfs_proto::ZoneStatusResponse,
+    stall: std::time::Duration,
+) -> ReplicationReport {
+    use kernel::kernel::vfs_proto::peer_replication::State;
+    use kernel::kernel::vfs_proto::zone_status_response::Presence;
+
+    let mut report = ReplicationReport::default();
+    let stall_ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX);
+    if status.presence() != Presence::Resident {
+        report.lines.push(format!(
+            "presence   = {:?} (no replica runs here)",
+            status.presence()
+        ));
+        return report;
+    }
+    let Some(facts) = status.cluster.as_ref() else {
+        report.alarms.push(
+            "NO_RAFT_FACTS: the daemon withheld the raft facts — this identity is not an \
+             operator of the zone"
+                .into(),
+        );
+        return report;
+    };
+    let secs = |ms: u64| ms / 1000;
+    report.lines.push(format!(
+        "leader     = {}  term = {}  commit = {}  applied = {}",
+        facts.leader_id, facts.term, facts.commit_index, facts.applied_index
+    ));
+    for peer in &facts.peers {
+        let lag = facts.commit_index.saturating_sub(peer.matched);
+        let role = if peer.learner { "learner" } else { "voter" };
+        report.lines.push(format!(
+            "peer {} ({role}): {:?} for {}s, matched = {} (lag {lag}), next = {}, \
+             matched still for {}s, {} consecutive send failure(s)",
+            peer.node_id,
+            peer.state(),
+            secs(peer.state_age_ms),
+            peer.matched,
+            peer.next_index,
+            secs(peer.stalled_ms),
+            peer.send_failures,
+        ));
+        if peer.send_failing_ms >= stall_ms {
+            report.alarms.push(format!(
+                "PEER_SEND_FAILING: every message to peer {} ({role}) has failed for {}s \
+                 ({} attempts); last: {}. A message too large for the peer is held back \
+                 and retried with backoff; it is accepted once the peer runs a build \
+                 with the same message bound.",
+                peer.node_id,
+                secs(peer.send_failing_ms),
+                peer.send_failures,
+                peer.last_send_error,
+            ));
+        }
+        let stuck_state = match peer.state() {
+            State::Snapshot => Some("PEER_STUCK_IN_SNAPSHOT"),
+            State::Probe => Some("PEER_STUCK_IN_PROBE"),
+            State::Replicate | State::Unknown => None,
+        }
+        .filter(|_| peer.state_age_ms >= stall_ms);
+        if let Some(code) = stuck_state {
+            report.alarms.push(format!(
+                "{code}: peer {} ({role}) has held {:?} for {}s at matched {} of commit {}. \
+                 RECOVERY: every snapshot the leader sends is reported delivered or failed \
+                 and re-sent; a peer held here means each attempt fails — the leader's log \
+                 names why (`Raft message send failed` / `timeout`, snapshot=true).",
+                peer.node_id,
+                peer.state(),
+                secs(peer.state_age_ms),
+                peer.matched,
+                facts.commit_index,
+            ));
+        } else if peer.stalled_ms >= stall_ms {
+            report.alarms.push(format!(
+                "PEER_REPLICATION_STALLED: peer {} ({role}) matched {} has not moved for {}s \
+                 while the commit index is {} (lag {lag}).",
+                peer.node_id,
+                peer.matched,
+                secs(peer.stalled_ms),
+                facts.commit_index,
+            ));
+        }
+    }
+    let leads = facts.leader_contact_age_ms == Some(0) && facts.leader_commit_index.is_none();
+    if !leads {
+        match facts.leader_contact_age_ms {
+            Some(age) if age >= stall_ms => report.alarms.push(format!(
+                "LEADER_UNREACHABLE: no message from leader {} for {}s.",
+                facts.leader_id,
+                secs(age)
+            )),
+            None => report
+                .lines
+                .push("leader contact: none since the zone became resident".into()),
+            Some(_) => {}
+        }
+        match (facts.leader_commit_index, facts.leader_commit_age_ms) {
+            (Some(leader_commit), Some(age)) => {
+                let lag = leader_commit.saturating_sub(facts.applied_index);
+                report.lines.push(format!(
+                    "leader commit = {leader_commit} ({}s ago), replica lag = {lag}, \
+                     applied still for {}s",
+                    secs(age),
+                    secs(facts.stalled_ms)
+                ));
+                if facts.stalled_ms >= stall_ms {
+                    report.alarms.push(format!(
+                        "REPLICA_LAGGING: applied {} has not moved for {}s while the leader's \
+                         commit is {leader_commit} (lag {lag}); reads here wait for this \
+                         node's own writes and fail with the lag. RECOVERY: `doctor --live` on \
+                         the leader names this member's replication state.",
+                        facts.applied_index,
+                        secs(facts.stalled_ms),
+                    ));
+                }
+                if age >= stall_ms {
+                    report.alarms.push(format!(
+                        "LEADER_COMMIT_UNKNOWN: the leader has not answered this replica's \
+                         commit probe for {}s, so its lag cannot be measured.",
+                        secs(age)
+                    ));
+                }
+            }
+            _ if facts.leader_id != 0 => report
+                .lines
+                .push("leader commit: commit probe not answered yet".into()),
+            _ => {}
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod replication_tests {
+    use super::*;
+    use kernel::kernel::vfs_proto::{
+        peer_replication::State, zone_status_response::Presence, ClusterFacts, PeerReplication,
+        ZoneStatusResponse,
+    };
+    use std::time::Duration;
+
+    fn resident(facts: ClusterFacts) -> ZoneStatusResponse {
+        ZoneStatusResponse {
+            zone_id: "sharedzone".into(),
+            presence: Presence::Resident.into(),
+            cluster: Some(facts),
+            deletion: None,
+        }
+    }
+
+    fn alarm_codes(report: &ReplicationReport) -> Vec<&str> {
+        report
+            .alarms
+            .iter()
+            .map(|alarm| alarm.split(':').next().unwrap())
+            .collect()
+    }
+
+    /// The incident: the leader holds a learner in Snapshot while the
+    /// learner's own facts look current — both sides now alarm.
+    #[test]
+    fn a_learner_held_in_snapshot_alarms_on_both_sides() {
+        let stall = Duration::from_secs(30);
+        let leader = resident(ClusterFacts {
+            has_store: true,
+            commit_index: 32_775,
+            applied_index: 32_775,
+            leader_id: 1,
+            leader_contact_age_ms: Some(0),
+            peers: vec![PeerReplication {
+                node_id: 2,
+                learner: true,
+                state: State::Snapshot.into(),
+                matched: 32_756,
+                next_index: 32_757,
+                state_age_ms: 3_600_000,
+                stalled_ms: 3_600_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            alarm_codes(&audit_replication(&leader, stall)),
+            ["PEER_STUCK_IN_SNAPSHOT"]
+        );
+
+        // The production evidence: the learner rejects every append as too
+        // large, and the leader says so instead of retrying in silence.
+        let rejecting = resident(ClusterFacts {
+            commit_index: 482_384,
+            applied_index: 482_384,
+            leader_id: 1,
+            leader_contact_age_ms: Some(0),
+            peers: vec![PeerReplication {
+                node_id: 2,
+                learner: true,
+                state: State::Probe.into(),
+                matched: 32_756,
+                next_index: 32_757,
+                state_age_ms: 1_000,
+                stalled_ms: 3_600_000,
+                send_failures: 16_681,
+                send_failing_ms: 1_140_000,
+                last_send_error: "message too large: decoded message length too large".into(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            alarm_codes(&audit_replication(&rejecting, stall)),
+            ["PEER_SEND_FAILING", "PEER_REPLICATION_STALLED"]
+        );
+
+        let learner = resident(ClusterFacts {
+            has_store: true,
+            commit_index: 32_756,
+            applied_index: 32_756,
+            leader_id: 1,
+            leader_contact_age_ms: Some(19),
+            leader_commit_index: Some(32_775),
+            leader_commit_age_ms: Some(400),
+            stalled_ms: 3_600_000,
+            ..Default::default()
+        });
+        assert_eq!(
+            alarm_codes(&audit_replication(&learner, stall)),
+            ["REPLICA_LAGGING"]
+        );
+    }
+
+    #[test]
+    fn healthy_and_briefly_lagging_replicas_do_not_alarm() {
+        let stall = Duration::from_secs(30);
+        let leader = resident(ClusterFacts {
+            commit_index: 10,
+            leader_contact_age_ms: Some(0),
+            peers: vec![PeerReplication {
+                node_id: 2,
+                state: State::Probe.into(),
+                matched: 8,
+                state_age_ms: 2_000,
+                stalled_ms: 2_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(audit_replication(&leader, stall).alarms.is_empty());
+        let follower = resident(ClusterFacts {
+            applied_index: 9,
+            leader_id: 1,
+            leader_contact_age_ms: Some(30),
+            leader_commit_index: Some(10),
+            leader_commit_age_ms: Some(500),
+            stalled_ms: 40,
+            ..Default::default()
+        });
+        assert!(audit_replication(&follower, stall).alarms.is_empty());
+    }
+
+    #[test]
+    fn an_unanswered_probe_and_a_silent_leader_alarm() {
+        let follower = resident(ClusterFacts {
+            leader_id: 1,
+            leader_contact_age_ms: Some(120_000),
+            leader_commit_index: Some(10),
+            leader_commit_age_ms: Some(120_000),
+            applied_index: 10,
+            ..Default::default()
+        });
+        assert_eq!(
+            alarm_codes(&audit_replication(&follower, Duration::from_secs(30))),
+            ["LEADER_UNREACHABLE", "LEADER_COMMIT_UNKNOWN"]
+        );
+    }
 }
 
 #[cfg(test)]
