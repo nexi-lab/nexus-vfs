@@ -65,7 +65,7 @@ impl MembershipPolicy {
             let next = first.max(state_machine.last_applied_index().saturating_add(1));
             return self.validate_retained_entries(storage, next, last, None);
         }
-        if config.id == 0 || config.is_witness || !config.peers.is_empty() {
+        if config.id == 0 || config.is_witness {
             return Err(invalid("requires one local voter and local bootstrap"));
         }
         let state = storage.initial_state_impl()?;
