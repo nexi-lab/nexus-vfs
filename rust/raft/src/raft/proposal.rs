@@ -7,6 +7,7 @@ pub(crate) const PROPOSAL_TIMEOUT_SECS: u64 = 10;
 /// applied when it answered. Every entry through that index is committed,
 /// the command's own included, so a replica that has applied through it
 /// observes the command.
+#[cfg(all(feature = "grpc", has_protos))]
 #[derive(Debug)]
 pub(crate) struct Committed {
     pub(crate) result: super::CommandResult,
