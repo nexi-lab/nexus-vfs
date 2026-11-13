@@ -209,6 +209,7 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         .await
     {
         Err(RaftError::CommittedNotVisible { index, applied, .. }) => {
+            let index = index.expect("a current leader reports the index it applied at");
             assert!(applied < index, "lag reported: applied {applied} < {index}");
             index
         }

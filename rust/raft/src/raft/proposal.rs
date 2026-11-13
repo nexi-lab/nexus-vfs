@@ -4,14 +4,15 @@
 pub(crate) const PROPOSAL_TIMEOUT_SECS: u64 = 10;
 
 /// A command the leader applied: its result, and the index the leader had
-/// applied when it answered. Every entry through that index is committed,
-/// the command's own included, so a replica that has applied through it
-/// observes the command.
+/// applied when it answered, when it says so. Every entry through that index
+/// is committed, the command's own included, so a replica that has applied
+/// through it observes the command. `None` is a leader that did not report
+/// the index (one that predates the field), not index 0.
 #[cfg(all(feature = "grpc", has_protos))]
 #[derive(Debug)]
 pub(crate) struct Committed {
     pub(crate) result: super::CommandResult,
-    pub(crate) index: u64,
+    pub(crate) index: Option<u64>,
 }
 
 pub(super) async fn wait_for_commit(

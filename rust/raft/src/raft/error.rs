@@ -80,17 +80,19 @@ pub enum RaftError {
     #[error("transport error: {0}")]
     Transport(String),
 
-    /// The proposal COMMITTED — the leader applied it at or before `index` and
-    /// answered with `result` — but this replica had applied only through
-    /// `applied` when the deadline passed, so a read here would not observe
-    /// it yet. The write is not undone: re-issuing it applies it twice.
+    /// The proposal COMMITTED — the leader applied it and answered with
+    /// `result` — but this replica had applied only through `applied` when the
+    /// deadline passed, so a read here would not observe it yet. `index`
+    /// covers the command's entry; `None` when it could not be learned in
+    /// time. The write is not undone: re-issuing it applies it twice.
     #[error(
-        "committed through index {index}, but this node has applied only through {applied} \
-         (replica lag {lag}); the write is not yet visible here",
-        lag = .index.saturating_sub(*.applied)
+        "committed{}, but this node has applied only through {applied}{}; the write is not \
+         yet visible here",
+        through_index(.index),
+        replica_lag(.index, *.applied)
     )]
     CommittedNotVisible {
-        index: u64,
+        index: Option<u64>,
         applied: u64,
         result: Box<super::CommandResult>,
     },
@@ -118,6 +120,16 @@ pub enum RaftError {
     /// survives the hop into this vocabulary; see that variant for why it is typed.
     #[error("data dir already open by another process: {0}")]
     DataDirLocked(String),
+}
+
+fn through_index(index: &Option<u64>) -> String {
+    index.map_or_else(String::new, |index| format!(" through index {index}"))
+}
+
+fn replica_lag(index: &Option<u64>, applied: u64) -> String {
+    index.map_or_else(String::new, |index| {
+        format!(" (replica lag {})", index.saturating_sub(applied))
+    })
 }
 
 impl RaftError {

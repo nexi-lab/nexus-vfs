@@ -71,7 +71,7 @@ mod member_registration;
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use member_registration::MemberRegistration;
 mod read_index;
-use read_index::{PendingRead, ReadContext, ReadRequestIds};
+use read_index::{PendingRead, ReadContext, ReadReply, ReadRequestIds};
 mod replication;
 use replication::{CommitProbe, ReplicationView};
 pub use replication::{LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus};
@@ -385,6 +385,9 @@ pub enum RaftMsg {
     /// or parks it in `applied_waiters` until a later
     /// `apply_entries` catches up.
     ReadIndex { tx: oneshot::Sender<Result<()>> },
+    /// ReadIndex without the apply wait: resolve `tx` with the leader's
+    /// commit index once raft-rs confirms it.
+    LeaderCommit { tx: oneshot::Sender<Result<u64>> },
     /// Resolve `tx` once the local state machine has applied through
     /// `index`. The second half of ReadIndex, offered on its own to callers
     /// that already know the index they need: a write forwarded to the
@@ -1391,6 +1394,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         Ok(f(&*sm))
     }
 
+    /// The leader's commit index, confirmed through ReadIndex — the first
+    /// half of [`Self::read_linearizable`], without its wait for the local
+    /// apply. Every entry the leader had applied before this call is covered.
+    pub async fn leader_commit_index(&self) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .try_send(RaftMsg::LeaderCommit { tx })
+            .map_err(channel_try_send_err)?;
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
+    }
+
     /// Execute a mutable closure against the state machine.
     ///
     /// Used for operations like snapshot restore that require `&mut S`.
@@ -1637,25 +1651,39 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
     }
 
-    /// Report a forwarded command once this replica can see it: record its
-    /// index as this node's read-your-writes floor, then wait for the local
-    /// apply until `deadline`.
+    /// Report a forwarded command once this replica can see it: record the
+    /// index that covers it as this node's read-your-writes floor, then wait
+    /// for the local apply until `deadline`.
+    ///
+    /// A leader that predates `ProposeResponse.applied_index` does not say
+    /// which index that is. Its commit index, read after it applied the
+    /// command, covers the command too, so it is learned through ReadIndex —
+    /// never assumed to be 0, which would report a write visible that this
+    /// replica has not applied.
     #[cfg(all(feature = "grpc", has_protos))]
     async fn applied_here(
         &self,
         committed: super::proposal::Committed,
         deadline: tokio::time::Instant,
     ) -> Result<CommandResult> {
-        self.own_write_floor
-            .fetch_max(committed.index, Ordering::AcqRel);
-        match self.await_applied(committed.index, deadline).await {
-            Ok(()) => Ok(committed.result),
-            Err(applied) => Err(RaftError::CommittedNotVisible {
-                index: committed.index,
-                applied,
-                result: Box::new(committed.result),
-            }),
+        let index = match committed.index {
+            Some(index) => Some(index),
+            None => tokio::time::timeout_at(deadline, self.leader_commit_index())
+                .await
+                .ok()
+                .and_then(Result::ok),
+        };
+        if let Some(index) = index {
+            self.own_write_floor.fetch_max(index, Ordering::AcqRel);
+            if self.await_applied(index, deadline).await.is_ok() {
+                return Ok(committed.result);
+            }
         }
+        Err(RaftError::CommittedNotVisible {
+            index,
+            applied: self.applied_index(),
+            result: Box::new(committed.result),
+        })
     }
 
     /// Forward a proposal to the current leader via gRPC.
@@ -1745,7 +1773,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                         let result = super::proposal::wait_for_commit(rx, deadline).await?;
                         return Ok(super::proposal::Committed {
                             result,
-                            index: self.applied_index(),
+                            index: Some(self.applied_index()),
                         });
                     }
                     Err(RaftError::NotLeader { .. }) => continue,
@@ -2357,17 +2385,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 self.update_cached_status();
                 let _ = tx.send(result);
             }
-            RaftMsg::ReadIndex { tx } => {
-                // Keep the request until Raft can accept it. A newly elected
-                // leader drops ReadIndex until it commits its first entry.
-                let Some(id) = self.read_request_ids.allocate() else {
-                    let _ = tx.send(Err(RaftError::Config(
-                        "ReadIndex request sequence exhausted".into(),
-                    )));
-                    return;
-                };
-                self.pending_reads_by_ctx.insert(id, PendingRead::new(tx));
-            }
+            RaftMsg::ReadIndex { tx } => self.queue_read(ReadReply::Applied(tx)),
+            RaftMsg::LeaderCommit { tx } => self.queue_read(ReadReply::Index(tx)),
             RaftMsg::AwaitApplied { index, tx } => {
                 // Apply runs only on this task, so the check cannot race it.
                 if self.applied_index_atom.load(Ordering::Acquire) >= index {
@@ -2380,6 +2399,25 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 let _ = tx.send(read_membership(&self.raw_node));
             }
         }
+    }
+
+    /// Keep a ReadIndex request until Raft can accept it. A newly elected
+    /// leader drops ReadIndex until it commits its first entry.
+    fn queue_read(&mut self, reply: ReadReply) {
+        let Some(id) = self.read_request_ids.allocate() else {
+            let exhausted = || RaftError::Config("ReadIndex request sequence exhausted".into());
+            match reply {
+                ReadReply::Applied(tx) => {
+                    let _ = tx.send(Err(exhausted()));
+                }
+                ReadReply::Index(tx) => {
+                    let _ = tx.send(Err(exhausted()));
+                }
+            }
+            return;
+        };
+        self.pending_reads_by_ctx
+            .insert(id, PendingRead::new(reply));
     }
 
     fn step_message(&mut self, msg: Message, protocol: RaftMessageProtocol) -> Result<()> {
@@ -3032,11 +3070,14 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 // previous driver instance or a stale ctx; drop.
                 continue;
             };
-            let tx = request.tx;
-            if applied >= state.index {
-                let _ = tx.send(Ok(()));
-            } else {
-                self.applied_waiters.push((state.index, tx));
+            match request.reply {
+                ReadReply::Index(tx) => {
+                    let _ = tx.send(Ok(state.index));
+                }
+                ReadReply::Applied(tx) if applied >= state.index => {
+                    let _ = tx.send(Ok(()));
+                }
+                ReadReply::Applied(tx) => self.applied_waiters.push((state.index, tx)),
             }
         }
     }

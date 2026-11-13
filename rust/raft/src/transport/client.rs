@@ -839,8 +839,9 @@ pub struct ProposeResult {
     pub error: Option<String>,
     /// Leader address if this node is not the leader.
     pub leader_address: Option<String>,
-    /// Log index where the command was applied.
-    pub applied_index: u64,
+    /// On success, the index the answering node had applied when the command
+    /// resolved; `None` when it did not say (a refusal, or an older node).
+    pub applied_index: Option<u64>,
 }
 
 /// Result of a Query operation.

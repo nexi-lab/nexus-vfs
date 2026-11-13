@@ -289,7 +289,7 @@ fn decode_propose_response(
         Some(error)
             if error == NOT_LEADER_ERROR
                 && response.result.is_none()
-                && response.applied_index == 0 =>
+                && response.applied_index.is_none() =>
         {
             Err(RaftError::NotLeader {
                 leader_hint: response.leader_address,
@@ -813,6 +813,43 @@ mod decode_tests {
         ));
     }
 
+    /// Absence of `applied_index` is "not reported", never index 0: a leader
+    /// that predates the field leaves it off the wire, and a follower that
+    /// read it as 0 would call the write visible before applying it.
+    #[test]
+    fn a_success_without_applied_index_reports_the_index_unknown() {
+        use super::decode_propose_response;
+        use super::proto::nexus::raft::ProposeResponse;
+        use prost::Message as _;
+
+        let success = |applied_index| ProposeResponse {
+            success: true,
+            error: None,
+            leader_address: None,
+            result: Some(RaftResponse {
+                success: true,
+                error: None,
+                result: None,
+            }),
+            applied_index,
+        };
+        assert_eq!(
+            decode_propose_response(success(Some(17))).unwrap().index,
+            Some(17)
+        );
+        assert_eq!(decode_propose_response(success(None)).unwrap().index, None);
+
+        // What a leader that predates the field puts on the wire: the same
+        // response with no field 5 at all.
+        let old_leader = success(None).encode_to_vec();
+        let decoded = ProposeResponse::decode(old_leader.as_slice()).unwrap();
+        assert_eq!(decoded.applied_index, None);
+        assert_eq!(decode_propose_response(decoded).unwrap().index, None);
+        // An explicit 0 is still an index: proto3 `optional` keeps presence.
+        let zero = ProposeResponse::decode(success(Some(0)).encode_to_vec().as_slice()).unwrap();
+        assert_eq!(zero.applied_index, Some(0));
+    }
+
     #[test]
     fn only_a_definite_pre_submission_refusal_can_redirect_a_write() {
         use super::proto::nexus::raft::ProposeResponse;
@@ -824,7 +861,7 @@ mod decode_tests {
             error: Some(NOT_LEADER_ERROR.into()),
             leader_address: Some("127.0.0.1:9000".into()),
             result: None,
-            applied_index: 0,
+            applied_index: None,
         };
         let error = decode_propose_response(refused.clone()).unwrap_err();
         assert!(
@@ -837,7 +874,7 @@ mod decode_tests {
                 ..refused.clone()
             },
             ProposeResponse {
-                applied_index: 42,
+                applied_index: Some(42),
                 ..refused.clone()
             },
             ProposeResponse {

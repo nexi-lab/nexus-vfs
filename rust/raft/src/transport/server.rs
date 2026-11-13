@@ -1076,7 +1076,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some(format!("Failed to deserialize raw command: {}", e)),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1089,7 +1089,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("No command provided".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             };
@@ -1102,7 +1102,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("Unsupported command type".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1159,7 +1159,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // follower waits for its replica to apply through it before it tells
         // its caller the write is visible.
         let committed = match result {
-            Ok(result) => Ok((result, node.applied_index())),
+            Ok(result) => Ok((result, Some(node.applied_index()))),
             // Relayed by this node for its caller: the commit is the answer;
             // this node's own replica lag is not the caller's.
             Err(RaftError::CommittedNotVisible { index, result, .. }) => Ok((*result, index)),
@@ -1185,7 +1185,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     error: Some(super::NOT_LEADER_ERROR.to_string()),
                     leader_address: leader_hint,
                     result: None,
-                    applied_index: 0,
+                    applied_index: None,
                 }))
             }
             Err(e) => Ok(Response::new(ProposeResponse {
@@ -1193,7 +1193,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some(format!("Proposal failed: {}", e)),
                 leader_address: None,
                 result: None,
-                applied_index: 0,
+                applied_index: None,
             })),
         }
     }
