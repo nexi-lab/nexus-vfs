@@ -25,6 +25,11 @@ use raft::ProgressState;
 
 use super::read_index::ReadContext;
 
+/// How long an index may stand still behind the commit index, or a peer hold
+/// `Probe` / `Snapshot` behind it, before it counts as stalled rather than in
+/// flight. The one threshold for `doctor --live` alarms and the logs.
+pub const REPLICATION_STALL: Duration = Duration::from_secs(30);
+
 /// How often a follower asks the leader for its commit index.
 pub(super) const COMMIT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// A probe unanswered for this long is abandoned and replaced: raft-rs drops a

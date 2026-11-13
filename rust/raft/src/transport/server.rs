@@ -589,6 +589,13 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
     // but ordinary heartbeats/appends may arrive first. Clamp the commit hint
     // to the highest index this message/local handle can actually account for;
     // the later snapshot or append will advance commit normally.
+    //
+    // A clamp alone is not news: a learner of a zone whose voters commit
+    // without it sees the leader's commit ahead of its own log on every
+    // message while entries are in flight. It is news once this replica's
+    // applied index has stood still behind the leader for
+    // `REPLICATION_STALL` — the stall `doctor --live` reports as
+    // REPLICA_LAGGING — so only then is it a warning.
     if matches!(
         msg.get_msg_type(),
         raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgHeartbeat
@@ -597,17 +604,33 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
         let msg_last = msg.get_entries().last().map(|e| e.index).unwrap_or(0);
         let safe_commit = local_last.max(msg_last).max(node.applied_index());
         if msg.get_commit() > safe_commit {
-            tracing::warn!(
-                zone = %zone_id,
-                from = msg.from,
-                to = msg.to,
-                msg_type = ?msg.get_msg_type(),
-                leader_commit = msg.get_commit(),
-                safe_commit,
-                local_last,
-                msg_last,
-                "Clamping inbound raft commit hint until follower catches up",
-            );
+            let stalled_for = node.replication().stalled_for;
+            if stalled_for >= crate::raft::REPLICATION_STALL {
+                tracing::warn!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    to = msg.to,
+                    msg_type = ?msg.get_msg_type(),
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    stalled_secs = stalled_for.as_secs(),
+                    "Clamping inbound raft commit hint: this replica has applied nothing \
+                     behind the leader's commit for {}s, so it is not receiving entries",
+                    stalled_for.as_secs(),
+                );
+            } else {
+                tracing::debug!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    "Clamping inbound raft commit hint while entries are in flight",
+                );
+            }
             msg.set_commit(safe_commit);
         }
     }

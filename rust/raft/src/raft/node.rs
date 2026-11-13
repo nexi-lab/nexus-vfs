@@ -74,7 +74,9 @@ mod read_index;
 use read_index::{PendingRead, ReadContext, ReadReply, ReadRequestIds};
 mod replication;
 use replication::{CommitProbe, ReplicationView};
-pub use replication::{LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus};
+pub use replication::{
+    LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus, REPLICATION_STALL,
+};
 mod storage_activation;
 pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
 #[cfg(all(feature = "grpc", has_protos))]
