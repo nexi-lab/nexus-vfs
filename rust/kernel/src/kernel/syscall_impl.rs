@@ -1276,7 +1276,10 @@ impl Kernel {
                     .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                     .and_then(|r| {
                         r.map_err(|e| {
-                            KernelError::IOError(format!("metastore_put({}): {e:?}", input.path))
+                            KernelError::from_metastore(
+                                &e,
+                                format!("metastore_put({}): {e:?}", input.path),
+                            )
                         })
                     });
                 put_res?;
@@ -2048,7 +2051,9 @@ impl Kernel {
             .with_metastore_route(&route, |ms| ms.delete(path))
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
             .and_then(|r| {
-                r.map_err(|e| KernelError::IOError(format!("metastore_delete({path}): {e:?}")))
+                r.map_err(|e| {
+                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+                })
             });
         if let Err(e) = del_res {
             self.lock_manager.do_release(lock_handle);
@@ -2394,17 +2399,21 @@ impl Kernel {
                         .map(|b| b.rename(&new_route.backend_path, &old_route.backend_path))
                     {
                         release_locks(&self.lock_manager, lock1, lock2);
-                        return Err(KernelError::IOError(format!(
-                            "sys_rename: metastore failed and storage rollback also failed \
+                        return Err(KernelError::from_metastore(
+                            &meta_err,
+                            format!(
+                                "sys_rename: metastore failed and storage rollback also failed \
                              (data at {new_path} is inaccessible): meta={meta_err:?} \
                              rollback={rollback_err:?}"
-                        )));
+                            ),
+                        ));
                     }
                 }
                 release_locks(&self.lock_manager, lock1, lock2);
-                return Err(KernelError::IOError(format!(
-                    "sys_rename: metastore.rename_path: {meta_err:?}"
-                )));
+                return Err(KernelError::from_metastore(
+                    &meta_err,
+                    format!("sys_rename: metastore.rename_path: {meta_err:?}"),
+                ));
             }
 
             // CAS: drive backend rename (no-op for hash-addressed content) after metadata.
@@ -2821,12 +2830,15 @@ impl Kernel {
             };
             release_locks(&self.lock_manager, lock1, lock2);
             return Err(match rollback_err {
-                Some(Err(rollback_err)) => KernelError::IOError(format!(
-                    "sys_copy: metastore.put failed ({e:?}) and rollback \
+                Some(Err(rollback_err)) => KernelError::from_metastore(
+                    &e,
+                    format!(
+                        "sys_copy: metastore.put failed ({e:?}) and rollback \
                      also failed ({rollback_err:?}); destination bytes at {} may remain",
-                    dst_route.backend_path
-                )),
-                _ => KernelError::IOError(format!("sys_copy: metastore.put: {e:?}")),
+                        dst_route.backend_path
+                    ),
+                ),
+                _ => KernelError::from_metastore(&e, format!("sys_copy: metastore.put: {e:?}")),
             });
         }
 
@@ -3051,7 +3063,9 @@ impl Kernel {
         // 7. Atomic commit via the per-mount metastore Arc on RouteResult.
         self.with_metastore_route(&route, |ms| ms.put(path, meta))
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
-            .map_err(|e| KernelError::IOError(format!("metastore_put({path}): {e:?}")))?;
+            .map_err(|e| {
+                KernelError::from_metastore(&e, format!("metastore_put({path}): {e:?}"))
+            })?;
 
         // 8. OBSERVE-phase dispatch (§11 OBSERVE): queue DirCreate.
         // Only fires on the newly-created path — the early return at
@@ -3118,7 +3132,9 @@ impl Kernel {
             );
             self.with_metastore_route(route, |ms| ms.put(dir_ref, meta))
                 .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
-                .map_err(|e| KernelError::IOError(format!("metastore_put({dir_ref}): {e:?}")))?;
+                .map_err(|e| {
+                    KernelError::from_metastore(&e, format!("metastore_put({dir_ref}): {e:?}"))
+                })?;
         }
         Ok(())
     }
@@ -3196,7 +3212,10 @@ impl Kernel {
                     let child_paths: Vec<String> =
                         children.iter().map(|c| c.path.clone()).collect();
                     ms.delete_batch(&child_paths).map_err(|e| {
-                        KernelError::IOError(format!("metastore_delete_batch({path}): {e:?}"))
+                        KernelError::from_metastore(
+                            &e,
+                            format!("metastore_delete_batch({path}): {e:?}"),
+                        )
                     })
                 } else {
                     Ok(0)
@@ -3251,7 +3270,9 @@ impl Kernel {
             .with_metastore_route(&route, |ms| ms.delete(path))
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
             .and_then(|result| {
-                result.map_err(|e| KernelError::IOError(format!("metastore_delete({path}): {e:?}")))
+                result.map_err(|e| {
+                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+                })
             });
         if let Err(err) = delete_result {
             self.lock_manager.do_release(lock_handle);
@@ -3507,7 +3528,9 @@ impl Kernel {
                     let put_res = self
                         .with_metastore_route(route, |ms| ms.put(path, meta))
                         .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
-                        .and_then(|r| r.map_err(|e| KernelError::IOError(format!("{e:?}"))));
+                        .and_then(|r| {
+                            r.map_err(|e| KernelError::from_metastore(&e, format!("{e:?}")))
+                        });
                     if let Err(error) = put_res {
                         results[idx] = Err(error);
                     }
@@ -3524,7 +3547,10 @@ impl Kernel {
                     .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                     .and_then(|ms| {
                         ms.put_batch(&global_items).map_err(|error| {
-                            KernelError::IOError(format!("metastore_put_batch: {error:?}"))
+                            KernelError::from_metastore(
+                                &error,
+                                format!("metastore_put_batch: {error:?}"),
+                            )
                         })
                     });
                 if let Err(error) = put_result {

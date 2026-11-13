@@ -1803,7 +1803,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             "Forwarding propose to leader"
         );
 
-        // A transport failure retains its unknown proposal outcome.
+        // Each failure is propagated as what it is, never rewritten to `NotLeader`.
         match crate::transport::forward_propose(
             &ctx.client_pool,
             &leader_addr,
@@ -1815,7 +1815,22 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         .await
         {
             Ok(result) => Ok(result),
-            // Propagated as a TRANSPORT failure, not rewritten to `NotLeader`.
+            // The connection to the leader never came up, so the proposal never
+            // left this node: nothing was applied and a retry is safe. It is not
+            // `NotLeader` either — no node answered, so nothing is known about
+            // leadership, and `NotLeader` would send the retry loop back to the
+            // same unreachable address as though a leader had redirected it.
+            Err(error @ RaftError::NotSubmitted { .. }) => {
+                tracing::warn!(
+                    leader_node_id = leader_id,
+                    leader_addr = %leader_addr.to_operator_str(),
+                    zone = %ctx.zone_id,
+                    "Forward to leader NOT SENT — the connection was never established, \
+                     nothing was submitted, safe to retry: {}",
+                    error,
+                );
+                Err(error)
+            }
             // The request was sent; what is missing is the answer. The leader may
             // have appended and committed it before the connection broke, so the
             // outcome is UNKNOWN — see `RaftError::proposal_outcome_unknown`.
@@ -1831,8 +1846,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                     leader_node_id = leader_id,
                     leader_addr = %leader_addr.to_operator_str(),
                     zone = %ctx.zone_id,
-                    "Forward to leader failed after the proposal was sent — the \
-                     outcome is UNKNOWN, it may have committed: {}",
+                    "Forward to leader SENT with no answer — the outcome is UNKNOWN, \
+                     it may have committed; read back before retrying: {}",
                     e,
                 );
                 Err(RaftError::Transport(e))
