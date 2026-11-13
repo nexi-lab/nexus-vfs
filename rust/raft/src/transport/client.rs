@@ -1090,6 +1090,85 @@ pub async fn call_join_zone_rpc(
     })
 }
 
+/// What one [`join_zone_round`] came to.
+#[derive(Debug, Clone)]
+pub enum JoinRound {
+    /// The leader at `endpoint` admitted this node: its membership change
+    /// committed there.
+    Admitted { endpoint: String },
+    /// No endpoint admitted this node. `catching_up` is the
+    /// `(commit_index, applied_index)` a leader reported while still
+    /// replicating to it as a learner.
+    Refused {
+        last_error: String,
+        catching_up: Option<(u64, u64)>,
+    },
+}
+
+/// One JoinZone round: ask each of `endpoints` in turn, following a
+/// follower's redirect to its leader once, until a leader admits
+/// `node_id` (advertising `node_address`). The one round data nodes and
+/// witnesses run; the replica they host and the retry policy around the
+/// round are theirs.
+pub async fn join_zone_round(
+    endpoints: impl IntoIterator<Item = String>,
+    zone_id: &str,
+    node_id: u64,
+    node_address: &str,
+    as_learner: bool,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> JoinRound {
+    let mut last_error = String::from("no endpoint to request membership from");
+    let mut catching_up = None;
+    for seed in endpoints {
+        let mut endpoint = seed;
+        let mut redirected = false;
+        loop {
+            match call_join_zone_rpc(
+                &endpoint,
+                zone_id,
+                node_id,
+                node_address,
+                as_learner,
+                tls.clone(),
+                timeout_secs,
+            )
+            .await
+            {
+                Ok(result) if result.success => return JoinRound::Admitted { endpoint },
+                Ok(result) => {
+                    if let Some(leader) = result
+                        .leader_address
+                        .filter(|leader| !redirected && !leader.is_empty() && *leader != endpoint)
+                    {
+                        tracing::info!(
+                            from = %endpoint,
+                            to = %leader,
+                            zone = %zone_id,
+                            "JoinZone redirect to leader",
+                        );
+                        endpoint = leader;
+                        redirected = true;
+                        continue;
+                    }
+                    if result.catching_up {
+                        catching_up = Some((result.commit_index, result.applied_index));
+                    }
+                    last_error = format!("{endpoint}: {}", result.error.unwrap_or_default());
+                }
+                Err(error) => last_error = format!("{endpoint}: {error}"),
+            }
+            tracing::debug!(zone = %zone_id, error = %last_error, "JoinZone not admitted; next endpoint");
+            break;
+        }
+    }
+    JoinRound::Refused {
+        last_error,
+        catching_up,
+    }
+}
+
 /// One federation zone reported by [`call_discover_zones_rpc`] —
 /// `zone_id` + the responder's local `mount_path` for it.
 #[derive(Debug, Clone)]

@@ -385,6 +385,10 @@ pub struct TransportLoop<S: StateMachine + 'static> {
     /// leaves the set when it routes again, so losing a route warns once per
     /// loss rather than once per message. Ephemeral diagnostic state.
     unrouted: HashSet<u64>,
+    /// EC anti-entropy snapshot tasks. Each reads the state machine, so it
+    /// holds the zone's store: the loop joins them before it returns, and the
+    /// zone's storage is released when [`Self::run`] ends.
+    snapshot_readers: tokio::task::JoinSet<()>,
 }
 
 impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
@@ -419,6 +423,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             ec_completion_rx,
             quorum_health: QuorumHealth::default(),
             unrouted: HashSet::new(),
+            snapshot_readers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -644,7 +649,11 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             //    EC send — raft heartbeats and elections are not held
             //    behind a slow EC handshake.
             self.spawn_ec_replications();
+            while self.snapshot_readers.try_join_next().is_some() {}
         }
+        // The driver — owner of the raft storage and the state machine — drops
+        // with `self`; a snapshot reader still running is the last other holder.
+        self.snapshot_readers.shutdown().await;
     }
 
     /// Select routes for this zone's current Raft members. Learned or retained
@@ -1007,9 +1016,10 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             });
         }
 
-        // Fire-and-forget anti-entropy snapshots for peers that fell behind the
-        // compacted WAL.  Same `in_flight` discipline as the incremental sends:
-        // mark before spawning so the next tick skips a duplicate.  The state
+        // Anti-entropy snapshots for peers that fell behind the compacted WAL,
+        // run as `snapshot_readers` tasks.  Same `in_flight` discipline as the
+        // incremental sends: mark before spawning so the next tick skips a
+        // duplicate.  The state
         // read + entry materialization run INSIDE the task because the state
         // machine's `RwLock` read is async; it is a shared read (the apply loop
         // takes the write lock) and never touches the driver's exclusive
@@ -1032,7 +1042,7 @@ impl<S: StateMachine + Send + Sync + 'static> TransportLoop<S> {
             // under LWW).
             let covering_seq = repl_log.max_seq().saturating_sub(1);
 
-            tokio::spawn(async move {
+            self.snapshot_readers.spawn(async move {
                 // Materialization and serialization participate in the same
                 // completion path as transmission. Failed reads cannot become
                 // an acknowledged empty snapshot and advance the peer's floor.
