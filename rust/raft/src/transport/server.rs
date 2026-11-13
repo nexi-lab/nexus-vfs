@@ -82,8 +82,6 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Maximum message size in bytes.
-    pub max_message_size: usize,
     /// Optional TLS configuration for mTLS. None = plain HTTP/2.
     pub tls: Option<super::TlsConfig>,
 }
@@ -93,7 +91,6 @@ impl Default for ServerConfig {
         Self {
             bind_address: "0.0.0.0:2026".parse().unwrap(),
             max_connections: 100,
-            max_message_size: 64 * 1024 * 1024, // 64MB
             tls: None,
         }
     }
@@ -172,10 +169,14 @@ impl RaftGrpcServer {
             local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
         Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
-                .with_owner_replica_data(),
             NodeControlService::new(
-                ZoneApiServiceServer::new(api),
+                bounded!(ZoneTransportServiceServer::new(raft)),
+                policy.clone(),
+                &[],
+            )
+            .with_owner_replica_data(),
+            NodeControlService::new(
+                bounded!(ZoneApiServiceServer::new(api)),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
             )
@@ -1075,7 +1076,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some(format!("Failed to deserialize raw command: {}", e)),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1088,7 +1089,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("No command provided".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             };
@@ -1101,7 +1102,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("Unsupported command type".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1153,15 +1154,26 @@ impl ZoneApiService for ZoneApiServiceImpl {
             node.propose(cmd).await
         };
 
-        match result {
-            Ok(result) => {
+        // A success names the index this node had applied when the command
+        // resolved, which covers the command's own entry: a forwarding
+        // follower waits for its replica to apply through it before it tells
+        // its caller the write is visible.
+        let committed = match result {
+            Ok(result) => Ok((result, Some(node.applied_index()))),
+            // Relayed by this node for its caller: the commit is the answer;
+            // this node's own replica lag is not the caller's.
+            Err(RaftError::CommittedNotVisible { index, result, .. }) => Ok((*result, index)),
+            Err(error) => Err(error),
+        };
+        match committed {
+            Ok((result, applied_index)) => {
                 let proto_result = command_result_to_proto(&result);
                 Ok(Response::new(ProposeResponse {
                     success: true,
                     error: None,
                     leader_address: None,
                     result: Some(proto_result),
-                    applied_index: 0,
+                    applied_index,
                 }))
             }
             Err(RaftError::NotLeader { leader_hint }) => {
@@ -1173,7 +1185,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     error: Some(super::NOT_LEADER_ERROR.to_string()),
                     leader_address: leader_hint,
                     result: None,
-                    applied_index: 0,
+                    applied_index: None,
                 }))
             }
             Err(e) => Ok(Response::new(ProposeResponse {
@@ -1181,7 +1193,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some(format!("Proposal failed: {}", e)),
                 leader_address: None,
                 result: None,
-                applied_index: 0,
+                applied_index: None,
             })),
         }
     }
@@ -2586,7 +2598,7 @@ pub async fn serve_node_enrollment(
         "node-enrollment listener up (plaintext, token-gated, JoinCluster only)"
     );
     lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
-        .add_service(NodeEnrollmentServiceServer::new(svc))
+        .add_service(bounded!(NodeEnrollmentServiceServer::new(svc)))
         .serve_with_shutdown(addr, shutdown)
         .await
         .map_err(TransportError::Tonic)?;
@@ -2976,7 +2988,7 @@ impl RaftWitnessServer {
         let policy = super::node_authority::NodeControlPolicy::from_tls(self.config.tls.as_ref())
             .map_err(TransportError::Connection)?;
         let router = builder.add_service(super::node_authority::NodeControlService::new(
-            ZoneTransportServiceServer::new(service),
+            bounded!(ZoneTransportServiceServer::new(service)),
             policy,
             &[],
         ));
@@ -3126,7 +3138,6 @@ mod tests {
             config.bind_address,
             "0.0.0.0:2026".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.max_message_size, 64 * 1024 * 1024);
     }
 
     #[tokio::test]

@@ -39,6 +39,19 @@
 //! nexus_raft = { version = "0.1", features = ["grpc"] }
 //! ```
 
+/// Bound a generated tonic server or client by the raft message bound
+/// ([`crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES`]) in both
+/// directions. Every endpoint applies the same bound, so whatever one peer
+/// may send, every other accepts. Defined ahead of the submodules, which see
+/// it in textual scope.
+macro_rules! bounded {
+    ($endpoint:expr) => {
+        $endpoint
+            .max_decoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+    };
+}
+
 mod node_authority;
 pub use node_authority::{
     current_local_node_certificate, local_node_identity, LocalNodeCertificate,
@@ -104,10 +117,10 @@ pub use client::{
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
     call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_local_node_certificate_rpc,
     call_renew_node_certificate_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
-    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, join_zone_round, ClientConfig,
-    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound, JoinZoneResult,
-    MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult, ProposeResult,
-    QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
+    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, call_zone_status_rpc, join_zone_round,
+    zone_api_client, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound,
+    JoinZoneResult, MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult,
+    ProposeResult, QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
@@ -122,10 +135,10 @@ pub use transport_loop::TransportLoop;
 /// Serializes the command with bincode and sends as `raw_command` bytes
 /// in `ProposeRequest` — avoids double serialization (bincode→proto→bincode).
 ///
-/// `cached_client` provides a reusable `RaftApiClient` across calls.
-/// On first use (or after eviction), a new connection is established and
-/// cached. On transport error, the cached client is evicted so the next
-/// call reconnects.
+/// `cached_client` holds ONE client per leader endpoint, shared by every
+/// concurrent forward: a tonic channel multiplexes calls and reconnects on
+/// its own. Only a broken channel (`Unavailable`) is dropped; an answer the
+/// leader refused, or a call that ran out of time, leaves it in place.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) async fn forward_propose(
     client_pool: &RaftClientPool,
@@ -134,38 +147,36 @@ pub(crate) async fn forward_propose(
     zone_id: &str,
     deadline: tokio::time::Instant,
     cached_client: &tokio::sync::Mutex<Option<(String, RaftApiClient)>>,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
     let request = propose_request(command, zone_id, true, deadline)?;
-
-    // Get or create a cached API client. Evict if the leader endpoint changed.
     let mut api_client = {
-        let mut guard = cached_client.lock().await;
-        match guard.take() {
-            Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
-            _ => connect_api_client(client_pool.config(), &leader_addr.endpoint).await?,
+        let mut cached = cached_client.lock().await;
+        match cached.as_ref() {
+            Some((endpoint, client)) if *endpoint == leader_addr.endpoint => client.clone(),
+            // Dialed under the lock: overlapping forwards share the one dial.
+            _ => {
+                let client =
+                    connect_api_client(client_pool.config(), &leader_addr.endpoint).await?;
+                *cached = Some((leader_addr.endpoint.clone(), client.clone()));
+                client
+            }
         }
     };
-
-    let result = api_client
-        .inner_mut()
-        .propose(request)
-        .await
-        .map_err(|e| RaftError::Transport(e.to_string()));
-
-    match result {
-        Ok(response) => {
-            // Success — cache the client for reuse.
-            let mut guard = cached_client.lock().await;
-            *guard = Some((leader_addr.endpoint.clone(), api_client));
-
-            decode_propose_response(response.into_inner())
-        }
-        Err(e) => {
-            // Transport error — evict cached client (already taken above).
-            // Next call will reconnect.
-            Err(e)
+    match api_client.inner_mut().propose(request).await {
+        Ok(response) => decode_propose_response(response.into_inner()),
+        Err(status) => {
+            if status.code() == tonic::Code::Unavailable {
+                let mut cached = cached_client.lock().await;
+                if cached
+                    .as_ref()
+                    .is_some_and(|(endpoint, _)| *endpoint == leader_addr.endpoint)
+                {
+                    *cached = None;
+                }
+            }
+            Err(RaftError::Transport(status.to_string()))
         }
     }
 }
@@ -181,7 +192,7 @@ pub(crate) async fn propose_to(
     command: &crate::raft::Command,
     zone_id: &str,
     deadline: tokio::time::Instant,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     let request = propose_request(command, zone_id, false, deadline)?;
     let mut client = connect_api_client(config, endpoint).await?;
     let response = client
@@ -265,17 +276,20 @@ pub(super) const NOT_LEADER_ERROR: &str = "Not the leader";
 #[cfg(all(feature = "grpc", has_protos))]
 fn decode_propose_response(
     response: proto::nexus::raft::ProposeResponse,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
     if response.success {
-        return Ok(proto_result_to_command_result(response.result));
+        return Ok(crate::raft::proposal::Committed {
+            result: proto_result_to_command_result(response.result),
+            index: response.applied_index,
+        });
     }
     match response.error {
         Some(error)
             if error == NOT_LEADER_ERROR
                 && response.result.is_none()
-                && response.applied_index == 0 =>
+                && response.applied_index.is_none() =>
         {
             Err(RaftError::NotLeader {
                 leader_hint: response.leader_address,
@@ -799,6 +813,43 @@ mod decode_tests {
         ));
     }
 
+    /// Absence of `applied_index` is "not reported", never index 0: a leader
+    /// that predates the field leaves it off the wire, and a follower that
+    /// read it as 0 would call the write visible before applying it.
+    #[test]
+    fn a_success_without_applied_index_reports_the_index_unknown() {
+        use super::decode_propose_response;
+        use super::proto::nexus::raft::ProposeResponse;
+        use prost::Message as _;
+
+        let success = |applied_index| ProposeResponse {
+            success: true,
+            error: None,
+            leader_address: None,
+            result: Some(RaftResponse {
+                success: true,
+                error: None,
+                result: None,
+            }),
+            applied_index,
+        };
+        assert_eq!(
+            decode_propose_response(success(Some(17))).unwrap().index,
+            Some(17)
+        );
+        assert_eq!(decode_propose_response(success(None)).unwrap().index, None);
+
+        // What a leader that predates the field puts on the wire: the same
+        // response with no field 5 at all.
+        let old_leader = success(None).encode_to_vec();
+        let decoded = ProposeResponse::decode(old_leader.as_slice()).unwrap();
+        assert_eq!(decoded.applied_index, None);
+        assert_eq!(decode_propose_response(decoded).unwrap().index, None);
+        // An explicit 0 is still an index: proto3 `optional` keeps presence.
+        let zero = ProposeResponse::decode(success(Some(0)).encode_to_vec().as_slice()).unwrap();
+        assert_eq!(zero.applied_index, Some(0));
+    }
+
     #[test]
     fn only_a_definite_pre_submission_refusal_can_redirect_a_write() {
         use super::proto::nexus::raft::ProposeResponse;
@@ -810,7 +861,7 @@ mod decode_tests {
             error: Some(NOT_LEADER_ERROR.into()),
             leader_address: Some("127.0.0.1:9000".into()),
             result: None,
-            applied_index: 0,
+            applied_index: None,
         };
         let error = decode_propose_response(refused.clone()).unwrap_err();
         assert!(
@@ -823,7 +874,7 @@ mod decode_tests {
                 ..refused.clone()
             },
             ProposeResponse {
-                applied_index: 42,
+                applied_index: Some(42),
                 ..refused.clone()
             },
             ProposeResponse {

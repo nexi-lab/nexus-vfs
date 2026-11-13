@@ -88,6 +88,6 @@ pub mod vfs {
 // namespace so existing call sites keep working.
 pub use lib::transport_primitives::{
     create_channel, hostname_to_node_id, ClientConfig, ConnectionPool, NodeAddress, PeerAddress,
-    ServerConfig, TlsConfig, TransportError,
+    TlsConfig, TransportError,
 };
 pub type Result<T> = lib::transport_primitives::Result<T>;
