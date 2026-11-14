@@ -41,6 +41,7 @@ mod managed_csr;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod managed_csr_binding;
 mod node_renewal;
+mod open_files;
 #[cfg(feature = "operator-agent-enrollment")]
 pub mod operator_enrollment;
 mod plugin_loading;
@@ -1274,6 +1275,17 @@ where
         std::env::set_var("NEXUS_DATA_DIR", &args.common.data_dir);
     }
     let _tracing_guard = install_tracing(/* logs_to_stderr */ !is_daemon);
+    // Before any runtime or store opens a descriptor: see `open_files`.
+    #[cfg(unix)]
+    if is_daemon {
+        match open_files::raise_open_file_limit() {
+            Ok((before, after)) if after > before => {
+                tracing::info!(before, after, "raised the open-file soft limit");
+            }
+            Ok(_) => {}
+            Err(why) => tracing::warn!("could not raise the open-file soft limit: {why}"),
+        }
+    }
     // Size the multi-thread runtime against the host: federation
     // gRPC + raft IO is IO-bound, so the kernel `available_parallelism`
     // estimate (logical cores under cgroup / affinity constraints) is
