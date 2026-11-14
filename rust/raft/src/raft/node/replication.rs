@@ -107,29 +107,43 @@ pub struct ReplicationStatus {
 #[derive(Debug, Clone, Copy)]
 struct IndexClock {
     index: u64,
-    moved_at: Instant,
+    /// When a target was first seen above `index`, since `index` last moved.
+    /// A stall is time spent behind: an index that stood still while nothing
+    /// was ahead of it (an idle zone) is caught up, however long the gap.
+    behind_since: Option<Instant>,
 }
 
 impl IndexClock {
-    fn new(index: u64, now: Instant) -> Self {
+    fn new(index: u64) -> Self {
         Self {
             index,
-            moved_at: now,
+            behind_since: None,
         }
     }
 
-    fn observe(&mut self, index: u64, now: Instant) {
+    /// A moved index starts over: any stall it had is over.
+    fn observe(&mut self, index: u64) {
         if index != self.index {
-            *self = Self::new(index, now);
+            *self = Self::new(index);
         }
     }
 
-    /// How long the index has stood still while below `target`.
-    fn stalled_behind(&self, target: u64, now: Instant) -> Duration {
-        if self.index >= target {
-            Duration::ZERO
+    /// Record the index this one should reach: the commit index for a peer's
+    /// `matched`, the leader's commit for a replica's `applied`.
+    fn observe_target(&mut self, target: u64, now: Instant) {
+        if self.index < target {
+            self.behind_since.get_or_insert(now);
         } else {
-            now.saturating_duration_since(self.moved_at)
+            self.behind_since = None;
+        }
+    }
+
+    /// How long the index has stood still while below `target`, counted from
+    /// when it was first seen behind.
+    fn stalled_behind(&self, target: u64, now: Instant) -> Duration {
+        match self.behind_since {
+            Some(since) if self.index < target => now.saturating_duration_since(since),
+            _ => Duration::ZERO,
         }
     }
 }
@@ -191,7 +205,7 @@ impl ReplicationView {
                 learner,
                 state,
                 state_since: now,
-                matched: IndexClock::new(matched, now),
+                matched: IndexClock::new(matched),
                 next_index,
                 round,
             });
@@ -200,7 +214,8 @@ impl ReplicationView {
                 watch.state_since = now;
             }
             watch.learner = learner;
-            watch.matched.observe(matched, now);
+            watch.matched.observe(matched);
+            watch.matched.observe_target(commit, now);
             watch.next_index = next_index;
             watch.round = round;
         }
@@ -210,16 +225,19 @@ impl ReplicationView {
     }
 
     /// Drop leader-only state: this node no longer leads.
-    pub(super) fn observe_follower(&mut self, applied: u64, now: Instant) {
+    pub(super) fn observe_follower(&mut self, applied: u64) {
         self.leader = None;
         match self.applied.as_mut() {
-            Some(clock) => clock.observe(applied, now),
-            None => self.applied = Some(IndexClock::new(applied, now)),
+            Some(clock) => clock.observe(applied),
+            None => self.applied = Some(IndexClock::new(applied)),
         }
     }
 
     pub(super) fn record_leader_commit(&mut self, index: u64, now: Instant) {
         self.leader_commit = Some((index, now));
+        if let Some(applied) = self.applied.as_mut() {
+            applied.observe_target(index, now);
+        }
     }
 
     /// Record one send to `peer`: `failure` is its `(kind, description)`,
@@ -432,6 +450,33 @@ mod tests {
         assert_eq!(healthy.last_send_error, None);
     }
 
+    /// An index that stood still because nothing was ahead of it — an idle zone
+    /// — is caught up. When the next entry commits, the stall is counted from
+    /// then, not from the last time the index moved, so the first entry after a
+    /// long idle gap is not a long stall.
+    #[test]
+    fn an_idle_gap_is_not_a_stall() {
+        let t0 = Instant::now();
+        let mut view = ReplicationView::default();
+        view.observe_follower(50);
+        view.record_leader_commit(50, t0);
+        let t100 = t0 + Duration::from_secs(100);
+        view.observe_follower(50);
+        view.record_leader_commit(51, t100);
+        let status = view.status(t100 + Duration::from_secs(1));
+        assert_eq!(status.stalled_for, Duration::from_secs(1));
+
+        let mut leader = ReplicationView::default();
+        leader.observe_leader(50, [peer(7, ProgressState::Replicate, 50)].into_iter(), t0);
+        leader.observe_leader(
+            51,
+            [peer(7, ProgressState::Replicate, 50)].into_iter(),
+            t100,
+        );
+        let watched = &leader.status(t100 + Duration::from_secs(1)).peers[0];
+        assert_eq!(watched.stalled_for, Duration::from_secs(1));
+    }
+
     #[test]
     fn a_departed_member_is_no_longer_reported() {
         let now = Instant::now();
@@ -454,10 +499,10 @@ mod tests {
     fn a_follower_behind_the_probed_commit_reports_how_long_it_stood_still() {
         let t0 = Instant::now();
         let mut view = ReplicationView::default();
-        view.observe_follower(40, t0);
+        view.observe_follower(40);
         view.record_leader_commit(60, t0 + Duration::from_secs(1));
         let t9 = t0 + Duration::from_secs(9);
-        view.observe_follower(40, t9);
+        view.observe_follower(40);
         let status = view.status(t9);
         assert_eq!(
             status.leader_commit,
@@ -466,9 +511,13 @@ mod tests {
                 observed_ago: Duration::from_secs(8)
             })
         );
-        assert_eq!(status.stalled_for, Duration::from_secs(9));
+        assert_eq!(
+            status.stalled_for,
+            Duration::from_secs(8),
+            "behind since the probe first answered ahead of it"
+        );
 
-        view.observe_follower(60, t9);
+        view.observe_follower(60);
         assert_eq!(view.status(t9).stalled_for, Duration::ZERO);
         assert!(view.status(t9).peers.is_empty());
     }

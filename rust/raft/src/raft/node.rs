@@ -3162,7 +3162,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 now,
             );
         } else {
-            view.observe_follower(self.applied_index_atom.load(Ordering::Acquire), now);
+            view.observe_follower(self.applied_index_atom.load(Ordering::Acquire));
         }
     }
 
