@@ -6,8 +6,9 @@
 //! flight. Compacting the whole log up to the applied index left those entries
 //! below `first_index`, and every compaction then needed an InstallSnapshot of
 //! the whole zone. Production showed one per compaction, about every 18
-//! minutes, on a learner at lag 0 between them. The leader now keeps a
-//! catch-up tail of half the compaction threshold.
+//! minutes, on a learner at lag 0 between them. The leader now keeps the
+//! entries a lagging peer still needs, up to half the compaction threshold,
+//! and no more.
 //!
 //! Topology: a founder (sole voter, leader) and a learner behind a
 //! [`LossyLink`]. Every write happens while the link starves the learner, so
@@ -186,16 +187,25 @@ async fn a_learner_behind_by_a_few_entries_at_compaction_catches_up_by_appends()
     // Release every handle on the leader's stores before reopening its log.
     drop((leader, learner, leader_zm, learner_zm));
 
-    // The leader did compact, and kept the catch-up tail behind its snapshot.
+    // The leader did compact, and kept exactly what the learner lacked at its
+    // last compaction: at least one entry, at most the window's writes.
     let storage = RaftStorage::open(raft_dir(leader_dir.path())).expect("reopen leader log");
     let first = storage.first_index_impl().expect("first index");
+    let snapshot = raft::Storage::snapshot(&storage, 0, 0).expect("stored snapshot");
+    let snapshot_index = snapshot.get_metadata().index;
     assert!(
         first > 1,
         "the leader compacted its log (first index {first})"
     );
+    let kept = snapshot_index + 1 - first;
     assert!(
-        applied + 1 - first >= SNAPSHOT_THRESHOLD / 2,
-        "a catch-up tail of at least {} entries stays behind applied {applied} (first index {first})",
-        SNAPSHOT_THRESHOLD / 2
+        (1..=LAG).contains(&kept),
+        "kept {kept} entries before snapshot {snapshot_index} (first index {first}, applied {applied}); \
+         expected the learner's lag of 1..={LAG}"
+    );
+    assert_eq!(
+        raft::Storage::term(&storage, first - 1).expect("term(first_index - 1)"),
+        snapshot.get_metadata().term,
+        "the boundary's term stays answerable"
     );
 }
