@@ -38,7 +38,60 @@ async fn leader(
         .await
         .unwrap();
     }
+    quiescent(&node).await;
     node
+}
+
+/// What the zone has written on its own: term, last index and member-address records.
+async fn log_state(node: &ZoneConsensus<FullStateMachine>) -> String {
+    let records = node
+        .with_state_machine(|state| state.member_addresses().unwrap())
+        .await;
+    format!(
+        "term {}, last index {}, applied {}, member addresses {records:?}",
+        node.term(),
+        node.last_index(),
+        node.applied_index()
+    )
+}
+
+/// Wait until the zone has stopped writing on its own. A zone created after
+/// `set_self_address` registers this node's address in the background
+/// (`register_member_address`), and its self-election can race the explicit
+/// campaign; either can append an entry after a caller starts measuring the
+/// log. Quiescent: leader, own address record applied, nothing unapplied, and
+/// the term unchanged for longer than the election timeout (10 ticks of 10 ms,
+/// randomized up to twice that).
+async fn quiescent(node: &ZoneConsensus<FullStateMachine>) {
+    let id = node.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut stable_since: Option<(u64, std::time::Instant)> = None;
+    loop {
+        let registered = node
+            .with_state_machine(move |state| {
+                state
+                    .member_addresses()
+                    .unwrap()
+                    .is_some_and(|records| records.iter().any(|(member, _)| *member == id))
+            })
+            .await;
+        let settled = node.is_leader() && registered && node.applied_index() >= node.last_index();
+        let term = node.term();
+        match stable_since {
+            Some((seen, since)) if settled && seen == term => {
+                if since.elapsed() >= std::time::Duration::from_millis(300) {
+                    return;
+                }
+            }
+            _ => stable_since = settled.then(|| (term, std::time::Instant::now())),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the zone did not settle: {}",
+            log_state(node).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 async fn no_activation(node: &ZoneConsensus<FullStateMachine>) {
@@ -80,10 +133,16 @@ async fn all_configured_learners_prepare_but_unconfigured_routes_do_not() {
         zone.into(),
     );
     let before = node.last_index();
+    let state_before = log_state(&node).await;
     let prepared = node.prepare_replica_control_members().await.unwrap();
     assert_eq!(prepared.member_ids(), vec![1, 2, 3]);
     assert_eq!(pool.connection_count().await, 2);
-    assert_eq!(node.last_index(), before);
+    assert_eq!(
+        node.last_index(),
+        before,
+        "preparation appended to the log: before {state_before}; after {}",
+        log_state(&node).await
+    );
     for current in [&node, &second_node, &third_node] {
         no_activation(current).await;
     }
