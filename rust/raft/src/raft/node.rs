@@ -99,6 +99,16 @@ const DRIVER_CHANNEL_CAPACITY: usize = 256;
 /// Overridable via `NEXUS_SC_SNAPSHOT_THRESHOLD` (`0` disables compaction).
 const DEFAULT_SC_SNAPSHOT_THRESHOLD: u64 = 8192;
 
+/// The most a leader's compaction keeps behind the applied index for a
+/// lagging peer: half the threshold. A single-voter zone commits and compacts
+/// on the leader's own append, while its learners' last few entries are still
+/// in flight; compacting through `applied` left them below `first_index`, and
+/// each needed an InstallSnapshot of the whole zone (observed: one per
+/// compaction, about every 18 minutes, on a learner at lag 0 between them).
+fn catch_up_entries(threshold: u64) -> u64 {
+    threshold / 2
+}
+
 /// How long a read on a replica waits for this node's own earlier writes to
 /// apply before it reports the replica's lag instead of answering stale.
 pub(crate) const OWN_WRITES_READ_BUDGET: Duration = Duration::from_secs(2);
@@ -638,10 +648,10 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// EC replication WAL (shared with handle via Arc).
     /// Used by the transport loop for EC background replication.
     replication_log: Option<Arc<ReplicationLog>>,
-    /// SC raft-log compaction trigger: once `applied - first_index` exceeds this
-    /// many entries, the ready loop snapshots the (bounded, post-P1) state
-    /// machine at the applied index and compacts the log up to it — bounding the
-    /// log + join transfer. `0` disables it (unbounded log, the pre-P2
+    /// SC raft-log compaction trigger: once this many entries have been applied
+    /// since the last snapshot, the ready loop snapshots the (bounded, post-P1)
+    /// state machine at the applied index and compacts the log up to its
+    /// catch-up tail — bounding the log + join transfer. `0` disables it (unbounded log, the pre-P2
     /// behaviour). High default so only high-append zones (streams) ever cross
     /// it; low-churn metadata/lock zones never compact. From
     /// `NEXUS_SC_SNAPSHOT_THRESHOLD`.
@@ -660,7 +670,7 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// atomic `cached_last_index` load + a subtraction here, never a redb read
     /// or state-machine lock — so the compaction machinery adds no measurable
     /// latency to the ready loop. Advisory (over-triggers, since `last_index >=
-    /// applied`); the authoritative `applied - first_index` check runs only past
+    /// applied`); the authoritative applied-since-snapshot check runs only past
     /// this gate. Updated on snapshot create AND on inbound snapshot install.
     last_index_at_snapshot: u64,
 }
@@ -2748,12 +2758,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         Ok(messages)
     }
 
-    /// P2: bound the SC raft LOG. Once the log has grown a full threshold of
-    /// entries past the last compaction, snapshot the (bounded, post-P1) state
-    /// machine at the applied index and compact the log up to it. A lagging or
-    /// joining follower then catches up via an InstallSnapshot of the small
-    /// snapshot (hot tail + segment index, not every historical entry) and
-    /// cold-reads spilled data from CAS.
+    /// P2: bound the SC raft LOG. Once a full threshold of entries has been
+    /// applied since the last snapshot, snapshot the (bounded, post-P1) state
+    /// machine at the applied index and compact the log up to
+    /// [`Self::compaction_start`]. A peer whose entries were kept catches up by
+    /// appends. One further behind, or joining, catches up via an
+    /// InstallSnapshot of the small snapshot (hot tail + segment index, not
+    /// every historical entry) and cold-reads spilled data from CAS.
     ///
     /// Consistent cut: runs on the single ready-loop thread right after
     /// `advance_apply`, so the applied index, the SM state, and the conf_state
@@ -2804,10 +2815,12 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             // applied entry, which is still in the log (`first <= applied`), with
             // the current conf_state. The growth path is unchanged: a full
             // threshold of genuinely new applied entries past `first`.
+            // Growth counts from the last snapshot, not from `first`: the
+            // retained catch-up tail must not make snapshots more frequent.
             let enough = if membership_refresh {
                 applied >= first
             } else {
-                applied > first && applied - first >= threshold
+                applied >= first && applied.saturating_sub(self.last_index_at_snapshot) >= threshold
             };
             if !enough {
                 return Ok(());
@@ -2841,16 +2854,17 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         snapshot.data = data.into();
 
         // Persist the snapshot (advances HardState.commit/term to cover it) THEN
-        // compact up to it. store-before-compact so `term(applied)` keeps
-        // resolving via the snapshot once `first_index` passes it — the raft-rs
-        // `term(first_index - 1)` invariant that keeps the leader appendable.
+        // compact. Storage keeps `term(first_index - 1)` answerable across the
+        // compaction, so the leader stays appendable and a peer whose next
+        // entry is `first_index` is fed by appends.
+        let keep_from = self.compaction_start(applied, first, threshold);
         self.raw_node
             .mut_store()
             .store_snapshot(&snapshot)
             .map_err(|e| RaftError::Storage(format!("store_snapshot: {e}")))?;
         self.raw_node
             .mut_store()
-            .compact(applied + 1)
+            .compact(keep_from)
             .map_err(|e| RaftError::Storage(format!("compact: {e}")))?;
         // The fresh snapshot now reflects the current membership; reset the
         // cheap gate to measure the next window from here.
@@ -2860,10 +2874,32 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         tracing::info!(
             index = applied,
             first_before = first,
-            entries_compacted = applied + 1 - first,
+            entries_compacted = keep_from - first,
+            catch_up_kept = applied + 1 - keep_from,
             "raft SC log snapshot+compact"
         );
         Ok(())
+    }
+
+    /// Where a compaction starts the log. A leader keeps the entries its
+    /// lagging peers still need, back to the oldest peer within
+    /// [`catch_up_entries`] of `applied`; a peer further behind gets the stored
+    /// snapshot, as it would without the tail. With every peer caught up, or
+    /// on a non-leader, the whole applied log is compacted, so a kept entry
+    /// costs only a peer's actual lag.
+    fn compaction_start(&self, applied: u64, first: u64, threshold: u64) -> u64 {
+        let raft = &self.raw_node.raft;
+        let floor = (applied + 1).saturating_sub(catch_up_entries(threshold));
+        let mut start = applied + 1;
+        if raft.state == raft::StateRole::Leader {
+            for (id, progress) in raft.prs().iter() {
+                let next = progress.matched + 1;
+                if *id != self.config.id && next >= floor {
+                    start = start.min(next);
+                }
+            }
+        }
+        start.max(first)
     }
 
     /// Apply committed entries to the state machine.
