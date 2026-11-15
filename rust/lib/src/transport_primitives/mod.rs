@@ -26,6 +26,7 @@ mod secret_file;
 mod server_limits;
 mod shared_tls;
 mod shared_tls_server;
+mod tls_incoming;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};

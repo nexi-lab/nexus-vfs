@@ -53,7 +53,7 @@ impl SharedTlsListener {
         listener: TcpListener,
     ) -> impl Stream<Item = std::io::Result<TlsStream<TcpStream>>> {
         let source = self.source.clone();
-        super::federated_tls::tls_incoming_checked(
+        super::tls_incoming::incoming(
             listener,
             move || self.config().ok(),
             move |snapshot| source.is_current(snapshot),

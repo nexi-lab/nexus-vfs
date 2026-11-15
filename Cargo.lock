@@ -2668,6 +2668,7 @@ dependencies = [
  "gethostname",
  "kernel",
  "lib",
+ "libc",
  "llm-mount",
  "managed-agent",
  "nexus-http-api",
