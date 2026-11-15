@@ -179,7 +179,10 @@ pub(crate) async fn forward_propose(
     };
     match api_client
         .inner_mut()
-        .map_err(|e| RaftError::NotSubmitted(e.to_string()))?
+        .map_err(|e| RaftError::NotSubmitted {
+            endpoint: leader_addr.endpoint.clone(),
+            reason: e.to_string(),
+        })?
         .propose(request)
         .await
     {
@@ -222,7 +225,10 @@ pub(crate) async fn propose_to(
     let mut client = connect_api_client(config, endpoint).await?;
     let response = client
         .inner_mut()
-        .map_err(|e| crate::raft::RaftError::NotSubmitted(e.to_string()))?
+        .map_err(|e| crate::raft::RaftError::NotSubmitted {
+            endpoint: endpoint.to_owned(),
+            reason: e.to_string(),
+        })?
         .propose(request)
         .await
         .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
