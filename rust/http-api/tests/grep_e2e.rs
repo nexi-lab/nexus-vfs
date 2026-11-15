@@ -11,7 +11,10 @@
 //!   * error mapping: `InvalidArgument` → 400, upstream-down → 503
 //!   * defaults: absent `root_path` → `/`; absent numeric knobs → 0
 
+mod support;
+
 use std::sync::{Arc, Mutex};
+use support::UnavailableBackend;
 
 use nexus_http_api::search_proto::search_service_server::{SearchService, SearchServiceServer};
 use nexus_http_api::search_proto::{
@@ -204,25 +207,27 @@ impl SearchService for MockSearchService {
 struct Harness {
     http_base: String,
     log: RequestLog,
+    _unavailable_backend: Option<UnavailableBackend>,
 }
 
 impl Harness {
     async fn start(behaviour: MockBehaviour) -> Self {
         let (grpc_target, log) = spawn_mock_grpc_server(behaviour).await;
         let http_base = spawn_http_listener(grpc_target).await;
-        Self { http_base, log }
+        Self {
+            http_base,
+            log,
+            _unavailable_backend: None,
+        }
     }
 
     async fn start_pointing_at_dead_backend() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind + release ephemeral port");
-        let dead_addr = listener.local_addr().expect("dead addr");
-        drop(listener);
-        let http_base = spawn_http_listener(format!("http://{dead_addr}")).await;
+        let unavailable_backend = UnavailableBackend::bind();
+        let http_base = spawn_http_listener(unavailable_backend.endpoint()).await;
         Self {
             http_base,
             log: RequestLog::default(),
+            _unavailable_backend: Some(unavailable_backend),
         }
     }
 }
