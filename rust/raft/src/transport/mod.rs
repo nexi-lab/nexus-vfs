@@ -53,6 +53,7 @@ macro_rules! bounded {
 }
 
 mod node_authority;
+pub(crate) use node_authority::prepared_local_replication_id;
 pub use node_authority::{
     current_local_node_certificate, local_node_identity, LocalNodeCertificate,
 };
@@ -107,6 +108,7 @@ pub use crl::{
 mod client;
 #[cfg(all(feature = "grpc", has_protos))]
 mod server;
+pub(crate) use server::PreparedRaftListener;
 #[cfg(all(feature = "grpc", has_protos))]
 mod transport_loop;
 
@@ -159,9 +161,15 @@ pub(crate) async fn forward_propose(
     let mut api_client = {
         let mut cached = cached_client.lock().await;
         match cached.as_ref() {
-            Some((endpoint, client)) if *endpoint == leader_addr.endpoint => client.clone(),
+            Some((endpoint, client))
+                if *endpoint == leader_addr.endpoint
+                    && client.uses_current_credentials(client_pool.config()) =>
+            {
+                client.clone()
+            }
             // Dialed under the lock: overlapping forwards share the one dial.
             _ => {
+                *cached = None;
                 let client =
                     connect_api_client(client_pool.config(), &leader_addr.endpoint).await?;
                 *cached = Some((leader_addr.endpoint.clone(), client.clone()));
@@ -169,7 +177,15 @@ pub(crate) async fn forward_propose(
             }
         }
     };
-    match api_client.inner_mut().propose(request).await {
+    match api_client
+        .inner_mut()
+        .map_err(|e| RaftError::NotSubmitted {
+            endpoint: leader_addr.endpoint.clone(),
+            reason: e.to_string(),
+        })?
+        .propose(request)
+        .await
+    {
         Ok(response) => decode_propose_response(response.into_inner()),
         Err(status) => {
             // `Unavailable` here is not proof that nothing was sent. The channel
@@ -209,6 +225,10 @@ pub(crate) async fn propose_to(
     let mut client = connect_api_client(config, endpoint).await?;
     let response = client
         .inner_mut()
+        .map_err(|e| crate::raft::RaftError::NotSubmitted {
+            endpoint: endpoint.to_owned(),
+            reason: e.to_string(),
+        })?
         .propose(request)
         .await
         .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
@@ -419,37 +439,50 @@ pub(crate) struct ZoneTasks {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     transport: tokio::task::JoinHandle<()>,
     registration: Option<tokio::task::JoinHandle<()>>,
+    completion: tokio::sync::watch::Receiver<bool>,
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
 impl ZoneTasks {
-    /// Tell the tasks to stop.
+    /// Observe task lifetimes before extracting a zone for removal.
+    pub(crate) fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
+    /// Signal shutdown; completion remains observable if a waiter is cancelled.
     pub(crate) fn stop(self) -> ZonesStopped {
         let _ = self.shutdown_tx.send(true);
-        ZonesStopped {
-            tasks: std::iter::once(self.transport)
-                .chain(self.registration)
-                .collect(),
-        }
+        let Self {
+            transport,
+            registration,
+            completion,
+            ..
+        } = self;
+        // Dropping JoinHandles detaches the signalled tasks. Their captured
+        // completion senders close only after they release their resources.
+        drop((transport, registration));
+        ZonesStopped::from_completions(vec![completion])
     }
 }
 
-/// Zones told to stop. [`Self::released`] returns once every task that held
-/// their storage has finished, so their data directories can be reopened.
+/// Zones told to stop. Each waiter observes the same task lifetimes, so a
+/// cancelled waiter cannot make another report that live storage is released.
 #[cfg(all(feature = "grpc", has_protos))]
 #[must_use = "await `released()` before reopening the zones' data directories"]
 pub struct ZonesStopped {
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    completions: Vec<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
 impl ZonesStopped {
-    /// Wait until the stopped zones' tasks have finished.
+    pub(crate) fn from_completions(completions: Vec<tokio::sync::watch::Receiver<bool>>) -> Self {
+        Self { completions }
+    }
+
+    /// Wait until all originally captured tasks and removals have finished.
     pub async fn released(self) {
-        for task in self.tasks {
-            if let Err(error) = task.await {
-                tracing::warn!(%error, "a stopped zone task did not finish cleanly");
-            }
+        for mut completion in self.completions {
+            while completion.changed().await.is_ok() {}
         }
     }
 }
@@ -457,9 +490,12 @@ impl ZonesStopped {
 #[cfg(all(feature = "grpc", has_protos))]
 impl FromIterator<ZonesStopped> for ZonesStopped {
     fn from_iter<I: IntoIterator<Item = ZonesStopped>>(stopped: I) -> Self {
-        Self {
-            tasks: stopped.into_iter().flat_map(|zone| zone.tasks).collect(),
-        }
+        Self::from_completions(
+            stopped
+                .into_iter()
+                .flat_map(|zone| zone.completions)
+                .collect(),
+        )
     }
 }
 
@@ -475,14 +511,14 @@ pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
     handle: &mut crate::raft::ZoneConsensus<S>,
     mut driver: crate::raft::ZoneConsensusDriver<S>,
     zone_id: &str,
-    tls: &std::sync::Arc<std::sync::RwLock<Option<TlsConfig>>>,
+    tls: &lib::transport_primitives::SharedTlsConfig,
     advertise: String,
     seeds: Vec<NodeAddress>,
     runtime_handle: &tokio::runtime::Handle,
 ) -> StartedZone {
     let peers: SharedPeerMap =
         std::sync::Arc::new(std::sync::RwLock::new(PeerMap::new(handle.id())));
-    driver.set_peer_map(peers.clone(), tls.read().unwrap().is_some());
+    driver.set_peer_map(peers.clone(), tls.snapshot().uses_tls());
     let client_config = ClientConfig {
         tls: tls.clone(),
         ..Default::default()
@@ -500,23 +536,33 @@ pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
     .with_zone_id(zone_id.to_string())
     .with_self_address(advertise.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (task_lifetime, task_completion) = tokio::sync::watch::channel(false);
     // The fixed local root has no network members.
     let registration = (handle.config().membership_policy
         == crate::raft::MembershipPolicy::Managed
         && !advertise.is_empty())
     .then(|| {
-        runtime_handle.spawn(handle.clone().register_member_address(
+        let registration = handle.clone().register_member_address(
             crate::raft::MemberRegistration { advertise, seeds },
             shutdown_rx.clone(),
-        ))
+        );
+        let lifetime = task_lifetime.clone();
+        runtime_handle.spawn(async move {
+            let _lifetime = lifetime;
+            registration.await;
+        })
     });
-    let transport = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+    let transport_handle = runtime_handle.spawn(async move {
+        let _lifetime = task_lifetime;
+        transport_loop.run(shutdown_rx).await;
+    });
     StartedZone {
         peers,
         tasks: ZoneTasks {
             shutdown_tx,
-            transport,
+            transport: transport_handle,
             registration,
+            completion: task_completion,
         },
     }
 }
@@ -788,6 +834,9 @@ mod peer_map_tests {
         assert_eq!(peers.read().unwrap().len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod proposal_client_tests;
 
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod decode_tests {

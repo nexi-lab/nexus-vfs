@@ -1080,7 +1080,7 @@ fn attempt_join_zone_round(
         node_id,
         self_address,
         as_learner,
-        zm.registry().tls_config(),
+        &zm.registry().shared_tls(),
         rpc_timeout_secs,
     ));
     match round {

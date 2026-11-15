@@ -64,6 +64,23 @@ pub(super) fn authenticated_node_id(extensions: &http::Extensions) -> Result<Opt
     Ok(authenticated_peer(extensions)?.map(AuthenticatedPeer::node_id))
 }
 
+/// Recheck a replica's original TLS caller before and after a blocking read.
+pub(super) fn current_replica_id(extensions: &http::Extensions) -> Result<Option<u64>, Status> {
+    let Some(AuthenticatedPeer::Replica(id)) = authenticated_peer(extensions)? else {
+        return Ok(None);
+    };
+    let policy = extensions.get::<NodeControlPolicy>().ok_or_else(|| {
+        Status::permission_denied("replica request has no listener admission policy")
+    })?;
+    policy.check_local_credentials()?;
+    match policy.check(extensions)? {
+        Some(AuthenticatedPeer::Replica(current)) if current == id => Ok(Some(id)),
+        _ => Err(Status::permission_denied(
+            "replica caller is no longer current",
+        )),
+    }
+}
+
 /// Storage format preparation requires Node authority even on a development
 /// listener. Numeric replica identity alone carries no control authority.
 pub(super) fn require_authenticated_control_node(
@@ -159,6 +176,35 @@ pub fn current_local_node_certificate(
     node_certificate_identity(&leaf)
 }
 
+/// Validate a local-root replica's signed bootstrap identity. An expired leaf
+/// can wait for renewal; request and handshake admission still require validity.
+pub(crate) fn prepared_local_replication_id(
+    der: &[u8],
+    local_ca_der: &[u8],
+) -> Result<u64, String> {
+    let leaf = locally_signed_leaf(der, local_ca_der)?;
+    if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&leaf)? {
+        if leaf.validity().not_before > x509_parser::time::ASN1Time::now()
+            || leaf.validity().not_after <= leaf.validity().not_before
+        {
+            return Err("replica certificate has an invalid bootstrap validity window".into());
+        }
+        return Ok(id);
+    }
+    current_local_node_certificate(der, local_ca_der).map(|node| node.node_id)
+}
+
+fn current_local_peer_certificate(
+    der: &[u8],
+    local_ca_der: &[u8],
+) -> Result<AuthenticatedPeer, String> {
+    let certificate = current_local_leaf(der, local_ca_der)?;
+    if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
+        return Ok(AuthenticatedPeer::Replica(id));
+    }
+    node_certificate_identity(&certificate).map(|node| AuthenticatedPeer::Node(node.node_id))
+}
+
 /// The Node a data directory's PEM TLS bundle names, under exactly the checks
 /// above: its first certificate is current, signed by the bundle's own CA and
 /// carries one canonical Node identity. Boot, operator grants and `doctor`
@@ -173,8 +219,19 @@ fn current_local_leaf<'a>(
     der: &'a [u8],
     local_ca_der: &[u8],
 ) -> Result<X509Certificate<'a>, String> {
+    let leaf = locally_signed_leaf(der, local_ca_der)?;
+    if !leaf.validity().is_valid() {
+        return Err("Node certificate is malformed or outside its validity window".into());
+    }
+    Ok(leaf)
+}
+
+fn locally_signed_leaf<'a>(
+    der: &'a [u8],
+    local_ca_der: &[u8],
+) -> Result<X509Certificate<'a>, String> {
     let (rest, leaf) = X509Certificate::from_der(der).map_err(|_| "invalid Node certificate")?;
-    if !rest.is_empty() || !leaf.validity().is_valid() {
+    if !rest.is_empty() {
         return Err("Node certificate is malformed or outside its validity window".into());
     }
     let (rest, ca) =
@@ -200,10 +257,12 @@ fn node_certificate_identity(leaf: &X509Certificate<'_>) -> Result<LocalNodeCert
 #[derive(Clone)]
 pub(super) struct NodeControlPolicy {
     local_ca: Option<Arc<[u8]>>,
+    local_credentials: Option<(lib::transport_primitives::SharedTlsConfig, Option<Vec<u8>>)>,
 }
 impl NodeControlPolicy {
     pub(super) fn from_tls(tls: Option<&super::TlsConfig>) -> Result<Self, String> {
         Ok(Self {
+            local_credentials: None,
             local_ca: tls
                 .map(|t| {
                     lib::transport_primitives::first_certificate_der(&t.ca_pem, "local cluster CA")
@@ -211,6 +270,29 @@ impl NodeControlPolicy {
                 })
                 .transpose()?,
         })
+    }
+
+    pub(super) fn from_shared_tls(
+        source: lib::transport_primitives::SharedTlsConfig,
+    ) -> Result<Self, String> {
+        let initial = source.snapshot();
+        let tls = initial.configured_material()?;
+        let mut policy = Self::from_tls(tls)?;
+        policy.local_credentials = Some((source, tls.map(|tls| tls.ca_pem.clone())));
+        Ok(policy)
+    }
+
+    fn check_local_credentials(&self) -> Result<(), Status> {
+        if let Some((source, ca)) = &self.local_credentials {
+            source.read(|snapshot| -> Result<(), Status> {
+                let tls = snapshot.config().map_err(Status::unavailable)?;
+                if tls.map(|tls| tls.ca_pem.as_slice()) != ca.as_deref() {
+                    return Err(Status::unavailable("local listener trust anchor changed"));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
     fn check(&self, extensions: &http::Extensions) -> Result<Option<AuthenticatedPeer>, Status> {
         // Explicit plaintext/development listeners retain their old contract.
@@ -227,19 +309,13 @@ impl NodeControlPolicy {
         let leaf = certs
             .first()
             .ok_or_else(|| Status::permission_denied("missing Node mTLS leaf"))?;
-        let classify = || -> Result<AuthenticatedPeer, String> {
-            let certificate = current_local_leaf(leaf.as_ref(), ca)?;
-            if let Some(id) = lib::transport_primitives::replica_node_id_from_x509(&certificate)? {
-                return Ok(AuthenticatedPeer::Replica(id));
-            }
-            node_certificate_identity(&certificate)
-                .map(|node| AuthenticatedPeer::Node(node.node_id))
-        };
-        classify().map(Some).map_err(|_| {
-            Status::permission_denied(
-                "Raft control requires a current local Node or owner replica certificate",
-            )
-        })
+        current_local_peer_certificate(leaf.as_ref(), ca)
+            .map(Some)
+            .map_err(|_| {
+                Status::permission_denied(
+                    "Raft control requires a current local Node or owner replica certificate",
+                )
+            })
     }
 }
 
@@ -306,6 +382,7 @@ impl RequestAdmission {
     // Keep one implementation across all generated tonic service wrappers.
     #[inline(never)]
     fn check(&self, request: &mut http::Request<Body>) -> Result<(), Status> {
+        self.policy.check_local_credentials()?;
         if !self.delegated.iter().any(|p| p == request.uri().path()) {
             match self.policy.check(request.extensions()) {
                 Ok(Some(AuthenticatedPeer::Replica(_)))
@@ -320,6 +397,9 @@ impl RequestAdmission {
                 }
                 Ok(Some(peer)) => {
                     request.extensions_mut().insert(peer);
+                    if matches!(peer, AuthenticatedPeer::Replica(_)) {
+                        request.extensions_mut().insert(self.policy.clone());
+                    }
                 }
                 Ok(None) => {}
                 Err(status) => return Err(status),
@@ -346,6 +426,7 @@ const REPLICA_DATA_METHODS: &[&str] = &[
     "Propose",
     "Query",
     "GetClusterInfo",
+    "JoinZone",
     "GetSearchCapabilities",
     "ReadZoneBlob",
 ];

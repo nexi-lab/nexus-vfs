@@ -37,40 +37,18 @@ const DEFAULT_GLOBAL_PERMITS: usize = 16;
 /// Default per-RPC timeout. Matches Python `PeerBlobClient.timeout` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-enum TlsPolicy {
-    Plaintext,
-    Configured(lib::transport_primitives::TlsConfig),
-    Rejected(&'static str),
-}
-
-struct ConnectionPolicy {
-    generation: u64,
-    tls: TlsPolicy,
-}
-
-struct CachedChannel {
-    generation: u64,
-    channel: tonic::transport::Channel,
-}
+use crate::peer_channels::{PeerChannels, TlsPolicy};
 
 /// Shared peer-RPC client. Construct once per kernel, clone the `Arc` into
 /// any caller that needs to fetch blobs from peers.
 #[allow(dead_code)]
 pub struct PeerBlobClient {
     runtime: tokio::runtime::Handle,
-    channels: DashMap<String, CachedChannel>,
+    channels: PeerChannels,
     per_peer_semaphores: DashMap<String, Arc<Semaphore>>,
     global_semaphore: Arc<Semaphore>,
     timeout: Duration,
     per_peer_permits: usize,
-    /// Late-bound mTLS material. Populated by the kernel via
-    /// `install_tls_config` once the leader / joiner has resolved the
-    /// on-disk `ca.pem` / `node.pem` / `node-key.pem` triplet. When
-    /// present, peer channels are built as `https://…` with full mTLS
-    /// (same cert material that `ZoneManager` uses for raft RPCs — one
-    /// trust anchor per cluster). When absent, plaintext HTTP/2 — the
-    /// docker federation test intentionally sets `NEXUS_RAFT_TLS=false`.
-    policy: parking_lot::RwLock<ConnectionPolicy>,
 }
 
 #[allow(dead_code)]
@@ -82,17 +60,26 @@ impl PeerBlobClient {
     /// keeps runtime shutdown a kernel-side responsibility and makes
     /// drops here side-effect-free.
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self::with_shared_tls(
+            runtime,
+            lib::transport_primitives::SharedTlsConfig::default(),
+        )
+    }
+
+    pub fn with_shared_tls(
+        runtime: tokio::runtime::Handle,
+        tls: lib::transport_primitives::SharedTlsConfig,
+    ) -> Self {
         Self {
             runtime,
-            channels: DashMap::new(),
+            channels: PeerChannels::new(
+                tls,
+                lib::transport_primitives::ClientConfig::default().request_timeout,
+            ),
             per_peer_semaphores: DashMap::new(),
             global_semaphore: Arc::new(Semaphore::new(DEFAULT_GLOBAL_PERMITS)),
             timeout: DEFAULT_RPC_TIMEOUT,
             per_peer_permits: DEFAULT_PER_PEER_PERMITS,
-            policy: parking_lot::RwLock::new(ConnectionPolicy {
-                generation: 0,
-                tls: TlsPolicy::Plaintext,
-            }),
         }
     }
 
@@ -102,68 +89,7 @@ impl PeerBlobClient {
     /// reconnects over TLS. Called by the boot installer once the
     /// leader / joiner has resolved the cluster CA + node cert.
     pub fn install_tls_config(&self, tls: lib::transport_primitives::TlsConfig) {
-        self.replace_tls_policy(TlsPolicy::Configured(tls));
-    }
-
-    fn replace_tls_policy(&self, tls: TlsPolicy) {
-        let mut policy = self.policy.write();
-        policy.tls = match policy.generation.checked_add(1) {
-            Some(generation) => {
-                policy.generation = generation;
-                tls
-            }
-            None => TlsPolicy::Rejected("peer TLS generation exhausted"),
-        };
-        // Publication below holds a policy read guard, so an earlier dial
-        // cannot repopulate this pool after the credential transition.
-        self.channels.clear();
-    }
-
-    /// Fetch or build a tonic `Channel` for `address`.
-    ///
-    /// `tonic::transport::Channel` is `Clone` and internally reference-counted
-    /// (wraps a `tower` service). We cache one per peer so concurrent callers
-    /// share a single HTTP/2 connection.
-    async fn channel_for(&self, address: &str) -> Result<tonic::transport::Channel, String> {
-        let (generation, tls) = {
-            let policy = self.policy.read();
-            let tls = match &policy.tls {
-                TlsPolicy::Plaintext => None,
-                TlsPolicy::Configured(tls) => Some(tls.clone()),
-                TlsPolicy::Rejected(error) => return Err((*error).into()),
-            };
-            if let Some(cached) = self.channels.get(address) {
-                if cached.generation == policy.generation {
-                    return Ok(cached.channel.clone());
-                }
-            }
-            (policy.generation, tls)
-        };
-        let scheme = if tls.is_some() { "https" } else { "http" };
-        let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
-            address.to_string()
-        } else {
-            format!("{}://{}", scheme, address)
-        };
-        let client_cfg = lib::transport_primitives::ClientConfig {
-            tls,
-            ..Default::default()
-        };
-        let channel = lib::transport_primitives::create_channel(&endpoint, &client_cfg)
-            .await
-            .map_err(|e| format!("peer channel {}: {}", address, e))?;
-        let policy = self.policy.read();
-        if policy.generation != generation {
-            return Err("peer TLS configuration changed while connecting".into());
-        }
-        let cached = self
-            .channels
-            .entry(address.to_string())
-            .or_insert_with(|| CachedChannel {
-                generation,
-                channel,
-            });
-        Ok(cached.channel.clone())
+        self.channels.replace_tls(TlsPolicy::Configured(tls));
     }
 
     /// Resolve (or create) the per-peer semaphore gating outstanding RPCs.
@@ -230,7 +156,7 @@ impl PeerBlobClient {
             .await
             .map_err(|e| format!("per-peer semaphore closed: {e}"))?;
 
-        let channel = self.channel_for(address).await?;
+        let channel = self.channels.channel_for(address).await?;
         // ReadBlob lives on the raft ``ZoneApiService`` (co-located
         // with consensus on the advertised raft port — inherits
         // cluster mTLS). Message caps match the server: tonic's
@@ -336,7 +262,7 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
 
     fn install_tls(&self, ca_pem: &[u8], cert_pem: Option<&[u8]>, key_pem: Option<&[u8]>) {
         let (Some(cert), Some(key)) = (cert_pem, key_pem) else {
-            self.replace_tls_policy(TlsPolicy::Rejected(
+            self.channels.replace_tls(TlsPolicy::Rejected(
                 "peer mTLS requires both client certificate and private key",
             ));
             return;
@@ -357,7 +283,21 @@ impl kernel::hal::peer::PeerBlobClient for PeerBlobClient {
 /// runtime via `Handle` and installs it via `Kernel::set_peer_client`,
 /// replacing the `NoopPeerBlobClient` default.
 pub fn install(kernel: &kernel::kernel::Kernel) {
-    let client = Arc::new(PeerBlobClient::new(kernel.runtime().handle().clone()));
+    install_with_shared_tls(
+        kernel,
+        lib::transport_primitives::SharedTlsConfig::default(),
+    );
+}
+
+/// Share the running node's credential installation with content fetches.
+pub fn install_with_shared_tls(
+    kernel: &kernel::kernel::Kernel,
+    credentials: lib::transport_primitives::SharedTlsConfig,
+) {
+    let client = Arc::new(PeerBlobClient::with_shared_tls(
+        kernel.runtime().handle().clone(),
+        credentials,
+    ));
     kernel.set_peer_client(client as Arc<dyn kernel::hal::peer::PeerBlobClient>);
 }
 

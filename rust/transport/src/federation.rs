@@ -25,13 +25,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use tonic::transport::Channel;
 
+use crate::peer_channels::{PeerChannels, TlsPolicy};
 use kernel::abc::object_store::BackendStat;
 use kernel::federation::grpc_ops::{FederationGrpcOps, FederationPeerResult};
 use kernel::kernel::vfs_proto;
-use lib::transport_primitives::{create_channel, ClientConfig, TlsConfig};
+use lib::transport_primitives::{SharedTlsConfig, TlsConfig};
 use nexus_raft::federation::TofuTrustStore;
 use nexus_raft::transport::proto::nexus::raft::{
     zone_api_service_client::ZoneApiServiceClient, JoinZoneRequest,
@@ -41,76 +41,35 @@ pub mod runtime_directory;
 
 /// Per-peer channel cache + shared runtime.
 ///
-/// TLS storage + channel build delegate to
-/// `lib::transport_primitives::{TlsConfig, create_channel}` — the
-/// same machinery the sibling `PeerBlobClient` uses for its
-/// `ZoneApiService.ReadBlob` channel pool — so a single set of
-/// timeout / keepalive defaults and TLS handshake logic serves both
-/// out-bound transport-tier clients.
+/// Federation and content reads share the credential-bound channel pool.
+/// The host owns the executor and each RPC retains its existing timeout.
 pub struct FederationClient {
     // The host owns shutdown. Peer pools may outlive a registry/service field
     // during teardown and must never become a runtime's final async owner.
     runtime: tokio::runtime::Handle,
-    channels: DashMap<String, Channel>,
-    /// Late-bound TLS material.  `None` until the boot installer wires
-    /// the cluster CA + node cert (mirrors `PeerBlobClient::tls`); when
-    /// `Some`, [`Self::channel_for`] builds the channel as `https://`
-    /// with mTLS.
-    tls: parking_lot::RwLock<Option<TlsConfig>>,
+    channels: PeerChannels,
     timeout: Duration,
 }
 
 impl FederationClient {
     pub fn new(runtime: tokio::runtime::Handle, tls: Option<TlsConfig>) -> Self {
+        Self::with_shared_tls(runtime, SharedTlsConfig::new(tls))
+    }
+
+    pub fn with_shared_tls(runtime: tokio::runtime::Handle, tls: SharedTlsConfig) -> Self {
         Self {
             runtime,
-            channels: DashMap::new(),
-            tls: parking_lot::RwLock::new(tls),
+            channels: PeerChannels::new(tls, Duration::from_secs(10)),
             timeout: Duration::from_secs(10),
         }
     }
 
     /// Install mTLS material so subsequent channel builds use TLS.
     ///
-    /// Drops any cached plaintext channels — the next RPC to each
-    /// peer reconnects over TLS.  Mirrors
-    /// `PeerBlobClient::install_tls_config`.
+    /// Reconnect subsequent requests with the replacement identity and refuse
+    /// publication of connections established under the preceding policy.
     pub fn install_tls(&self, tls: TlsConfig) {
-        *self.tls.write() = Some(tls);
-        self.channels.clear();
-    }
-
-    /// Fetch or build a tonic channel for ``address``.
-    ///
-    /// Address forms: ``host:port`` or ``http(s)://host:port``.
-    /// ``https://`` is selected automatically when TLS material is
-    /// attached — callers shouldn't need to pick the scheme.
-    /// Delegates Endpoint configuration (timeouts / keepalive / TLS)
-    /// to `lib::transport_primitives::create_channel` so the build
-    /// rules stay aligned with the sibling `PeerBlobClient`.
-    async fn channel_for(&self, address: &str) -> Result<Channel, String> {
-        if let Some(ch) = self.channels.get(address) {
-            return Ok(ch.clone());
-        }
-        let tls = self.tls.read().clone();
-        let scheme = if tls.is_some() { "https" } else { "http" };
-        let endpoint = if address.starts_with("http://") || address.starts_with("https://") {
-            address.to_string()
-        } else {
-            format!("{scheme}://{address}")
-        };
-        let client_cfg = ClientConfig {
-            tls,
-            request_timeout: self.timeout,
-            ..Default::default()
-        };
-        let channel = create_channel(&endpoint, &client_cfg)
-            .await
-            .map_err(|e| format!("federation channel {address}: {e}"))?;
-        self.channels
-            .entry(address.to_string())
-            .or_insert_with(|| channel.clone());
-        Ok(channel)
+        self.channels.replace_tls(TlsPolicy::Configured(tls));
     }
 
     /// Discover a peer zone's DT_MOUNT target via VFS ``sys_stat``.
@@ -125,7 +84,7 @@ impl FederationClient {
         peer_addr: &str,
         path: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let channel = self.channel_for(peer_addr).await?;
+        let channel = self.channels.channel_for(peer_addr).await?;
         let mut client = vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient::new(channel);
 
         let req_json = serde_json::json!({ "path": path });
@@ -182,7 +141,7 @@ impl FederationClient {
                 "JoinZone: too many leader redirects (peer={peer_addr}, zone={zone_id})"
             ));
         }
-        let channel = self.channel_for(peer_addr).await?;
+        let channel = self.channels.channel_for(peer_addr).await?;
         let mut client = ZoneApiServiceClient::new(channel);
 
         let mut request = tonic::Request::new(JoinZoneRequest {
@@ -241,7 +200,7 @@ impl FederationClient {
         &self,
         peer_addr: &str,
     ) -> Result<vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient<Channel>, String> {
-        let channel = self.channel_for(peer_addr).await?;
+        let channel = self.channels.channel_for(peer_addr).await?;
         Ok(
             vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient::new(channel)
                 .max_decoding_message_size(contracts::MAX_GRPC_MESSAGE_BYTES)
@@ -659,13 +618,10 @@ mod tests {
         );
         // Plaintext variant.
         let plain = FederationClient::new(rt.handle().clone(), None);
-        assert!(plain.tls.read().is_none());
+        assert!(!plain.channels.uses_tls());
 
-        // TLS variant — the material isn't parsed until the first
-        // `channel_for` call, so we just check it was stored.  Uses
-        // the shared `lib::transport_primitives::TlsConfig` so the
-        // sibling `PeerBlobClient` and `FederationClient` share a
-        // single TLS material type.
+        // A configured TLS policy remains distinguishable from plaintext;
+        // malformed material is refused when a channel is requested.
         let tls = FederationClient::new(
             rt.handle().clone(),
             Some(TlsConfig {
@@ -674,37 +630,9 @@ mod tests {
                 key_pem: b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_vec(),
             }),
         );
-        assert!(tls.tls.read().is_some());
-    }
-
-    /// `install_tls` swaps the slot and drops cached channels so
-    /// follow-up RPCs reconnect over TLS — same shape as
-    /// `PeerBlobClient::install_tls_config`.
-    #[test]
-    fn install_tls_updates_slot_and_clears_channel_cache() {
-        let rt = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .unwrap(),
-        );
-        let client = FederationClient::new(rt.handle().clone(), None);
-        // Pre-seed a fake cached channel so we can assert it gets cleared.
-        // We can't construct a real `tonic::transport::Channel` cheaply,
-        // so verify by asserting the channels map is empty post-install
-        // (boot state) and stays empty after install.
-        assert_eq!(client.channels.len(), 0);
-        client.install_tls(TlsConfig {
-            ca_pem: make_ca_pem("ca").into_bytes(),
-            cert_pem: make_ca_pem("node").into_bytes(),
-            key_pem: b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_vec(),
-        });
-        assert!(client.tls.read().is_some(), "tls slot must be populated");
-        assert_eq!(
-            client.channels.len(),
-            0,
-            "install_tls must clear any cached channels"
-        );
+        assert!(tls.channels.uses_tls());
     }
 }
+
+#[cfg(test)]
+mod tls_tests;

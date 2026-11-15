@@ -101,7 +101,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .forward_ctx
             .as_ref()
             .ok_or_else(|| RaftError::Config("zone has no transport to register over".into()))?;
-        let use_tls = ctx.client_pool.config().tls.read().unwrap().is_some();
+        let use_tls = ctx.client_pool.config().tls.snapshot().uses_tls();
         let records = match self.with_state_machine(|sm| sm.member_addresses()).await? {
             Some(records) => records,
             None => {

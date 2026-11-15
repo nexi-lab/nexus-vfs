@@ -62,10 +62,11 @@ impl FederationClient {
     ) -> Result<RuntimeInventory, &'static str> {
         // A trusted node already has peer-plane authority. Keep the original
         // caller's resolved filter; never forward a client token or delegation.
-        if self.tls.read().is_none() {
+        if !self.channels.uses_tls() {
             return Err("peer_identity_unavailable");
         }
         let channel = self
+            .channels
             .channel_for(endpoint)
             .await
             .map_err(|_| "unavailable")?;

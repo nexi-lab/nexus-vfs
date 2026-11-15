@@ -29,8 +29,12 @@ use dashmap::DashMap;
 use lib::rt::block_on_via as bridge_block_on;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 /// Wall-clock ms — the epoch space both the creation marker and the
 /// replicated deletion epoch live in (strictly increasing via
@@ -194,6 +198,11 @@ pub struct ZoneRaftRegistry {
     /// durable one: a zone is materialized on first access and stays until
     /// shutdown.
     zones: DashMap<String, ZoneEntry>,
+    /// Set by shutdown before any subsequent zone publication can proceed.
+    closed: AtomicBool,
+    /// Setup holds a reader through publication; shutdown retains completion
+    /// receivers so concurrent or cancelled waiters share the same drain.
+    shutdown_tasks: RwLock<Vec<watch::Receiver<bool>>>,
     /// Every zone id this node HOSTS on disk, materialized or not.
     ///
     /// Disk stays the source of truth for "which zones does this node host?"
@@ -215,7 +224,7 @@ pub struct ZoneRaftRegistry {
     node_id: u64,
     /// Shared TLS config — can be updated at runtime for plaintext→mTLS upgrade.
     /// All zones' client pools read from this on new connections.
-    tls: Arc<RwLock<Option<TlsConfig>>>,
+    tls: lib::transport_primitives::SharedTlsConfig,
     /// This node's advertise address — carried in outbound StepMessage
     /// `sender_address` so peers learn `(self.node_id -> address)` on
     /// inbound contact.  Set once at boot via [`Self::set_self_address`];
@@ -253,8 +262,6 @@ pub struct ZoneRaftRegistry {
     /// registry never materializes anything on its own: an embedded or test
     /// registry only ever holds the zones it was explicitly given.
     materialization: RwLock<Option<Materialization>>,
-    /// Set by [`Self::shutdown`]: no zone opens afterwards.
-    closed: std::sync::atomic::AtomicBool,
     /// Fired once per zone, right after its runtime is published.
     ///
     /// The hook exists because "a zone became resident" is now an event that
@@ -329,9 +336,9 @@ impl ZoneRaftRegistry {
         base_path: PathBuf,
         node_id: u64,
         root_node_id: u64,
-        tls: Option<TlsConfig>,
+        tls: lib::transport_primitives::SharedTlsConfig,
     ) -> Self {
-        let mut registry = Self::with_tls(base_path, node_id, tls);
+        let mut registry = Self::with_shared_tls(base_path, node_id, tls);
         registry.storage_policy = ZoneStoragePolicy::LocalRoot {
             node_id: root_node_id,
         };
@@ -340,13 +347,27 @@ impl ZoneRaftRegistry {
 
     /// Create a new empty registry with TLS configuration.
     pub fn with_tls(base_path: PathBuf, node_id: u64, tls: Option<TlsConfig>) -> Self {
+        Self::with_shared_tls(
+            base_path,
+            node_id,
+            lib::transport_primitives::SharedTlsConfig::new(tls),
+        )
+    }
+
+    pub(crate) fn with_shared_tls(
+        base_path: PathBuf,
+        node_id: u64,
+        tls: lib::transport_primitives::SharedTlsConfig,
+    ) -> Self {
         Self {
             zones: DashMap::new(),
+            closed: AtomicBool::new(false),
+            shutdown_tasks: RwLock::new(Vec::new()),
             hosted: dashmap::DashSet::new(),
             base_path,
             storage_policy: ZoneStoragePolicy::Managed,
             node_id,
-            tls: Arc::new(RwLock::new(tls)),
+            tls,
             self_address: Arc::new(RwLock::new(String::new())),
             seeds: RwLock::new(Vec::new()),
             identity_dir: Arc::new(RwLock::new(None)),
@@ -354,7 +375,6 @@ impl ZoneRaftRegistry {
             creating: DashMap::new(),
             recently_removed: DashMap::new(),
             materialization: RwLock::new(None),
-            closed: std::sync::atomic::AtomicBool::new(false),
             on_materialized: RwLock::new(Vec::new()),
         }
     }
@@ -558,14 +578,29 @@ impl ZoneRaftRegistry {
     }
 
     /// Get a snapshot of the current TLS config.
-    pub fn tls_config(&self) -> Option<TlsConfig> {
-        self.tls.read().unwrap().clone()
+    pub fn tls_config(&self) -> Result<Option<TlsConfig>, String> {
+        self.tls
+            .snapshot()
+            .config()
+            .map(|tls| tls.cloned())
+            .map_err(str::to_owned)
+    }
+
+    /// The credential source shared by outbound transports and the listener.
+    pub fn shared_tls(&self) -> lib::transport_primitives::SharedTlsConfig {
+        self.tls.clone()
+    }
+
+    /// Select the endpoint scheme; actual I/O validates the current installation.
+    pub(crate) fn tls_enabled(&self) -> bool {
+        self.tls.snapshot().uses_tls()
     }
 
     /// Replace the Node TLS identity outbound clients present. Pooled Raft
     /// clients see the change on their next use and reconnect with it.
     pub fn install_tls(&self, tls: TlsConfig) {
-        *self.tls.write().unwrap() = Some(tls);
+        self.tls
+            .replace(lib::transport_primitives::TlsPolicy::Configured(tls));
     }
 
     /// Create a new zone with its own Raft group.
@@ -868,6 +903,11 @@ impl ZoneRaftRegistry {
         // persisted. See `identity::persist_zone_intent`.
         intended_role: crate::identity::IdentityZoneRole,
     ) -> Result<ZoneConsensus<FullStateMachine>, TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Connection(
+                "zone registry is shut down".into(),
+            ));
+        }
         let node_id = config.id;
         let membership_policy = self.storage_policy.membership(zone_id)?;
         if membership_policy == super::MembershipPolicy::FixedLocal {
@@ -937,12 +977,11 @@ impl ZoneRaftRegistry {
             creating: &self.creating,
             zone_id: zone_id.to_string(),
         };
-        // Checked after claiming the guard, which `shutdown` waits on: either
-        // shutdown sees this setup in flight, or this setup sees it closed.
-        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(TransportError::Connection(format!(
-                "zone registry is shut down; zone '{zone_id}' does not open"
-            )));
+        let publication = self.shutdown_tasks.read().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Connection(
+                "zone registry is shut down".into(),
+            ));
         }
 
         // Re-check: zone may have been created between the fast-path check
@@ -1148,6 +1187,7 @@ impl ZoneRaftRegistry {
         // hosts the zone whichever way we got here — created, joined, or
         // materialized from disk.
         self.hosted.insert(zone_id.to_string());
+        drop(publication);
 
         // Per-zone wiring rides the zone's own lifecycle. Fired after the
         // insert above, and with the lock released, because a subscriber can
@@ -1175,6 +1215,9 @@ impl ZoneRaftRegistry {
     /// old boot loop did (two redb opens and a few fsyncs, single-digit ms on
     /// an SSD), so a caller on an async worker blocks for that first touch.
     pub fn get_node(&self, zone_id: &str) -> Option<ZoneConsensus<FullStateMachine>> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
         if let Some(entry) = self.zones.get(zone_id) {
             return Some(entry.node.clone());
         }
@@ -1284,12 +1327,7 @@ impl ZoneRaftRegistry {
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        crate::transport::observe_sender(
-            &entry.peers,
-            peer_id,
-            endpoint,
-            self.tls_config().is_some(),
-        )
+        crate::transport::observe_sender(&entry.peers, peer_id, endpoint, self.tls_enabled())
     }
 
     /// The network replica identity used by managed data zones.
@@ -1361,10 +1399,23 @@ impl ZoneRaftRegistry {
             zone_id: zone_id.to_string(),
         };
 
-        let (_, entry) = self
-            .zones
-            .remove(zone_id)
-            .ok_or_else(|| TransportError::Connection(format!("Zone '{}' not found", zone_id)))?;
+        let (entry, removal_lifetime) = {
+            let mut completions = self.shutdown_tasks.write().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TransportError::Connection(
+                    "zone registry is shut down".into(),
+                ));
+            }
+            let (_, entry) = self.zones.remove(zone_id).ok_or_else(|| {
+                TransportError::Connection(format!("Zone '{}' not found", zone_id))
+            })?;
+            completions.retain(|completion| completion.has_changed().is_ok());
+            completions.push(entry.tasks.completion());
+            let (lifetime, completion) = watch::channel(false);
+            completions.push(completion);
+            (entry, lifetime)
+        };
+        let _removal_lifetime = removal_lifetime;
 
         let ZoneEntry {
             node,
@@ -1409,17 +1460,21 @@ impl ZoneRaftRegistry {
             None => persistence.write_tombstone(),
         };
         if let Err(e) = tombstone_err {
-            // Best-effort: put the zone back so state isn't lost from memory.
-            self.zones.insert(
-                zone_id.to_string(),
-                ZoneEntry {
-                    node,
-                    peers,
-                    node_id,
-                    tasks,
-                    persistence,
-                },
-            );
+            let _publication = self.shutdown_tasks.write().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                let _ = tasks.stop();
+            } else {
+                self.zones.insert(
+                    zone_id.to_string(),
+                    ZoneEntry {
+                        node,
+                        peers,
+                        node_id,
+                        tasks,
+                        persistence,
+                    },
+                );
+            }
             self.recently_removed.remove(zone_id);
             self.hosted.insert(zone_id.to_string());
             return Err(TransportError::Connection(format!(
@@ -1532,30 +1587,22 @@ impl ZoneRaftRegistry {
         self.hosted.contains(zone_id)
     }
 
-    /// Stop every resident zone and stop materializing hosted ones. Await
-    /// [`ZonesStopped::released`] to know the zones' tasks — and with them
-    /// the registry's hold on their storage — are gone; a `ZoneConsensus`
-    /// handle a caller still holds keeps its zone's store open until dropped.
+    /// Stop admission and return a view of every original task and removal.
+    /// Repeated or cancelled waiters observe the same storage drain.
     pub fn shutdown(&self) -> ZonesStopped {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        *self.materialization.write().unwrap() = None;
-        // A setup already past its check publishes its zone in a few
-        // milliseconds of synchronous work; drain after it, not before.
-        while self
-            .creating
-            .iter()
-            .any(|op| matches!(*op.value(), ZoneOp::Creating))
-        {
-            std::thread::yield_now();
+        let mut completions = self.shutdown_tasks.write().unwrap();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            *self.materialization.write().unwrap() = None;
+            let resident: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
+            for zone_id in resident {
+                if let Some((_, entry)) = self.zones.remove(&zone_id) {
+                    completions.push(entry.tasks.completion());
+                    let _ = entry.tasks.stop();
+                }
+            }
+            tracing::info!("All zones shut down");
         }
-        let resident: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
-        let stopped = resident
-            .iter()
-            .filter_map(|zone_id| self.zones.remove(zone_id))
-            .map(|(_, entry)| entry.tasks.stop())
-            .collect();
-        tracing::info!("All zones shut down");
-        stopped
+        ZonesStopped::from_completions(completions.clone())
     }
 }
 
@@ -1946,5 +1993,56 @@ mod tests {
             base.join("persist").exists(),
             "shutdown must preserve zone dir"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_survives_cancelled_and_concurrent_waiters() {
+        use std::{future::Future, task::Poll};
+
+        let tmp = TempDir::new().unwrap();
+        let reg = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        reg.create_zone("persist", &tokio::runtime::Handle::current())
+            .unwrap();
+        // The current-thread runtime has not polled either owned task yet.
+        {
+            let mut wait = std::pin::pin!(reg.shutdown().released());
+            std::future::poll_fn(|context| {
+                assert!(wait.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        tokio::join!(reg.shutdown().released(), reg.shutdown().released());
+        assert!(reg.get_node("persist").is_none());
+        assert!(reg
+            .create_zone("new", &tokio::runtime::Handle::current())
+            .is_err());
+        assert!(!tmp.path().join("new").exists());
+
+        // The original registry stays alive while its storage is reopened.
+        let next = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        next.open_persisted_zone("persist", &tokio::runtime::Handle::current())
+            .unwrap();
+        next.shutdown().released().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_includes_an_extracted_removal() {
+        use std::{future::Future, task::Poll};
+
+        let tmp = TempDir::new().unwrap();
+        let reg = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        reg.create_zone("removing", &tokio::runtime::Handle::current())
+            .unwrap();
+        let mut remove = std::pin::pin!(reg.remove_zone("removing"));
+        std::future::poll_fn(|context| {
+            assert!(remove.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!reg.is_resident("removing"));
+        let (removed, ()) = tokio::join!(remove, reg.shutdown().released());
+        removed.unwrap();
+        assert!(!tmp.path().join("removing").exists());
     }
 }
