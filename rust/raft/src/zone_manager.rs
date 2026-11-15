@@ -350,6 +350,7 @@ pub struct ZoneManager {
     /// leaders settle. BTreeMap so parent paths process before children.
     /// Empty when no static topology is configured.
     pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
+    local_zone_operation: parking_lot::Mutex<()>,
 }
 
 /// A holder of this Node's TLS identity outside the `ZoneManager` (an outbound
@@ -709,11 +710,17 @@ impl PreparedZoneManager {
             node_identity_holders: parking_lot::Mutex::new(Vec::new()),
             local_node_renewer_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
+            local_zone_operation: parking_lot::Mutex::new(()),
         }))
     }
 }
 
 impl ZoneManager {
+    /// Execution ownership for the process holding this local root store.
+    pub(crate) fn try_local_zone_operation(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.local_zone_operation.try_lock()
+    }
+
     /// Create a new `ZoneManager`.
     ///
     /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted

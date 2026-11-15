@@ -28,6 +28,10 @@ use crate::zone_deletion_registry::ZoneDeletionRegistry;
 use crate::zone_manager::{decode_file_metadata, ZoneManager, ZonePresence, DT_MOUNT};
 use crate::zone_op_journal::{BeginOutcome, JournalError, JournalRecord, ZoneOpJournal};
 
+#[cfg(test)]
+#[path = "zone_runtime/local_root_tests.rs"]
+mod local_root_tests;
+
 /// prost flattens the nested `ZoneStatusResponse.Presence` enum into a
 /// sibling module — re-exported here so the ladder reads as one type.
 use kernel::kernel::vfs_proto::zone_status_response::Presence;
@@ -103,7 +107,7 @@ const PENDING_TAKEOVER_GRACE_MS: i64 = 120_000;
 pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
     journal: ZoneOpJournal,
-    deletions: Arc<ZoneDeletionRegistry>,
+    deletions: Option<Arc<ZoneDeletionRegistry>>,
     /// Operations whose execution on this node stopped without a terminal
     /// outcome, with when it stopped. Memory only: it records that no
     /// executor on this node runs them, so a same-operation retry drives one
@@ -120,9 +124,60 @@ impl ZoneRuntimeBackend {
         Self {
             zm,
             journal,
-            deletions,
+            deletions: Some(deletions),
             stopped: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Bind owner-local operations to the existing private root journal.
+    /// Remote Node authority still controls initial data-zone admission.
+    pub fn for_local_root(zm: Arc<ZoneManager>) -> Result<Self, ZoneRuntimeError> {
+        if !zm.registry().owns_local_root() {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local operations require a private local root".into(),
+            ));
+        }
+        let root = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+            ZoneRuntimeError::Unavailable("local root journal is not open".into())
+        })?;
+        Ok(Self {
+            journal: ZoneOpJournal::new(root.consensus_node(), root.runtime_handle()),
+            zm,
+            deletions: None,
+            stopped: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn deletion_authority(&self) -> Result<&ZoneDeletionRegistry, ZoneRuntimeError> {
+        self.deletions.as_deref().ok_or_else(|| {
+            ZoneRuntimeError::PermissionDenied(
+                "global zone lifecycle requires the control plane".into(),
+            )
+        })
+    }
+
+    fn local_execution(&self) -> Result<Option<parking_lot::MutexGuard<'_, ()>>, ZoneRuntimeError> {
+        if self.deletions.is_some() {
+            return Ok(None);
+        }
+        // Share ownership across backend instances for this local root,
+        // including old PENDING retries. A slow worker retains ownership
+        // until its actual execution returns.
+        self.zm.try_local_zone_operation().map(Some).ok_or_else(|| {
+            ZoneRuntimeError::Unavailable(
+                "another local zone operation is executing; retain the original operation ID"
+                    .into(),
+            )
+        })
+    }
+
+    fn check_mount_parent(&self, parent: &str) -> Result<(), ZoneRuntimeError> {
+        if self.deletions.is_none() && parent != contracts::ROOT_ZONE_ID {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local mounts belong to the private root".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// R12: a deprovisioned zone stays gone — a create for a recorded-
@@ -132,7 +187,7 @@ impl ZoneRuntimeBackend {
         // Checked variant — store errors propagate, not degrade to "not
         // deleted": by the time an RPC is answered the control zone is
         // resident, so a store fault is a real failure the caller must see.
-        match self.deletions.deletion_epoch_checked(zone_id) {
+        match self.deletion_authority()?.deletion_epoch_checked(zone_id) {
             Ok(Some(epoch)) => Err(ZoneRuntimeError::Conflict(format!(
                 "zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); re-creating it \
                  requires an operator-supervised recovery (founder boot with --force / \
@@ -151,6 +206,7 @@ impl ZoneRuntimeBackend {
     /// operation retried under a NEW operation id after a crash mid-flight
     /// yields ALREADY_PRESENT, not a second zone.
     pub fn zone_create(&self, req: &ZoneCreateRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        self.deletion_authority()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -216,6 +272,12 @@ impl ZoneRuntimeBackend {
     /// UNAVAILABLE, leaves no replica no leader reached, stays PENDING, and a
     /// retry of the same operation id drives it again.
     pub fn zone_join(&self, req: &ZoneJoinRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        if self.deletions.is_none() && !req.learner {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner replicas join as learners".into(),
+            ));
+        }
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::RemoteLearned, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -317,8 +379,11 @@ impl ZoneRuntimeBackend {
         // time an RPC is answered).
         if let Some(info) = self
             .deletions
-            .deletion_info_checked(&req.zone_id)
+            .as_ref()
+            .map(|deletions| deletions.deletion_info_checked(&req.zone_id))
+            .transpose()
             .map_err(ZoneRuntimeError::Internal)?
+            .flatten()
         {
             resp.presence = Presence::Deleted.into();
             resp.deletion = Some(DeletionInfo {
@@ -347,6 +412,15 @@ impl ZoneRuntimeBackend {
     /// Mount target under parent (R11 zone-level layer) + DT_MOUNT
     /// read-back into MountFacts.
     pub fn zone_mount(&self, req: &ZoneMountRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        self.check_mount_parent(&req.parent_zone_id)?;
+        if self.deletions.is_none()
+            && contracts::RESERVED_ZONE_IDS.contains(&req.target_zone_id.as_str())
+        {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local mounts require a data zone".into(),
+            ));
+        }
         let header = require_header(req.mutation.as_ref())?;
         for (label, id) in [
             ("parent_zone_id", &req.parent_zone_id),
@@ -464,6 +538,8 @@ impl ZoneRuntimeBackend {
     /// Unmount, restoring DT_DIR; MountFacts carries the post-unmount
     /// link count of the former target.
     pub fn zone_unmount(&self, req: &ZoneUnmountRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        self.check_mount_parent(&req.parent_zone_id)?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.parent_zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("parent_zone_id: {e}")))?;
@@ -544,6 +620,7 @@ impl ZoneRuntimeBackend {
         &self,
         req: &ZoneRemoveReplicaRequest,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -588,6 +665,7 @@ impl ZoneRuntimeBackend {
         &self,
         req: &ZoneDeprovisionRequest,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let deletions = self.deletion_authority()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -681,7 +759,7 @@ impl ZoneRuntimeBackend {
         // Record the deletion FIRST: the epoch must exist in the replicated
         // registry before any replica tears down, so a crash mid-fan-out
         // still leaves the anti-resurrection authority in place.
-        let epoch = match self.deletions.mark_deleted(&req.zone_id) {
+        let epoch = match deletions.mark_deleted(&req.zone_id) {
             Ok(epoch) => epoch,
             Err(e) => {
                 return self.fail(
