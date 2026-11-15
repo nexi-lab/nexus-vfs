@@ -80,7 +80,7 @@ jobs:
           cargo test --locked -p raft@0.1.0 --test test_durable_storage_admission -- --test-threads=1
           cargo test --locked -p raft@0.1.0 --test test_raft_apply_failure -- --test-threads=1
       - name: Conditional metadata, local root and data-zone boundaries
-        run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission --test test_zone_owner_replication -- --test-threads=1
+        run: cargo test --locked -p raft@0.1.0 --test test_conditional_zone_metadata --test test_conditional_metadata_ec_boundary --test test_isolated_root_admission --test test_zone_owner_replication --test test_zone_runtime_removal -- --test-threads=1
       - name: ReadIndex election, quorum and cancellation boundaries
         run: cargo test --locked -p raft@0.1.0 --lib raft::node::read_index::tests -- --test-threads=1
       - name: Registry shutdown drains owned tasks before reopening storage

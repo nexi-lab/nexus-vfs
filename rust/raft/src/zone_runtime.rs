@@ -538,10 +538,8 @@ impl ZoneRuntimeBackend {
         self.complete(&header.operation_id, &req.parent_zone_id, receipt)
     }
 
-    /// Destroy this node's replica only — `ZoneManager::remove_zone`
-    /// semantics (peer fan-out of the local-destroy DeleteZone RPC, POSIX
-    /// i_links guard unless forced). No global Deleted state; that is
-    /// [`Self::zone_deprovision`].
+    /// Destroy this node's replica, preserving other members and the shared
+    /// deletion state. References require an explicit forced removal.
     pub fn zone_remove_replica(
         &self,
         req: &ZoneRemoveReplicaRequest,
@@ -560,7 +558,7 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
-        if let Err(e) = self.zm.remove_zone(&req.zone_id, req.force) {
+        if let Err(e) = self.zm.remove_local_replica(&req.zone_id, req.force) {
             return self.fail(
                 &header.operation_id,
                 map_raft_err(e),
