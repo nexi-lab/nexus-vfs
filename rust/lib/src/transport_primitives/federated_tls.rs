@@ -49,7 +49,6 @@ use rustls::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
 
 /// One in-memory server identity snapshot shared by handshakes and request gates.
 pub struct ReloadableServerIdentity {
@@ -136,7 +135,6 @@ fn tls_identity(
         expires_at,
     ))
 }
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
 use super::foreign_ca::{certificate_ders, first_certificate_der};
@@ -362,11 +360,6 @@ pub fn server_config(
     Ok(cfg)
 }
 
-/// Backpressure bound for accepted-but-not-yet-consumed connections. Small: tonic
-/// drains this promptly, and a bound keeps a connection flood from unbounded
-/// buffering.
-const ACCEPT_BUFFER: usize = 1024;
-
 /// Turn a listening `TcpListener` + a `ServerConfig` into the stream of
 /// TLS-accepted connections `tonic::Server::serve_with_incoming` consumes.
 ///
@@ -393,42 +386,11 @@ fn tls_incoming(
     listener: TcpListener,
     config: impl Fn() -> Option<Arc<ServerConfig>> + Send + 'static,
 ) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_BUFFER);
-    tokio::spawn(async move {
-        loop {
-            let accepted = tokio::select! {
-                biased;
-                // Consumer (tonic) dropped the stream → stop accepting, so the
-                // task and the listener fd are released rather than looping
-                // forever. Checked first so shutdown wins a ready accept.
-                _ = tx.closed() => break,
-                r = listener.accept() => r,
-            };
-            let tcp = match accepted {
-                Ok((stream, _peer)) => stream,
-                // A listener-level error (fd exhaustion, etc.) is surfaced to the
-                // consumer; keep accepting — a transient error must not kill serve.
-                Err(e) => {
-                    if tx.send(Err(e)).await.is_err() {
-                        break; // consumer dropped → stop accepting
-                    }
-                    continue;
-                }
-            };
-            let Some(config) = config() else {
-                drop(tcp);
-                continue;
-            };
-            let acceptor = TlsAcceptor::from(config);
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                // A failed handshake (untrusted cert, garbage) is surfaced as an
-                // Err item; tonic drops that one connection and keeps serving.
-                let _ = tx.send(acceptor.accept(tcp).await).await;
-            });
-        }
-    });
-    ReceiverStream::new(rx)
+    super::tls_incoming::incoming(
+        listener,
+        move || config().map(|config| (config, ())),
+        |_: &()| true,
+    )
 }
 
 /// One-shot: bind `addr` and produce the federated-mTLS accept stream that
@@ -641,6 +603,86 @@ mod tests {
             key_pem: key.serialize_pem().into_bytes(),
             ca_pem,
         }
+    }
+
+    fn rebind_listener(address: std::net::SocketAddr) -> io::Result<TcpListener> {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        // Match TcpListener::bind's Unix reuse policy without an await that
+        // could schedule a detached accept loop before the assertion.
+        #[cfg(unix)]
+        socket.set_reuseaddr(true)?;
+        socket.bind(address)?;
+        socket.listen(1024)
+    }
+
+    #[test]
+    fn dropping_an_unpolled_tls_stream_releases_its_listener_immediately() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let incoming = tls_incoming(listener, || None);
+                drop(incoming);
+                let _replacement = rebind_listener(address)
+                    .expect("dropping the stream must synchronously release its listening socket");
+            });
+    }
+
+    #[test]
+    fn dropping_a_tls_stream_releases_its_listener_and_pending_handshake() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ca, ca_key) = mint_ca("cluster");
+                let node = mint_node(&ca, &ca_key);
+                let verifier = FederatedClientCertVerifier::new(&node.ca_pem).unwrap();
+                let config =
+                    Arc::new(server_config(verifier, &node.cert_pem, &node.key_pem).unwrap());
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let accepted = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&accepted);
+                let mut incoming = Box::pin(tls_incoming(listener, move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::clone(&config))
+                }));
+                let mut peer = TcpStream::connect(address).await.unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        assert!(incoming.as_mut().poll_next(cx).is_pending());
+                        if accepted.load(Ordering::SeqCst) == 1 {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                )
+                .await
+                .expect("the actual TCP connection reaches TLS admission");
+                drop(incoming);
+                let _replacement = rebind_listener(address)
+                    .expect("a pending handshake cannot retain the listening socket");
+                let mut byte = [0];
+                let result = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut byte))
+                    .await
+                    .expect("dropping the stream cancels its pending handshake");
+                assert!(
+                    matches!(result, Ok(0))
+                        || matches!(result, Err(ref error)
+                    if error.kind() == io::ErrorKind::ConnectionReset)
+                );
+            });
     }
 
     /// A replaced Node identity is what every NEW handshake presents, while a
