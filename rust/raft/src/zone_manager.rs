@@ -2308,7 +2308,10 @@ impl ZoneManager {
         // Zones first: an in-flight handler of a stopped zone fails at once
         // instead of holding the server's drain open on a live proposal.
         let stopped = self.registry.shutdown();
-        let server = self.server_task.lock().take();
+        // Keep the shutdown owner until the server releases its resources.
+        // Concurrent callers must wait for that same completion.
+        let mut server_owner = self.server_task.lock();
+        let server = server_owner.take();
         bridge_block_on(self.rt().handle(), async {
             stopped.released().await;
             if let Some(tx) = self.shutdown_tx.lock().await.take() {
@@ -2320,6 +2323,7 @@ impl ZoneManager {
                 }
             }
         });
+        drop(server_owner);
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
@@ -2805,6 +2809,10 @@ mod tests {
         let _ = zm.create_zone("z1").expect("create idempotent on restart");
     }
 }
+
+#[cfg(test)]
+#[path = "zone_manager/shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod bind_failure_tests {
