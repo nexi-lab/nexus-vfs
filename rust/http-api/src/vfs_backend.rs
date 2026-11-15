@@ -4,9 +4,9 @@ use crate::upstream::GrpcEndpoint;
 use crate::BackendError;
 use contracts::constants::MAX_GRPC_MESSAGE_BYTES;
 use kernel::kernel::vfs_proto::nexus_vfs_service_client::NexusVfsServiceClient;
+use nexus_search_common::transport::CredentialChannel;
 use nexus_search_common::transport::PeerChannelCache;
 use std::sync::Arc;
-use tonic::transport::Channel;
 
 #[derive(Clone)]
 pub struct VfsBackend {
@@ -26,7 +26,7 @@ impl VfsBackend {
         Self { endpoint }
     }
 
-    pub async fn client(&self) -> Result<NexusVfsServiceClient<Channel>, BackendError> {
+    pub async fn client(&self) -> Result<NexusVfsServiceClient<CredentialChannel>, BackendError> {
         Ok(NexusVfsServiceClient::new(self.endpoint.channel().await?)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES))

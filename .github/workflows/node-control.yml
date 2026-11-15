@@ -28,6 +28,9 @@ on:
       - 'rust/transport/src/runtime_scope.rs'
       - 'rust/transport/tests/user_runtime_scope.rs'
       - 'rust/profiles/cluster/**'
+      - 'rust/search-common/**'
+      - 'rust/search-plugin/**'
+      - 'rust/http-api/**'
       - 'rust/managed_agent/**'
       - 'rust/lib/src/transport_primitives/**'
       - 'rust/lib/src/rt.rs'
@@ -98,6 +101,8 @@ jobs:
       - name: Content peer TLS configuration and connection rotation
         run: |
           cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::credential_channel::tests
+          cargo test --locked -p nexus-search-common --features transport --lib transport::tests
           cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls_server::tests
           cargo test --locked -p transport --lib peer_blob::
           cargo test --locked -p transport --lib federation::
@@ -134,3 +139,7 @@ jobs:
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator
       - name: Allocation-bound replica issuer and original-operation readback
         run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test replica_issuer -- --test-threads=1
+      - name: HTTP clients consume the live node identity
+        run: |
+          cargo test --locked -p nexus-http-api --features rebac --tests
+          cargo test --locked -p nexus-cluster --features http-api --test http_identity --test production_http_files -- --test-threads=1
