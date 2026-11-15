@@ -282,6 +282,10 @@ pub(super) async fn serve(
         .map_err(|_| anyhow::anyhow!("runtime verifier already installed"))?;
     let scope = scope.with_server_identity(identity.clone());
     let ready = DataPlaneReady::pending();
+    let zone_ops: transport::zone_runtime::ZoneRuntimeOpsSlot =
+        Arc::new(std::sync::OnceLock::new());
+    let zone_caps: transport::zone_runtime::ZoneRuntimeCapabilitiesSlot =
+        Arc::new(std::sync::OnceLock::new());
     let routes = build_user_runtime_routes(
         Arc::clone(&kernel),
         Arc::clone(&auth),
@@ -291,6 +295,17 @@ pub(super) async fn serve(
         contracts::MAX_GRPC_MESSAGE_BYTES,
         super::daemon_version_string(),
     );
+    let zone_routes = transport::zone_runtime::build_user_zone_runtime_routes(
+        Arc::clone(&auth),
+        Arc::clone(&zone_ops),
+        Arc::clone(&ready),
+        Arc::clone(&kernel),
+        Arc::clone(&zone_caps),
+        Arc::clone(&verifier_slot),
+        scope.clone(),
+        contracts::MAX_GRPC_MESSAGE_BYTES,
+    );
+    let routes = tonic::service::Routes::from(routes.into_axum_router().merge(zone_routes));
     let routes = super::plugin_loading::routes(
         routes,
         &kernel,
@@ -322,6 +337,11 @@ pub(super) async fn serve(
     {
         bail!("user root zone has no leader; durable writes are unavailable");
     }
+    let zone_backend = nexus_raft::ZoneRuntimeBackend::for_local_root(Arc::clone(&zones))
+        .map_err(|error| anyhow::anyhow!("open confined user zone journal: {error}"))?;
+    if zone_ops.set(Arc::new(zone_backend)).is_err() {
+        bail!("user zone backend was already installed");
+    }
     let peer_client = Arc::new(transport::federation::FederationClient::with_shared_tls(
         kernel.runtime().handle().clone(),
         identity.clone(),
@@ -352,6 +372,28 @@ pub(super) async fn serve(
         .bring_up_services(build_decls(&ctx))
         .map_err(|error| anyhow::anyhow!("bring up user runtime services: {error}"))?;
     backends.install(&kernel)?;
+    let mut capabilities = vec![
+        "zone-runtime:status".into(),
+        "zone-runtime:mount".into(),
+        "zone-runtime:unmount".into(),
+        "zone-runtime:remove-replica".into(),
+        "zone-runtime:operation-journal".into(),
+    ];
+    if initial.identity.replica_id.is_some() {
+        capabilities.push("zone-runtime:join".into());
+    }
+    let capabilities = transport::zone_runtime::ZoneRuntimeCapabilities {
+        node_id: zones.node_id().to_string(),
+        auth_armed: true,
+        auth_mode: auth.mode().to_owned(),
+        permission_provider_armed: kernel.permission_provider_armed(),
+        journal_zone: contracts::ROOT_ZONE_ID.into(),
+        deletion_protection: false,
+        capabilities,
+    };
+    if zone_caps.set(Arc::new(capabilities)).is_err() {
+        bail!("user zone capabilities were already installed");
+    }
     ready.mark_ready();
     tracing::info!(owner = %owner, bind = %bind, replica = ?initial.identity.replica_id, "confined user runtime ready");
     let reload = tokio::spawn(async move {

@@ -1753,3 +1753,198 @@ async fn replica_listener_keeps_the_owner_boundary_and_local_root_across_restart
         drop(daemon);
     }
 }
+
+#[tokio::test]
+async fn owner_zone_runtime_preserves_scope_and_original_journal_across_restart() {
+    use kernel::kernel::vfs_proto::{
+        zone_runtime_service_client::ZoneRuntimeServiceClient, GetRuntimeCapabilitiesRequest,
+        GetZoneOperationRequest, ZoneCreateRequest, ZoneDeprovisionRequest, ZoneMutationHeader,
+        ZoneStatusRequest, ZoneUnmountRequest,
+    };
+    use nexus_raft::transport::{generate_node_cert, generate_user_replica_cert};
+
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let mut clients = Vec::new();
+    for owner in ["alice", "bob"] {
+        let actor = format!("session-{owner}");
+        let (cert, key) = generate_session_agent_cert(&actor, owner, 300, &ca, &ca_key).unwrap();
+        clients.push(bundle(
+            &root.path().join(owner),
+            &actor,
+            "alice",
+            &ca,
+            &cert,
+            &key,
+        ));
+    }
+    let (node_cert, node_key) = generate_node_cert(19, "root", &ca, &ca_key, &[], None).unwrap();
+    let node = bundle(
+        &root.path().join("node"),
+        "controller",
+        "alice",
+        &ca,
+        &node_cert,
+        &node_key,
+    );
+    for is_replica in [false, true] {
+        let profile = if is_replica { "replica" } else { "ordinary" };
+        let (cert, key) = if is_replica {
+            generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key)
+        } else {
+            generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key)
+        }
+        .unwrap();
+        let credential = root.path().join(format!("credential-{profile}"));
+        bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+        let data = root.path().join(format!("data-{profile}"));
+        let port = free_port();
+        let mut original_record = None;
+        let mut original_node_id = None;
+        for round in 0..2 {
+            let mut daemon = start(&data, &credential, "alice", port);
+            daemon
+                .wait_for_log("confined user runtime ready", BUDGET)
+                .await
+                .unwrap();
+            let mut owner =
+                ZoneRuntimeServiceClient::new(dial_channel(port, &clients[0]).await.unwrap());
+            let mut other =
+                ZoneRuntimeServiceClient::new(dial_channel(port, &clients[1]).await.unwrap());
+            let mut controller =
+                ZoneRuntimeServiceClient::new(dial_channel(port, &node).await.unwrap());
+            let caps = owner
+                .get_runtime_capabilities(GetRuntimeCapabilitiesRequest::default())
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(caps.data_plane_ready);
+            assert!(caps.auth.as_ref().unwrap().armed);
+            assert_eq!(caps.zone_runtime.as_ref().unwrap().journal_zone, "root");
+            assert!(!caps.zone_runtime.as_ref().unwrap().deletion_protection);
+            assert!(caps
+                .capabilities
+                .iter()
+                .any(|c| c == "zone-runtime:operation-journal"));
+            assert_eq!(
+                caps.capabilities.iter().any(|c| c == "zone-runtime:join"),
+                is_replica
+            );
+            assert!(!caps.capabilities.iter().any(|c| matches!(
+                c.as_str(),
+                "zone-runtime:create" | "zone-runtime:deprovision"
+            )));
+            match &original_node_id {
+                None => original_node_id = Some(caps.node_id),
+                Some(expected) => assert_eq!(&caps.node_id, expected),
+            }
+            let status = ZoneStatusRequest {
+                zone_id: "root".into(),
+                ..Default::default()
+            };
+            assert!(owner
+                .zone_status(status.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .cluster
+                .is_none());
+            assert_eq!(
+                other.zone_status(status.clone()).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                controller.zone_status(status).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+
+            let forbidden = ZoneMutationHeader {
+                operation_id: "forbidden-create".into(),
+                request_hash: 0,
+            };
+            assert_eq!(
+                owner
+                    .zone_create(ZoneCreateRequest {
+                        zone_id: "global-data".into(),
+                        mutation: Some(forbidden),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                owner
+                    .zone_deprovision(ZoneDeprovisionRequest {
+                        zone_id: "global-data".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                owner
+                    .get_zone_operation(GetZoneOperationRequest {
+                        operation_id: "forbidden-create".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::NotFound
+            );
+            assert!(!data.join("global-data").exists());
+
+            let request = ZoneUnmountRequest {
+                parent_zone_id: "root".into(),
+                mount_path: "/missing".into(),
+                mutation: Some(ZoneMutationHeader {
+                    operation_id: "original-unmount".into(),
+                    request_hash: 0,
+                }),
+                ..Default::default()
+            };
+            let readback = GetZoneOperationRequest {
+                operation_id: "original-unmount".into(),
+                ..Default::default()
+            };
+            if round == 1 {
+                assert_eq!(
+                    owner
+                        .get_zone_operation(readback.clone())
+                        .await
+                        .unwrap()
+                        .into_inner(),
+                    *original_record.as_ref().unwrap()
+                );
+            }
+            assert_eq!(
+                owner.zone_unmount(request).await.unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+            let record = owner
+                .get_zone_operation(readback.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(record.operation_id, "original-unmount");
+            assert_eq!(record.error, "operation was rejected");
+            match &original_record {
+                None => original_record = Some(record),
+                Some(expected) => assert_eq!(&record, expected),
+            }
+            assert_eq!(
+                other.get_zone_operation(readback).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+            assert!(!data.join("tls/ca-key.pem").exists());
+            drop(controller);
+            drop(other);
+            drop(owner);
+            drop(daemon);
+        }
+    }
+}
