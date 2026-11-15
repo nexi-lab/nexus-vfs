@@ -169,6 +169,7 @@ pub(crate) async fn forward_propose(
             }
             // Dialed under the lock: overlapping forwards share the one dial.
             _ => {
+                *cached = None;
                 let client =
                     connect_api_client(client_pool.config(), &leader_addr.endpoint).await?;
                 *cached = Some((leader_addr.endpoint.clone(), client.clone()));

@@ -1166,7 +1166,7 @@ pub enum JoinRound {
 /// follower's redirect to its leader once, until a leader admits
 /// `node_id` (advertising `node_address`). The one round data nodes and
 /// witnesses run; the replica they host and the retry policy around the
-/// round are theirs.
+/// round are theirs. Each endpoint and redirect reads the current credentials.
 pub async fn join_zone_round(
     endpoints: impl IntoIterator<Item = String>,
     zone_id: &str,
