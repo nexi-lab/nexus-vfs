@@ -51,6 +51,21 @@ their existing VFS semantics at the VFS boundary. Scoped peer clients use the
 same explicit RPC across versions and preserve an unsupported-method error.
 See [profile storage composition](../rust/profiles/README.md).
 
+Cold-segment reads retain the committed index object ID alongside the zone,
+stream path and exact segment base. The peer compares that ID before reading
+the indexed object. A versioned `nexus-cold-v1:` request is neither a VFS path
+nor a raw CAS hash, so an older reader refuses it without a legacy retry.
+The stored segment key, Raft command and durable index format stay unchanged.
+An object ID comparison does not establish a storage incarnation: path-addressed
+objects still require the original owning storage binding when their IDs can
+be reused.
+
+Cold reads retain their existing enrolled-owner check. Managed tenant
+record-lifetime admission and the specialized logical-file owner boundary
+remain a separate, unqualified Session capability. Raw CAS replication retains
+its existing contract. Session consumers require the owning Session service
+and its original storage authority.
+
 ## Outgoing replication identity
 
 The Raft peer pool connects to the Node ID selected by the transport's route.
