@@ -1,8 +1,8 @@
 //! Node address and TLS channels shared by the HTTP protocol clients.
 
+use nexus_search_common::transport::CredentialChannel;
 use nexus_search_common::transport::{DialError, PeerChannelCache, PeerChannelConfig};
 use std::sync::Arc;
-use tonic::transport::Channel;
 
 #[derive(Clone)]
 pub(crate) struct GrpcEndpoint {
@@ -28,7 +28,7 @@ impl GrpcEndpoint {
         }
     }
 
-    pub(crate) async fn channel(&self) -> Result<Channel, DialError> {
+    pub(crate) async fn channel(&self) -> Result<CredentialChannel, DialError> {
         self.channels.get_or_dial(&self.target).await
     }
 }
