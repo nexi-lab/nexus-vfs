@@ -176,6 +176,66 @@ class Journey:
         response = self.request(label, claim, grant)
         assert response == {"outcome": "not_submitted", "detail": detail}, (label, response)
 
+    def named_agents(self):
+        """Two product Agents use their own names, never a frontend thread claim."""
+        workspaces = {name: self.root / name for name in ("private-executor", "private-verifier")}
+        for workspace in workspaces.values():
+            workspace.mkdir()
+        grant = self.root / "named" / "grant.json"
+        argv = [str(self.operator), "--initialize", "--grant", str(grant),
+                "--data-dir", str(self.data), "--endpoint", f"https://{self.node.address}"]
+        for name in ("con", "com1", "../escape", "Upper", "a" * 65):
+            invalid = subprocess.run(argv + ["--agent", f"{name}={self.workspace}"],
+                                     env=self.node.env, capture_output=True, timeout=30)
+            assert invalid.returncode != 0, name
+            assert not grant.exists(), "Invalid names must not publish a grant"
+        for name, workspace in workspaces.items():
+            argv += ["--agent", f"{name}={workspace}"]
+        initialized = subprocess.run(argv, env=self.node.env, capture_output=True, timeout=30)
+        assert initialized.returncode == 0, initialized.stderr.decode(errors="replace")
+        assert json.loads(initialized.stdout)["issued"] is False
+        policy = json.loads(grant.read_text(encoding="utf-8"))
+        state = Path(policy["stateDirectory"])
+        assert policy["version"] == 2 and policy["purpose"] == "named-agent-a2a"
+        assert not state.exists(), "Named grant preparation issues nothing"
+        claims = [{"version": 2, "actor": name,
+                   "operationId": f"20000000-0000-4000-8000-00000000000{i}",
+                   "workspace": str(workspace)} for i, (name, workspace) in enumerate(workspaces.items(), 1)]
+        first = claims[0]
+        child = Path(first["workspace"]) / "child"
+        child.mkdir()
+        for label, claim in (
+            ("named-ungranted", first | {"actor": "ungranted"}),
+            ("named-other-workspace", first | {"workspace": claims[1]["workspace"]}),
+            ("named-child-workspace", first | {"workspace": str(child)}),
+            ("named-forged-thread", first | {"threadId": "30000000-0000-4000-8000-000000000001"}),
+            ("named-path-name", first | {"actor": "../private-executor"}),
+            ("named-frontend-claim", self.claim("a", "1")),
+        ):
+            assert self.request(label, claim, grant)["outcome"] == "not_submitted", label
+        assert self.request("named-on-old-grant", first)["outcome"] == "not_submitted"
+        assert not state.exists(), "Named preflight refusals must not reserve"
+        receipts = []
+        hashes = []
+        for i, claim in enumerate(claims):
+            receipt = self.request(f"named-mint-{i}", claim, grant)
+            assert receipt["actor"] == claim["actor"], receipt
+            receipts.append(receipt)
+            hashes.append(digest(Path(receipt["credentialDirectory"]) / "agent.pem"))
+        assert hashes[0] != hashes[1], "Two Agents must have distinct actual credentials"
+        self.node.stop()
+        for i, claim in enumerate(claims):
+            # Offline replay must not contact or implicitly start the Node.
+            assert self.request(f"named-offline-replay-{i}", claim, grant) == receipts[i]
+        self.node.start()
+        for i, claim in enumerate(claims):
+            assert self.request(f"named-restart-replay-{i}", claim, grant) == receipts[i]
+            assert digest(Path(receipts[i]["credentialDirectory"]) / "agent.pem") == hashes[i]
+        changed = first | {"operationId": "40000000-0000-4000-8000-000000000001"}
+        assert self.request("named-different-operation", changed, grant)["outcome"] == "unknown"
+        self.proof.update(namedAgentsMinted=True, namedExactWorkspaceEnforced=True,
+                          namedOfflineAndRestartReplay=True, frontendGrantUnchanged=True)
+
     def run(self):
         self.node.start()
         identity = f"nexus://zone/root/node/{node_id(self.data)}"
@@ -231,6 +291,9 @@ class Journey:
         assert claude_receipt["actor"] == claude["actor"], claude_receipt
         assert self.request("claude-replay", claude) == claude_receipt
         assert (Path(claude_receipt["credentialDirectory"]) / "agent.pem").is_file()
+
+        self.proof["stage"] = "named product Agents"
+        self.named_agents()
 
         self.proof["stage"] = "unreachable issuer is not submitted"
         self.node.stop()

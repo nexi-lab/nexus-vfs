@@ -52,6 +52,49 @@ repository or a peer-writable mount. The common owner-only persistence helper
 protects new records on Unix and Windows. Possession of the Node credential is
 verified by the server; a caller-supplied owner name is never authentication.
 
+## Named product Agents
+
+A standalone SudoCode deployment can explicitly grant two persistent names
+without presenting them as Codex threads or Claude Code sessions:
+
+```sh
+nexus-agent-enroll --data-dir /absolute/existing-box \
+  --initialize --grant /absolute/private/named-grant.json \
+  --endpoint https://selected-issuer:2126 \
+  --agent private-executor=/absolute/workspaces/executor \
+  --agent private-verifier=/absolute/workspaces/verifier
+```
+
+This creates a version-2 `named-agent-a2a` grant, issues nothing, and authorizes
+only those exact names at their distinct canonical existing directories.
+`--agent` and `--workspace-root` cannot be combined. Names are portable single
+components: 1-64 lowercase letters, digits or hyphens, starting with a letter;
+Windows device names are excluded on every platform.
+An existing grant is never rewritten or expanded implicitly. Version-1 frontend
+grants retain their original prefix and workspace-subtree rules.
+
+Each named Agent submits one version-2 claim through the same client:
+
+```json
+{"version":2,"actor":"private-executor","operationId":"00000000-0000-4000-8000-000000000001","workspace":"/absolute/workspaces/executor"}
+```
+
+There is no `threadId`: the operation enrolls a durable product Agent, not a
+frontend thread. A new session does not require another issuance. A wrong name,
+the other Agent's directory, a child directory, a frontend claim or an added
+thread identity is refused before reserving or sending. Claims cannot select
+an issuer, credential path or Node authority. The existing Node/CA pins, single
+MintAgent RPC, ordinary Agent credential writer and conservative recovery below
+apply unchanged. The grant supplies local enrollment policy, not a new server
+authorization role or identity store.
+
+Native real-process acceptance covers two distinct credentials, offline and
+post-restart replay without replacement, cross-workspace refusal and unchanged
+frontend grants. This client does not launch or supervise either Agent, create
+an ACP session, publish the OS-user Node record, or qualify product A2A delivery.
+
+## Frontend claims and shared recovery
+
 The command accepts one JSON claim on stdin, bounded to 8 KiB:
 
 ```json
