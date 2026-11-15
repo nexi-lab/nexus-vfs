@@ -170,6 +170,12 @@ struct ZoneRequest {
     owner: Option<Arc<OwnerRequest>>,
 }
 
+// Zone control operations share one blocking worker per response type. Erase
+// the small operation closure before spawning so each RPC does not instantiate
+// its own copy of Tokio's worker, cancellation and result machinery.
+type ZoneOperation<T> =
+    Box<dyn FnOnce(&dyn ZoneRuntimeOps, &OperationContext) -> Result<T, Status> + Send>;
+
 impl ZoneRequest {
     fn check(&self) -> Result<OperationContext, Status> {
         self.owner
@@ -205,7 +211,9 @@ impl ZoneRuntimeServiceImpl {
                 Arc::clone(&self.auth),
                 Arc::clone(&self.foreign_ca_verifier),
                 Arc::clone(scope),
-                &req,
+                req.get_ref().auth_token(),
+                req.extensions(),
+                req.metadata(),
             )?);
             let context = owner.context().clone();
             return Ok((
@@ -256,9 +264,7 @@ impl ZoneRuntimeServiceImpl {
         request: Arc<ZoneRequest>,
         mutation: bool,
         mount: Option<(String, String)>,
-        operation: impl FnOnce(&dyn ZoneRuntimeOps, &OperationContext) -> Result<T, Status>
-            + Send
-            + 'static,
+        operation: ZoneOperation<T>,
     ) -> Result<T, Status> {
         let ops = self.ops()?;
         let worker = Arc::clone(&request);
@@ -345,9 +351,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         self.require_mutation(&request, "create")?;
         let out = self
-            .execute(request, true, None, move |ops, _context| {
-                ops.zone_create(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_create(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -359,9 +368,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         self.require_mutation(&request, "join")?;
         let out = self
-            .execute(request, true, None, move |ops, _context| {
-                ops.zone_join(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_join(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -374,9 +386,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         self.require_mutation(&request, "mount")?;
         let mount = Some((inner.parent_zone_id.clone(), inner.mount_path.clone()));
         let out = self
-            .execute(request, true, mount, move |ops, _context| {
-                ops.zone_mount(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                mount,
+                Box::new(move |ops, _context| ops.zone_mount(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -389,9 +404,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         self.require_mutation(&request, "unmount")?;
         let mount = Some((inner.parent_zone_id.clone(), inner.mount_path.clone()));
         let out = self
-            .execute(request, true, mount, move |ops, _context| {
-                ops.zone_unmount(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                mount,
+                Box::new(move |ops, _context| ops.zone_unmount(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -403,9 +421,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         self.require_mutation(&request, "remove_replica")?;
         let out = self
-            .execute(request, true, None, move |ops, _context| {
-                ops.zone_remove_replica(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_remove_replica(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -417,9 +438,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         self.require_mutation(&request, "deprovision")?;
         let out = self
-            .execute(request, true, None, move |ops, _context| {
-                ops.zone_deprovision(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_deprovision(&inner).map_err(status_from)),
+            )
             .await?;
         Ok(Response::new(out))
     }
@@ -431,9 +455,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         let operator = request.context.is_admin || request.context.is_system;
         let mut out = self
-            .execute(request, false, None, move |ops, _| {
-                ops.zone_status(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                false,
+                None,
+                Box::new(move |ops, _| ops.zone_status(&inner).map_err(status_from)),
+            )
             .await?;
         if !operator {
             out.cluster = None;
@@ -448,9 +475,12 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         let (request, inner) = self.authenticate(req).await?;
         let operator = request.context.is_admin || request.context.is_system;
         let mut out = self
-            .execute(request, false, None, move |ops, _| {
-                ops.get_zone_operation(&inner).map_err(status_from)
-            })
+            .execute(
+                request,
+                false,
+                None,
+                Box::new(move |ops, _| ops.get_zone_operation(&inner).map_err(status_from)),
+            )
             .await?;
         if !operator {
             if let Some(receipt) = out.receipt.as_mut() {

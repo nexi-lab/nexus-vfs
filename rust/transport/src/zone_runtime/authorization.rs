@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use kernel::kernel::OperationContext;
 use lib::transport_primitives::{SharedTlsConfig, TlsSnapshot};
-use tonic::{Request, Status};
+use tonic::Status;
 
 use crate::auth::AuthProvider;
-use crate::grpc::{resolve_request_identity, AuthedRequest, ForeignCaVerifierSlot};
+use crate::grpc::{resolve_request_identity, ForeignCaVerifierSlot};
 use crate::runtime_scope::RuntimeScope;
 
 pub(super) struct OwnerRequest {
@@ -23,11 +23,14 @@ pub(super) struct OwnerRequest {
 }
 
 impl OwnerRequest {
-    pub(super) fn capture<T: AuthedRequest>(
+    #[inline(never)]
+    pub(super) fn capture(
         auth: Arc<dyn AuthProvider>,
         verifier: ForeignCaVerifierSlot,
         scope: Arc<RuntimeScope>,
-        request: &Request<T>,
+        token: &str,
+        extensions: &tonic::Extensions,
+        metadata: &tonic::metadata::MetadataMap,
     ) -> Result<Self, Status> {
         let source = scope.server_identity().cloned().ok_or_else(|| {
             Status::unavailable("owner zone operations require a live receiver credential")
@@ -41,21 +44,15 @@ impl OwnerRequest {
         // The shared resolver consumes the actual envelope, including current
         // certificate validity and revocation; cached in-process contexts are
         // intentionally handled only by the ordinary VFS resolver.
-        let original = resolve_request_identity(
-            &auth,
-            &verifier,
-            Some(&scope),
-            request.get_ref().auth_token(),
-            request.extensions(),
-            request.metadata(),
-        )?;
+        let original =
+            resolve_request_identity(&auth, &verifier, Some(&scope), token, extensions, metadata)?;
         let captured = Self {
             auth,
             verifier,
             scope,
-            token: request.get_ref().auth_token().to_owned(),
-            extensions: request.extensions().clone(),
-            metadata: request.metadata().clone(),
+            token: token.to_owned(),
+            extensions: extensions.clone(),
+            metadata: metadata.clone(),
             source,
             installation,
             original,
