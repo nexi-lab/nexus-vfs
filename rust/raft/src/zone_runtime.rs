@@ -148,6 +148,11 @@ impl ZoneRuntimeBackend {
         })
     }
 
+    /// Whether operations are confined to this process's private root.
+    pub fn is_local_root(&self) -> bool {
+        self.deletions.is_none()
+    }
+
     fn deletion_authority(&self) -> Result<&ZoneDeletionRegistry, ZoneRuntimeError> {
         self.deletions.as_deref().ok_or_else(|| {
             ZoneRuntimeError::PermissionDenied(

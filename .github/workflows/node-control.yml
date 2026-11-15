@@ -27,6 +27,9 @@ on:
       - 'rust/transport/src/test_peer.rs'
       - 'rust/transport/src/runtime_scope.rs'
       - 'rust/transport/tests/user_runtime_scope.rs'
+      - 'rust/transport/src/zone_runtime.rs'
+      - 'rust/transport/src/zone_runtime/**'
+      - 'rust/transport/tests/user_zone_runtime.rs'
       - 'rust/profiles/cluster/**'
       - 'rust/search-common/**'
       - 'rust/search-plugin/**'
@@ -67,6 +70,8 @@ jobs:
           cache-key: node-control-${{ matrix.os }}
       - run: cargo test --locked -p raft@0.1.0 --test node_rpc_boundaries
       - run: cargo test --locked -p raft@0.1.0 --test generated_contract_binding
+      - name: Confined owner zone operations
+        run: cargo test --locked -p transport --test user_zone_runtime -- --test-threads=1
       - name: Durable replica allocation authority
         run: |
           cargo test --locked -p raft@0.1.0 --lib raft::node::storage_submission_tests
