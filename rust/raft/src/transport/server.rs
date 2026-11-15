@@ -1019,6 +1019,30 @@ impl ZoneApiServiceImpl {
         })
     }
 
+    async fn replica_csr_response(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+        query_only: bool,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        let caller = peer_cert_der(&request);
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().clone());
+        let Some(minter) = minter else {
+            return Ok(Response::new(super::proto::ReplicaCsrResponse {
+                state: super::proto::ReplicaCsrState::Refused as i32,
+                error: Some("allocation-bound replica issuer is unarmed on this node".into()),
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(
+            minter
+                .replica_csr_v1(caller, request.into_inner(), query_only)
+                .await,
+        ))
+    }
+
     async fn agent_csr_response(
         &self,
         request: Request<super::proto::AgentCsrRequest>,
@@ -1043,6 +1067,43 @@ impl ZoneApiServiceImpl {
 
 #[tonic::async_trait]
 impl ZoneApiService for ZoneApiServiceImpl {
+    async fn control_replica_v1(
+        &self,
+        request: Request<super::proto::ReplicaControlRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaControlResponse>, Status> {
+        let caller = peer_cert_der(&request);
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().clone());
+        let Some(minter) = minter else {
+            return Ok(Response::new(super::proto::ReplicaControlResponse {
+                state: super::proto::ReplicaControlState::Refused as i32,
+                error: Some("replica lifecycle controller is unarmed on this node".into()),
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(
+            minter
+                .replica_control_v1(caller, request.into_inner())
+                .await,
+        ))
+    }
+
+    async fn issue_replica_csr_v1(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        self.replica_csr_response(request, false).await
+    }
+
+    async fn query_replica_csr_v1(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        self.replica_csr_response(request, true).await
+    }
+
     async fn get_agent_csr_capabilities(
         &self,
         _request: Request<super::proto::AgentCsrCapabilitiesRequest>,

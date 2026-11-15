@@ -174,6 +174,12 @@ service ZoneApiService {
   rpc IssueAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
   rpc QueryAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
 
+  // Current local Node controllers supply an original allocation-bound intent.
+  // Both operations use the CA-holder slot on this strict-mTLS listener.
+  rpc IssueReplicaCsrV1(ReplicaCsrRequest) returns (ReplicaCsrResponse);
+  rpc QueryReplicaCsrV1(ReplicaCsrRequest) returns (ReplicaCsrResponse);
+  rpc ControlReplicaV1(ReplicaControlRequest) returns (ReplicaControlResponse);
+
   // MintSessionAgent signs a SESSION credential: an agent identity bound to an
   // owner, with a fresh per-call subject and a short validity. Unlike MintAgent
   // this is reachable by an AGENT caller — that is its purpose, so a front door
@@ -277,6 +283,64 @@ message PrepareReplicaControlReaderResponse {
   // readers return an empty reply, which decodes to false. Member-set
   // validation and replicated activation remain separate.
   bool replica_control_transport_v1 = 1;
+}
+
+// The oneof names the existing native contract encoded as UTF-8 JSON. Preserve
+// exact uint64 values and the original command bytes across uncertain replies.
+message ReplicaControlRequest {
+  oneof operation {
+    bytes apply_binding_json = 1;      // ReplicaBindingRequest
+    bytes current_binding_json = 2;    // ReplicaAllocation
+    bytes reconcile_binding_json = 3;  // original ReplicaBindingRequest
+    bytes apply_issuer_json = 4;        // ReplicaIssuanceRequest: Authority or Revoke
+    ReplicaIssuerQuery current_issuer = 5;
+    bytes reconcile_issuer_json = 6;    // original Authority or Revoke request
+  }
+}
+message ReplicaIssuerQuery {}
+enum ReplicaControlState {
+  REPLICA_CONTROL_STATE_UNSPECIFIED = 0;
+  // result_json is the original typed outcome or current durable fact.
+  REPLICA_CONTROL_STATE_RESULT = 1;
+  // Absence is an observation; an earlier proposal may still commit.
+  REPLICA_CONTROL_STATE_NOT_OBSERVED = 2;
+  REPLICA_CONTROL_STATE_REFUSED = 3;
+  REPLICA_CONTROL_STATE_UNKNOWN = 4;
+}
+message ReplicaControlResponse {
+  ReplicaControlState state = 1;
+  optional string error = 2;
+  bytes result_json = 3;
+}
+
+// UTF-8 JSON is the existing contracts::ReplicaIssuanceRequest encoding.
+// Callers retain its original Prepare variant as opaque bytes; uint64 fields
+// must retain their exact integer representation across client languages.
+message ReplicaCsrRequest {
+  bytes preparation_json = 1;
+  string publication_operation_id = 2;
+  bytes csr_pem = 3;
+  optional ReplicaCsrRenewalProof renewal = 4;
+}
+message ReplicaCsrRenewalProof {
+  uint64 issued_at_unix_ms = 1;
+  bytes signature = 2;
+}
+enum ReplicaCsrState {
+  REPLICA_CSR_STATE_UNSPECIFIED = 0;
+  REPLICA_CSR_STATE_PUBLISHED = 1;
+  REPLICA_CSR_STATE_PREPARED = 2;
+  REPLICA_CSR_STATE_NOT_OBSERVED = 3; // unresolved: an original proposal may still commit
+  REPLICA_CSR_STATE_REFUSED = 4; // current invocation refused; preserve original operation
+  REPLICA_CSR_STATE_UNKNOWN = 5; // reconcile the original operation before another mutation
+}
+message ReplicaCsrResponse {
+  ReplicaCsrState state = 1;
+  optional string error = 2;
+  string operation_id = 3;
+  bytes preparation_json = 4;
+  bytes certificate_der = 5;
+  bytes ca_pem = 6;
 }
 
 message AgentCsrCapabilitiesRequest {}

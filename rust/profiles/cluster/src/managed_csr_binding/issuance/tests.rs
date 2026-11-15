@@ -163,6 +163,7 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
         tls_dir: tls_dir.clone(),
         data_dir: private.path().to_path_buf(),
         session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        replica_store: crate::replica_rpc::new_store_slot(),
         peer_verifier: verifier_slot.clone(),
     }));
     let kernel = Arc::new(Kernel::new());

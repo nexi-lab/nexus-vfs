@@ -92,6 +92,33 @@ pub struct SessionRenewal<'a> {
 /// the gate + the CA + the store all live in the impl (cluster profile).
 #[tonic::async_trait]
 pub trait CaIssuer: Send + Sync {
+    /// Allocation-bound issuance shares the configured CA holder. The request
+    /// contains public intent/proof bytes; caller identity comes from mTLS.
+    async fn replica_control_v1(
+        &self,
+        _caller_cert_der: Option<Vec<u8>>,
+        _request: crate::transport::proto::ReplicaControlRequest,
+    ) -> crate::transport::proto::ReplicaControlResponse {
+        crate::transport::proto::ReplicaControlResponse {
+            state: crate::transport::proto::ReplicaControlState::Refused as i32,
+            error: Some("replica lifecycle controller is unavailable".into()),
+            ..Default::default()
+        }
+    }
+
+    async fn replica_csr_v1(
+        &self,
+        _caller_cert_der: Option<Vec<u8>>,
+        _request: crate::transport::proto::ReplicaCsrRequest,
+        _query_only: bool,
+    ) -> crate::transport::proto::ReplicaCsrResponse {
+        crate::transport::proto::ReplicaCsrResponse {
+            state: crate::transport::proto::ReplicaCsrState::Refused as i32,
+            error: Some("allocation-bound replica issuer is unavailable".into()),
+            ..Default::default()
+        }
+    }
+
     /// No second issuer slot: compositions opt into the I/F coordinator here.
     fn csr_capabilities(&self) -> crate::transport::proto::AgentCsrCapabilitiesResponse {
         crate::transport::proto::AgentCsrCapabilitiesResponse::default()

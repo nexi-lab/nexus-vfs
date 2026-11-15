@@ -188,10 +188,21 @@ pub fn with_unrevoked_serials<T>(
     serials: &[&[u8]],
     issue: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    let _guard = unrevoked_serials_guard(path, serials)?;
+    issue()
+}
+
+// Keep the file read and serial validation shared across callback types. The
+// caller retains this same writer guard until its issuance callback returns.
+#[inline(never)]
+fn unrevoked_serials_guard(
+    path: &Path,
+    serials: &[&[u8]],
+) -> Result<std::sync::MutexGuard<'static, ()>, String> {
     if serials.is_empty() || serials.iter().any(|serial| serial.is_empty()) {
         return Err("issuance requires nonempty certificate serials".into());
     }
-    let _guard = SERIALS_WRITE_LOCK
+    let guard = SERIALS_WRITE_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if read_revoked_serials_checked(path)?
@@ -200,7 +211,7 @@ pub fn with_unrevoked_serials<T>(
     {
         return Err("session renewal refused for a revoked certificate".into());
     }
-    issue()
+    Ok(guard)
 }
 
 /// The revoked serials (raw bytes) — what the CRL is built from. Thin view over
