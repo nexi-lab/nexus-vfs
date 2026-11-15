@@ -630,7 +630,9 @@ impl KernelConvenience for Kernel {
             self.with_metastore_route(&route, |ms| ms.put(path, meta))
                 .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                 .and_then(|r| {
-                    r.map_err(|e| KernelError::IOError(format!("write create({path}): {e:?}")))
+                    r.map_err(|e| {
+                        KernelError::from_metastore(&e, format!("write create({path}): {e:?}"))
+                    })
                 })?;
             return self.sys_write_with_link_depth(path, ctx, content, offset, 1);
         }

@@ -228,4 +228,50 @@ async fn share_against_a_running_daemon_explains_itself() {
         err.contains("--cluster-init-mount") && err.contains("stop the daemon"),
         "it must offer both the no-downtime path and the offline one:\n{err}"
     );
+
+    // A free listener reaches the independent storage-lock failure.
+    let alternate_bind = format!("127.0.0.1:{}", free_port());
+    let (ok, out, err) = cli(
+        &e,
+        &[
+            "--bind-addr",
+            &alternate_bind,
+            "share",
+            MOUNT,
+            "--zone-id",
+            ZONE,
+        ],
+    );
+    assert!(
+        !ok,
+        "locked storage must refuse with a free listener:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("another process already has this data dir open") && err.contains(&data),
+        "{err}"
+    );
+    assert!(
+        err.contains("--cluster-init-mount") && err.contains("stop the daemon"),
+        "{err}"
+    );
+
+    // A different directory can conflict on the socket without being locked.
+    let other_data = tmp.path().join("other-data").to_string_lossy().into_owned();
+    let other_id = tmp.path().join("other-id").to_string_lossy().into_owned();
+    let (ok, out, err) = cli(
+        &env(&other_data, &other_id, &adv),
+        &["--bind-addr", &adv, "share", MOUNT, "--zone-id", ZONE],
+    );
+    assert!(
+        !ok,
+        "occupied listener must refuse for a separate directory:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("holds listener") && err.contains(&other_data),
+        "{err}"
+    );
+    assert!(
+        !err.contains("already has this data dir open"),
+        "a socket conflict is not storage-lock evidence: {err}"
+    );
 }

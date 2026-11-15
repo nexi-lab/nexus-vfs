@@ -1145,7 +1145,6 @@ impl ZoneRuntime {
     pub async fn zone_create(
         &mut self,
         zone_id: &str,
-        peers: &[String],
         operation_id: &str,
         token: &str,
     ) -> Result<kernel::kernel::vfs_proto::ZoneReceipt, tonic::Status> {
@@ -1158,7 +1157,6 @@ impl ZoneRuntime {
                     request_hash: 0,
                 }),
                 zone_id: zone_id.to_string(),
-                peers: peers.to_vec(),
             })
             .await?
             .into_inner())
@@ -1167,7 +1165,6 @@ impl ZoneRuntime {
     pub async fn zone_join(
         &mut self,
         zone_id: &str,
-        peers: &[String],
         learner: bool,
         operation_id: &str,
         token: &str,
@@ -1181,7 +1178,6 @@ impl ZoneRuntime {
                     request_hash: 0,
                 }),
                 zone_id: zone_id.to_string(),
-                peers: peers.to_vec(),
                 learner,
             })
             .await?

@@ -63,9 +63,8 @@ async fn old_crl_replay_and_restart_cannot_unrevoke_an_observed_serial() {
         Err(CrlStateError::Refused(_))
     ));
     drop(store);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
     let node = registry
         .open_persisted_zone(contracts::CONTROL_ZONE_ID, &runtime)
@@ -78,7 +77,7 @@ async fn old_crl_replay_and_restart_cannot_unrevoke_an_observed_serial() {
         Err(CrlStateError::Revoked)
     );
     store.check_serial(&other_ca, &serial).unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -123,7 +122,7 @@ async fn freshness_is_checked_on_every_admission_and_corrupt_state_refuses() {
         store.check_serial(&ca, &[1]),
         Err(CrlStateError::Unavailable(_))
     ));
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -198,7 +197,7 @@ async fn registered_admission_requires_exact_current_issuer_and_unambiguous_scop
     check().unwrap();
     issuers.unregister(&anchor.fingerprint_hex()).unwrap();
     assert!(matches!(check(), Err(CrlStateError::Unavailable(_))));
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,5 +232,5 @@ async fn local_admission_also_requires_fresh_crl_and_rejects_foreign_alias() {
     crls.publish(&local, &generate_crl(&[vec![7]], 1, &local, &key).unwrap())
         .unwrap();
     assert_eq!(check(), Err(CrlStateError::Revoked));
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }

@@ -12,6 +12,8 @@ mod member_preparation;
 mod reader_capability;
 #[path = "node_rpc_boundaries/reader_preparation.rs"]
 mod reader_preparation;
+#[path = "node_rpc_boundaries/replica_join.rs"]
+mod replica_join;
 #[path = "node_rpc_boundaries/replica_transport.rs"]
 mod replica_transport;
 #[path = "node_rpc_boundaries/revocation.rs"]
@@ -123,7 +125,7 @@ impl PeerServer {
     async fn shutdown_preserving_storage(self) -> tempfile::TempDir {
         self.stop.send(()).unwrap();
         self.task.await.unwrap();
-        self.registry.shutdown_all();
+        self.registry.shutdown().released().await;
         drop(self.registry);
         self._directory
     }
@@ -1146,9 +1148,8 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     stop.send(()).unwrap();
     running.await.unwrap();
     drop(node);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1272,7 +1273,6 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
     );
     stop.send(()).unwrap();
     running.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }

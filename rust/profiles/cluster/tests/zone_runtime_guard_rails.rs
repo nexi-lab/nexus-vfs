@@ -51,7 +51,7 @@ async fn bad_mount_paths_are_refused_at_admission() {
         .expect("boot wires the typed zone runtime surface");
     let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
 
-    rt.zone_create(ZONE, &[], "op-gr-create-0001", "")
+    rt.zone_create(ZONE, "op-gr-create-0001", "")
         .await
         .expect("create");
 
@@ -125,7 +125,7 @@ async fn joining_a_reserved_zone_over_rpc_is_refused() {
 
     for reserved in contracts::RESERVED_ZONE_IDS {
         let refused = rt
-            .zone_join(reserved, &[], false, "op-gr-join-reserved", "")
+            .zone_join(reserved, false, "op-gr-join-reserved", "")
             .await
             .expect_err("joining a reserved zone via RPC must be refused");
         assert_eq!(
@@ -151,7 +151,7 @@ async fn deprovision_of_a_mounted_zone_is_refused_until_unmounted() {
         .expect("boot wires the typed zone runtime surface");
     let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
 
-    rt.zone_create(ZONE, &[], "op-dg-create-0001", "")
+    rt.zone_create(ZONE, "op-dg-create-0001", "")
         .await
         .expect("create");
     rt.zone_mount("root", "/tenant-a", ZONE, "op-dg-mount-0002", "")
@@ -201,7 +201,7 @@ async fn mount_onto_a_deprovisioned_target_is_refused() {
         .expect("boot wires the typed zone runtime surface");
     let mut rt = ZoneRuntime::dial_ready(port, BUDGET).await;
 
-    rt.zone_create(ZONE, &[], "op-md-create-0001", "")
+    rt.zone_create(ZONE, "op-md-create-0001", "")
         .await
         .expect("create");
     rt.zone_deprovision(ZONE, "op-md-deprovision-0002", "")

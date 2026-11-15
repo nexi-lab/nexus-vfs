@@ -250,12 +250,16 @@ pub mod env {
     pub const BIND_ADDR: &str = "NEXUS_BIND_ADDR";
 }
 
-/// Maximum gRPC message size (bytes) for the unified VFS service.
+/// Maximum gRPC message size (bytes) on the data-plane port.
 ///
 /// Applies to every client/server that talks to `NexusVFSService`:
 /// Python server (`grpc.aio.server(options=...)`), Python client
 /// (`nexus.grpc.defaults.build_channel_options`), and the Rust peer-
-/// blob client (`tonic` `max_decoding/encoding_message_size`).
+/// blob client (`tonic` `max_decoding/encoding_message_size`) — and to
+/// the raft transport co-hosted on the same port, whose message, append
+/// and entry bounds derive from it (`raft::message_bound`). Every endpoint
+/// applying the same bound is what makes a message one node can send one
+/// every other node accepts.
 ///
 /// 64 MiB accommodates files above the 16 MiB CDC chunk threshold —
 /// both single-blob content reads and scatter-gather `ReadBlob`

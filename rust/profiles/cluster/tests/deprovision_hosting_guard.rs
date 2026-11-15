@@ -72,10 +72,10 @@ async fn deprovision_on_a_non_hosting_node_refuses_without_side_effects() {
     let mut rt_a = ZoneRuntime::dial_ready(a_port, BUDGET).await;
     let mut rt_b = ZoneRuntime::dial_ready(b_port, BUDGET).await;
 
-    rt_a.zone_create(ZONE_A, &[], "op-hg-create-a-0001", "")
+    rt_a.zone_create(ZONE_A, "op-hg-create-a-0001", "")
         .await
         .expect("node A creates its zone");
-    rt_b.zone_create(ZONE_B, &[], "op-hg-create-b-0002", "")
+    rt_b.zone_create(ZONE_B, "op-hg-create-b-0002", "")
         .await
         .expect("node B creates its own zone");
 
@@ -109,7 +109,7 @@ async fn deprovision_on_a_non_hosting_node_refuses_without_side_effects() {
     assert_eq!(ghost.code(), tonic::Code::NotFound, "{ghost:?}");
 
     let created = rt_b
-        .zone_create(GHOST, &[], "op-hg-ghost-create-0005", "")
+        .zone_create(GHOST, "op-hg-ghost-create-0005", "")
         .await
         .expect("the id was never banned — create must succeed");
     assert_eq!(created.outcome, "CREATED");

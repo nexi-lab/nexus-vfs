@@ -128,13 +128,7 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
     // replica exists on the joiner.
     let mut j_rt = ZoneRuntime::dial_tls(jport, &ca, &jcert, &jkey, BUDGET).await;
     let joined = j_rt
-        .zone_join(
-            ZONE,
-            std::slice::from_ref(&fadv),
-            true,
-            "op-join-victim-0000",
-            "",
-        )
+        .zone_join(ZONE, true, "op-join-victim-0000", "")
         .await
         .expect("joiner joins the victim zone over RPC");
     assert_eq!(joined.outcome, "JOINED");
@@ -195,18 +189,12 @@ async fn a_stale_replica_cannot_resurrect_a_deleted_zone() {
 
     // ── And the deleted zone cannot be re-created or re-joined (R12) ──
     let err = f_rt
-        .zone_create(ZONE, &[], "op-recreate-victim-0002", "")
+        .zone_create(ZONE, "op-recreate-victim-0002", "")
         .await
         .expect_err("creating a deprovisioned zone must be refused");
     assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
     let err = j_rt
-        .zone_join(
-            ZONE,
-            std::slice::from_ref(&fadv),
-            false,
-            "op-rejoin-victim-0003",
-            "",
-        )
+        .zone_join(ZONE, false, "op-rejoin-victim-0003", "")
         .await
         .expect_err("joining a deprovisioned zone must be refused");
     assert_eq!(

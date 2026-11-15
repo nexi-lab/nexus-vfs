@@ -436,7 +436,12 @@ message ProposeResponse {
   optional string error = 2;
   optional string leader_address = 3;
   optional RaftResponse result = 4;
-  uint64 applied_index = 5;
+  // On success: the index the answering node had applied when the command
+  // resolved, which covers the command's own entry. A forwarding follower
+  // waits for its replica to apply through it before reporting the write
+  // visible. Absent means unknown (a refusal, or a node that predates the
+  // field) — never index 0.
+  optional uint64 applied_index = 5;
 }
 
 // QueryRequest reads from the local state machine.

@@ -75,32 +75,12 @@ impl Locks for DistributedLocks {
             .runtime
             .block_on(self.node.propose(cmd))
             .map_err(|e| format!("DistributedLocks.acquire({path}): {e}"))?;
+        // `propose` answers once this replica has applied the acquire, so the
+        // holder is in `shared_state` for the next local read. An acquire
+        // that committed but is not applied here yet is an error the caller
+        // may retry: re-acquiring under the same lock_id is idempotent.
         match result {
-            CommandResult::LockResult(state) => {
-                if state.acquired {
-                    // Read-your-writes on follower: poll local state
-                    // machine until the exact lock_id we just wrote
-                    // appears. SSOT = `shared_state` (the same
-                    // `Arc<Mutex<LockState>>` the apply path mutates).
-                    // Using a raft-index barrier instead would fail on
-                    // followers — `commit_index()` immediately after
-                    // propose is stale until AppendEntries arrives.
-                    let shared = Arc::clone(&self.shared_state);
-                    let lock_id_owned = lock_id.to_string();
-                    let path_owned = path.to_string();
-                    let _ = self.node.wait_until(
-                        || {
-                            shared
-                                .lock()
-                                .get_lock(&path_owned)
-                                .map(|info| info.holders.iter().any(|h| h.lock_id == lock_id_owned))
-                                .unwrap_or(false)
-                        },
-                        500,
-                    );
-                }
-                Ok(state.acquired)
-            }
+            CommandResult::LockResult(state) => Ok(state.acquired),
             CommandResult::Error(e) => {
                 Err(format!("DistributedLocks.acquire({path}) rejected: {e}"))
             }

@@ -85,7 +85,7 @@ impl Peer {
     async fn shutdown(self) {
         self.stop.send(()).unwrap();
         self.task.await.unwrap();
-        self.registry.shutdown_all();
+        self.registry.shutdown().released().await;
         drop(self.registry);
         drop(self.directory);
     }
@@ -211,7 +211,7 @@ async fn listener_refuses_credentials_different_from_its_registry() {
     );
     let probe = tokio::net::TcpListener::bind(address).await.unwrap();
     drop(probe);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

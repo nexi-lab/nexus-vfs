@@ -29,15 +29,20 @@ pub(crate) fn decode(key: &str, value: &[u8]) -> Option<(u64, String)> {
 }
 
 /// The canonical bare `host:port` form of `address` (a scheme prefix is
-/// accepted and dropped), or `None` when it is not a dial address. A build
-/// without the network transport has no dial addresses.
+/// accepted and dropped), or `None` when it is not a dial address. A wildcard
+/// host (`0.0.0.0`, `[::]`) names no machine to dial. A build without the
+/// network transport has no dial addresses.
 #[cfg(feature = "consensus")]
 pub(crate) fn canonical(address: &str) -> Option<String> {
     #[cfg(feature = "grpc")]
     {
-        lib::transport_primitives::PeerAddress::parse_operator_addr(address, false)
-            .ok()
-            .map(|parsed| parsed.to_operator_str())
+        let parsed =
+            lib::transport_primitives::PeerAddress::parse_operator_addr(address, false).ok()?;
+        let wildcard = parsed
+            .hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified());
+        (!wildcard).then(|| parsed.to_operator_str())
     }
     #[cfg(not(feature = "grpc"))]
     {
@@ -219,6 +224,9 @@ mod tests {
             "nexus-2:0",
             "7@nexus-2:2126",
             "::1:2126",
+            "0.0.0.0:2126",
+            "http://0.0.0.0:2126",
+            "[::]:2126",
             "\u{0}",
         ] {
             assert!(
@@ -366,7 +374,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            sm.member_addresses().unwrap(),
+            sm.member_addresses().unwrap().unwrap(),
             vec![(7, "nexus-7:9100".to_string())]
         );
 
@@ -375,7 +383,7 @@ mod tests {
         restored.apply(1, &put(99, "stale:1").unwrap()).unwrap();
         restored.restore_snapshot(&snapshot).unwrap();
         assert_eq!(
-            restored.member_addresses().unwrap(),
+            restored.member_addresses().unwrap().unwrap(),
             vec![(7, "nexus-7:9100".to_string())],
             "a snapshot install replaces the records with the snapshot's cut"
         );
@@ -395,14 +403,17 @@ mod tests {
             ));
         }
         assert!(
-            sm.member_addresses().unwrap().is_empty(),
+            sm.member_addresses().unwrap().unwrap().is_empty(),
             "neither the local nor the peer EC path wrote a record"
         );
         let witness = crate::raft::WitnessStateMachineInMemory::new();
         assert!(witness
             .requires_strong_consistency(&put(7, "nexus-7:9000").unwrap())
             .unwrap());
-        assert!(witness.member_addresses().unwrap().is_empty());
+        assert!(
+            witness.member_addresses().unwrap().is_none(),
+            "a state machine without a control store holds no records to read"
+        );
     }
 
     #[test]
@@ -418,19 +429,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sm.last_applied_index(), 3);
-        assert_eq!(sm.member_addresses().unwrap().len(), 2);
+        assert_eq!(sm.member_addresses().unwrap().unwrap().len(), 2);
         // A replayed entry at or below the marker writes nothing.
         sm.apply_membership(3, &[delete(7)]).unwrap();
-        assert_eq!(sm.member_addresses().unwrap().len(), 2);
+        assert_eq!(sm.member_addresses().unwrap().unwrap().len(), 2);
         sm.apply_membership(4, &[delete(7)]).unwrap();
         assert_eq!(
-            sm.member_addresses().unwrap(),
+            sm.member_addresses().unwrap().unwrap(),
             vec![(8, "nexus-8:9000".to_string())]
         );
         // An entry with no address effect advances only the marker.
         sm.apply_membership(5, &[]).unwrap();
         assert_eq!(sm.last_applied_index(), 5);
-        assert_eq!(sm.member_addresses().unwrap().len(), 1);
+        assert_eq!(sm.member_addresses().unwrap().unwrap().len(), 1);
     }
 
     #[test]

@@ -71,7 +71,7 @@ use protobuf::Message as ProtobufV2Message;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
@@ -82,8 +82,6 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Maximum message size in bytes.
-    pub max_message_size: usize,
     /// Optional TLS configuration for mTLS. None = plain HTTP/2.
     pub tls: Option<super::TlsConfig>,
 }
@@ -93,7 +91,6 @@ impl Default for ServerConfig {
         Self {
             bind_address: "0.0.0.0:2026".parse().unwrap(),
             max_connections: 100,
-            max_message_size: 64 * 1024 * 1024, // 64MB
             tls: None,
         }
     }
@@ -148,13 +145,18 @@ type GuardedRaftService =
 type GuardedApiService =
     super::node_authority::NodeControlService<ZoneApiServiceServer<ZoneApiServiceImpl>>;
 
+pub(crate) struct PreparedRaftListener {
+    policy: super::node_authority::NodeControlPolicy,
+    tls: Option<lib::transport_primitives::SharedTlsListener>,
+}
+
 fn listener_credentials(
     source: lib::transport_primitives::SharedTlsConfig,
     configured: Option<&super::TlsConfig>,
 ) -> Result<lib::transport_primitives::SharedTlsConfig> {
     let snapshot = source.snapshot();
     let current = snapshot
-        .config()
+        .configured_material()
         .map_err(|e| TransportError::Connection(e.into()))?;
     if current != configured {
         return Err(TransportError::Connection(
@@ -165,12 +167,34 @@ fn listener_credentials(
 }
 
 impl RaftGrpcServer {
-    fn guarded_services(&self) -> Result<(GuardedRaftService, GuardedApiService)> {
-        use super::node_authority::{
-            NodeControlPolicy, NodeControlService, AGENT_CREDENTIAL_METHODS,
-        };
-        let policy = NodeControlPolicy::from_shared_tls(self.registry.shared_tls())
+    pub(crate) fn prepare_listener(
+        credentials: lib::transport_primitives::SharedTlsConfig,
+        configured: Option<&super::TlsConfig>,
+        verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    ) -> Result<PreparedRaftListener> {
+        let original = credentials.snapshot();
+        listener_credentials(credentials.clone(), configured)?;
+        let policy = super::node_authority::NodeControlPolicy::from_shared_tls(credentials.clone())
             .map_err(TransportError::Connection)?;
+        let tls = configured
+            .map(|_| {
+                lib::transport_primitives::SharedTlsListener::prepare(credentials.clone(), verifier)
+                    .map_err(TransportError::Connection)
+            })
+            .transpose()?;
+        if !credentials.snapshot().same_installation(&original) {
+            return Err(TransportError::Connection(
+                "listener credentials changed during preparation".into(),
+            ));
+        }
+        Ok(PreparedRaftListener { policy, tls })
+    }
+
+    fn guarded_services(
+        &self,
+        policy: super::node_authority::NodeControlPolicy,
+    ) -> (GuardedRaftService, GuardedApiService) {
+        use super::node_authority::{NodeControlService, AGENT_CREDENTIAL_METHODS};
         let raft = ZoneTransportServiceImpl {
             registry: self.registry.clone(),
         };
@@ -184,16 +208,20 @@ impl RaftGrpcServer {
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
             local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
-        Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[])
-                .with_owner_replica_data(),
+        (
             NodeControlService::new(
-                ZoneApiServiceServer::new(api),
+                bounded!(ZoneTransportServiceServer::new(raft)),
+                policy.clone(),
+                &[],
+            )
+            .with_owner_replica_data(),
+            NodeControlService::new(
+                bounded!(ZoneApiServiceServer::new(api)),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
             )
             .with_owner_replica_data(),
-        ))
+        )
     }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
         Self {
@@ -311,54 +339,71 @@ impl RaftGrpcServer {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        let addr = self.config.bind_address;
-        let prepared = (|| {
-            let credentials =
-                listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
-            let services = self.guarded_services()?;
-            let incoming = self.config.tls.is_some().then(|| {
-                lib::transport_primitives::shared_mtls_incoming(
-                    addr,
-                    credentials,
-                    self.foreign_ca_verifier.clone(),
-                )
-            });
-            Ok::<_, TransportError>((services, incoming))
-        })();
+        let prepared = Self::prepare_listener(
+            self.registry.shared_tls(),
+            self.config.tls.as_ref(),
+            self.foreign_ca_verifier.clone(),
+        );
         async move {
-            let ((raft_service, client_service), incoming) = prepared?;
-            tracing::info!(
-                "Starting Raft gRPC server on {} (zones={}, tls={})",
-                addr,
-                self.registry.list_zones().len(),
-                incoming.is_some(),
-            );
-            let mut builder =
-                lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-            let router = if let Some(extra) = self.extra_services {
-                builder
-                    .add_routes(extra)
-                    .add_service(raft_service)
-                    .add_service(client_service)
-            } else {
-                builder
-                    .add_service(raft_service)
-                    .add_service(client_service)
-            };
-            if let Some(incoming) = incoming {
-                let incoming = incoming.await.map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming_shutdown(incoming, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            } else {
-                router
-                    .serve_with_shutdown(addr, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            Ok(())
+            let prepared = prepared?;
+            let listener = tokio::net::TcpListener::bind(self.config.bind_address)
+                .await
+                .map_err(|e| TransportError::Connection(e.to_string()))?;
+            self.serve_listener(prepared, listener, shutdown).await
         }
+    }
+
+    /// Serve a socket and trust policy prepared before opening runtime storage.
+    pub(crate) async fn serve_prepared(
+        self,
+        prepared: PreparedRaftListener,
+        listener: std::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| TransportError::Connection(e.to_string()))?;
+        self.serve_listener(prepared, listener, shutdown).await
+    }
+
+    async fn serve_listener(
+        self,
+        prepared: PreparedRaftListener,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let (raft_service, client_service) = self.guarded_services(prepared.policy);
+        tracing::info!(
+            "Starting Raft gRPC server on {} (zones={}, tls={})",
+            self.config.bind_address,
+            self.registry.list_zones().len(),
+            prepared.tls.is_some(),
+        );
+        let mut builder =
+            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
+        let router = if let Some(extra) = self.extra_services {
+            builder
+                .add_routes(extra)
+                .add_service(raft_service)
+                .add_service(client_service)
+        } else {
+            builder
+                .add_service(raft_service)
+                .add_service(client_service)
+        };
+        if let Some(tls) = prepared.tls {
+            router
+                .serve_with_incoming_shutdown(tls.incoming(listener), shutdown)
+                .await
+                .map_err(TransportError::Tonic)?;
+        } else {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await
+                .map_err(TransportError::Tonic)?;
+        }
+        Ok(())
     }
 }
 
@@ -514,6 +559,13 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
     // but ordinary heartbeats/appends may arrive first. Clamp the commit hint
     // to the highest index this message/local handle can actually account for;
     // the later snapshot or append will advance commit normally.
+    //
+    // A clamp alone is not news: a learner of a zone whose voters commit
+    // without it sees the leader's commit ahead of its own log on every
+    // message while entries are in flight. It is news once this replica's
+    // applied index has stood still behind the leader for
+    // `REPLICATION_STALL` — the stall `doctor --live` reports as
+    // REPLICA_LAGGING — so only then is it a warning.
     if matches!(
         msg.get_msg_type(),
         raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgHeartbeat
@@ -522,17 +574,33 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
         let msg_last = msg.get_entries().last().map(|e| e.index).unwrap_or(0);
         let safe_commit = local_last.max(msg_last).max(node.applied_index());
         if msg.get_commit() > safe_commit {
-            tracing::warn!(
-                zone = %zone_id,
-                from = msg.from,
-                to = msg.to,
-                msg_type = ?msg.get_msg_type(),
-                leader_commit = msg.get_commit(),
-                safe_commit,
-                local_last,
-                msg_last,
-                "Clamping inbound raft commit hint until follower catches up",
-            );
+            let stalled_for = node.replication().stalled_for;
+            if stalled_for >= crate::raft::REPLICATION_STALL {
+                tracing::warn!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    to = msg.to,
+                    msg_type = ?msg.get_msg_type(),
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    stalled_secs = stalled_for.as_secs(),
+                    "Clamping inbound raft commit hint: this replica has applied nothing \
+                     behind the leader's commit for {}s, so it is not receiving entries",
+                    stalled_for.as_secs(),
+                );
+            } else {
+                tracing::debug!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    "Clamping inbound raft commit hint while entries are in flight",
+                );
+            }
             msg.set_commit(safe_commit);
         }
     }
@@ -823,6 +891,16 @@ fn peer_cert_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
 
 /// Each member's dial endpoint from the zone's member-address records — the
 /// one source for addresses reported to clients, the local node's included.
+fn member_endpoints(records: Vec<(u64, String)>, use_tls: bool) -> HashMap<u64, String> {
+    records
+        .into_iter()
+        .filter_map(|(id, address)| {
+            crate::raft::member_address::endpoint(id, &address, use_tls)
+                .map(|route| (id, route.endpoint))
+        })
+        .collect()
+}
+
 async fn recorded_endpoints(
     node: &ZoneConsensus<FullStateMachine>,
     use_tls: bool,
@@ -831,14 +909,9 @@ async fn recorded_endpoints(
     let records = node
         .with_state_machine(|sm| sm.member_addresses())
         .await
-        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?;
-    Ok(records
-        .into_iter()
-        .filter_map(|(id, address)| {
-            crate::raft::member_address::endpoint(id, &address, use_tls)
-                .map(|route| (id, route.endpoint))
-        })
-        .collect())
+        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?
+        .unwrap_or_default();
+    Ok(member_endpoints(records, use_tls))
 }
 
 /// Voters and learners with their recorded addresses; a member without a
@@ -887,6 +960,9 @@ struct ZoneApiServiceImpl {
     /// empty) → `RenewLocalNodeCertificate` refuses.
     local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
 }
+
+#[path = "server/replica_join.rs"]
+mod replica_join;
 
 impl ZoneApiServiceImpl {
     async fn blob_response(
@@ -1061,7 +1137,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some(format!("Failed to deserialize raw command: {}", e)),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1074,7 +1150,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("No command provided".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             };
@@ -1087,7 +1163,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("Unsupported command type".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -1139,15 +1215,26 @@ impl ZoneApiService for ZoneApiServiceImpl {
             node.propose(cmd).await
         };
 
-        match result {
-            Ok(result) => {
+        // A success names the index this node had applied when the command
+        // resolved, which covers the command's own entry: a forwarding
+        // follower waits for its replica to apply through it before it tells
+        // its caller the write is visible.
+        let committed = match result {
+            Ok(result) => Ok((result, Some(node.applied_index()))),
+            // Relayed by this node for its caller: the commit is the answer;
+            // this node's own replica lag is not the caller's.
+            Err(RaftError::CommittedNotVisible { index, result, .. }) => Ok((*result, index)),
+            Err(error) => Err(error),
+        };
+        match committed {
+            Ok((result, applied_index)) => {
                 let proto_result = command_result_to_proto(&result);
                 Ok(Response::new(ProposeResponse {
                     success: true,
                     error: None,
                     leader_address: None,
                     result: Some(proto_result),
-                    applied_index: 0,
+                    applied_index,
                 }))
             }
             Err(RaftError::NotLeader { leader_hint }) => {
@@ -1159,7 +1246,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     error: Some(super::NOT_LEADER_ERROR.to_string()),
                     leader_address: leader_hint,
                     result: None,
-                    applied_index: 0,
+                    applied_index: None,
                 }))
             }
             Err(e) => Ok(Response::new(ProposeResponse {
@@ -1167,7 +1254,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some(format!("Proposal failed: {}", e)),
                 leader_address: None,
                 result: None,
-                applied_index: 0,
+                applied_index: None,
             })),
         }
     }
@@ -1380,6 +1467,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<JoinZoneRequest>,
     ) -> std::result::Result<Response<JoinZoneResponse>, Status> {
+        if let Some(replica_id) = super::node_authority::current_replica_id(request.extensions())? {
+            return self.read_replica_join(request, replica_id).await;
+        }
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -2572,7 +2662,7 @@ pub async fn serve_node_enrollment(
         "node-enrollment listener up (plaintext, token-gated, JoinCluster only)"
     );
     lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
-        .add_service(NodeEnrollmentServiceServer::new(svc))
+        .add_service(bounded!(NodeEnrollmentServiceServer::new(svc)))
         .serve_with_shutdown(addr, shutdown)
         .await
         .map_err(TransportError::Tonic)?;
@@ -2588,11 +2678,10 @@ pub async fn serve_node_enrollment(
 struct WitnessZoneEntry {
     node: ZoneConsensus<WitnessStateMachine>,
     /// Per-zone route book. A witness state machine holds no member-address
-    /// records, so its routes are the observed senders; ``auto_join_zone``
-    /// reads root's routes for a new zone's voter roster.
+    /// records, so its routes are the observed senders.
     peers: SharedPeerMap,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    _transport_handle: JoinHandle<()>,
+    /// The transport loop and member-address registration running the zone.
+    tasks: super::ZoneTasks,
 }
 
 /// Multi-zone registry for witness nodes.
@@ -2605,10 +2694,12 @@ pub struct WitnessZoneRegistry {
     base_path: PathBuf,
     node_id: u64,
     tls: lib::transport_primitives::SharedTlsConfig,
-    /// Cluster peer addresses — used by auto_join_zone() for transport routing.
+    /// Operator seed addresses: JoinZone and member-address registration targets.
     peers: Vec<NodeAddress>,
     /// This node's advertise address — carried in outbound StepMessage.
     self_address: String,
+    /// Set by [`Self::shutdown`]: no zone opens, and boot joins stop.
+    closed: std::sync::atomic::AtomicBool,
     /// Serializes ``auto_join_zone`` so concurrent step_messages from
     /// multiple data nodes for the same fresh zone don't both pass the
     /// ``zones.get()`` check, both call ``setup_witness_zone``, and
@@ -2639,6 +2730,7 @@ impl WitnessZoneRegistry {
             tls: lib::transport_primitives::SharedTlsConfig::new(tls),
             peers: Vec::new(),
             self_address: String::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
             auto_join_lock: parking_lot::Mutex::new(()),
         }
     }
@@ -2661,62 +2753,28 @@ impl WitnessZoneRegistry {
     }
 
     /// Record a peer's advertise address observed on an inbound
-    /// `StepMessage` — mirrors `ZoneRaftRegistry::learn_peer_address`.
+    /// `StepMessage`, as `ZoneRaftRegistry::learn_peer_address` does.
     /// A witness holds no member-address records, so these observations
     /// are its routes.  Returns `true` if the route changed.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
-        if endpoint.is_empty() || peer_id == 0 {
-            return false;
-        }
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        let use_tls = endpoint.starts_with("https://");
-        let parsed = match NodeAddress::parse(endpoint, use_tls) {
-            Ok(mut p) => {
-                p.id = peer_id;
-                p
-            }
-            Err(_) => return false,
-        };
-        let changed = entry.peers.write().unwrap().observe(peer_id, parsed);
-        changed
-    }
-
-    /// Create a witness Raft group for a zone (static bootstrap).
-    ///
-    /// Opens zone-specific storage at `{base_path}/{zone_id}/`, creates a
-    /// `ZoneConsensus<WitnessStateMachine>`, and spawns a `TransportLoop` task.
-    #[allow(clippy::result_large_err)]
-    pub fn create_zone(
-        &self,
-        zone_id: &str,
-        peers: Vec<NodeAddress>,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use crate::raft::RaftConfig;
-
-        if self.zones.contains_key(zone_id) {
-            return Err(TransportError::Connection(format!(
-                "Witness zone '{}' already exists",
-                zone_id
-            )));
-        }
-
-        // Witness RaftConfig (no replication log, cannot become leader)
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
-        let config = RaftConfig::witness(self.node_id, peer_ids);
-
-        self.setup_witness_zone(zone_id, config, runtime_handle)
+        super::observe_sender(
+            &entry.peers,
+            peer_id,
+            endpoint,
+            self.tls.snapshot().uses_tls(),
+        )
     }
 
     /// Bootstrap or join a zone at boot time under the opaque-ID
-    /// contract.  Sends `JoinZone` RPC against each configured peer
-    /// until one succeeds, then locally registers the zone with
-    /// `skip_bootstrap=true` so the leader's snapshot installs the
-    /// authoritative ConfState.  Looping is indefinite — misconfig
-    /// (no reachable peer) surfaces as "witness stays up retrying"
-    /// rather than a silent exit.
+    /// contract.  A zone this witness holds on disk resumes first (see
+    /// [`Self::auto_join_zone`]).  Then sends `JoinZone` RPC against each
+    /// configured peer until one succeeds, and registers the zone locally
+    /// if it is not yet.  Looping is indefinite — misconfig (no reachable
+    /// peer) surfaces as "witness stays up retrying" rather than a silent
+    /// exit.
     ///
     /// Witness joins as a **voter** (`as_learner=false`) by default,
     /// matching TiKV's witness-as-voter pattern: votes in elections
@@ -2733,91 +2791,87 @@ impl WitnessZoneRegistry {
         timeout_secs: u64,
         retry_interval: std::time::Duration,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use super::call_join_zone_rpc;
-
-        if let Some(existing) = self.zones.get(zone_id) {
-            return Ok(existing.node.clone());
+        // A zone this witness already holds resumes from its own raft
+        // storage before the JoinZone below re-asserts its voter role: its
+        // vote can be what elects the leader that answers, and the resumed
+        // zone registers this witness's member address.
+        if self.holds_zone(zone_id) {
+            self.auto_join_zone(zone_id, &tokio::runtime::Handle::current())?;
         }
 
-        let peers = self.peers.clone();
-        let self_address = self.self_address.clone();
+        // Its own entry in NEXUS_PEERS (a hostname-derived id) is never a target.
+        let endpoints: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|peer| peer.id != self.node_id)
+            .map(|peer| peer.endpoint.clone())
+            .collect();
         loop {
-            for peer in &peers {
-                if peer.id == self.node_id {
-                    continue;
-                }
-                let mut endpoint = peer.endpoint.clone();
-                let mut redirected_once = false;
-                loop {
-                    let tls = self
-                        .tls
-                        .snapshot()
-                        .config()
-                        .map_err(|e| TransportError::Connection(e.into()))?
-                        .cloned();
-                    match call_join_zone_rpc(
-                        &endpoint,
-                        zone_id,
-                        self.node_id,
-                        &self_address,
-                        as_learner,
-                        tls.clone(),
-                        timeout_secs,
-                    )
-                    .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                zone = %zone_id,
-                                endpoint = %endpoint,
-                                witness_id = self.node_id,
-                                "Witness joined zone via leader",
-                            );
-                            return self
-                                .auto_join_zone(zone_id, &tokio::runtime::Handle::current());
-                        }
-                        Ok(result) => {
-                            if let Some(addr) = result.leader_address.as_ref() {
-                                if !redirected_once && !addr.is_empty() && addr != &endpoint {
-                                    tracing::info!(
-                                        from = %endpoint,
-                                        to = %addr,
-                                        "Witness JoinZone redirect to leader",
-                                    );
-                                    endpoint = addr.clone();
-                                    redirected_once = true;
-                                    continue;
-                                }
-                            }
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = ?result.error,
-                                "Witness JoinZone non-success; trying next peer",
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = %e,
-                                "Witness JoinZone RPC error; trying next peer",
-                            );
-                            break;
-                        }
-                    }
-                }
+            if self.is_closed() {
+                return Err(TransportError::Connection(format!(
+                    "witness shut down before zone '{zone_id}' joined"
+                )));
+            }
+            if let super::JoinRound::Admitted { endpoint } = super::join_zone_round(
+                endpoints.iter().cloned(),
+                zone_id,
+                self.node_id,
+                &self.self_address,
+                as_learner,
+                &self.tls,
+                timeout_secs,
+            )
+            .await
+            {
+                tracing::info!(
+                    zone = %zone_id,
+                    endpoint = %endpoint,
+                    witness_id = self.node_id,
+                    "Witness joined zone via leader",
+                );
+                return self.auto_join_zone(zone_id, &tokio::runtime::Handle::current());
             }
             tokio::time::sleep(retry_interval).await;
         }
     }
 
-    /// Auto-join a zone when receiving Raft messages for an unknown zone.
+    /// Join each of `zones` at boot, one task per zone: each resumes and
+    /// retries on its own (see [`Self::bootstrap_or_join_zone`]), so a zone
+    /// whose leader cannot be reached delays no other.
+    pub fn join_at_boot(
+        self: &Arc<Self>,
+        zones: Vec<String>,
+        retry_interval: std::time::Duration,
+    ) -> Vec<JoinHandle<()>> {
+        zones
+            .into_iter()
+            .map(|zone_id| {
+                let registry = Arc::clone(self);
+                tokio::spawn(async move {
+                    match registry
+                        .bootstrap_or_join_zone(&zone_id, false, 5, retry_interval)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(zone = %zone_id, "Witness joined zone"),
+                        Err(_) if registry.is_closed() => {}
+                        Err(error) => tracing::error!(
+                            zone = %zone_id,
+                            %error,
+                            "Witness JoinZone failed permanently",
+                        ),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Open a witness replica of `zone_id` — on an inbound Raft message for a
+    /// zone not yet open, and for the boot join.
     ///
-    /// Creates a witness Raft group with `skip_bootstrap=true` (empty ConfState).
-    /// The leader will send a snapshot with the correct ConfState — this is the
-    /// standard raft-rs contract for late-joining nodes.
-    ///
-    /// Used by step_message() handler for dynamic zone support.
+    /// A witness never founds a zone: the replica starts with
+    /// `skip_bootstrap=true`, so its membership is the ConfState it stored
+    /// for a zone it holds on disk, else empty until the leader's log or
+    /// snapshot brings it — the raft-rs contract for a late-joining node.
     #[allow(clippy::result_large_err)]
     pub fn auto_join_zone(
         &self,
@@ -2846,43 +2900,23 @@ impl WitnessZoneRegistry {
         if let Some(existing) = self.zones.get(zone_id) {
             return Ok(existing.node.clone());
         }
-
-        let peers = self.current_auto_join_peers();
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
-        let config = if peer_ids.is_empty() {
-            // No known roster yet: start uninitialized and wait for a
-            // snapshot to carry ConfState.
-            RaftConfig {
-                id: self.node_id,
-                peers: vec![],
-                is_witness: true,
-                skip_bootstrap: true,
-                election_tick: 10_000_000, // witness never initiates election
-                ..Default::default()
-            }
-        } else {
-            // Dynamic federation zones are initially bootstrapped from a
-            // static voter roster; that ConfState is not a log entry. If the
-            // witness auto-joins with an empty ConfState it can replay appends
-            // but never learn that it may vote, so failover loses quorum.
-            RaftConfig::witness(self.node_id, peer_ids)
-        };
-        self.setup_witness_zone(zone_id, config, runtime_handle)
-    }
-
-    fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
-        if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
-            let peers = root.peers.read().unwrap();
-            if !peers.is_empty() {
-                return peers.routes().map(|(_, address)| address.clone()).collect();
-            }
+        // Under the same lock `shutdown` drains under: no zone opens after it.
+        if self.is_closed() {
+            return Err(TransportError::Connection(format!(
+                "witness is shut down; zone '{zone_id}' does not open"
+            )));
         }
-        self.peers.clone()
+
+        self.setup_witness_zone(zone_id, RaftConfig::witness(self.node_id), runtime_handle)
     }
 
-    /// Internal: open storage, create ZoneConsensus + driver, spawn transport loop, register zone.
-    ///
-    /// Shared by `create_zone()` (static bootstrap) and `auto_join_zone()` (dynamic federation).
+    /// Whether this witness holds `zone_id`'s raft state on disk.
+    fn holds_zone(&self, zone_id: &str) -> bool {
+        self.base_path.join(zone_id).join("raft").exists()
+    }
+
+    /// Internal: open storage, create ZoneConsensus + driver, start the zone
+    /// (transport loop and member-address registration), register it.
     #[allow(clippy::result_large_err)]
     fn setup_witness_zone(
         &self,
@@ -2891,7 +2925,6 @@ impl WitnessZoneRegistry {
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
         use crate::raft::RaftStorage;
-        use crate::transport::{ClientConfig, RaftClientPool, TransportLoop};
 
         // Zone-specific storage
         let zone_path = self.base_path.join(zone_id);
@@ -2903,30 +2936,23 @@ impl WitnessZoneRegistry {
             TransportError::Connection(format!("Failed to create witness state machine: {}", e))
         })?;
 
-        let (handle, mut driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
+        let (mut handle, driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
             .map_err(|e| {
                 TransportError::Connection(format!("Failed to create witness ZoneConsensus: {}", e))
             })?;
 
-        let shared_peers: super::SharedPeerMap =
-            Arc::new(RwLock::new(super::PeerMap::new(self.node_id)));
-        driver.set_peer_map(shared_peers.clone(), self.tls.snapshot().uses_tls());
-
-        // Spawn transport loop with zone_id routing
-        let client_config = ClientConfig {
-            tls: self.tls.clone(),
-            ..Default::default()
-        };
-        let transport_loop = TransportLoop::new(
+        let super::StartedZone {
+            peers: shared_peers,
+            tasks,
+        } = super::start_zone(
+            &mut handle,
             driver,
-            shared_peers.clone(),
-            RaftClientPool::with_config(client_config),
-        )
-        .with_zone_id(zone_id.to_string())
-        .with_self_address(self.self_address.clone());
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+            zone_id,
+            &self.tls,
+            self.self_address.clone(),
+            self.peers.clone(),
+            runtime_handle,
+        );
 
         tracing::info!(
             "Witness zone '{}' registered (node_id={})",
@@ -2939,8 +2965,7 @@ impl WitnessZoneRegistry {
             WitnessZoneEntry {
                 node: handle.clone(),
                 peers: shared_peers,
-                shutdown_tx,
-                _transport_handle: transport_handle,
+                tasks,
             },
         );
 
@@ -2957,13 +2982,25 @@ impl WitnessZoneRegistry {
         self.zones.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Shutdown all zones.
-    pub fn shutdown_all(&self) {
-        for entry in self.zones.iter() {
-            let _ = entry.shutdown_tx.send(true);
-        }
-        self.zones.clear();
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stop every open zone; no zone opens afterwards and boot joins end.
+    /// Await [`super::ZonesStopped::released`] to know the zones' tasks — and
+    /// with them the registry's hold on their storage — are gone.
+    pub fn shutdown(&self) -> super::ZonesStopped {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _guard = self.auto_join_lock.lock();
+        let open: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
+        let stopped = open
+            .iter()
+            .filter_map(|zone_id| self.zones.remove(zone_id))
+            .map(|(_, entry)| entry.tasks.stop())
+            .collect();
         tracing::info!("All witness zones shut down");
+        stopped
     }
 }
 
@@ -3023,7 +3060,7 @@ impl RaftWitnessServer {
             let mut builder =
                 lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
             let router = builder.add_service(super::node_authority::NodeControlService::new(
-                ZoneTransportServiceServer::new(service),
+                bounded!(ZoneTransportServiceServer::new(service)),
                 policy,
                 &[],
             ));
@@ -3165,7 +3202,6 @@ mod tests {
             config.bind_address,
             "0.0.0.0:2026".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.max_message_size, 64 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -3211,8 +3247,10 @@ mod tests {
         assert!(registry.list_zones().is_empty());
     }
 
+    /// A witness opening a zone it does not hold — even with seeds known —
+    /// never founds it: no bootstrap entry, no ConfState of its own.
     #[test]
-    fn test_witness_auto_join_bootstraps_known_peer_roster() {
+    fn a_witness_opening_a_fresh_zone_never_founds_it() {
         use tempfile::TempDir;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -3227,25 +3265,13 @@ mod tests {
 
         let node = registry
             .auto_join_zone("corp-eng", runtime.handle())
-            .expect("witness auto-join");
+            .expect("witness opens the zone");
 
-        assert!(
-            !node.config().skip_bootstrap,
-            "known witness rosters must bootstrap ConfState so the witness can vote"
-        );
-        let mut peers = node.config().peers.clone();
-        peers.sort_unstable();
-        let mut expected = vec![
-            NodeAddress::parse("nexus-1:2126", false).unwrap().id,
-            NodeAddress::parse("nexus-2:2126", false).unwrap().id,
-        ];
-        expected.sort_unstable();
-        assert_eq!(
-            peers, expected,
-            "witness RaftConfig.peers must include full voters and exclude self"
-        );
+        assert!(node.config().skip_bootstrap);
+        assert!(node.voters().is_empty(), "no ConfState of its own");
+        assert_eq!(node.last_index(), 0, "no bootstrap entry");
 
-        registry.shutdown_all();
+        runtime.block_on(registry.shutdown().released());
     }
 
     // ---------------------------------------------------------------

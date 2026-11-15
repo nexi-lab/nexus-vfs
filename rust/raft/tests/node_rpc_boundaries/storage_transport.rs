@@ -272,7 +272,7 @@ async fn versioned_client_never_falls_back_on_legacy_peer_or_reconnect() {
     pool.remove(7).await;
     stop.send(()).unwrap();
     current.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     // Each iteration replaces the actual listening server at the same address.
     // Pool eviction uses the same recovery entry used by transport send errors.
     for _ in 0..2 {

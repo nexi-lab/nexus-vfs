@@ -43,26 +43,9 @@ impl MetadataCache {
         path: &str,
         load: impl FnOnce() -> Result<Option<KernelFileMetadata>, MetaStoreError>,
     ) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
-        self.load(path, true, load)
-    }
-
-    pub(super) fn load_uncached(
-        &self,
-        path: &str,
-        load: impl FnOnce() -> Result<Option<KernelFileMetadata>, MetaStoreError>,
-    ) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
-        self.load(path, false, load)
-    }
-
-    fn load(
-        &self,
-        path: &str,
-        use_cached: bool,
-        load: impl FnOnce() -> Result<Option<KernelFileMetadata>, MetaStoreError>,
-    ) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
         let generation = {
             let state = self.state.read();
-            if let Some(value) = state.entries.get(path).filter(|_| use_cached) {
+            if let Some(value) = state.entries.get(path) {
                 return Ok(Some(value.clone()));
             }
             state.generation
@@ -76,8 +59,6 @@ impl MetadataCache {
         Ok(value)
     }
 
-    // Ordinary reads and write observations share one compiled cache-fill
-    // path while their read closures remain independently specialized.
     #[inline(never)]
     fn fill_if_current(&self, path: &str, generation: Option<u64>, value: &KernelFileMetadata) {
         let mut state = self.state.write();
@@ -168,8 +149,8 @@ mod tests {
     }
 
     #[test]
-    fn late_reads_and_write_observations_cannot_refill_an_invalidated_image() {
-        for (use_cached, subtree) in [(true, false), (true, true), (false, false), (false, true)] {
+    fn late_reads_cannot_refill_an_invalidated_image() {
+        for subtree in [false, true] {
             let cache = Arc::new(MetadataCache::default());
             let image = |value: &str| KernelFileMetadata {
                 content_id: Some(value.into()),
@@ -183,7 +164,7 @@ mod tests {
             let reading = Arc::clone(&cache);
             let old_read = std::thread::spawn(move || {
                 reading
-                    .load("/source", use_cached, || {
+                    .get_or_load("/source", || {
                         let old = image("old");
                         observed_tx.send(()).unwrap();
                         resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();

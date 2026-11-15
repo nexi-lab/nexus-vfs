@@ -25,6 +25,8 @@ on:
       - 'rust/transport/src/federation.rs'
       - 'rust/transport/src/federation/**'
       - 'rust/transport/src/test_peer.rs'
+      - 'rust/transport/src/runtime_scope.rs'
+      - 'rust/transport/tests/user_runtime_scope.rs'
       - 'rust/profiles/cluster/**'
       - 'rust/search-common/**'
       - 'rust/search-plugin/**'
@@ -47,9 +49,13 @@ defaults:
     shell: bash
 
 jobs:
-  node-boundary:
+  # One job per OS: the three suites share one build of raft and nexus-cluster,
+  # and a run queues one macOS runner instead of three (macOS capacity is the
+  # scarce resource; see ci.yml native-suites).
+  node-control:
+    name: Node control / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +89,7 @@ jobs:
       - name: Owner replica identity and renewal boundaries
         run: |
           cargo test --locked -p lib --features transport --lib transport_primitives::authorship::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::federated_tls::tests
           cargo test --locked -p lib --features transport --lib transport_primitives::replica_credential::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::tests::replica_certificate_retains_owner_identity_without_node_authority
           cargo test --locked -p raft@0.1.0 --lib transport::session_renewal::tests
@@ -96,8 +103,11 @@ jobs:
           cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls::tests
           cargo test --locked -p lib --features transport --lib transport_primitives::credential_channel::tests
           cargo test --locked -p nexus-search-common --features transport --lib transport::tests
+          cargo test --locked -p lib --features transport --lib transport_primitives::shared_tls_server::tests
           cargo test --locked -p transport --lib peer_blob::
           cargo test --locked -p transport --lib federation::
+      - name: Retained user connection observes credential withdrawal
+        run: cargo test --locked -p transport --test user_runtime_scope retained_user_connection_obeys_the_shared_credential_source -- --exact
       - name: Forwarded proposal credentials and pending TLS dials
         run: cargo test --locked -p raft@0.1.0 --lib transport::proposal_client_tests -- --test-threads=1
       - name: Shared executor bridge across runtime flavors
@@ -105,6 +115,7 @@ jobs:
       - run: cargo test --locked -p raft@0.1.0 --lib agent_csr_client::tests
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::mismatched_node_certificate
       - run: cargo test --locked -p raft@0.1.0 --lib zone_manager::tests::renewal_
+      - run: 'cargo test --locked -p raft@0.1.0 --lib zone_manager::shutdown_tests::'
       - name: Previous reader refuses the durable replica format
         if: runner.os == 'Linux'
         run: python3 .github/scripts/storage-format-compatibility.py --output "${{ runner.temp }}/replica-storage-compatibility"
@@ -117,42 +128,18 @@ jobs:
             ${{ runner.temp }}/replica-storage-compatibility/*.log
             ${{ runner.temp }}/replica-storage-compatibility/receipt.json
           if-no-files-found: warn
-
-  runtime-enrollment:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-tests
-        with:
-          cache-key: node-control-${{ matrix.os }}
-      - run: cargo test --locked -p nexus-cluster --lib
-      - name: Enroll, replicate credentials and restore the same Node identity
+      - name: 'Runtime enrollment: nexus-cluster unit suites'
+        run: cargo test --locked -p nexus-cluster --lib
+      - name: 'Runtime enrollment: enroll, replicate credentials and restore the same Node identity'
         run: cargo test --locked -p nexus-cluster --test node_enrollment --test node_certificate_renewal --test cross_node_sk_replication -- --test-threads=1
-      - name: HTTP clients consume the live node identity
-        run: |
-          cargo test --locked -p nexus-http-api --features rebac --tests
-          cargo test --locked -p nexus-cluster --features http-api --test http_identity --test production_http_files -- --test-threads=1
-
-  managed-credentials:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-tests
-        with:
-          cache-key: node-control-${{ matrix.os }}
-      - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
+      - name: 'Managed credentials: CSR'
+        run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr::tests
       - run: cargo test --locked -p managed-agent --lib credential_binding::tests
       - run: 'cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --lib managed_csr_binding::'
       - run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test csr_operator
       - name: Allocation-bound replica issuer and original-operation readback
         run: cargo test --locked -p nexus-cluster --features experimental-managed-agent-csr --test replica_issuer -- --test-threads=1
+      - name: HTTP clients consume the live node identity
+        run: |
+          cargo test --locked -p nexus-http-api --features rebac --tests
+          cargo test --locked -p nexus-cluster --features http-api --test http_identity --test production_http_files -- --test-threads=1

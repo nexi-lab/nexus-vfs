@@ -72,6 +72,7 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
                         state
                             .member_addresses()
                             .expect("member addresses must be readable")
+                            .expect("a data node keeps member addresses")
                             .iter()
                             .any(|(id, address)| *id == 1 && *address == bind)
                     })

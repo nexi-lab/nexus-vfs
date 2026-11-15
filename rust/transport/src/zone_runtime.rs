@@ -256,6 +256,7 @@ fn status_from(e: ZoneRuntimeError) -> Status {
         ZoneRuntimeError::Invalid(m) => Status::invalid_argument(m),
         ZoneRuntimeError::Conflict(m) => Status::failed_precondition(m),
         ZoneRuntimeError::NotFound(m) => Status::not_found(m),
+        ZoneRuntimeError::Unavailable(m) => Status::unavailable(m),
         ZoneRuntimeError::Internal(m) => {
             // Same discipline as `map_kernel_err` on the VFS face: the
             // detail (store errors, RaftError Debug text) is for the
