@@ -1,5 +1,6 @@
 """Portable real-filesystem checks; never activate the user's node record."""
 import importlib.util
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,17 @@ RECORD = dict(version=1, endpoint='127.0.0.1:2126',
 
 
 class Publication(unittest.TestCase):
+    def test_only_explicit_loopback_ports_are_accepted(self):
+        for port in (1, 2126, 28619, 65535):
+            value = f'127.0.0.1:{port}'
+            self.assertEqual(publisher.loopback_endpoint(value), value)
+        for value in ('127.0.0.1:0', '127.0.0.1:65536', '127.0.0.1:02126',
+                      'localhost:2126', '0.0.0.0:2126', '192.0.2.1:2126',
+                      'https://127.0.0.1:2126', '127.0.0.1:2126/path',
+                      '127.0.0.1:+2126', '127.0.0.1:2126\n', '127.0.0.1'):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                publisher.loopback_endpoint(value)
+
     @unittest.skipUnless(os.name == 'nt', 'Windows PowerShell module discovery')
     def test_windows_acl_ignores_parent_powershell_module_path(self):
         with tempfile.TemporaryDirectory(prefix='nexus-record-modules-') as temporary:

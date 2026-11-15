@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import uuid
@@ -115,11 +116,19 @@ def publish(record, target):
     return 'published'
 
 
+def loopback_endpoint(value):
+    """Keep discovery local while allowing a separately owned Node's port."""
+    match = re.fullmatch(r'127\.0\.0\.1:([1-9][0-9]{0,4})', value)
+    if not match or int(match[1]) > 65535:
+        raise argparse.ArgumentTypeError('expected 127.0.0.1:PORT with PORT between 1 and 65535')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--role', choices=['founder', 'joiner'], required=True)
     parser.add_argument('--agents-dir', type=Path, required=True)
-    parser.add_argument('--endpoint', default='127.0.0.1:2126')
+    parser.add_argument('--endpoint', type=loopback_endpoint, default='127.0.0.1:2126')
     parser.add_argument('--zone', required=True)
     parser.add_argument('--agent', required=True)
     client = parser.add_mutually_exclusive_group(required=True)
@@ -133,8 +142,6 @@ def main():
         parser.error('agents-dir and client must be absolute paths')
     if args.grpcurl and (not args.proto or not args.proto.is_absolute()):
         parser.error('grpcurl requires an absolute --proto path')
-    if '://' in args.endpoint or args.endpoint != '127.0.0.1:2126':
-        parser.error('this shared-machine record uses the verified loopback mTLS endpoint 127.0.0.1:2126')
     node_id = args.agents_dir.parent / '.node_id'
     if hashlib.sha256(node_id.read_bytes()).hexdigest().lower() != args.node_id_sha256.lower():
         parser.error('node identity does not match the verified owner receipt')

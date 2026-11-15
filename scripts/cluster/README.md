@@ -67,8 +67,12 @@ The public proto must match the running revision. grpcurl uses the existing
 bundle's CA, certificate, key and `server_name` for mTLS. Each of `/agents`,
 `/conversations`, and `/sessions` must pass Stat and Readdir; each Stat must
 report the exact requested zone. They are distinct subtrees, not aliases of
-one storage path. The dial endpoint is `127.0.0.1:2126`; TLS authenticates the
-bundle's server name rather than assuming an IP SAN.
+one storage path. The dial endpoint defaults to `127.0.0.1:2126`. Use
+`--endpoint 127.0.0.1:PORT` for a separately owned local Node; hostnames, remote
+addresses, wildcard listeners, URLs and invalid ports are refused. TLS still
+authenticates the bundle's server name rather than assuming an IP SAN. Changing
+the port does not bypass the Node identity pin, authenticated mount probes, or
+no-clobber publication. An existing record cannot be retargeted this way.
 
 The record is `$HOME/.nexus/run/node.json` for the node-owning OS user, outside
 both the legacy `~/.nexus-vfs` service root and sudocode configuration. Version 1
