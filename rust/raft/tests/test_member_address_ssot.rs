@@ -18,372 +18,21 @@
 #![cfg(all(feature = "grpc", has_protos))]
 
 mod common;
+#[path = "common/zone_cluster.rs"]
+mod zone_cluster;
 
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use nexus_raft::prelude::Command;
-use nexus_raft::raft::{RaftStorage, StateMachine};
-use nexus_raft::storage::RedbStore;
-use nexus_raft::transport::{
-    call_join_zone_rpc, ClientConfig, NodeAddress, RaftApiClient, RaftWitnessServer, ServerConfig,
-    WitnessZoneRegistry,
-};
 use nexus_raft::ZoneManager;
 use raft::eraftpb::ConfChangeType;
-use raft::Storage;
-use tempfile::TempDir;
+use zone_cluster::*;
 
-const ZONE: &str = "sharedzone";
 /// Small enough that a few dozen writes compact past the membership entries.
 const SNAPSHOT_THRESHOLD: &str = "16";
 const WRITES_PAST_THRESHOLD: usize = 48;
-const BUDGET: Duration = Duration::from_secs(30);
 
 fn configure_compaction() {
     std::env::set_var("NEXUS_SC_SNAPSHOT_THRESHOLD", SNAPSHOT_THRESHOLD);
-}
-
-/// One node's durable identity: its id, data directory and advertise/bind
-/// address. A restart reuses all three unless the test moves it on purpose.
-struct Node {
-    id: u64,
-    dir: TempDir,
-    bind: String,
-}
-
-impl Node {
-    fn new() -> Self {
-        let dir = TempDir::new().expect("node dir");
-        let id = loop {
-            let id = rand::random::<u64>();
-            if id != 0 {
-                break id;
-            }
-        };
-        std::fs::write(dir.path().join(".node_id"), id.to_be_bytes()).expect("write .node_id");
-        Self {
-            id,
-            dir,
-            bind: common::node_bind_addr(),
-        }
-    }
-
-    fn endpoint(&self) -> String {
-        format!("http://{}", self.bind)
-    }
-
-    fn raft_dir(&self) -> PathBuf {
-        self.dir.path().join(ZONE).join("raft")
-    }
-
-    /// Start (or restart) this node. `seeds` are the operator `--peers`.
-    async fn start(&self, seeds: Vec<String>) -> Arc<ZoneManager> {
-        wait_until_bindable(&self.bind).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match ZoneManager::with_node_id(
-                "member-address-ssot",
-                self.id,
-                self.dir.path().to_str().expect("utf-8 dir"),
-                seeds.clone(),
-                &self.bind,
-                None,
-                Some(self.bind.clone()),
-                None,
-            ) {
-                Ok(manager) => return manager,
-                Err(nexus_raft::raft::RaftError::DataDirLocked(_)) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(error) => panic!("start node {}: {error}", self.id),
-            }
-        }
-    }
-}
-
-/// A witness voter's durable identity: its id, data directory and address.
-struct Witness {
-    id: u64,
-    dir: TempDir,
-    bind: String,
-}
-
-/// A running witness: its zone registry, gRPC server and boot join.
-struct RunningWitness {
-    registry: Arc<WitnessZoneRegistry>,
-    stop: tokio::sync::oneshot::Sender<()>,
-    server: tokio::task::JoinHandle<()>,
-    boot: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Witness {
-    fn new() -> Self {
-        let id = loop {
-            let id = rand::random::<u64>();
-            if id != 0 {
-                break id;
-            }
-        };
-        Self {
-            id,
-            dir: TempDir::new().expect("witness dir"),
-            bind: common::node_bind_addr(),
-        }
-    }
-
-    fn endpoint(&self) -> String {
-        format!("http://{}", self.bind)
-    }
-
-    /// Boot the witness as `nexus-witness` does: advertising its address,
-    /// with `seeds` as `NEXUS_PEERS`, joining `ZONE` at boot.
-    async fn boot(&self, seeds: &[&Node]) -> RunningWitness {
-        let mut registry = WitnessZoneRegistry::new(self.dir.path().to_path_buf(), self.id, None);
-        registry.set_peers(
-            seeds
-                .iter()
-                .map(|seed| NodeAddress::parse(&seed.bind, false).expect("seed address"))
-                .collect(),
-        );
-        registry.set_self_address(self.endpoint());
-        let mut running = self.serve(registry).await;
-        let registry = running.registry.clone();
-        running.boot = Some(tokio::spawn(async move {
-            registry
-                .bootstrap_or_join_zone(ZONE, false, 5, Duration::from_millis(200))
-                .await
-                .expect("witness boot join");
-        }));
-        running
-    }
-
-    /// Serve the witness the way witnesses ran before they registered: no
-    /// advertise address and no seeds. It joins `ZONE` when the leader's
-    /// first message arrives and never registers its address.
-    async fn start_unregistered(&self) -> RunningWitness {
-        self.serve(WitnessZoneRegistry::new(
-            self.dir.path().to_path_buf(),
-            self.id,
-            None,
-        ))
-        .await
-    }
-
-    async fn serve(&self, registry: WitnessZoneRegistry) -> RunningWitness {
-        wait_until_bindable(&self.bind).await;
-        let registry = Arc::new(registry);
-        let server = RaftWitnessServer::new(
-            registry.clone(),
-            ServerConfig {
-                bind_address: self.bind.parse().expect("witness bind"),
-                ..Default::default()
-            },
-        );
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            server
-                .serve_with_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await
-                .expect("witness server");
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while tokio::net::TcpStream::connect(&self.bind).await.is_err() {
-            assert!(Instant::now() < deadline, "witness never listened");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        RunningWitness {
-            registry,
-            stop,
-            server,
-            boot: None,
-        }
-    }
-}
-
-impl RunningWitness {
-    fn follows(&self, leader: u64) -> bool {
-        self.registry
-            .get_node(ZONE)
-            .is_some_and(|node| node.leader_id() == Some(leader))
-    }
-
-    /// Stop the witness and wait until its zone's stores are free to reopen.
-    async fn stop(self, witness: &Witness) {
-        if let Some(boot) = self.boot {
-            boot.abort();
-            let _ = boot.await;
-        }
-        let _ = self.stop.send(());
-        self.server.await.expect("witness server task");
-        self.registry.shutdown_all();
-        drop(self.registry);
-        let zone = witness.dir.path().join(ZONE);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let released = RedbStore::open(zone.join("sm")).is_ok()
-                && RaftStorage::open(zone.join("raft")).is_ok();
-            if released {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the stopped witness still holds its stores"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-}
-
-/// A restarted node binds the same address; the previous listener must be
-/// gone first (a failed bind ends the process).
-async fn wait_until_bindable(bind: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::net::TcpListener::bind(bind).is_err() {
-        assert!(Instant::now() < deadline, "{bind} still bound");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn stop(manager: Arc<ZoneManager>) {
-    tokio::task::spawn_blocking(move || manager.shutdown())
-        .await
-        .expect("shutdown");
-}
-
-async fn eventually<F, Fut>(what: &str, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + BUDGET;
-    while !check().await {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn consensus(
-    manager: &ZoneManager,
-) -> nexus_raft::raft::ZoneConsensus<nexus_raft::raft::FullStateMachine> {
-    manager
-        .get_zone(ZONE)
-        .expect("zone hosted here")
-        .consensus_node()
-}
-
-async fn records(manager: &ZoneManager) -> Vec<(u64, String)> {
-    let mut records = consensus(manager)
-        .with_state_machine(|sm| sm.member_addresses().unwrap().unwrap())
-        .await;
-    records.sort();
-    records
-}
-
-async fn has_key(manager: &ZoneManager, key: &str) -> bool {
-    consensus(manager)
-        .with_state_machine(|sm| sm.get_metadata(key).unwrap().is_some())
-        .await
-}
-
-async fn write(manager: &ZoneManager, key: &str) {
-    consensus(manager)
-        .propose(Command::SetMetadata {
-            key: key.to_string(),
-            value: key.as_bytes().to_vec(),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("write {key}: {e}"));
-}
-
-async fn found(node: &Node, seeds: Vec<String>) -> Arc<ZoneManager> {
-    let manager = node.start(seeds).await;
-    manager.create_zone(ZONE).expect("create zone");
-    await_leader(&manager, node.id).await;
-    manager
-}
-
-async fn await_leader(manager: &ZoneManager, id: u64) {
-    eventually("the sole voter to lead", || async {
-        consensus(manager).leader_id() == Some(id)
-    })
-    .await;
-}
-
-/// Join `learner` to the zone led by `leader`, advertising `advertised` in
-/// the JoinZone request (the AddLearnerNode context).
-async fn join_as_learner(manager: &ZoneManager, learner: &Node, leader: &Node, advertised: &str) {
-    manager.join_zone(ZONE, true).expect("local join_zone");
-    let joined = call_join_zone_rpc(
-        &leader.endpoint(),
-        ZONE,
-        learner.id,
-        advertised,
-        true,
-        None,
-        30,
-    )
-    .await
-    .expect("JoinZone RPC");
-    assert!(joined.success, "JoinZone: {:?}", joined.error);
-}
-
-async fn wait_for_records(manager: &ZoneManager, expected: &[(u64, &str)], whose: &str) {
-    let mut expected: Vec<(u64, String)> = expected
-        .iter()
-        .map(|(id, address)| (*id, address.to_string()))
-        .collect();
-    expected.sort();
-    eventually(whose, || {
-        let expected = expected.clone();
-        async move { records(manager).await == expected }
-    })
-    .await;
-}
-
-/// The stopped node's first retained log index. Storage handles release
-/// asynchronously after shutdown, so the reopen retries the lock only.
-async fn first_retained_index(raft_dir: &Path) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match RaftStorage::open(raft_dir) {
-            Ok(storage) => return storage.first_index().expect("first index"),
-            Err(error) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "raft storage still locked: {error}"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-    }
-}
-
-/// Restart `node` and make its zone resident, as a daemon does when it
-/// serves the zone's mount.
-async fn restart_member(node: &Node, seeds: Vec<String>) -> Arc<ZoneManager> {
-    let manager = node.start(seeds).await;
-    // The previous runtime releases the zone's store asynchronously; until
-    // then materialization reports the zone absent.
-    eventually("the restarted zone to become resident", || async {
-        manager.get_zone(ZONE).is_some()
-    })
-    .await;
-    manager
-}
-
-async fn cluster_info(endpoint: &str) -> nexus_raft::transport::ClusterInfoResult {
-    RaftApiClient::connect(endpoint, ClientConfig::default())
-        .await
-        .expect("connect")
-        .with_zone_id(ZONE.into())
-        .get_cluster_info()
-        .await
-        .expect("GetClusterInfo")
 }
 
 /// The production failure, end to end: compaction drops the learner's
@@ -419,7 +68,7 @@ async fn a_restarted_founder_reaches_its_learner_after_compaction() {
     .await;
 
     stop(founder_zm).await;
-    let first = first_retained_index(&founder.raft_dir()).await;
+    let first = first_retained_index(&founder.raft_dir());
     assert!(
         first > membership_index,
         "the founder's log must be compacted past the membership entries \
@@ -693,8 +342,8 @@ async fn a_booted_witness_registers_and_a_restarted_founder_reaches_it() {
     let (unregistered, membership_index) =
         witness_without_a_record(&founder, &founder_zm, &witness).await;
 
-    unregistered.stop(&witness).await;
-    let booted = witness.boot(&[&founder]).await;
+    unregistered.stop().await;
+    let booted = witness.boot(&[&founder], &[ZONE]).await;
     let both = [
         (founder.id, founder.bind.as_str()),
         (witness.id, witness.bind.as_str()),
@@ -707,7 +356,7 @@ async fn a_booted_witness_registers_and_a_restarted_founder_reaches_it() {
     .await;
 
     stop(founder_zm).await;
-    let first = first_retained_index(&founder.raft_dir()).await;
+    let first = first_retained_index(&founder.raft_dir());
     assert!(
         first > membership_index,
         "the founder's log must be compacted past the witness's membership entry \
@@ -748,7 +397,7 @@ async fn a_booted_witness_registers_and_a_restarted_founder_reaches_it() {
     expected.sort();
     assert_eq!(voters, expected);
 
-    booted.stop(&witness).await;
+    booted.stop().await;
     stop(founder_zm).await;
 }
 
@@ -765,7 +414,7 @@ async fn a_witness_and_its_founder_restarted_together_reach_each_other() {
     let founder_zm = found(&founder, Vec::new()).await;
     let (unregistered, _) = witness_without_a_record(&founder, &founder_zm, &witness).await;
     stop(founder_zm).await;
-    unregistered.stop(&witness).await;
+    unregistered.stop().await;
 
     let founder_zm = restart_member(&founder, Vec::new()).await;
     // Ten election timeouts: a founder that could reach the witness would
@@ -785,7 +434,7 @@ async fn a_witness_and_its_founder_restarted_together_reach_each_other() {
         "the restarted founder has no route to an unregistered witness"
     );
 
-    let booted = witness.boot(&[&founder]).await;
+    let booted = witness.boot(&[&founder], &[ZONE]).await;
     await_leader(&founder_zm, founder.id).await;
     wait_for_records(
         &founder_zm,
@@ -798,6 +447,6 @@ async fn a_witness_and_its_founder_restarted_together_reach_each_other() {
     .await;
     write(&founder_zm, "/after-registration").await;
 
-    booted.stop(&witness).await;
+    booted.stop().await;
     stop(founder_zm).await;
 }

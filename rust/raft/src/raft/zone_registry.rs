@@ -11,8 +11,8 @@
 //!
 //! ```text
 //!   ZoneRaftRegistry
-//!   ├── "zone-alpha" → ZoneEntry { ZoneConsensus, TransportLoop task, shutdown_tx }
-//!   ├── "zone-beta"  → ZoneEntry { ZoneConsensus, TransportLoop task, shutdown_tx }
+//!   ├── "zone-alpha" → ZoneEntry { ZoneConsensus, ZoneTasks }
+//!   ├── "zone-beta"  → ZoneEntry { ZoneConsensus, ZoneTasks }
 //!   └── ...
 //! ```
 
@@ -21,7 +21,9 @@ use crate::raft::{
     FullStateMachine, RaftConfig, RaftStorage, ReplicationLog, StateMachine, ZoneConsensus,
     ZonePersistence,
 };
-use crate::transport::{NodeAddress, SharedPeerMap, TlsConfig, TransportError};
+use crate::transport::{
+    NodeAddress, SharedPeerMap, TlsConfig, TransportError, ZoneTasks, ZonesStopped,
+};
 use crate::zone_deletion_registry::DeletionEpochSource;
 use dashmap::DashMap;
 use lib::rt::block_on_via as bridge_block_on;
@@ -33,7 +35,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 /// Wall-clock ms — the epoch space both the creation marker and the
 /// replicated deletion epoch live in (strictly increasing via
@@ -177,15 +178,9 @@ struct ZoneEntry {
     peers: SharedPeerMap,
     /// This node's ID within the zone.
     node_id: u64,
-    /// Shutdown signal for the transport loop.
-    shutdown_tx: watch::Sender<bool>,
-    /// Transport loop task handle (for join on removal).
-    transport_handle: JoinHandle<()>,
-    /// Member-address self-registration task of a managed zone (for join on
-    /// removal; it ends by itself once the record matches).
-    registration_handle: Option<JoinHandle<()>>,
-    /// Closes after both owned tasks release their consensus handles.
-    task_completion: watch::Receiver<bool>,
+    /// The transport loop and member-address registration running the zone;
+    /// stopped and joined on removal and on shutdown.
+    tasks: ZoneTasks,
     /// On-disk lifecycle owner. Committed (not armed) post-insert —
     /// Drop on process shutdown is a no-op; explicit `destroy()` during
     /// `remove_zone` deletes the dir.
@@ -203,6 +198,7 @@ pub struct ZoneRaftRegistry {
     /// durable one: a zone is materialized on first access and stays until
     /// shutdown.
     zones: DashMap<String, ZoneEntry>,
+    /// Set by shutdown before any subsequent zone publication can proceed.
     closed: AtomicBool,
     /// Setup holds a reader through publication; shutdown retains completion
     /// receivers so concurrent or cancelled waiters share the same drain.
@@ -654,9 +650,9 @@ impl ZoneRaftRegistry {
     /// ConfChange commit.
     ///
     /// `learner` is informational here — the actual Voter/Learner classification is
-    /// determined by the ConfChange the leader proposes (AddNode vs AddLearnerNode).
-    /// Callers must send a JoinZone RPC to the leader with the same learner flag via
-    /// PyFederationClient::request_join_zone.
+    /// determined by the ConfChange the leader proposes (AddNode vs AddLearnerNode)
+    /// for the JoinZone request carrying the same flag
+    /// (`distributed_coordinator::join_zone_via_peers`).
     #[allow(clippy::result_large_err)]
     pub fn join_zone(
         &self,
@@ -674,7 +670,6 @@ impl ZoneRaftRegistry {
         // the ConfChange(AddNode/AddLearnerNode) is committed.
         let config = RaftConfig {
             id: self.node_id,
-            peers: vec![],
             skip_bootstrap: true,
             ..Default::default()
         };
@@ -712,7 +707,6 @@ impl ZoneRaftRegistry {
         self.clear_auto_join_suppression(zone_id);
         let config = RaftConfig {
             id: self.node_id_for_zone(zone_id),
-            peers: vec![],
             skip_bootstrap: true,
             ..Default::default()
         };
@@ -983,7 +977,6 @@ impl ZoneRaftRegistry {
             creating: &self.creating,
             zone_id: zone_id.to_string(),
         };
-
         let publication = self.shutdown_tasks.read().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::Connection(
@@ -1144,10 +1137,7 @@ impl ZoneRaftRegistry {
         // registration — the parts every zone member runs.
         let crate::transport::StartedZone {
             peers: shared_peers,
-            shutdown_tx,
-            transport_handle,
-            registration_handle,
-            task_completion,
+            tasks,
         } = crate::transport::start_zone(
             &mut handle,
             driver,
@@ -1189,10 +1179,7 @@ impl ZoneRaftRegistry {
                 node: handle.clone(),
                 peers: shared_peers,
                 node_id,
-                shutdown_tx,
-                transport_handle,
-                registration_handle,
-                task_completion,
+                tasks,
                 persistence,
             },
         );
@@ -1366,11 +1353,11 @@ impl ZoneRaftRegistry {
     /// 2. Write the tombstone file — the durable commit point of "this zone
     ///    is being torn down". A crash after this leaves a tombstoned dir;
     ///    next startup's `index_persisted_zones` completes cleanup.
-    /// 3. Signal shutdown to the transport loop, await its JoinHandle so
-    ///    the spawned task has fully exited before we drop `ZoneConsensus`.
-    /// 4. Drop `ZoneConsensus` (entry goes out of scope). Driver task
-    ///    exits, closing all redb table handles so `remove_dir_all` can
-    ///    succeed on Windows (which refuses to delete open-handle files).
+    /// 3. Stop the zone's tasks and join them: the transport loop owns the
+    ///    driver, so its exit closes the raft storage.
+    /// 4. Drop the last `ZoneConsensus` handle, closing the state-machine
+    ///    store so `remove_dir_all` can succeed on Windows (which refuses
+    ///    to delete open-handle files).
     /// 5. `persistence.destroy()` — the `rmdir -r`.
     #[allow(clippy::result_large_err)]
     pub async fn remove_zone(&self, zone_id: &str) -> Result<(), TransportError> {
@@ -1423,7 +1410,7 @@ impl ZoneRaftRegistry {
                 TransportError::Connection(format!("Zone '{}' not found", zone_id))
             })?;
             completions.retain(|completion| completion.has_changed().is_ok());
-            completions.push(entry.task_completion.clone());
+            completions.push(entry.tasks.completion());
             let (lifetime, completion) = watch::channel(false);
             completions.push(completion);
             (entry, lifetime)
@@ -1434,10 +1421,7 @@ impl ZoneRaftRegistry {
             node,
             peers,
             node_id,
-            shutdown_tx,
-            transport_handle,
-            registration_handle,
-            task_completion,
+            tasks,
             persistence,
         } = entry;
         self.recently_removed
@@ -1478,7 +1462,7 @@ impl ZoneRaftRegistry {
         if let Err(e) = tombstone_err {
             let _publication = self.shutdown_tasks.write().unwrap();
             if self.closed.load(Ordering::Acquire) {
-                let _ = shutdown_tx.send(true);
+                let _ = tasks.stop();
             } else {
                 self.zones.insert(
                     zone_id.to_string(),
@@ -1486,10 +1470,7 @@ impl ZoneRaftRegistry {
                         node,
                         peers,
                         node_id,
-                        shutdown_tx,
-                        transport_handle,
-                        registration_handle,
-                        task_completion,
+                        tasks,
                         persistence,
                     },
                 );
@@ -1502,33 +1483,11 @@ impl ZoneRaftRegistry {
             )));
         }
 
-        // Signal transport shutdown and await its exit so Windows release
-        // of file handles completes before we try to rmdir.
-        let _ = shutdown_tx.send(true);
-        if let Err(e) = transport_handle.await {
-            tracing::warn!(
-                zone = %zone_id,
-                error = %e,
-                "Transport loop task failed during remove_zone; continuing with destroy",
-            );
-        }
-        // The registration task holds a consensus handle; it observes the
-        // same shutdown and must be gone before the store is released.
-        if let Some(registration) = registration_handle {
-            let _ = registration.await;
-        }
-
-        // Explicitly drop the ZoneConsensus handle so the driver task's
-        // last reference goes away. On Windows, any surviving redb handle
-        // would fail remove_dir_all with PermissionDenied.
+        // Stop and join the zone's tasks, then drop the last handle: no redb
+        // handle may survive into the rmdir (Windows refuses to remove an open
+        // file).
+        tasks.stop().released().await;
         drop(node);
-
-        // Short yield to let the driver task observe the dropped handle
-        // and exit before we attempt rmdir. The driver uses an internal
-        // channel with this as the only external reference (besides the
-        // clones given to the zone's own transport/gRPC surfaces, all of
-        // which are already gone by this point).
-        tokio::task::yield_now().await;
 
         if let Err(e) = persistence.destroy() {
             // Dir deletion failed — log but don't resurrect the zone.
@@ -1628,28 +1587,22 @@ impl ZoneRaftRegistry {
         self.hosted.contains(zone_id)
     }
 
-    /// Shutdown all zones.
-    pub fn shutdown_all(&self) {
+    /// Stop admission and return a view of every original task and removal.
+    /// Repeated or cancelled waiters observe the same storage drain.
+    pub fn shutdown(&self) -> ZonesStopped {
         let mut completions = self.shutdown_tasks.write().unwrap();
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            *self.materialization.write().unwrap() = None;
+            let resident: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
+            for zone_id in resident {
+                if let Some((_, entry)) = self.zones.remove(&zone_id) {
+                    completions.push(entry.tasks.completion());
+                    let _ = entry.tasks.stop();
+                }
+            }
+            tracing::info!("All zones shut down");
         }
-        for entry in self.zones.iter() {
-            completions.push(entry.task_completion.clone());
-            let _ = entry.shutdown_tx.send(true);
-        }
-        self.zones.clear();
-        tracing::info!("All zones shut down");
-    }
-
-    /// Stop admitting zones and wait for the registry's tasks to release storage.
-    /// Independently retained consensus handles remain their callers' responsibility.
-    pub async fn shutdown_all_and_wait(&self) {
-        self.shutdown_all();
-        let completions = self.shutdown_tasks.read().unwrap().clone();
-        for mut completion in completions {
-            while completion.changed().await.is_ok() {}
-        }
+        ZonesStopped::from_completions(completions.clone())
     }
 }
 
@@ -1668,14 +1621,6 @@ mod tests {
         assert!(reg.list_zones().is_empty());
     }
 
-    /// Wait for a transport task's held Arc<RedbStore> to be released
-    /// after `shutdown_all`. The transport loop's tick period is ~100ms,
-    /// so 500ms is a generous margin. Test-only — production paths use
-    /// the explicit transport shutdown handshake, not a sleep.
-    async fn await_shutdown_cleanup() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
     #[tokio::test]
     async fn a_persisted_zone_is_hosted_at_boot_and_materializes_on_first_access() {
         // The restart contract, in the two halves the split makes distinct:
@@ -1691,9 +1636,8 @@ mod tests {
             .unwrap();
         assert_eq!(reg.list_zones(), vec!["corp-eng".to_string()]);
         // Simulate process restart: shutdown tasks, release file locks.
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         // New registry, same base_path — index from disk.
         let reg2 = ZoneRaftRegistry::new(base, 1);
@@ -1711,8 +1655,7 @@ mod tests {
         );
         assert_eq!(reg2.resident_zones(), vec!["corp-eng".to_string()]);
 
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg2.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -1722,9 +1665,8 @@ mod tests {
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
         reg.create_zone("zone-a", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
@@ -1800,9 +1742,8 @@ mod tests {
             .unwrap();
         reg.create_zone("healthy", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base.clone(), 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 2);
@@ -1860,8 +1801,7 @@ mod tests {
             "its runtime was torn down (not just the dir)"
         );
         assert!(!reg.hosts("victim"), "and it is de-catalogued");
-        reg.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -1873,9 +1813,8 @@ mod tests {
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
         reg.create_zone("victim", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 1);
@@ -1889,8 +1828,7 @@ mod tests {
         assert!(reg2.resident_zones().is_empty(), "nothing became resident");
         // The dir itself stays for the sweep (documented split: the gate
         // stops resurrection, the sweep reclaims the dir).
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg2.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -1906,9 +1844,8 @@ mod tests {
             .unwrap();
         reg.create_zone("sharedzone", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base, 1);
         assert_eq!(reg2.index_persisted_zones().unwrap(), 2, "both are hosted");
@@ -1931,8 +1868,7 @@ mod tests {
             "and the refused lookup must not have opened it either",
         );
 
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg2.shutdown().released().await;
     }
 
     // Zone lifecycle regression tests — zone lifecycle is crash-safe
@@ -1961,8 +1897,7 @@ mod tests {
         assert!(reg.get_node("temp-zone").is_none());
         assert!(reg.list_zones().is_empty());
 
-        reg.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -1986,8 +1921,7 @@ mod tests {
             "explicit recreate/join must clear the transport suppression marker",
         );
 
-        reg.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -2002,9 +1936,8 @@ mod tests {
         reg.create_zone("gone", &tokio::runtime::Handle::current())
             .unwrap();
         reg.remove_zone("gone").await.unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         let reg2 = ZoneRaftRegistry::new(base.clone(), 1);
         let n = reg2.index_persisted_zones().unwrap();
@@ -2012,8 +1945,7 @@ mod tests {
         assert_eq!(reg2.list_zones(), vec!["keep".to_string()]);
         assert!(!base.join("gone").exists());
 
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg2.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -2026,9 +1958,8 @@ mod tests {
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
         reg.create_zone("crash-zone", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         // Plant a tombstone by hand to mimic a crashed-mid-teardown run.
         std::fs::write(base.join("crash-zone").join(".removed"), b"").unwrap();
@@ -2043,12 +1974,11 @@ mod tests {
         );
         assert!(reg2.list_zones().is_empty());
 
-        reg2.shutdown_all();
-        await_shutdown_cleanup().await;
+        reg2.shutdown().released().await;
     }
 
     #[tokio::test]
-    async fn test_shutdown_all_preserves_disk() {
+    async fn test_shutdown_preserves_disk() {
         // Regression guard: process shutdown must NOT delete zone dirs
         // (post-commit `armed == false`; Drop is a no-op on disk).
         let tmp = TempDir::new().unwrap();
@@ -2056,9 +1986,8 @@ mod tests {
         let reg = ZoneRaftRegistry::new(base.clone(), 1);
         reg.create_zone("persist", &tokio::runtime::Handle::current())
             .unwrap();
-        reg.shutdown_all();
+        reg.shutdown().released().await;
         drop(reg);
-        await_shutdown_cleanup().await;
 
         assert!(
             base.join("persist").exists(),
@@ -2076,14 +2005,14 @@ mod tests {
             .unwrap();
         // The current-thread runtime has not polled either owned task yet.
         {
-            let mut wait = std::pin::pin!(reg.shutdown_all_and_wait());
+            let mut wait = std::pin::pin!(reg.shutdown().released());
             std::future::poll_fn(|context| {
                 assert!(wait.as_mut().poll(context).is_pending());
                 Poll::Ready(())
             })
             .await;
         }
-        tokio::join!(reg.shutdown_all_and_wait(), reg.shutdown_all_and_wait());
+        tokio::join!(reg.shutdown().released(), reg.shutdown().released());
         assert!(reg.get_node("persist").is_none());
         assert!(reg
             .create_zone("new", &tokio::runtime::Handle::current())
@@ -2094,7 +2023,7 @@ mod tests {
         let next = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         next.open_persisted_zone("persist", &tokio::runtime::Handle::current())
             .unwrap();
-        next.shutdown_all_and_wait().await;
+        next.shutdown().released().await;
     }
 
     #[tokio::test]
@@ -2112,7 +2041,7 @@ mod tests {
         })
         .await;
         assert!(!reg.is_resident("removing"));
-        let (removed, ()) = tokio::join!(remove, reg.shutdown_all_and_wait());
+        let (removed, ()) = tokio::join!(remove, reg.shutdown().released());
         removed.unwrap();
         assert!(!tmp.path().join("removing").exists());
     }

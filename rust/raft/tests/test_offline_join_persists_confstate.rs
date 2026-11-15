@@ -161,7 +161,8 @@ async fn offline_join_persists_confstate_before_returning() {
             &joiner_self_addr_for_task,
             &peer_addrs,
             /* bootstrap_new */ false,
-            /* max_attempts  */ Some(15),
+            /* max_attempts  */
+            Some(nexus_raft::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
             /* as_learner    */ true,
         )
     })
@@ -265,26 +266,10 @@ async fn offline_join_persists_confstate_before_returning() {
     //    learners=[joiner] — no rejection, ConfState is consistent
     //    with the leader's authoritative view.
     // -------------------------------------------------------------
-    // `shutdown()` signals the transport loop + registry workers but the
-    // underlying redb file lock is released only when the last
-    // `Arc<RaftStorage>` drops on the worker threads.  A fixed-duration
-    // sleep here would be flaky — instead, poll until the file is
-    // openable or a generous deadline elapses.  If the deadline trips,
-    // that's a real shutdown bug to surface, not a timing flake.
-    let lock_release_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let joiner_storage = loop {
-        match RaftStorage::open(&joiner_zone_raft_path) {
-            Ok(s) => break s,
-            Err(e) if std::time::Instant::now() < lock_release_deadline => {
-                let _ = e;
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => panic!(
-                "joiner raft storage still locked 5s after ZoneManager::shutdown() — \
-                 likely a shutdown bug, not a test timing issue: {e}",
-            ),
-        }
-    };
+    // `shutdown()` returns once the zones' tasks — the owners of the raft
+    // storage — have finished, so the store reopens at once.
+    let joiner_storage = RaftStorage::open(&joiner_zone_raft_path)
+        .unwrap_or_else(|e| panic!("joiner raft storage still locked after shutdown(): {e}"));
     let persisted = joiner_storage
         .initial_state()
         .expect("read joiner initial state");

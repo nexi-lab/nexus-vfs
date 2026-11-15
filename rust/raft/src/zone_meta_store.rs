@@ -6,6 +6,17 @@
 //! ``propose`` (Raft consensus); reads hit the local state machine
 //! directly.
 //!
+//! ## What a replica reports
+//!
+//! A write returns ``Ok`` only once THIS replica has applied it
+//! (``ZoneConsensus::propose``); a write that committed but is not applied
+//! here in time fails with the replica's lag rather than reporting a success
+//! no read on this node would confirm. A metadata read waits for every write
+//! this node submitted to be applied here, and otherwise reports the lag
+//! instead of a stale answer (``ZoneConsensus::own_writes_visible``). Stream
+//! reads are exempt: an offset this replica has not applied yet reads as
+//! not-yet-written, which a stream reader already waits on.
+//!
 //! ## Write consistency
 //!
 //! ``put`` / ``delete`` / CAS / ``append_stream_entry`` all go through
@@ -53,7 +64,9 @@
 
 use std::sync::Arc;
 
-use crate::prelude::{AppliedEntry, Command, CommandResult, FullStateMachine, ZoneConsensus};
+use crate::prelude::{
+    AppliedEntry, Command, CommandResult, FullStateMachine, RaftError, ZoneConsensus,
+};
 use crate::transport::proto::nexus::core::FileMetadata as ProtoFileMetadata;
 use contracts::VFS_ROOT;
 use lib::rt::block_on_via as bridge_block_on;
@@ -114,8 +127,8 @@ pub struct ZoneMetaStore {
     /// `RemoteMetaStore`.  Each zone metastore caches its own hot
     /// entries (keyed by the caller-facing GLOBAL path, mirroring the
     /// `to_global_path` rewrite done on read so callers see consistent
-    /// keys). `get` consults the cache first; `put` fills it from an
-    /// authoritative committed image; `delete` invalidates pre-propose.
+    /// keys). `get` consults the cache first and fills it from the state
+    /// machine; `delete` invalidates pre-propose.
     ///
     /// Apply-side coherence on follower nodes (and on crosslink
     /// surfaces of the same zone on the leader): every ZoneMetaStore
@@ -379,6 +392,18 @@ impl ZoneMetaStore {
         metadata.path = self.to_global_path(&metadata.path);
         Ok(metadata)
     }
+
+    /// Read-your-writes for a metadata read on this replica: every write this
+    /// node submitted must be applied here first, or the read reports the
+    /// replica's lag. Two atomic loads when it already is.
+    fn own_writes_visible(&self, operation: &str, path: &str) -> Result<(), MetaStoreError> {
+        let node = self.node()?;
+        if node.own_writes_applied() {
+            return Ok(());
+        }
+        bridge_block_on(&self.runtime, node.own_writes_visible())
+            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.{operation}({path}): {e}")))
+    }
 }
 
 /// A wire/proto `target_subtree` as the domain value: empty means the whole
@@ -567,6 +592,9 @@ impl MetaStore for ZoneMetaStore {
     }
 
     fn get(&self, path: &str) -> Result<Option<KernelFileMetadata>, MetaStoreError> {
+        // Before the cache: a row cached before this node's own write may
+        // still be there until the replica applies the write and evicts it.
+        self.own_writes_visible("get", path)?;
         self.cache.get_or_load(path, || {
             self.read_metadata_image(path)?
                 .as_deref()
@@ -583,36 +611,13 @@ impl MetaStore for ZoneMetaStore {
         // travels through a different mount point would see the
         // originating mount's global path, not its own.
         metadata.path = zone_key.clone();
-        let value = kernel_to_proto(&metadata);
-        let value_snapshot = value.clone();
         let cmd = Command::SetMetadata {
-            key: zone_key.clone(),
-            value,
+            key: zone_key,
+            value: kernel_to_proto(&metadata),
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.put({path}): {e}")))?;
-        require_metadata_success(result, "put", path)?;
-        // Read-your-writes: poll local state machine until the exact
-        // bytes we just wrote show up. Propose returns on leader commit;
-        // on a follower, local apply lags by up to one raft tick.
-        // SSOT = raft state machine.
-        let _ = self.node()?.wait_until(
-            || {
-                matches!(
-                    self.cache.load_uncached(path, || {
-                        match self.read_metadata_image(path)? {
-                            Some(bytes) if bytes == value_snapshot => {
-                                self.decode_metadata(&bytes).map(Some)
-                            }
-                            _ => Ok(None),
-                        }
-                    }),
-                    Ok(Some(_))
-                )
-            },
-            500,
-        );
-        Ok(())
+            .map_err(|e| proposal_error(format_args!("ZoneMetaStore.put({path})"), &e))?;
+        require_metadata_success(result, "put", path)
     }
 
     fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
@@ -621,7 +626,7 @@ impl MetaStore for ZoneMetaStore {
         let zone_key = self.to_zone_key(path);
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.delete({path}): {e}")))?;
+            .map_err(|e| proposal_error(format_args!("ZoneMetaStore.delete({path})"), &e))?;
         require_metadata_success(result, "delete", path)?;
         Ok(true)
     }
@@ -644,11 +649,12 @@ impl MetaStore for ZoneMetaStore {
                 is_pas,
             ),
         )
-        .map_err(|error| MetaStoreError::IOError(format!("ZoneMetaStore.rename_path: {error}")))?;
+        .map_err(|error| proposal_error("ZoneMetaStore.rename_path", &error))?;
         require_metadata_success(result, "rename", old_path)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {
+        self.own_writes_visible("list", prefix)?;
         let zone_prefix = self.to_zone_key(prefix);
         let key = zone_prefix.clone();
         let fut = self
@@ -697,8 +703,20 @@ impl MetaStore for ZoneMetaStore {
             stream_prefix: stream_prefix.to_string(),
             data: data.to_vec(),
         };
-        let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
-            .map_err(|e| append_error(stream_prefix, &e))?;
+        let result = match bridge_block_on(&self.runtime, self.node()?.propose(cmd)) {
+            Ok(result) => result,
+            // Committed at its offset. A stream reader on this replica reads
+            // an offset it has not applied yet as not-yet-written and waits,
+            // so the lag needs no error — and an error here would read as a
+            // refusal and append the entry twice on retry.
+            Err(RaftError::CommittedNotVisible { result, .. }) => *result,
+            Err(error) => {
+                return Err(proposal_error(
+                    format_args!("ZoneMetaStore.append_stream_entry({stream_prefix})"),
+                    &error,
+                ))
+            }
+        };
         append_offset(stream_prefix, result)
     }
 
@@ -744,9 +762,10 @@ impl MetaStore for ZoneMetaStore {
             size,
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.seal_stream_segment({stream_prefix}): {e}"
-            ))
+            proposal_error(
+                format_args!("ZoneMetaStore.seal_stream_segment({stream_prefix})"),
+                &e,
+            )
         })?;
         match result {
             crate::prelude::CommandResult::Success => Ok(()),
@@ -849,9 +868,10 @@ impl MetaStore for ZoneMetaStore {
             trimmed,
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd)).map_err(|e| {
-            MetaStoreError::IOError(format!(
-                "ZoneMetaStore.trim_stream_segments({stream_prefix}): {e}"
-            ))
+            proposal_error(
+                format_args!("ZoneMetaStore.trim_stream_segments({stream_prefix})"),
+                &e,
+            )
         })?;
         match result {
             crate::prelude::CommandResult::Success => Ok(()),
@@ -891,12 +911,17 @@ fn append_offset(stream_prefix: &str, result: CommandResult) -> Result<u64, Meta
     }
 }
 
-/// A failed append proposal, typed by what the raft layer knows about it: sent
-/// with no answer (it may have committed) or refused (nothing was applied).
-/// The two need different handling, a read-back versus a plain retry, and
+/// A failed proposal, typed by what the raft layer knows about it. Sent with no
+/// answer, it may have committed: `OutcomeUnknown`. Otherwise the outcome is
+/// known and the message states it — refused or never sent, so nothing was
+/// applied, or committed but not yet applied on this replica: `IOError`. The
+/// two need different handling, a read-back versus a plain retry, and
 /// `RaftError::proposal_outcome_unknown` is the one place that decides which.
-fn append_error(stream_prefix: &str, e: &crate::prelude::RaftError) -> MetaStoreError {
-    let message = format!("ZoneMetaStore.append_stream_entry({stream_prefix}): {e}");
+///
+/// Every proposing method reports its failures through here, `operation`
+/// naming the call (`ZoneMetaStore.put(/a)`) at the head of the message.
+fn proposal_error(operation: impl std::fmt::Display, e: &RaftError) -> MetaStoreError {
+    let message = format!("{operation}: {e}");
     if e.proposal_outcome_unknown() {
         MetaStoreError::OutcomeUnknown(message)
     } else {
@@ -910,30 +935,84 @@ mod tests {
     use crate::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
 
-    /// A proposal that was sent without an answer may have committed; one the
-    /// cluster refused applied nothing. The append error keeps them apart.
-    #[test]
-    fn append_errors_say_whether_the_entry_may_have_committed() {
-        use crate::prelude::RaftError;
-        for unknown in [
+    /// Failures whose proposal may have committed: sent, with no answer.
+    fn unanswered() -> [RaftError; 4] {
+        [
             RaftError::Transport("connection reset".into()),
             RaftError::Timeout(10),
             RaftError::ProposalDropped,
             RaftError::ProposalOutcomeUnknown("lost".into()),
-        ] {
+        ]
+    }
+
+    /// Failures that applied nothing: answered with a refusal, or never sent.
+    fn applied_nothing() -> [RaftError; 4] {
+        [
+            RaftError::NotLeader { leader_hint: None },
+            RaftError::ProposalRejected("configuration changed".into()),
+            RaftError::EntryTooLarge { bytes: 2, limit: 1 },
+            RaftError::NotSubmitted {
+                endpoint: "https://100.64.0.27:2126".into(),
+                reason: "connection refused".into(),
+            },
+        ]
+    }
+
+    /// A proposal that was sent without an answer may have committed; one the
+    /// cluster refused applied nothing. The append error keeps them apart.
+    #[test]
+    fn append_errors_say_whether_the_entry_may_have_committed() {
+        let append = |e: &RaftError| {
+            proposal_error(format_args!("ZoneMetaStore.append_stream_entry(p/)"), e)
+        };
+        for unknown in unanswered() {
             assert!(
-                matches!(
-                    append_error("p/", &unknown),
-                    MetaStoreError::OutcomeUnknown(_)
-                ),
+                matches!(append(&unknown), MetaStoreError::OutcomeUnknown(_)),
                 "{unknown}"
             );
         }
-        let refused = RaftError::NotLeader { leader_hint: None };
-        assert!(matches!(
-            append_error("p/", &refused),
-            MetaStoreError::IOError(_)
-        ));
+        for refused in applied_nothing() {
+            assert!(
+                matches!(append(&refused), MetaStoreError::IOError(_)),
+                "{refused}"
+            );
+        }
+    }
+
+    /// `put` and `delete` classify through the same helper as appends, so a
+    /// caller can tell a write that may have landed from one that did not by
+    /// the variant alone. Each keeps its own message prefix.
+    #[test]
+    fn put_and_delete_errors_say_whether_the_write_may_have_committed() {
+        for operation in ["ZoneMetaStore.put(/a)", "ZoneMetaStore.delete(/a)"] {
+            for unknown in unanswered() {
+                match proposal_error(operation, &unknown) {
+                    MetaStoreError::OutcomeUnknown(why) => {
+                        assert_eq!(why, format!("{operation}: {unknown}"))
+                    }
+                    other => panic!("{operation} after {unknown} must not read as {other:?}"),
+                }
+            }
+            for refused in applied_nothing() {
+                match proposal_error(operation, &refused) {
+                    MetaStoreError::IOError(why) => {
+                        assert_eq!(why, format!("{operation}: {refused}"))
+                    }
+                    other => panic!("{operation} after {refused} must not read as {other:?}"),
+                }
+            }
+            // Committed, only not applied here yet: the outcome is known, and the
+            // message says the write is not undone.
+            let committed = RaftError::CommittedNotVisible {
+                index: Some(9),
+                applied: 7,
+                result: Box::new(CommandResult::Success),
+            };
+            match proposal_error(operation, &committed) {
+                MetaStoreError::IOError(why) => assert!(why.contains("committed"), "{why}"),
+                other => panic!("a committed {operation} must not read as {other:?}"),
+            }
+        }
     }
 
     /// Once `propose` returns the entry is committed, so an answer without a
@@ -1204,6 +1283,6 @@ mod tests {
         let listed = store.list("/corp").expect("list from runtime");
         assert_eq!(listed.len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

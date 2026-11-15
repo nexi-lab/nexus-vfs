@@ -2017,8 +2017,8 @@ pub enum RpcErrorCode {
     /// requested offset was trimmed. Distinct from `InternalError` so a reader
     /// can catch it and reset to the stream's `earliest_offset`.
     OffsetOutOfRange = -32019,
-    /// A replicated append was sent and no answer came back: it may have
-    /// committed. A client that must not duplicate it reads the stream back
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed. A client that must not duplicate it reads the state back
     /// instead of retrying.
     OutcomeUnknown = -32020,
     /// A replicated append was refused: nothing was appended, so a retry is

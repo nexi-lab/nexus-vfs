@@ -141,7 +141,7 @@ impl Kernel {
         if let Some(route) = route {
             self.with_metastore_route(&route, |ms| ms.delete(path))
                 .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
-                .map_err(|e| KernelError::IOError(e.to_string()))?;
+                .map_err(|e| KernelError::from_metastore(&e, e.to_string()))?;
         } else {
             self.metastore_delete(path)?;
         }

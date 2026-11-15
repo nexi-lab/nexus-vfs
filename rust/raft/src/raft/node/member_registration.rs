@@ -158,7 +158,13 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         targets: &[String],
     ) -> Result<()> {
         if self.leader_id().is_some() {
-            match self.propose(command.clone()).await {
+            let committed = match self.propose(command.clone()).await {
+                // The record committed; this replica applying it is its own
+                // catch-up, not a reason to register again.
+                Err(RaftError::CommittedNotVisible { result, .. }) => Ok(*result),
+                other => other,
+            };
+            match committed {
                 Ok(CommandResult::Error(error)) => return Err(RaftError::Raft(error)),
                 Ok(_) => return Ok(()),
                 Err(error) => {
@@ -178,6 +184,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 deadline,
             )
             .await
+            .map(|committed| committed.result)
             {
                 Ok(CommandResult::Error(error)) => last = RaftError::Raft(error),
                 Ok(_) => return Ok(()),

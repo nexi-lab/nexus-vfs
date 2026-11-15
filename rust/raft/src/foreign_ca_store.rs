@@ -191,7 +191,7 @@ mod tests {
         ));
         assert_eq!(find(&scoped.fingerprint_hex()), Some(scoped));
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// A corrupt/undecodable record under our namespace makes `list` fail LOUD
@@ -223,6 +223,6 @@ mod tests {
             "a corrupt anchor must surface as Corrupt, not be dropped"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

@@ -402,5 +402,5 @@ async fn managed_control_refuses_before_unactivated_command_enters_the_log() {
     assert_eq!(node.last_index(), before);
     assert_eq!(store.current(&request.allocation).unwrap(), None);
     drop(store);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }

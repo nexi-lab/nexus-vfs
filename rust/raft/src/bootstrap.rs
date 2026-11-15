@@ -45,7 +45,7 @@
 //!
 //! Two fresh nodes with `--peers` pointed at each other + neither
 //! declares `NEXUS_FEDERATION_ZONES` both hit row 3.  Each retries
-//! `bootstrap_or_join_zone` up to `max_attempts=Some(15)` against a
+//! `bootstrap_or_join_zone` up to `BOUNDED_JOIN_ATTEMPTS` rounds against a
 //! peer that itself has no zones (JoinZone RPC fails until a founder
 //! exists).  After ~2 min both fail loud.  This is intentional — the
 //! operator must break symmetry by declaring which node is the
@@ -126,7 +126,7 @@ pub enum BootAction {
     },
 
     /// Joiner path — this node dispatches a per-zone
-    /// `bootstrap_or_join_zone(..., max_attempts=Some(15),
+    /// `bootstrap_or_join_zone(..., max_attempts=Some(BOUNDED_JOIN_ATTEMPTS),
     /// as_learner=<per-zone>)` against `peers` for each zone in
     /// `zones`.  Reuses the same primitive `run_join` calls.
     ///

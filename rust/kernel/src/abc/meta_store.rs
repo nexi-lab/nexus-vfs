@@ -113,11 +113,13 @@ pub struct FileMetadata {
 pub enum MetaStoreError {
     /// Key not found.
     NotFound(String),
-    /// Underlying I/O or storage error. In general this says nothing about
-    /// whether a replicated write committed: `ZoneMetaStore::put` still reports
-    /// every failed proposal this way, sent or not. Only where an operation's
-    /// contract says so (today [`MetaStore::append_stream_entry`]) does it mean
-    /// a refusal, with nothing applied.
+    /// Underlying I/O or storage error. For a replicated write it is an outcome
+    /// that is known, and the message states which: refused or never sent, so
+    /// nothing was applied, or committed but not yet applied on this replica. A
+    /// write that may have committed unseen is never this; it is
+    /// [`Self::OutcomeUnknown`]. Only where an operation's contract says so
+    /// (today [`MetaStore::append_stream_entry`]) does it mean nothing was
+    /// applied.
     IOError(String),
     /// A replicated write was sent and no answer came back: it may have
     /// committed, so a retry may apply it twice. A caller that must not
@@ -446,8 +448,9 @@ pub trait MetaStore: Send + Sync {
     ///
     /// Failure contract: `OutcomeUnknown` when the entry may have been
     /// appended (the proposal was sent and not answered, or it committed and
-    /// the answer is unusable); `IOError` only for a refusal before anything
-    /// was proposed, so nothing was appended and a retry is safe.
+    /// the answer is unusable); `IOError` only when nothing was proposed — a
+    /// refusal, or a forward that never connected — so nothing was appended and
+    /// a retry is safe.
     fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
         let _ = (stream_prefix, data);
         Err(MetaStoreError::IOError(

@@ -8,12 +8,17 @@
 //!   3. Same operation_id + a DIFFERENT request → refused
 //!      (`FailedPrecondition`): a reused id must not silently merge a new
 //!      request.
+//!   4. A join no leader admits is UNAVAILABLE and leaves no replica; the
+//!      same operation_id, retried once the leader is reachable, joins —
+//!      exactly once.
 
 mod common;
 
 use std::time::Duration;
 
 use common::{free_port, Daemon, ZoneRuntime, LOG_FILTER};
+use kernel::kernel::vfs_proto::zone_status_response::Presence;
+use nexus_raft::transport::{ClientConfig, RaftApiClient};
 use tonic::Code;
 
 const ZONE: &str = "idem-zone";
@@ -135,4 +140,94 @@ async fn a_lost_response_never_creates_a_second_zone() {
         restart_retry.outcome, "CREATED",
         "the replay is the original receipt, not a fresh ALREADY_PRESENT execution"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_retried_after_its_leader_appears_joins_exactly_once() {
+    const JOIN_OP: &str = "op-idem-join-0001";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fdata = tmp.path().join("f-data").to_string_lossy().into_owned();
+    let fid = tmp.path().join("f-id").to_string_lossy().into_owned();
+    let jdata = tmp.path().join("j-data").to_string_lossy().into_owned();
+    let jid = tmp.path().join("j-id").to_string_lossy().into_owned();
+    let fport = free_port();
+    let jport = free_port();
+    let fadv = format!("127.0.0.1:{fport}");
+    let jadv = format!("127.0.0.1:{jport}");
+
+    // The joiner's seed is the founder, which is not running yet.
+    let jenv = {
+        let mut e = env(&jdata, &jid, &jadv);
+        e.push(("NEXUS_PEERS", fadv.as_str()));
+        e
+    };
+    let mut joiner = Daemon::spawn(&["--bind-addr", &jadv, "--no-tls"], &jenv);
+    joiner
+        .wait_for_log("ZoneRuntimeService live", BUDGET)
+        .await
+        .expect("the joiner serves its typed surface without its seed");
+    let mut j_rt = ZoneRuntime::dial_ready(jport, BUDGET).await;
+
+    let refused = j_rt
+        .zone_join(ZONE, false, JOIN_OP, "")
+        .await
+        .expect_err("no leader is reachable");
+    assert_eq!(refused.code(), Code::Unavailable, "{}", refused.message());
+    let status = j_rt.zone_status(ZONE, "").await.expect("joiner status");
+    assert_eq!(
+        status.presence,
+        i32::from(Presence::LocalNotFound),
+        "an unadmitted join leaves no replica behind"
+    );
+    assert!(
+        !std::path::Path::new(&jdata).join(ZONE).exists(),
+        "no zone directory remains"
+    );
+
+    // The leader appears.
+    let fenv = env(&fdata, &fid, &fadv);
+    let mut founder = Daemon::spawn(&["--bind-addr", &fadv, "--no-tls"], &fenv);
+    founder
+        .wait_for_log("ZoneRuntimeService live", BUDGET)
+        .await
+        .expect("founder up");
+    let mut f_rt = ZoneRuntime::dial_ready(fport, BUDGET).await;
+    f_rt.zone_create(ZONE, "op-idem-join-create-0002", "")
+        .await
+        .expect("the founder creates the zone");
+
+    let joined = j_rt
+        .zone_join(ZONE, false, JOIN_OP, "")
+        .await
+        .expect("the same operation id joins once its leader is reachable");
+    assert_eq!(joined.outcome, "JOINED");
+    assert!(!joined.replayed, "the retry drove the join: {joined:?}");
+    let again = j_rt
+        .zone_join(ZONE, false, JOIN_OP, "")
+        .await
+        .expect("a further retry replays");
+    assert!(again.replayed, "the join ran once: {again:?}");
+    assert_eq!(again.outcome, "JOINED");
+    let record = j_rt
+        .get_zone_operation(JOIN_OP, "")
+        .await
+        .expect("journal record");
+    assert_eq!(record.status, "COMPLETED");
+
+    let info = RaftApiClient::connect(&format!("http://{fadv}"), ClientConfig::default())
+        .await
+        .expect("raft api on the founder")
+        .with_zone_id(ZONE.into())
+        .get_cluster_info()
+        .await
+        .expect("GetClusterInfo on the founder");
+    let voters: Vec<String> = info
+        .config
+        .expect("cluster config")
+        .voters
+        .into_iter()
+        .map(|node| node.address)
+        .collect();
+    assert_eq!(voters.len(), 2, "founder and joiner, once each: {voters:?}");
+    assert!(voters.contains(&format!("http://{jadv}")), "{voters:?}");
 }

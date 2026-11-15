@@ -673,5 +673,5 @@ async fn credentials_and_live_permissions_survive_signed_plugin_and_cached_searc
     );
     server.abort();
     let _ = server.await;
-    registry.shutdown_all();
+    registry.shutdown().released().await;
 }

@@ -156,10 +156,32 @@ pub enum KernelError {
     /// A replicated append was refused: nothing was appended, so a retry is
     /// safe. Carries the whole sentence, like `IOError`.
     NotCommitted(String),
-    /// A replicated append was sent and no answer came back: it may have
-    /// committed, so a blind retry may append it twice. Carries the whole
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed, so a blind retry may apply it twice. Carries the whole
     /// sentence, like `IOError`.
     OutcomeUnknown(String),
+}
+
+impl KernelError {
+    /// The kernel error for a failed metastore call, worded `message`.
+    ///
+    /// A write the metastore reports as possibly committed stays
+    /// [`Self::OutcomeUnknown`], so a client can tell "read back before
+    /// retrying" from a plain failure by its code rather than its text. Every
+    /// other failure is an [`Self::IOError`]. That is not promoted to
+    /// [`Self::NotCommitted`]: a metastore `IOError` may report a write that
+    /// committed but is not yet visible on this replica, and a syscall's
+    /// metadata step can follow effects of its own, so "nothing was applied"
+    /// is not something this step can promise for the whole call.
+    pub(crate) fn from_metastore(
+        error: &crate::meta_store::MetaStoreError,
+        message: String,
+    ) -> Self {
+        match error {
+            crate::meta_store::MetaStoreError::OutcomeUnknown(_) => Self::OutcomeUnknown(message),
+            _ => Self::IOError(message),
+        }
+    }
 }
 
 /// The kernel's errors carry their own message.
@@ -1411,9 +1433,9 @@ impl Kernel {
         let mount_point = self.resolve_mount_point(path, zone);
         metadata.path = path.to_string();
         match self.with_metastore(&mount_point, move |ms| ms.put(path, metadata)) {
-            Some(result) => {
-                result.map_err(|e| KernelError::IOError(format!("metastore_put({path}): {e:?}")))
-            }
+            Some(result) => result.map_err(|e| {
+                KernelError::from_metastore(&e, format!("metastore_put({path}): {e:?}"))
+            }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
     }
@@ -1421,9 +1443,9 @@ impl Kernel {
     pub(crate) fn metastore_delete(&self, path: &str) -> Result<bool, KernelError> {
         let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
         match self.with_metastore(&mount_point, |ms| ms.delete(path)) {
-            Some(result) => {
-                result.map_err(|e| KernelError::IOError(format!("metastore_delete({path}): {e:?}")))
-            }
+            Some(result) => result.map_err(|e| {
+                KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+            }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
     }
@@ -1432,9 +1454,9 @@ impl Kernel {
     #[allow(dead_code)]
     pub(crate) fn metastore_delete_batch(&self, paths: &[String]) -> Result<usize, KernelError> {
         match self.metastore.read().as_ref() {
-            Some(ms) => ms
-                .delete_batch(paths)
-                .map_err(|e| KernelError::IOError(format!("metastore_delete_batch: {e:?}"))),
+            Some(ms) => ms.delete_batch(paths).map_err(|e| {
+                KernelError::from_metastore(&e, format!("metastore_delete_batch: {e:?}"))
+            }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
     }
@@ -1450,7 +1472,10 @@ impl Kernel {
             ms.set_file_metadata(path, key, value)
         }) {
             Some(result) => result.map_err(|e| {
-                KernelError::IOError(format!("metastore_set_file_metadata({path}, {key}): {e:?}"))
+                KernelError::from_metastore(
+                    &e,
+                    format!("metastore_set_file_metadata({path}, {key}): {e:?}"),
+                )
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -2408,7 +2433,7 @@ impl Kernel {
             Some(route) => self
                 .with_metastore_route(&route, |ms| ms.put(path, meta))
                 .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
-                .map_err(|e| KernelError::IOError(format!("stream inode: {e:?}"))),
+                .map_err(|e| KernelError::from_metastore(&e, format!("stream inode: {e:?}"))),
             None => self.metastore_put(path, meta),
         }
     }
@@ -2573,7 +2598,10 @@ impl Kernel {
                     .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                     .and_then(|r| {
                         r.map_err(|e| {
-                            KernelError::IOError(format!("setattr_update put({path}): {e:?}"))
+                            KernelError::from_metastore(
+                                &e,
+                                format!("setattr_update put({path}): {e:?}"),
+                            )
                         })
                     })?;
             } else {
@@ -2647,7 +2675,10 @@ impl Kernel {
                 .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
                 .and_then(|r| {
                     r.map_err(|e| {
-                        KernelError::IOError(format!("setattr_update put({path}): {e:?}"))
+                        KernelError::from_metastore(
+                            &e,
+                            format!("setattr_update put({path}): {e:?}"),
+                        )
                     })
                 })?;
         } else {
@@ -4244,6 +4275,183 @@ mod tests {
         // Idempotent: second call is an update (created=false)
         let r2 = setattr(&k, "/newfile", 0).unwrap();
         assert!(!r2.created);
+    }
+
+    /// How a replicated metastore fails a write.
+    #[derive(Clone, Copy, Debug)]
+    enum WriteFault {
+        /// Sent, and the answer was lost: the write landed.
+        Unanswered,
+        /// Refused before anything was applied.
+        Refused,
+    }
+
+    /// A metastore whose writes fail as `fault` says once `armed`. Reads, and
+    /// writes before that, go straight to `inner`.
+    struct FaultyWrites {
+        inner: Arc<crate::meta_store::LocalMetaStore>,
+        fault: WriteFault,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultyWrites {
+        fn write<T>(
+            &self,
+            apply: impl FnOnce() -> Result<T, crate::meta_store::MetaStoreError>,
+        ) -> Result<T, crate::meta_store::MetaStoreError> {
+            use crate::meta_store::MetaStoreError;
+            if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return apply();
+            }
+            match self.fault {
+                WriteFault::Unanswered => {
+                    apply()?;
+                    Err(MetaStoreError::OutcomeUnknown(
+                        "ZoneMetaStore.put: transport error: the answer was lost".into(),
+                    ))
+                }
+                WriteFault::Refused => Err(MetaStoreError::IOError(
+                    "ZoneMetaStore.put: not leader, leader hint: None".into(),
+                )),
+            }
+        }
+    }
+
+    impl crate::meta_store::MetaStore for FaultyWrites {
+        fn get(
+            &self,
+            path: &str,
+        ) -> Result<Option<crate::meta_store::FileMetadata>, crate::meta_store::MetaStoreError>
+        {
+            self.inner.get(path)
+        }
+        fn put(
+            &self,
+            path: &str,
+            metadata: crate::meta_store::FileMetadata,
+        ) -> Result<(), crate::meta_store::MetaStoreError> {
+            self.write(|| self.inner.put(path, metadata))
+        }
+        fn delete(&self, path: &str) -> Result<bool, crate::meta_store::MetaStoreError> {
+            self.write(|| self.inner.delete(path))
+        }
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::meta_store::FileMetadata>, crate::meta_store::MetaStoreError>
+        {
+            self.inner.list(prefix)
+        }
+        fn exists(&self, path: &str) -> Result<bool, crate::meta_store::MetaStoreError> {
+            self.inner.exists(path)
+        }
+    }
+
+    /// A metadata write that may have committed reaches the caller as
+    /// `OutcomeUnknown` from every mutating syscall, `sys_setattr` first; a
+    /// refused one stays an `IOError`, never `NotCommitted`, because the kernel
+    /// cannot promise the whole call applied nothing.
+    #[test]
+    fn a_metadata_write_that_may_have_committed_is_unknown_at_every_mutating_syscall() {
+        for fault in [WriteFault::Unanswered, WriteFault::Refused] {
+            let directory = tempfile::tempdir().unwrap();
+            let inner = Arc::new(
+                crate::meta_store::LocalMetaStore::open(&directory.path().join("meta.redb"))
+                    .unwrap(),
+            );
+            let store = Arc::new(FaultyWrites {
+                inner: Arc::clone(&inner),
+                fault,
+                armed: std::sync::atomic::AtomicBool::new(false),
+            });
+            let k = Kernel::new();
+            let backend: Arc<dyn ObjectStore> = Arc::new(TestObjectStore::default());
+            k.add_mount(
+                "/files",
+                "root",
+                Some(backend),
+                Some(store.clone()),
+                None,
+                false,
+            )
+            .unwrap();
+            k.add_mount("/meta", "root", None, Some(store.clone()), None, false)
+                .unwrap();
+            let ctx = OperationContext::new("test", "root", true, None, true);
+            setattr(&k, "/meta/existing", 0).unwrap();
+            setattr(&k, "/meta/doomed", 0).unwrap();
+            setattr(&k, "/meta/moving", 0).unwrap();
+            store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            // An update with no field to change writes nothing, so it names one.
+            let set_mime_type = |path: &str| {
+                k.sys_setattr(
+                    path,
+                    &ctx,
+                    0,
+                    "",
+                    None,
+                    None,
+                    None,
+                    "memory",
+                    "root",
+                    false,
+                    65536,
+                    None,
+                    None,
+                    Some("text/plain"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+            let results: Vec<(&str, Result<(), KernelError>)> = vec![
+                ("sys_setattr create", setattr(&k, "/meta/new", 0).map(drop)),
+                (
+                    "sys_setattr update",
+                    set_mime_type("/meta/existing").map(drop),
+                ),
+                ("sys_setattr DT_DIR", setattr(&k, "/meta/dir", 1).map(drop)),
+                (
+                    "sys_write",
+                    crate::kernel::syscall::KernelSyscall::sys_write(
+                        &k,
+                        "/files/written",
+                        &ctx,
+                        b"bytes",
+                        0,
+                    )
+                    .map(drop),
+                ),
+                ("mkdir", k.mkdir("/meta/made", &ctx, false, false).map(drop)),
+                (
+                    "sys_unlink",
+                    k.sys_unlink_single("/meta/doomed", &ctx, false).map(drop),
+                ),
+                (
+                    "sys_rename",
+                    k.sys_rename("/meta/moving", "/meta/moved", &ctx).map(drop),
+                ),
+            ];
+            for (syscall, result) in results {
+                match (fault, result) {
+                    (WriteFault::Unanswered, Err(KernelError::OutcomeUnknown(why))) => {
+                        assert!(why.contains("the answer was lost"), "{syscall}: {why}")
+                    }
+                    (WriteFault::Refused, Err(KernelError::IOError(why))) => {
+                        assert!(why.contains("not leader"), "{syscall}: {why}")
+                    }
+                    (fault, other) => {
+                        panic!("{syscall} after a {fault:?} write must not read as {other:?}")
+                    }
+                }
+            }
+        }
     }
 
     // ── Metastore-key tests ────────────────────────────────────────────

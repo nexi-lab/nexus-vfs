@@ -24,20 +24,10 @@ pub(super) fn pool(tls: TlsConfig) -> RaftClientPool {
     })
 }
 
-pub(super) async fn reopened(directory: &std::path::Path) -> RaftStorage {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match RaftStorage::open(directory.join("root/raft")) {
-                Ok(store) => return store,
-                Err(error) => {
-                    assert!(error.to_string().contains("already open"), "{error}");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-    })
-    .await
-    .expect("original transport must release its store")
+/// The root zone's raft storage, reopened after its registry shut down —
+/// which released it.
+pub(super) fn reopened(directory: &std::path::Path) -> RaftStorage {
+    RaftStorage::open(directory.join("root/raft")).expect("a shut-down zone releases its store")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,7 +95,7 @@ async fn reader_preparation_acknowledges_durable_original_full_node_store() {
     assert_eq!(clients.connection_count().await, 0);
     drop(clients);
     let directory = server.shutdown_preserving_storage().await;
-    let store = reopened(directory.path()).await;
+    let store = reopened(directory.path());
     assert!(store.replica_control_reader_required().unwrap());
     assert_eq!(store.last_index_impl().unwrap(), last);
 }
@@ -134,7 +124,6 @@ async fn reader_preparation_refuses_agent_replica_and_plaintext_without_durable_
     }
     let directory = server.shutdown_preserving_storage().await;
     assert!(!reopened(directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 
@@ -204,11 +193,10 @@ async fn reader_preparation_refuses_agent_replica_and_plaintext_without_durable_
     drop(ordinary);
     stop.send(()).unwrap();
     task.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(root);
     drop(registry);
     assert!(!reopened(plain_directory.path())
-        .await
         .replica_control_reader_required()
         .unwrap());
 }
@@ -274,7 +262,7 @@ async fn reader_preparation_acknowledges_original_witness_store_without_leadersh
         Some(tls.clone()),
     ));
     let node = registry
-        .create_zone("root", Vec::new(), &tokio::runtime::Handle::current())
+        .auto_join_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     assert!(!node.is_leader());
     let last = node.last_index();
@@ -318,10 +306,10 @@ async fn reader_preparation_acknowledges_original_witness_store_without_leadersh
     drop(clients);
     stop.send(()).unwrap();
     task.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(node);
     drop(registry);
-    let store = reopened(directory.path()).await;
+    let store = reopened(directory.path());
     assert!(store.replica_control_reader_required().unwrap());
     assert_eq!(store.last_index_impl().unwrap(), last);
 }
