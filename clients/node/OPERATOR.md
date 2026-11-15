@@ -1,8 +1,8 @@
 # Node deployment operations
 
 `NexusNodeOperatorClient` uses the same generated protocol, TLS dialing and
-typed transport errors as the existing clients. It exposes the three existing
-Node-gated session-minter RPCs separately from `NexusZoneApiClient`. A JS class
+typed transport errors as the existing clients. It exposes Node-gated
+session-minter and replica controller RPCs. A JS class
 does not prove Node authority; the real daemon authenticates and authorizes
 the current credential on each operation. No admin methods were added to the
 agent-facing client and no server permission was widened.
@@ -32,9 +32,28 @@ with both available errors. No mutation is automatically retried. Revocation
 is an explicit separate operator decision; never remove a preexisting grant as
 an automatic deployment rollback.
 
-Scripted mTLS tests qualify the client transport and reconciliation behavior.
-Actual Node-versus-Agent authorization, real existing-controller minting and
-product session recovery still require a native daemon acceptance case.
+Scripted mTLS tests exercise the client transport and reconciliation behavior.
+The existing `test:zone-api-live` CI route builds the current daemon and checks
+Node-versus-Agent authorization through its actual control store. Product
+acceptance also exercises controller installation and session recovery.
+
+## Replica controller calls
+
+The trusted controller uses `controlReplica`, `issueReplicaCsr` and
+`queryReplicaCsr` on `NexusNodeOperatorClient`. Each invocation makes one RPC.
+Requests and responses retain the native field names. JSON contract fields are
+opaque `Uint8Array` bytes, and renewal proof timestamps are canonical decimal
+strings spanning the full native `uint64` range. The client copies request bytes
+before waiting for a connection and returns the complete native outcome state.
+
+Before submitting a mutation, the controller durably retains the original
+request, operation IDs, CSR proof and authenticated storage association. An
+uncertain CSR attempt is queried with the same request. Control mutations are
+reconciled by selecting `reconcile_binding_json` or `reconcile_issuer_json`
+with the original JSON bytes. `Unknown`, `NotObserved` and `Refused` preserve
+that original operation for recovery. Current native authorization and durable
+binding checks govern readiness; the controller verifies returned credentials
+before installation.
 
 `npm run package:operator -- /absolute/new-runtime.tgz` builds a portable
 runtime archive from clean producer source. It includes the normal compiled
