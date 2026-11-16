@@ -1106,7 +1106,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         let desc = self
             .agent_registry
             .get_instance_descriptor(instance)
-            .ok_or_else(|| ManagedAgentError::UnknownSession(desc.pid))?;
+            .ok_or(ManagedAgentError::UnknownSession(desc.pid))?;
         // Stop can be requested while the provider is still constructing its
         // handle. Without the original attachment, do not advertise readiness
         // or invent a cleanup outcome from the descriptor alone.
