@@ -87,9 +87,10 @@ impl BlobFetcher for ZoneContentBlobFetcher {
         let content_id = content_id.to_owned();
         let zone_id = zone_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            if let Some(segment) =
-                ColdSegmentAddress::parse(&zone_id, &content_id).map_err(|_| UNAVAILABLE)?
+            if let Some(read) =
+                ColdSegmentAddress::parse_read(&zone_id, &content_id).map_err(|_| UNAVAILABLE)?
             {
+                let segment = &read.address;
                 if let Some(records) = binding.metadata.as_guarded_records() {
                     records
                         .check_unscoped_io(&records.record_storage_key(segment.stream_path))
@@ -105,7 +106,9 @@ impl BlobFetcher for ZoneContentBlobFetcher {
                     .metadata
                     .find_stream_segment(&wal_stream_prefix(segment.stream_path), segment.base)
                     .map_err(|_| UNAVAILABLE)?
-                    .filter(|entry| entry.base == segment.base)
+                    .filter(|entry| {
+                        entry.base == segment.base && read.matches_content_id(&entry.content_id)
+                    })
                     .ok_or(UNAVAILABLE)?;
                 return binding
                     .objects

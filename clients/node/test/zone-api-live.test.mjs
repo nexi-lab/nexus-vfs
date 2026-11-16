@@ -23,7 +23,7 @@ import grpc from '@grpc/grpc-js'
 import protoLoader from '@grpc/proto-loader'
 import protobuf from 'protobufjs'
 
-import { NexusVfsClient, NexusZoneApiClient, userRuntimeServerName, createUserRuntimeCredentialBundle } from '../dist/index.js'
+import { NexusVfsClient, NexusZoneApiClient, NexusNodeOperatorClient, NexusRpcError, userRuntimeServerName, createUserRuntimeCredentialBundle } from '../dist/index.js'
 import {
   CORE_METADATA_PROTO,
   RAFT_COMMANDS_PROTO,
@@ -87,8 +87,42 @@ test(
     })
     t.after(() => agent.close())
 
+    await t.test('replica reads reach the native control store only with current Node authority', async replica => {
+      const operator = new NexusNodeOperatorClient(endpoint, {
+        ca: readFileSync(join(tlsDir, 'ca.pem')),
+        cert: readFileSync(join(tlsDir, 'node.pem')),
+        key: readFileSync(join(tlsDir, 'node-key.pem')),
+      })
+      const unprivileged = new NexusNodeOperatorClient(endpoint, {
+        ca: minted.ca_pem, cert: minted.agent_cert_pem, key: minted.agent_key_pem,
+      })
+      try {
+        const requests = [
+          { current_issuer: {} },
+          { current_binding_json: Buffer.from(JSON.stringify({
+            owner_id: OWNER, allocation_id: `unallocated-${process.pid}`,
+          })) },
+        ]
+        for (const request of requests) {
+          await replica.test(Object.keys(request)[0], async () => {
+            const absent = await operator.controlReplica(request)
+            assert.equal(absent.state, 'REPLICA_CONTROL_STATE_NOT_OBSERVED', absent.error)
+            assert.equal(absent.result_json.length, 0)
+            assert.equal(absent.error, undefined)
+            // The transport authenticates this Node-only method before the
+            // lifecycle adapter can produce an application outcome.
+            await assert.rejects(unprivileged.controlReplica(request), error =>
+              error instanceof NexusRpcError && error.code === grpc.status.PERMISSION_DENIED)
+            assert.deepEqual(await operator.controlReplica(request), absent,
+              'the refused caller leaves the same native observation available to the Node')
+          })
+        }
+      } finally { operator.close(); unprivileged.close() }
+    })
+
     await t.test('the client exposes no way to administer the list', () => {
-      for (const method of ['allowSessionMinter', 'denySessionMinter', 'listSessionMinters']) {
+      for (const method of ['allowSessionMinter', 'denySessionMinter', 'listSessionMinters',
+        'controlReplica', 'issueReplicaCsr', 'queryReplicaCsr']) {
         assert.equal(
           typeof agent[method],
           'undefined',
