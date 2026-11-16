@@ -130,6 +130,43 @@ pub struct RebacPermissionProvider {
 }
 
 impl RebacPermissionProvider {
+    /// Require an explicit grant from a current snapshot for the authenticated
+    /// caller and the captured route's zone. This is a blocking admission check,
+    /// not a durable SID/storage binding or a transferable permission token.
+    /// Service-internal system context is refused; admin flags do not bypass
+    /// the resource grant. Subsequent operations must be checked again.
+    pub fn check_current_grants(
+        &self,
+        path: &str,
+        route: &RouteResult,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        let subject = Self::subject_of(ctx);
+        if ctx.is_system || subject.entity_id.is_empty() || route.zone_id.is_empty() {
+            return Err(KernelError::PermissionDenied(
+                "current grants require the original caller and captured resource zone".into(),
+            ));
+        }
+        let graph = self
+            .cache
+            .current_graph_for_zone(&route.zone_id)
+            .map_err(|error| {
+                KernelError::PermissionDenied(format!(
+                    "current grant snapshot unavailable for zone {}: {error}",
+                    route.zone_id
+                ))
+            })?;
+        if self.allows(&subject, permission, &Self::object_of(path), &graph) {
+            Ok(())
+        } else {
+            Err(KernelError::PermissionDenied(format!(
+                "current grant missing for {}:{} on {path} (zone={})",
+                subject.entity_type, subject.entity_id, route.zone_id
+            )))
+        }
+    }
+
     /// Wrap a `ReBACGraphCache` with the v1 (empty-namespace)
     /// enforcer.  The composition root builds one `Arc<Self>` and
     /// hands it to `kernel::Kernel::set_permission_provider`.
@@ -290,6 +327,9 @@ impl PermissionProvider for RebacPermissionProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod current_grants_tests;
 
 #[cfg(test)]
 mod tests {

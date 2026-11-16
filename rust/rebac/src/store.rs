@@ -59,6 +59,15 @@ pub trait ReBACTupleStore: Send + Sync {
     /// see the trait doc for the size-budget rationale.
     fn list(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError>;
 
+    /// Read a snapshot ordered after previously committed grants and revocations.
+    /// Session admission must not silently fall back to a locally applied view.
+    /// Backends without this guarantee refuse even if `list` can return grants.
+    fn list_linearizable(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
+        Err(ReBACTupleStoreError::Backend(
+            "current grant snapshot is unsupported by this store".into(),
+        ))
+    }
+
     /// Revision of the entire locally applied store. Cache entries can be reused
     /// only while this value matches. It changes after put/delete and snapshot
     /// restore; zero means revisions are unavailable and caching must be bypassed.

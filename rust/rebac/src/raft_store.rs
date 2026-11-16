@@ -100,6 +100,12 @@ impl ReBACTupleStore for RaftReBACTupleStore {
         self.inner.list().map_err(ReBACTupleStoreError::Backend)
     }
 
+    fn list_linearizable(&self) -> Result<Vec<(String, Vec<u8>)>, ReBACTupleStoreError> {
+        self.inner
+            .list_linearizable()
+            .map_err(ReBACTupleStoreError::Backend)
+    }
+
     fn revision(&self) -> Result<u64, ReBACTupleStoreError> {
         // The state machine publishes this atomic after apply AND snapshot
         // restore. It also starts at the recovered index after restart. Using
@@ -115,6 +121,24 @@ mod tests {
     use nexus_raft::raft::ZoneRaftRegistry;
     use tempfile::TempDir;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_tuple_snapshot_reads_actual_committed_grant_and_revocation() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
+        let runtime = tokio::runtime::Handle::current();
+        let node = registry.create_zone("root", vec![], &runtime).unwrap();
+        node.campaign().await.unwrap();
+        let store = RaftReBACTupleStore::new(node, runtime);
+        let key = "root|file:/sessions/original|reader|user|alice";
+        store.put(key, b"").unwrap();
+        assert_eq!(
+            store.list_linearizable().unwrap(),
+            vec![(key.into(), Vec::new())]
+        );
+        assert!(store.delete(key).unwrap());
+        assert!(store.list_linearizable().unwrap().is_empty());
+        registry.shutdown_all();
+    }
     /// Full lifecycle against a live 1-voter zone, exercised from
     /// inside a multi-thread tokio runtime — the shape every real
     /// caller has (the http-api handler thread is a runtime worker),

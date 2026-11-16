@@ -108,6 +108,18 @@ impl ReBACGraphCache {
         Ok(graph)
     }
 
+    /// Build from one current store snapshot without consulting or populating
+    /// the local-applied cache. A prior cache hit cannot bypass ReadIndex.
+    pub fn current_graph_for_zone(
+        &self,
+        zone: &str,
+    ) -> Result<Arc<ReBACGraph>, ReBACTupleStoreError> {
+        Ok(Arc::new(graph_from_entries(
+            self.store.list_linearizable()?,
+            zone,
+        )))
+    }
+
     /// Drop the cached entry for `zone`, if any.  The next
     /// `graph_for_zone(zone)` call rebuilds unconditionally.
     ///
@@ -130,7 +142,10 @@ fn build_graph_for_zone(
     store: &dyn ReBACTupleStore,
     zone: &str,
 ) -> Result<ReBACGraph, ReBACTupleStoreError> {
-    let entries = store.list()?;
+    Ok(graph_from_entries(store.list()?, zone))
+}
+
+fn graph_from_entries(entries: Vec<(String, Vec<u8>)>, zone: &str) -> ReBACGraph {
     let tuples: Vec<ReBACTuple> = entries
         .into_iter()
         .filter_map(|(key, _value)| {
@@ -145,7 +160,7 @@ fn build_graph_for_zone(
             tuple_key::decode(&key).map(|(_zone, tuple)| tuple)
         })
         .collect();
-    Ok(ReBACGraph::from_tuples(&tuples))
+    ReBACGraph::from_tuples(&tuples)
 }
 
 #[cfg(test)]
