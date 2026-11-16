@@ -126,3 +126,85 @@ fn malformed_multiple_and_trailing_der_never_become_verified_crls() {
     assert!(verify_signed_crl(&vec![0; MAX_CRL_BYTES + 1], &ca).is_err());
     assert!(verify_signed_crl(b"not a CRL", &ca).is_err());
 }
+
+#[test]
+fn a_number_identifies_one_signed_snapshot_across_pem_encodings() {
+    let (ca, issuer) = issuer("native-root");
+    let original = signed(&params(NOW, NOW + 300), &issuer);
+    let current = verify_signed_crl(&original, &ca).unwrap();
+    let crlf = String::from_utf8(original.clone())
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    let reformatted = format!("\n{crlf}\n");
+    assert_ne!(original, reformatted.as_bytes());
+    let replay = verify_signed_crl(reformatted.as_bytes(), &ca).unwrap();
+    assert_eq!(replay.signed_der_sha256(), current.signed_der_sha256());
+    replay.check_successor(&current).unwrap();
+
+    let mut changed = params(NOW, NOW + 300);
+    changed.revoked_certs[0].serial_number = SerialNumber::from(9u64);
+    let conflicting = verify_signed_crl(&signed(&changed, &issuer), &ca).unwrap();
+    assert_eq!(conflicting.number(), current.number());
+    assert_ne!(conflicting.signed_der_sha256(), current.signed_der_sha256());
+    assert_eq!(
+        conflicting.check_successor(&current).unwrap_err(),
+        "CRL number already identifies another signed snapshot"
+    );
+}
+
+#[test]
+fn later_fresh_crl_cannot_replace_a_higher_number() {
+    let (ca, issuer) = issuer("native-root");
+    let current = verify_signed_crl(&signed(&params(NOW, NOW + 300), &issuer), &ca).unwrap();
+    let mut stale = params(NOW + 1, NOW + 301);
+    stale.crl_number = SerialNumber::from(6u64);
+    let stale = verify_signed_crl(&signed(&stale, &issuer), &ca).unwrap();
+    current.check_freshness(NOW + 1, 60).unwrap();
+    stale.check_freshness(NOW + 1, 60).unwrap();
+    assert_eq!(
+        stale.check_successor(&current).unwrap_err(),
+        "CRL number moved backwards"
+    );
+}
+
+#[test]
+fn successor_number_is_unsigned_and_can_exceed_u64() {
+    let (ca, issuer) = issuer("native-root");
+    let mut old = params(NOW, NOW + 300);
+    old.crl_number = SerialNumber::from(vec![0xff; 8]);
+    let old = verify_signed_crl(&signed(&old, &issuer), &ca).unwrap();
+    let mut next = params(NOW + 1, NOW + 301);
+    next.crl_number = SerialNumber::from(vec![1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // The issuer may prune expired entries. The installer retains its own
+    // irreversible tombstones when accepting this otherwise valid successor.
+    next.revoked_certs.clear();
+    let next = verify_signed_crl(&signed(&next, &issuer), &ca).unwrap();
+    next.check_successor(&old).unwrap();
+    assert!(next.revoked_serials().is_empty());
+    assert_eq!(
+        old.check_successor(&next).unwrap_err(),
+        "CRL number moved backwards"
+    );
+}
+
+#[test]
+fn a_greater_number_does_not_authorize_an_older_time_or_another_issuer() {
+    let (ca, issuer) = issuer("native-root");
+    let original = verify_signed_crl(&signed(&params(NOW, NOW + 300), &issuer), &ca).unwrap();
+    let mut future_number = params(NOW - 1, NOW + 299);
+    future_number.crl_number = SerialNumber::from(8u64);
+    let rollback = verify_signed_crl(&signed(&future_number, &issuer), &ca).unwrap();
+    rollback.check_freshness(NOW, 60).unwrap();
+    assert_eq!(
+        rollback.check_successor(&original).unwrap_err(),
+        "CRL issuance time moved backwards"
+    );
+
+    let (other_ca, other_issuer) = self::issuer("native-root");
+    let unrelated = verify_signed_crl(&signed(&future_number, &other_issuer), &other_ca).unwrap();
+    assert_eq!(
+        unrelated.check_successor(&original).unwrap_err(),
+        "CRL successor belongs to another signing authority"
+    );
+}
