@@ -16,6 +16,7 @@ struct Body {
     malformed: bool,
     cancel_during_spawn: bool,
     complete_during_spawn: bool,
+    join_during_stop: bool,
 }
 struct Handle {
     body: Arc<Body>,
@@ -31,6 +32,10 @@ impl SpawnHandle for Handle {
     fn abort(&self) {
         if !self.stopped.swap(true, Ordering::SeqCst) {
             self.body.stops.fetch_add(1, Ordering::SeqCst);
+            if self.body.join_during_stop {
+                let (cleanup, _) = self.body.owner.lock().unwrap().as_ref().unwrap().clone();
+                assert!(cleanup.complete(Ok(())));
+            }
         }
     }
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
@@ -69,6 +74,12 @@ impl SpawnTask<Kernel> for Provider {
         *self.0.owner.lock().unwrap() = Some((cleanup, observer));
         if self.0.cancel_during_spawn {
             assert!(kernel.agent_registry().kill(&desc.pid, 0).is_err());
+            let error =
+                call(&kernel, "get_session_v1", json!({"session_id":desc.pid})).unwrap_err();
+            assert!(
+                error.contains("before original cleanup attachment"),
+                "{error}"
+            );
         }
         Ok(Box::new(Handle {
             body: Arc::clone(&self.0),
@@ -109,14 +120,21 @@ fn cancel_retains_host_until_its_original_completion_and_never_reports_ready() {
     let (instance, _) = kernel.agent_registry().get_instance(pid).unwrap();
     assert!(kernel.agent_registry().is_managed_host_bound(&instance));
     for _ in 0..2 {
-        let error = call(
+        let response = call(
             &kernel,
             "cancel_v1",
             json!({"session_id":pid,"mode":"session"}),
         )
-        .unwrap_err();
-        assert!(error.contains("cleanup unconfirmed"), "{error}");
-        assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).is_err());
+        .unwrap();
+        assert_eq!(response, json!({"cancelled":true,"stopping":true}));
+        let state = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+        assert_eq!(state["state"], "stopping");
+        assert!(state["session_endpoint"].is_null());
+        assert_eq!(
+            kernel.agent_registry().get(pid).unwrap().state,
+            AgentState::Ready
+        );
+        assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 0);
         assert!(!kernel.agent_registry().reap(pid));
     }
     assert_eq!(body.stops.load(Ordering::SeqCst), 1);
@@ -124,12 +142,113 @@ fn cancel_retains_host_until_its_original_completion_and_never_reports_ready() {
     assert!(!kernel.agent_registry().is_managed_host_bound(&instance));
     let (cleanup, observer) = body.owner.lock().unwrap().as_ref().unwrap().clone();
     assert!(cleanup.complete(Ok(())));
+    let state = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+    assert_eq!(
+        state["state"], "stopping",
+        "joined latch alone is not terminal"
+    );
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 0);
     observer(AgentState::Terminated, None);
     assert_eq!(
         kernel.agent_registry().get(pid).unwrap().state,
         AgentState::Terminated
     );
+    let state = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+    assert_eq!(state["state"], "terminated");
+    assert!(state["session_endpoint"].is_null());
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 1);
     assert!(kernel.agent_registry().reap(pid));
+}
+
+#[test]
+fn unconfirmed_cleanup_stays_an_error_and_retains_original_custody() {
+    let (kernel, body) = fixture(Body::default());
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"agent"})).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    let (instance, _) = kernel.agent_registry().get_instance(pid).unwrap();
+    let response = call(
+        &kernel,
+        "cancel_v1",
+        json!({"session_id":pid,"mode":"session"}),
+    )
+    .unwrap();
+    assert_eq!(response, json!({"cancelled":true,"stopping":true}));
+    let (cleanup, observer) = body.owner.lock().unwrap().as_ref().unwrap().clone();
+    assert!(!cleanup.complete(Err("original receiver join failed".into())));
+    for (method, payload) in [
+        ("cancel_v1", json!({"session_id":pid,"mode":"session"})),
+        ("get_session_v1", json!({"session_id":pid})),
+    ] {
+        let error = call(&kernel, method, payload).unwrap_err();
+        assert!(error.contains("cleanup unconfirmed"), "{error}");
+        assert!(error.contains("original receiver join failed"), "{error}");
+    }
+    assert!(!cleanup.complete(Ok(())));
+    observer(AgentState::Terminated, None);
+    assert!(kernel.agent_registry().is_current_instance(&instance));
+    assert_eq!(
+        kernel.agent_registry().get(pid).unwrap().state,
+        AgentState::Ready
+    );
+    assert!(!kernel.agent_registry().reap(pid));
+    assert_eq!(body.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn synchronous_join_during_stop_is_not_a_terminal_callback() {
+    let (kernel, body) = fixture(Body {
+        join_during_stop: true,
+        ..Default::default()
+    });
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"agent"})).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    let response = call(
+        &kernel,
+        "cancel_v1",
+        json!({"session_id":pid,"mode":"session"}),
+    )
+    .unwrap();
+    assert_eq!(response, json!({"cancelled":true,"stopping":true}));
+    let (cleanup, observer) = body.owner.lock().unwrap().as_ref().unwrap().clone();
+    assert_eq!(cleanup.outcome(), HostCleanupOutcome::Joined);
+    let state = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+    assert_eq!(state["state"], "stopping");
+    assert!(state["session_endpoint"].is_null());
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 0);
+    observer(AgentState::Terminated, None);
+    let state = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+    assert_eq!(state["state"], "terminated");
+    assert_eq!(body.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancel_v2_pending_stop_keeps_channel_fencing_and_original_host() {
+    let (kernel, body) = fixture(Body::default());
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"agent"})).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    let channel = started["session_endpoint"]["channel_id"].as_str().unwrap();
+    let stale = call(
+        &kernel,
+        "cancel_v2",
+        json!({"session_id":pid,"channel_id":"old-channel"}),
+    )
+    .unwrap();
+    assert_eq!(stale, json!({"cancelled":false,"stopping":false}));
+    assert_eq!(body.stops.load(Ordering::SeqCst), 0);
+    for _ in 0..2 {
+        let response = call(
+            &kernel,
+            "cancel_v2",
+            json!({"session_id":pid,"channel_id":channel}),
+        )
+        .unwrap();
+        assert_eq!(response, json!({"cancelled":true,"stopping":true}));
+        assert!(!kernel.agent_registry().reap(pid));
+    }
+    assert_eq!(body.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(body.dropped_handles.load(Ordering::SeqCst), 0);
 }
 
 #[test]

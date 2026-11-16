@@ -48,8 +48,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, OperationContext};
+use kernel::core::agents::host_cleanup::{HostCleanupOutcome, ManagedHostCleanup};
 use kernel::core::agents::registry::{
-    AgentDescriptor, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
+    AgentDescriptor, AgentError, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
 };
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::service_registry::{RustCallError, RustService};
@@ -271,7 +272,11 @@ pub(crate) struct GetSessionRequest {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CancelResponse {
+    /// The request reached the captured instance; this is not a joined-cleanup receipt.
     pub cancelled: bool,
+    /// Original host cleanup or its terminal callback is still outstanding.
+    #[serde(default)]
+    pub stopping: bool,
 }
 
 #[derive(Debug)]
@@ -334,6 +339,7 @@ pub trait SpawnHandle: Send + Sync {
 pub(crate) struct HostedSession {
     instance: AgentInstance,
     handle: Arc<dyn SpawnHandle>,
+    cleanup: Option<ManagedHostCleanup>,
 }
 
 type HostedSessions = Arc<dashmap::DashMap<String, HostedSession>>;
@@ -364,6 +370,7 @@ fn store_host_handle(
                 let hosted = slot.insert(HostedSession {
                     instance,
                     handle: Arc::clone(&handle),
+                    cleanup: cleanup.cloned(),
                 });
                 drop(hosted);
                 if let Some(cleanup) = cleanup {
@@ -954,10 +961,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// mechanism it picks (channel, atomic flag, …) — kernel doesn't
     /// know about turn boundaries.
     ///
-    /// `Session` — terminate: transition AgentRegistry to `Terminated`.
-    /// The on_terminate observer registered at install time tears down
-    /// the per-pid procfs dirent.  The runtime crate observes the state
-    /// transition and shuts down the agent task.
+    /// `Session` requests stop of the captured runtime. A hosted session reports
+    /// `stopping` until its original cleanup and terminal observer finish.
+    /// Only that confirmation permits `Terminated` and releases host custody.
     pub(crate) fn cancel(
         &self,
         session_id: &str,
@@ -980,12 +986,23 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "turn cancellation uses session/cancel on the session mailbox".into(),
             )),
             CancelMode::Session => {
-                let cancelled = self
-                    .agent_registry
-                    .kill_instance(instance, 0)
-                    .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
-                    .is_some();
-                Ok(CancelResponse { cancelled })
+                match self.agent_registry.kill_instance(instance, 0) {
+                    Ok(updated) => Ok(CancelResponse {
+                        cancelled: updated.is_some(),
+                        stopping: false,
+                    }),
+                    // kill_instance already requested stop on this incarnation.
+                    // Its original host may finish between signalling and this
+                    // outcome snapshot; neither branch is a terminal receipt.
+                    Err(AgentError::CleanupUnconfirmed {
+                        outcome: HostCleanupOutcome::Pending | HostCleanupOutcome::Joined,
+                        ..
+                    }) => Ok(CancelResponse {
+                        cancelled: true,
+                        stopping: true,
+                    }),
+                    Err(error) => Err(ManagedAgentError::Internal(error.to_string())),
+                }
             }
         }
     }
@@ -1068,7 +1085,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         instance: &AgentInstance,
         desc: AgentDescriptor,
     ) -> Result<GetSessionResponse, ManagedAgentError> {
-        let (session_endpoint, durable_session_id) = self
+        let (mut session_endpoint, durable_session_id, stop_outcome) = self
             .spawn_handles
             .get(&desc.pid)
             .map(|host| {
@@ -1078,19 +1095,46 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 Ok((
                     host.handle.session_endpoint().cloned(),
                     host.handle.durable_session_id().map(str::to_owned),
+                    host.cleanup
+                        .as_ref()
+                        .and_then(ManagedHostCleanup::stop_outcome),
                 ))
             })
             .transpose()?
             .unwrap_or_default();
         // Never combine an authorized PCB with another incarnation's handle.
-        if !self.agent_registry.is_current_instance(instance) {
-            return Err(ManagedAgentError::UnknownSession(desc.pid));
-        }
-        if self.agent_registry.host_stop_requested(instance) {
+        let desc = self
+            .agent_registry
+            .get_instance_descriptor(instance)
+            .ok_or_else(|| ManagedAgentError::UnknownSession(desc.pid))?;
+        // Stop can be requested while the provider is still constructing its
+        // handle. Without the original attachment, do not advertise readiness
+        // or invent a cleanup outcome from the descriptor alone.
+        if !desc.state.is_terminal()
+            && stop_outcome.is_none()
+            && self.agent_registry.host_stop_requested(instance)
+        {
             return Err(ManagedAgentError::Internal(
-                "host stopping; original custody retained until joined cleanup".into(),
+                "host stopping before original cleanup attachment".into(),
             ));
         }
+        let state = match stop_outcome {
+            Some(HostCleanupOutcome::Unconfirmed(error)) => {
+                return Err(ManagedAgentError::Internal(format!(
+                    "host cleanup unconfirmed: {error}; original custody retained"
+                )));
+            }
+            Some(_) if !desc.state.is_terminal() => {
+                session_endpoint = None;
+                "stopping".to_string()
+            }
+            _ => {
+                if desc.state.is_terminal() {
+                    session_endpoint = None;
+                }
+                desc.state.as_str().to_lowercase()
+            }
+        };
         let workspace_path = format!("/proc/{}/workspace/", desc.pid);
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
         Ok(GetSessionResponse {
@@ -1101,7 +1145,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             owner_id: desc.owner_id.clone(),
             workspace_path,
             model,
-            state: desc.state.as_str().to_lowercase(),
+            state,
             reason: desc.reason.clone(),
         })
     }
@@ -1573,7 +1617,10 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                 let resp = if is_current_channel {
                     self.cancel_instance(&instance, CancelMode::Session)?
                 } else {
-                    CancelResponse { cancelled: false }
+                    CancelResponse {
+                        cancelled: false,
+                        stopping: false,
+                    }
                 };
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }

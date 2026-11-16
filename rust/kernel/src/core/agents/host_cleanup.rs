@@ -58,6 +58,13 @@ impl ManagedHostCleanup {
         self.0.lock().stop_requested
     }
 
+    /// Read the stop request and its original completion outcome together.
+    /// A pending or joined stop does not by itself publish registry termination.
+    pub fn stop_outcome(&self) -> Option<HostCleanupOutcome> {
+        let state = self.0.lock();
+        state.stop_requested.then(|| state.outcome.clone())
+    }
+
     /// All writer, receiver and completion-retirement joins must have run
     /// before calling this. Return true only for an accepted joined outcome.
     /// An error is retained even if another caller later reports Ok.
