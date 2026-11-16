@@ -117,12 +117,17 @@ fn renew(env: &[(&str, &str)], data: &str) -> TlsConfig {
             "nothing stays staged: {}",
             path.display()
         );
-        assert_ne!(
-            std::fs::read(&path).unwrap(),
-            before.key_pem,
-            "the replaced key is gone from disk ({})",
-            path.display()
-        );
+        // The TLS directory also holds a live CRL database and its lock.
+        // A file with a different length cannot be the retired PEM; compare
+        // every possible copy in full without reading unrelated locked files.
+        if std::fs::metadata(&path).unwrap().len() == before.key_pem.len() as u64 {
+            assert_ne!(
+                std::fs::read(&path).unwrap(),
+                before.key_pem,
+                "the replaced key is gone from disk ({})",
+                path.display()
+            );
+        }
     }
     after
 }
