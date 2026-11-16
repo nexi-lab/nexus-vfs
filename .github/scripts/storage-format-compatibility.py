@@ -12,6 +12,7 @@ PREVIOUS_READER = "8f6c072b9afef7e314b89161ea97315135767e9b"
 parser = argparse.ArgumentParser()
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--fixture-binary", type=Path)
+parser.add_argument("--crl-fixture-binary", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 output = args.output.resolve()
@@ -49,6 +50,14 @@ try:
     else:
         producer = ["cargo", "test", "--locked", "-p", "raft@0.1.0", "--test", "test_durable_storage_admission", "--"]
     run("produce-fixtures", [*producer, "replica_format_fixtures_for_previous_reader", "--exact", "--test-threads=1"])
+    crl_case = "raft::node::storage_submission_tests::crl_format::signed_crl_format_fixtures_for_previous_reader"
+    if args.crl_fixture_binary:
+        crl_producer = [args.crl_fixture_binary.resolve()]
+    else:
+        crl_producer = ["cargo", "test", "--locked", "-p", "raft@0.1.0", "--lib", "--"]
+    run("produce-crl-fixtures", [*crl_producer, crl_case, "--exact", "--test-threads=1"])
+    for fixture in ["crl-applied", "crl-compacted", "crl-snapshot"]:
+        assert (output / "fixtures" / fixture / ".node_id").is_file(), fixture
     present = subprocess.run(["git", "cat-file", "-e", PREVIOUS_READER + "^{commit}"], cwd=root, capture_output=True)
     if present.returncode:
         run("fetch-reader", ["git", "fetch", "--no-tags", "origin", PREVIOUS_READER])

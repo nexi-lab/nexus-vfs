@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use tempfile::TempDir;
 
 mod activation;
+mod crl_format;
 mod managed_activation;
 mod member_preparation;
 mod reader_preparation;

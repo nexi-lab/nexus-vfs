@@ -18,11 +18,12 @@ use nexus_raft::{
     zone_meta_store::ZoneMetaStore,
     ZoneManager,
 };
-use raft::{
-    eraftpb::{Entry, HardState, Message, MessageType, Snapshot},
-    Storage,
-};
+use raft::eraftpb::{Entry, HardState, Message, MessageType, Snapshot};
 use std::{path::Path, sync::Arc, time::Duration};
+
+#[path = "common/durable_storage_fixtures.rs"]
+mod durable_storage_fixtures;
+use durable_storage_fixtures::{install_snapshot, saved_image};
 
 const PATH: &str = "/__managed_content_v1__/session";
 
@@ -195,40 +196,6 @@ fn populate(path: &Path, case: Case) -> u64 {
         .block_on(node.read_linearizable(|_| ()))
         .unwrap();
     runtime.0.node_id()
-}
-
-fn saved_image(path: &Path, compact: bool) -> Snapshot {
-    let persistence = ZonePersistence::open(path, "root").unwrap();
-    let store = RedbStore::open(persistence.sm_path()).unwrap();
-    let state = FullStateMachine::new(&store).unwrap();
-    let storage = RaftStorage::open(persistence.raft_path()).unwrap();
-    let index = state.last_applied_index();
-    assert_eq!(index, storage.last_index_impl().unwrap());
-    let mut snapshot = Snapshot::default();
-    snapshot.data = state.snapshot().unwrap().into();
-    snapshot.mut_metadata().index = index;
-    snapshot.mut_metadata().term = storage.term(index).unwrap();
-    snapshot
-        .mut_metadata()
-        .set_conf_state(storage.conf_state().unwrap());
-    if compact {
-        storage.store_snapshot(&snapshot).unwrap();
-        storage.compact(index + 1).unwrap();
-        assert_eq!(storage.first_index_impl().unwrap(), index + 1);
-    }
-    snapshot
-}
-
-fn install_snapshot(source: &Path, target: &Path, snapshot: &Snapshot) {
-    std::fs::create_dir_all(target).unwrap();
-    // Local root identity is durable and independent of the network replica ID.
-    std::fs::copy(source.join(".node_id"), target.join(".node_id")).unwrap();
-    let mut persistence = ZonePersistence::create(target, "root").unwrap();
-    let storage = RaftStorage::open(persistence.raft_path()).unwrap();
-    storage.apply_snapshot(snapshot).unwrap();
-    let store = RedbStore::open(persistence.sm_path()).unwrap();
-    FullStateMachine::new(&store).unwrap();
-    persistence.commit();
 }
 
 #[test]
