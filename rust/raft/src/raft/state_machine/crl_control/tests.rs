@@ -64,6 +64,53 @@ fn enrolled(state: &mut FullStateMachine, ca: &[u8]) {
 }
 
 #[test]
+fn original_receipt_does_not_reactivate_a_withdrawn_issuer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.redb");
+    let db = RedbStore::open(&path).unwrap();
+    let mut state = FullStateMachine::new(&db).unwrap();
+    let (ca, signer) = generate_zone_ca("original").unwrap();
+    let initial = local("original-issuer", None, Some(&ca));
+    assert_eq!(state.local_crl_issuer().unwrap(), None);
+    assert_eq!(state.crl_control_receipt(&initial).unwrap(), None);
+    let issued = apply(&mut state, &initial);
+    let crl = generate_crl(&[], 1, &ca, &signer).unwrap();
+    let publication = install("original-crl", 1, &crl, &ca);
+    let installed = apply(&mut state, &publication);
+    apply(&mut state, &local("withdraw", Some(1), None));
+    let before = state.snapshot().unwrap();
+    let withdrawn = Some(LocalCrlIssuer {
+        revision: 2,
+        ca_pem: None,
+    });
+    assert_eq!(state.local_crl_issuer().unwrap(), withdrawn);
+    assert_eq!(state.crl_control_receipt(&initial).unwrap(), Some(issued));
+    assert_eq!(
+        state.crl_control_receipt(&publication).unwrap(),
+        Some(installed)
+    );
+    let changed = local("original-issuer", Some(2), Some(&ca));
+    assert_eq!(
+        state.crl_control_receipt(&changed).unwrap(),
+        Some(CrlControlOutcome::OperationMismatch)
+    );
+    let mut invalid = publication;
+    invalid.operation_id.clear();
+    assert!(state.crl_control_receipt(&invalid).is_err());
+    assert_snapshots_equal(&state.snapshot().unwrap(), &before);
+    drop(state);
+    drop(db);
+    let db = RedbStore::open(&path).unwrap();
+    let reopened = FullStateMachine::new(&db).unwrap();
+    assert_eq!(reopened.local_crl_issuer().unwrap(), withdrawn);
+    assert_eq!(
+        reopened.crl_control_receipt(&changed).unwrap(),
+        Some(CrlControlOutcome::OperationMismatch)
+    );
+    assert_snapshots_equal(&reopened.snapshot().unwrap(), &before);
+}
+
+#[test]
 fn abort_leaves_no_snapshot_revocations_receipt_floor_or_applied_index() {
     let db = RedbStore::open_temporary().unwrap();
     let mut state = FullStateMachine::new(&db).unwrap();

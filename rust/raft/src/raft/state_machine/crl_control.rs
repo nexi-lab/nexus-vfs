@@ -4,8 +4,8 @@ use super::{
     control_key, storage_admission::StorageFormat, CommandResult, FullStateMachine, Result,
 };
 #[cfg(all(feature = "grpc", has_protos))]
-use contracts::crl_control::{CrlControlChange, CrlIssuerSelection, LocalCrlIssuer};
-use contracts::crl_control::{CrlControlOutcome, CrlControlRequest};
+use contracts::crl_control::{CrlControlChange, CrlIssuerSelection};
+use contracts::crl_control::{CrlControlOutcome, CrlControlRequest, LocalCrlIssuer};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,40 @@ fn storage_error(error: impl std::fmt::Display) -> crate::raft::RaftError {
 }
 
 impl FullStateMachine {
+    /// Read the durable local issuer, including explicit withdrawal. Trusted
+    /// consumers combine this with their other admission records in one
+    /// `ZoneConsensus::read_linearizable` closure; this local accessor alone
+    /// neither supplies a consensus read barrier nor authorizes a TLS actor.
+    pub fn local_crl_issuer(&self) -> Result<Option<LocalCrlIssuer>> {
+        let issuer: Option<LocalCrlIssuer> = self
+            .control_state
+            .get(&key("issuer", "local"))?
+            .map(|bytes| bincode::deserialize(&bytes))
+            .transpose()?;
+        if issuer.as_ref().is_some_and(|issuer| issuer.revision == 0) {
+            return Err(storage_error("invalid stored local issuer revision"));
+        }
+        Ok(issuer)
+    }
+
+    /// Recover the exact original outcome after an uncertain submission.
+    /// A historical success does not imply that the issuer is still current;
+    /// absence does not prove that an outstanding request cannot still apply.
+    pub fn crl_control_receipt(
+        &self,
+        request: &CrlControlRequest,
+    ) -> Result<Option<CrlControlOutcome>> {
+        request.validate().map_err(storage_error)?;
+        let request_hash = *blake3::hash(&bincode::serialize(request)?).as_bytes();
+        self.control_state
+            .get(&key("operation", &request.operation_id))?
+            .map(|bytes| {
+                let receipt: Receipt = bincode::deserialize(&bytes)?;
+                Ok(original_outcome(receipt, request_hash))
+            })
+            .transpose()
+    }
+
     pub(super) fn apply_crl_control(
         &self,
         txn: &redb::WriteTransaction,
@@ -50,11 +84,7 @@ impl FullStateMachine {
             .map(|value| bincode::deserialize::<Receipt>(value.value()))
             .transpose()?;
         if let Some(previous) = previous {
-            let outcome = if previous.request_hash == request_hash {
-                previous.outcome
-            } else {
-                CrlControlOutcome::OperationMismatch
-            };
+            let outcome = original_outcome(previous, request_hash);
             return Ok(CommandResult::Value(bincode::serialize(&outcome)?));
         }
         let read = |key: &[u8]| {
@@ -77,6 +107,14 @@ impl FullStateMachine {
             .insert(receipt_key.as_slice(), receipt.as_slice())
             .map_err(storage_error)?;
         Ok(CommandResult::Value(bincode::serialize(&outcome)?))
+    }
+}
+
+fn original_outcome(receipt: Receipt, request_hash: [u8; 32]) -> CrlControlOutcome {
+    if receipt.request_hash == request_hash {
+        receipt.outcome
+    } else {
+        CrlControlOutcome::OperationMismatch
     }
 }
 
