@@ -2480,7 +2480,7 @@ struct NodeEnrollmentServiceImpl {
     ca_key_pem: Option<Vec<u8>>,
     /// Path to the accepted join-token hash SET (`tls/join-token-hash`, one
     /// SHA-256 hex per line). Read LIVE per `JoinCluster` (like
-    /// `revoked_serials_path` below is for `GetCrl`), so an offline
+    /// the current revoked membership is for `GetCrl`), so an offline
     /// `enroll-token` that appended a hash is accepted WITHOUT a founder
     /// restart. `None` ⇒ this node accepts no join requests.
     join_token_hash_path: Option<PathBuf>,
@@ -2491,11 +2491,8 @@ struct NodeEnrollmentServiceImpl {
     /// the response omits it and the joiner stays auth-off. Read once at
     /// construction from `tls/api-key-secret` (the single SSOT).
     api_key_secret: Option<String>,
-    /// Path to the founder's revoked-serial file (`tls/revoked-serials`). The
-    /// `GetCrl` handler reads it live and CA-signs a fresh CRL, so an offline
-    /// `auth revoke` that appended a serial is served without a restart. `None`
-    /// on a node holding no CA key — it never serves a CRL.
-    revoked_serials_path: Option<PathBuf>,
+    /// Current revoked membership and durable CA-scoped CRL issuance receipts.
+    crl_issuer: Option<Arc<super::crl::CrlIssuer>>,
 }
 
 #[tonic::async_trait]
@@ -2608,28 +2605,20 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         }))
     }
 
-    /// Serve the cluster's current CRL: read the revoked-serial file live and
-    /// CA-sign a fresh CRL over it. No token — the CRL is a public, CA-signed
-    /// artifact, so any node may fetch it to refresh its revocation view.
+    /// Serve the cluster's current signed CRL after its issuance receipt commits.
+    /// The public CA signature lets nodes verify the refreshed revocation view.
     async fn get_crl(
         &self,
         _request: Request<GetCrlRequest>,
     ) -> std::result::Result<Response<GetCrlResponse>, Status> {
-        let (Some(ca_pem), Some(ca_key_pem)) = (&self.ca_pem, &self.ca_key_pem) else {
-            return Err(Status::failed_precondition("CA material not configured"));
-        };
-        let serials = self
-            .revoked_serials_path
-            .as_deref()
-            .map(super::crl::read_revoked_serials_checked)
-            .transpose()
-            .map_err(|error| Status::unavailable(format!("read current revocations: {error}")))?
-            .unwrap_or_default();
-        // The count grows monotonically (revocation is append-only), so it is a
-        // fine crl_number: a stale CRL never carries a higher one.
-        let crl_number = serials.len() as u64;
-        let crl_pem = super::crl::generate_crl(&serials, crl_number, ca_pem, ca_key_pem)
-            .map_err(|e| Status::internal(format!("build CRL: {e}")))?;
+        let issuer = self
+            .crl_issuer
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("durable CRL authority not configured"))?;
+        let crl_pem = tokio::task::spawn_blocking(move || issuer.issue())
+            .await
+            .map_err(|e| Status::unavailable(format!("CRL issuance worker: {e}")))?
+            .map_err(Status::unavailable)?;
         Ok(Response::new(GetCrlResponse { crl_pem }))
     }
 }
@@ -2650,12 +2639,18 @@ pub async fn serve_node_enrollment(
     revoked_serials_path: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let crl_issuer = revoked_serials_path
+        .as_deref()
+        .map(|path| super::crl::CrlIssuer::open(path, &ca_pem, &ca_key_pem))
+        .transpose()
+        .map_err(TransportError::Rpc)?
+        .map(Arc::new);
     let svc = NodeEnrollmentServiceImpl {
         ca_pem: Some(ca_pem),
         ca_key_pem: Some(ca_key_pem),
         join_token_hash_path: Some(join_token_hash_path),
         api_key_secret,
-        revoked_serials_path,
+        crl_issuer,
     };
     tracing::info!(
         %addr,

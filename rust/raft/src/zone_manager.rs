@@ -350,6 +350,7 @@ pub struct ZoneManager {
     /// leaders settle. BTreeMap so parent paths process before children.
     /// Empty when no static topology is configured.
     pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
+    local_zone_operation: parking_lot::Mutex<()>,
 }
 
 /// A holder of this Node's TLS identity outside the `ZoneManager` (an outbound
@@ -709,11 +710,17 @@ impl PreparedZoneManager {
             node_identity_holders: parking_lot::Mutex::new(Vec::new()),
             local_node_renewer_slot,
             pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
+            local_zone_operation: parking_lot::Mutex::new(()),
         }))
     }
 }
 
 impl ZoneManager {
+    /// Execution ownership for the process holding this local root store.
+    pub(crate) fn try_local_zone_operation(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.local_zone_operation.try_lock()
+    }
+
     /// Create a new `ZoneManager`.
     ///
     /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted
@@ -1689,25 +1696,7 @@ impl ZoneManager {
     /// `i_links_count > 0` (i.e. the zone is still mounted somewhere).
     /// Mirrors Python `ZoneManager.remove_zone(force=...)`.
     pub fn remove_zone(&self, zone_id: &str, force: bool) -> Result<()> {
-        // R12 entry guard — the registry's `remove_zone` re-checks this
-        // (defense in depth), but refusing HERE keeps the reserved zone's
-        // peer fan-out from ever starting.
-        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
-            return Err(RaftError::InvalidState(format!(
-                "Zone '{zone_id}' is reserved and cannot be removed"
-            )));
-        }
-        if !force {
-            if let Some(count) = self.get_links_count(zone_id)? {
-                if count > 0 {
-                    return Err(RaftError::InvalidState(format!(
-                        "Zone '{}' still has {} reference(s) (i_links_count > 0); \
-                         unmount all references first, or pass force=true.",
-                        zone_id, count
-                    )));
-                }
-            }
-        }
+        self.check_zone_removal(zone_id, force)?;
 
         let peers = self.registry.get_peers(zone_id).unwrap_or_default();
         let self_id = self.registry.node_id();
@@ -1729,8 +1718,7 @@ impl ZoneManager {
             Ok::<(), RaftError>(())
         })?;
 
-        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
-            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+        self.remove_local_zone(zone_id)
     }
 
     /// R12 deprovision leg 1: best-effort peer fan-out of the local-destroy
@@ -1768,17 +1756,41 @@ impl ZoneManager {
         });
     }
 
-    /// R12 deprovision leg 2: LOCAL teardown only — no peer fan-out (the
-    /// deprovision path fans out separately and best-effort, so an offline
-    /// peer can never block the founder's own teardown).
+    /// Remove this node's replica, enforcing the reference guard unless forced.
+    /// Other members keep their storage and committed membership.
+    pub fn remove_local_replica(&self, zone_id: &str, force: bool) -> Result<()> {
+        self.check_zone_removal(zone_id, force)?;
+        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
+            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+    }
+
+    /// Local teardown after the caller has authorized forced removal.
     pub fn remove_local_zone(&self, zone_id: &str) -> Result<()> {
+        self.remove_local_replica(zone_id, true)
+    }
+
+    fn check_zone_removal(&self, zone_id: &str, force: bool) -> Result<()> {
+        // R12 entry guard — the registry's `remove_zone` re-checks this
+        // (defense in depth), but refusing HERE keeps the reserved zone's
+        // peer fan-out from ever starting.
         if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
             return Err(RaftError::InvalidState(format!(
                 "Zone '{zone_id}' is reserved and cannot be removed"
             )));
         }
-        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
-            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+        if !force {
+            if let Some(count) = self.get_links_count(zone_id)? {
+                if count > 0 {
+                    return Err(RaftError::InvalidState(format!(
+                        "Zone '{}' still has {} reference(s) (i_links_count > 0); \
+                         unmount all references first, or pass force=true.",
+                        zone_id, count
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Peer roster for a zone: `(id, hostname, endpoint, is_witness)`.

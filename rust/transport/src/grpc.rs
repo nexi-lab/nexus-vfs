@@ -300,11 +300,9 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
     runtime_scope: Option<&Arc<RuntimeScope>>,
     req: &Request<T>,
 ) -> Result<OperationContext, Status> {
-    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
-        return Err(Status::unavailable(
-            "nexusd is still booting: the VFS data plane is not wired yet \
-             (no distributed coordinator) — retry",
-        ));
+    wait_for_data_plane(ready).await?;
+    if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+        return Ok(ctx.0.clone());
     }
     resolve_request_identity(
         auth,
@@ -316,10 +314,20 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
     )
 }
 
+pub(crate) async fn wait_for_data_plane(ready: &DataPlaneReady) -> Result<(), Status> {
+    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
+        return Err(Status::unavailable(
+            "nexusd is still booting: the VFS data plane is not wired yet \
+             (no distributed coordinator) — retry",
+        ));
+    }
+    Ok(())
+}
+
 // Identity depends on the envelope, independently of the protobuf message type.
 // Keep one compiled resolver for every VFS and ZoneRuntime request shape.
 #[inline(never)]
-fn resolve_request_identity(
+pub(crate) fn resolve_request_identity(
     auth: &Arc<dyn AuthProvider>,
     foreign_ca_verifier: &ForeignCaVerifierSlot,
     runtime_scope: Option<&Arc<RuntimeScope>>,
@@ -327,9 +335,6 @@ fn resolve_request_identity(
     extensions: &tonic::Extensions,
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<OperationContext, Status> {
-    if let Some(ctx) = extensions.get::<AuthenticatedRequestContext>() {
-        return Ok(ctx.0.clone());
-    }
     // Reclassify against CURRENT roots even when the foreign set is empty.
     // A connection established before its last foreign anchor was removed
     // still carries that leaf; parsing it as local would revive its identity.

@@ -18,13 +18,61 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use common::{await_replicated, free_port, Daemon, Vfs, LOG_FILTER};
+use nexus_raft::transport::{ClientConfig, RaftApiClient};
 
 const ZONE: &str = "sharedzone";
 const MOUNT: &str = "/agents";
 const BUDGET: Duration = Duration::from_secs(90);
+
+async fn await_three_voters(addresses: [&str; 3]) {
+    let expected: BTreeSet<_> = addresses
+        .iter()
+        .map(|addr| format!("http://{addr}"))
+        .collect();
+    assert_eq!(expected.len(), 3, "three independent daemon endpoints");
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let mut clients = Vec::new();
+    for endpoint in &expected {
+        let client = tokio::time::timeout_at(
+            deadline,
+            RaftApiClient::connect(endpoint, ClientConfig::default()),
+        )
+        .await
+        .expect("membership connection within budget")
+        .expect("connect to running daemon");
+        clients.push(client.with_zone_id(ZONE.into()));
+    }
+    loop {
+        let mut observations = Vec::new();
+        for client in &mut clients {
+            observations.push(tokio::time::timeout_at(deadline, client.get_cluster_info()).await);
+        }
+        if observations.iter().all(|result| {
+            let Ok(Ok(info)) = result else { return false };
+            info.leader_id != 0
+                && info.config.as_ref().is_some_and(|config| {
+                    config.voters.len() == 3
+                        && config.learners.is_empty()
+                        && config
+                            .voters
+                            .iter()
+                            .map(|node| node.address.clone())
+                            .collect::<BTreeSet<_>>()
+                            == expected
+                })
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "all three daemons must report the same three voters before founder loss: {observations:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 fn founder_env<'a>(
     data: &'a str,
@@ -137,15 +185,9 @@ async fn three_voter_zone_survives_founder_loss_via_new_leader() {
         .await
         .expect("joiner2 applies discovered mounts and has a leader");
 
-    // Both joiners register the zone before their all-voter promotion COMMITS on
-    // the founder. Writing while a 1→2 or 2→3 AddNode ConfChange is still pending
-    // makes raft drop the proposal (`raft: proposal dropped`). Gate on the
-    // founder promoting BOTH learners to voters — one log per joiner — so the
-    // 3-voter config is committed and no ConfChange is in flight before we write.
-    founder
-        .wait_for_log_count("caught-up learner promoted to voter", 2, BUDGET)
-        .await
-        .expect("founder MUST promote both joiners to voters (3-voter quorum stable)");
+    // Observe applied membership on every daemon. A promotion can commit even
+    // when its requesting RPC ends before it emits its success log.
+    await_three_voters([&fadv, &j1adv, &j2adv]).await;
 
     // ── 2. Health + plant a mailbox while all three are up (founder leads). ─
     let mut fc = Vfs::dial_ready(fport, BUDGET).await;

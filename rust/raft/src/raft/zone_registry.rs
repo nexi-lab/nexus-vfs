@@ -317,6 +317,14 @@ impl ZoneRaftRegistry {
         matches!(self.storage_policy, ZoneStoragePolicy::Managed)
     }
 
+    /// This process owns its root independently of replicated data zones.
+    pub(crate) fn owns_local_root(&self) -> bool {
+        matches!(
+            self.storage_policy,
+            ZoneStoragePolicy::LocalRoot { .. } | ZoneStoragePolicy::RootOnly
+        )
+    }
+
     /// Create a new empty registry.
     ///
     /// # Arguments
