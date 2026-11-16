@@ -156,6 +156,8 @@ impl RaftCollaborationCrlStore {
     /// Compose CURRENT issuer registration and revocation in ONE consensus
     /// snapshot. Inputs must come from the actual admitted TLS leaf/anchor;
     /// this trusted composition method does not authenticate public values.
+    /// Local callers also require an active durable issuer with the exact TLS
+    /// CA certificate. Constructor CA bytes alone do not establish current trust.
     /// Foreign callers require the versioned collaboration-only purpose.
     pub fn check_registered_serial(
         &self,
@@ -167,9 +169,10 @@ impl RaftCollaborationCrlStore {
     ) -> Result<(), CrlStateError> {
         let snapshot = snapshot_key(authority);
         let revoked = revoked_key(authority, serial).map_err(CrlStateError::Unavailable)?;
-        let (anchors, values) = self
+        let (local_issuer, anchors, values) = self
             .inner
             .read_linearizable(move |sm| {
+                let local_issuer = sm.local_crl_issuer().map_err(|e| e.to_string())?;
                 let anchors = sm
                     .list_control_state(contracts::CONTROL_NS_FOREIGN_CA)
                     .map_err(|e| e.to_string())?;
@@ -180,7 +183,7 @@ impl RaftCollaborationCrlStore {
                             .map_err(|e| e.to_string())
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                Ok::<_, String>((anchors, values))
+                Ok::<_, String>((local_issuer, anchors, values))
             })
             .map_err(CrlStateError::Unavailable)?
             .map_err(CrlStateError::Unavailable)?;
@@ -224,7 +227,21 @@ impl RaftCollaborationCrlStore {
             None if *authority == local_authority
                 && <[u8; 32]>::from(Sha256::digest(&local_der)) == *selected_issuer_sha256 =>
             {
-                local_ca_pem
+                let current_ca = local_issuer
+                    .as_ref()
+                    .and_then(|issuer| issuer.ca_pem.as_deref())
+                    .ok_or_else(|| {
+                        CrlStateError::Unavailable("local issuer is not currently active".into())
+                    })?;
+                let current_der = pem::parse(current_ca)
+                    .map_err(|error| CrlStateError::Unavailable(error.to_string()))?
+                    .into_contents();
+                if <[u8; 32]>::from(Sha256::digest(&current_der)) != *selected_issuer_sha256 {
+                    return Err(CrlStateError::Unavailable(
+                        "TLS local issuer is no longer current".into(),
+                    ));
+                }
+                current_ca
             }
             Some(_) => selected.as_deref().ok_or_else(|| {
                 CrlStateError::Unavailable("TLS issuer is no longer registered".into())

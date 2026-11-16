@@ -206,15 +206,46 @@ async fn local_admission_also_requires_fresh_crl_and_rejects_foreign_alias() {
 
     let private = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Handle::current();
-    let registry = ZoneRaftRegistry::new(private.path().to_path_buf(), 1);
+    // Native current-issuer admission is qualified on its supported FixedLocal
+    // store. The separate Managed case below must still refuse missing authority.
+    let registry = ZoneRaftRegistry::isolated_root(private.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
+        .create_zone(contracts::ROOT_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
     let issuers = RaftForeignCaStore::new(node.clone(), runtime.clone());
     let crls = RaftCollaborationCrlStore::new(node, runtime, 60).unwrap();
     let (local, key) = generate_zone_ca("local").unwrap();
+    use contracts::crl_control::{
+        CrlControlChange, CrlControlOutcome, CrlControlRequest, CrlIssuerSelection,
+    };
+    assert!(matches!(
+        crls.apply_control(&CrlControlRequest {
+            operation_id: "local-admission-issuer".into(),
+            change: CrlControlChange::LocalIssuer {
+                expected_revision: None,
+                ca_pem: Some(local.clone()),
+            },
+        })
+        .unwrap(),
+        CrlControlOutcome::LocalIssuerChanged(_)
+    ));
+    let publish = |operation: &str, revoked: &[Vec<u8>], number: u64| {
+        assert!(matches!(
+            crls.apply_control(&CrlControlRequest {
+                operation_id: operation.into(),
+                change: CrlControlChange::Install {
+                    issuer: CrlIssuerSelection::Local { revision: 1 },
+                    crl_pem: generate_crl(revoked, number, &local, &key).unwrap(),
+                    observed_unix_s: now().unwrap(),
+                    maximum_age_secs: 60,
+                },
+            })
+            .unwrap(),
+            CrlControlOutcome::Installed { .. }
+        ));
+    };
     let anchor = ForeignCaAnchor::from_pem("not-local", &local)
         .unwrap()
         .collaboration_only();
@@ -222,15 +253,51 @@ async fn local_admission_also_requires_fresh_crl_and_rejects_foreign_alias() {
     let check =
         || crls.check_registered_serial(&local, &authority, &anchor.fingerprint(), None, &[7]);
     assert!(matches!(check(), Err(CrlStateError::Unavailable(_))));
-    crls.publish(&local, &generate_crl(&[], 0, &local, &key).unwrap())
-        .unwrap();
+    publish("local-admission-initial-crl", &[], 0);
     check().unwrap();
     issuers.register(&anchor).unwrap();
     assert!(matches!(check(), Err(CrlStateError::Unavailable(_))));
     issuers.unregister(&anchor.fingerprint_hex()).unwrap();
     check().unwrap();
-    crls.publish(&local, &generate_crl(&[vec![7]], 1, &local, &key).unwrap())
-        .unwrap();
+    publish("local-admission-revoked-crl", &[vec![7]], 1);
     assert_eq!(check(), Err(CrlStateError::Revoked));
+    registry.shutdown().released().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_local_admission_refuses_fresh_legacy_crl_without_durable_issuer() {
+    let private = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Handle::current();
+    let registry = ZoneRaftRegistry::new(private.path().into(), 1);
+    let node = registry
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
+        .unwrap();
+    node.campaign().await.unwrap();
+    ready(&node).await;
+    let store = RaftCollaborationCrlStore::new(node.clone(), runtime, 60).unwrap();
+    let (ca, key) = generate_zone_ca("unbound-local").unwrap();
+    store
+        .publish(&ca, &generate_crl(&[], 1, &ca, &key).unwrap())
+        .unwrap();
+    // A genuine fresh CRL is present; missing durable authority is the refusal.
+    store.check_serial(&ca, &[7]).unwrap();
+    assert_eq!(store.current_local_issuer().unwrap(), None);
+    let authority = lib::transport_primitives::ca_spki_sha256(&ca).unwrap();
+    let fingerprint = ForeignCaAnchor::from_pem("local", &ca)
+        .unwrap()
+        .fingerprint();
+    let before = node.last_index();
+    assert!(
+        matches!(
+            store.check_registered_serial(&ca, &authority, &fingerprint, None, &[7]),
+            Err(CrlStateError::Unavailable(_))
+        ),
+        "fresh legacy CRL must not grant an unbound local issuer"
+    );
+    assert_eq!(
+        node.last_index(),
+        before,
+        "admission must not install authority"
+    );
     registry.shutdown().released().await;
 }
