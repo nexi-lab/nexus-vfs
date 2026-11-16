@@ -10,6 +10,7 @@ on:
       - 'rust/contracts/src/node_identity.rs'
       - 'rust/contracts/src/credential_intent.rs'
       - 'rust/contracts/src/replica_credential.rs'
+      - 'rust/contracts/src/crl_control.rs'
       - 'rust/kernel/src/abc/meta_store.rs'
       - 'rust/kernel/src/core/meta_store/**'
       - 'rust/kernel/src/core/vfs_router.rs'
@@ -80,6 +81,7 @@ jobs:
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_binding::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::node_identity::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_issuance::tests
+            cargo test --locked -p raft@0.1.0 --lib raft::state_machine::crl_control::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::replica_activation::tests
           cargo test --locked -p raft@0.1.0 --lib transport::certgen::csr_intent::tests
           cargo test --locked -p raft@0.1.0 --lib raft::state_machine::storage_admission

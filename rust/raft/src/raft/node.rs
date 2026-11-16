@@ -1547,7 +1547,9 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 self.supports_replica_binding().await?,
                 "replica binding protocol is not activated",
             ),
-            StorageProtocol::ConditionalMetadata | StorageProtocol::RecordLifetime => (
+            StorageProtocol::ConditionalMetadata
+            | StorageProtocol::RecordLifetime
+            | StorageProtocol::SignedCrl => (
                 self.supports_conditional_metadata(),
                 "conditional metadata requires fixed local membership",
             ),

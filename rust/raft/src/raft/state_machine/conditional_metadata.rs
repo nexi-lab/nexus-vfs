@@ -24,7 +24,9 @@ impl Command {
         }
         match self {
             Self::PutControlState { namespace, .. }
-            | Self::DeleteControlState { namespace, .. } => namespace == NAMESPACE,
+            | Self::DeleteControlState { namespace, .. } => {
+                namespace == NAMESPACE || namespace == super::crl_control::NAMESPACE
+            }
             _ => false,
         }
     }
