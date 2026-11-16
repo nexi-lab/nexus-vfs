@@ -67,13 +67,48 @@ The public proto must match the running revision. grpcurl uses the existing
 bundle's CA, certificate, key and `server_name` for mTLS. Each of `/agents`,
 `/conversations`, and `/sessions` must pass Stat and Readdir; each Stat must
 report the exact requested zone. They are distinct subtrees, not aliases of
-one storage path. The dial endpoint is `127.0.0.1:2126`; TLS authenticates the
-bundle's server name rather than assuming an IP SAN.
+one storage path. The dial endpoint defaults to `127.0.0.1:2126`. Use
+`--endpoint 127.0.0.1:PORT` for a separately owned local Node; hostnames, remote
+addresses, wildcard listeners, URLs and invalid ports are refused. TLS still
+authenticates the bundle's server name rather than assuming an IP SAN. Changing
+the port does not bypass the Node identity pin, authenticated mount probes, or
+no-clobber publication. An existing record cannot be retargeted this way.
+
+### Enrolled remote clients
+
+A device may run SudoCode as an ordinary client of the same authority without
+running another Node or becoming a Raft voter. Its operator must first issue a
+distinct Agent credential through the existing native issuer and deliver only
+that client's bundle. Do not copy another Agent's identity, a Node credential or
+a private CA. This is not cross-domain federation.
+
+For a verified loopback transport to that existing Node, invoke the publisher
+directly with `--role client`, `--ca-cert-sha256` (the SHA256 of the exact public
+CA PEM bytes supplied by the operator), and the client's local `--agents-dir`.
+No local `.node_id` is created or fabricated. The existing mTLS probes still
+authenticate the server and client and require accessible native subtrees before
+writing discovery. This command does not establish or supervise the transport.
+
+By default all three Stat responses must report `--zone`. If the existing
+deployment reports different zones, the operator may explicitly pin a client
+subtree with `--mount-zone /agents=EXPECTED_ZONE`. Unknown paths, duplicate
+declarations and use with founder/joiner publication are refused. Every subtree
+is still checked; there is no ignore-zone flag or automatic acceptance of an
+observed value. The receipt retains all expected zones and actual responses.
+These values describe the observed Stat contract, not a new authorization rule:
+stored inode metadata may differ from current routing. Diagnose a discrepancy
+separately; the publisher neither changes mounts nor repairs inode metadata.
+Prove actual bidirectional A2A separately before claiming remote Agent acceptance.
+
+Client publication retains the same private, atomic, no-clobber Node record
+writer. The `client` role records placement only; it grants no Node authority and
+must not be passed to a Node founder/joiner startup flow.
 
 The record is `$HOME/.nexus/run/node.json` for the node-owning OS user, outside
 both the legacy `~/.nexus-vfs` service root and sudocode configuration. Version 1
 contains `endpoint`, `agents_dir`, `role`, and `zone`. The publisher checks the
-expected `.node_id` hash, creates a private directory and file (0700/0600 on
+local `.node_id` hash for a founder/joiner, or the operator-supplied public CA
+file hash for a client, creates a private directory and file (0700/0600 on
 POSIX; protected current-user-only DACL on Windows), and uses no-clobber atomic
 publication. Repeating the same declaration is idempotent; a different record
 is refused. It never retargets another owner's existing record.

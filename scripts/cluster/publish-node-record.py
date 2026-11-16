@@ -1,10 +1,11 @@
-"""Publish the verified local Nexus node through the canonical role launcher."""
+"""Publish verified Nexus discovery for a local Node or an enrolled client."""
 from pathlib import Path
 import argparse
 import ctypes
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import uuid
@@ -115,33 +116,68 @@ def publish(record, target):
     return 'published'
 
 
+def loopback_endpoint(value):
+    """Keep discovery local while allowing a separately owned Node's port."""
+    match = re.fullmatch(r'127\.0\.0\.1:([1-9][0-9]{0,4})', value)
+    if not match or int(match[1]) > 65535:
+        raise argparse.ArgumentTypeError('expected 127.0.0.1:PORT with PORT between 1 and 65535')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--role', choices=['founder', 'joiner'], required=True)
+    parser.add_argument('--role', choices=['founder', 'joiner', 'client'], required=True)
     parser.add_argument('--agents-dir', type=Path, required=True)
-    parser.add_argument('--endpoint', default='127.0.0.1:2126')
+    parser.add_argument('--endpoint', type=loopback_endpoint, default='127.0.0.1:2126')
     parser.add_argument('--zone', required=True)
+    parser.add_argument('--mount-zone', action='append', default=[], metavar='PATH=ZONE',
+                        help='explicit expected Stat zone for an enrolled client subtree')
     parser.add_argument('--agent', required=True)
     client = parser.add_mutually_exclusive_group(required=True)
     client.add_argument('--client', type=Path, help='existing mailbox_cli with zone-capable stat output')
     client.add_argument('--grpcurl', type=Path, help='verified standard grpcurl binary; avoids rebuilding an old helper')
     parser.add_argument('--proto', type=Path, help='the running Nexus revision public vfs.proto, for grpcurl')
-    parser.add_argument('--node-id-sha256', required=True)
+    pin = parser.add_mutually_exclusive_group(required=True)
+    pin.add_argument('--node-id-sha256', help='local Node identity file digest for founder/joiner')
+    pin.add_argument('--ca-cert-sha256', help='operator-verified CA PEM file digest for an enrolled client')
     parser.add_argument('--publish', action='store_true', help='activate only after old peer mailboxes are drained')
     args = parser.parse_args()
     if not args.agents_dir.is_absolute() or not (args.client or args.grpcurl).is_absolute():
         parser.error('agents-dir and client must be absolute paths')
     if args.grpcurl and (not args.proto or not args.proto.is_absolute()):
         parser.error('grpcurl requires an absolute --proto path')
-    if '://' in args.endpoint or args.endpoint != '127.0.0.1:2126':
-        parser.error('this shared-machine record uses the verified loopback mTLS endpoint 127.0.0.1:2126')
-    node_id = args.agents_dir.parent / '.node_id'
-    if hashlib.sha256(node_id.read_bytes()).hexdigest().lower() != args.node_id_sha256.lower():
-        parser.error('node identity does not match the verified owner receipt')
+    if args.role == 'client':
+        if not args.ca_cert_sha256:
+            parser.error('client discovery requires an operator-verified CA certificate digest')
+    else:
+        if not args.node_id_sha256:
+            parser.error('founder/joiner discovery requires the local Node identity digest')
+        node_id = args.agents_dir.parent / '.node_id'
+        if hashlib.sha256(node_id.read_bytes()).hexdigest().lower() != args.node_id_sha256.lower():
+            parser.error('node identity does not match the verified owner receipt')
+    expected_zones = {path: args.zone for path in ['/agents', '/conversations', '/sessions']}
+    overrides = set()
+    if args.mount_zone and args.role != 'client':
+        parser.error('mount-zone declarations are only supported for client discovery')
+    for declaration in args.mount_zone:
+        path, separator, zone = declaration.partition('=')
+        if not separator or path not in expected_zones or not zone or path in overrides:
+            parser.error('expected one PATH=ZONE per known client subtree')
+        overrides.add(path)
+        expected_zones[path] = zone
     bundle = args.agents_dir / args.agent
     credential = json.loads((bundle / 'credential.json').read_text(encoding='utf-8'))
     if credential['agent'] != args.agent:
         parser.error('credential identity differs from the requested agent')
+    if args.role == 'client':
+        # Client enrollment has no local Node identity, database or voter.
+        # Pin the public trust material supplied by the original operator;
+        # the existing mTLS probes below still prove usable native admission.
+        ca_path = (bundle / credential['ca']).resolve(strict=True)
+        if ca_path.parent != bundle.resolve(strict=True):
+            parser.error('client CA must remain in its enrolled credential directory')
+        if hashlib.sha256(ca_path.read_bytes()).hexdigest().lower() != args.ca_cert_sha256.lower():
+            parser.error('client CA certificate differs from the verified operator receipt')
     probes = []
     for path in ['/agents', '/conversations', '/sessions']:
         for operation in ['stat', 'readdir']:
@@ -165,18 +201,19 @@ def main():
                 output = json.loads(result.stdout)
                 if output.get('isError'):
                     raise RuntimeError(f'{operation} {path} returned an application error: {output}')
-                if operation == 'stat' and not (output.get('found') and output.get('zoneId') == args.zone):
+                if operation == 'stat' and not (output.get('found') and output.get('zoneId') == expected_zones[path]):
                     raise RuntimeError(f'{path} is not on the expected mounted zone')
             else:
                 output = result.stdout.strip()
                 if operation == 'stat' and not (
-                        f'zone={args.zone}' in output.split() and 'found=true' in output.split()):
+                        f'zone={expected_zones[path]}' in output.split() and 'found=true' in output.split()):
                     raise RuntimeError(f'{path} is not on the expected mounted zone')
             probes.append({'operation': operation, 'path': path, 'output': output})
     record = dict(version=1, endpoint=args.endpoint, agents_dir=str(args.agents_dir), role=args.role, zone=args.zone)
     target = Path.home() / '.nexus/run/node.json'
     status = publish(record, target) if args.publish else 'validated-not-published'
-    print(json.dumps({'status': status, 'target': str(target), 'record': record, 'authenticatedProbes': probes}, indent=2))
+    print(json.dumps({'status': status, 'target': str(target), 'record': record,
+                      'expectedStatZones': expected_zones, 'authenticatedProbes': probes}, indent=2))
 
 
 if __name__ == '__main__':
