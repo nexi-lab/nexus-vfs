@@ -22,6 +22,8 @@ use lib::transport_primitives::{
 };
 use sha2::{Digest, Sha256};
 
+mod control;
+
 const REVOKED: &[u8] = b"collaboration-certificate-revoked-v1";
 
 #[derive(Debug, PartialEq, Eq)]
