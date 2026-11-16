@@ -9,10 +9,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  database-bootstrap:
-    name: Database crash bootstrap / ${{ matrix.os }}
+  # Every native-filesystem suite runs in one job per OS. Hosted runners are the
+  # scarce resource: a job waits far longer for a runner than it runs, so the
+  # suites share one runner and one build cache per platform. Linux covers the
+  # process-instance suites in the full workspace test job.
+  native-suites:
+    name: Native functional suites / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -21,53 +25,67 @@ jobs:
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: ./.github/actions/setup-protoc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-database-bootstrap-${{ matrix.os }}
-      - run: cargo test -p lib --features redb-storage redb_storage --lib
-      - run: cargo test -p lib --features redb-storage file_durability::tests --lib
-      - run: cargo test -p raft@0.1.0 --lib -- zone_runtime::tests raft::storage::tests raft::replication_log::tests raft::zone_persistence::tests
-
-  # CAS has a different kernel feature/build graph. On Windows, compiling it
-  # after both completed bootstrap suites exhausted the 25-minute job budget
-  # before its tests ran. Keep the same command, platforms and budget in an
-  # independent job; no test deadline or assertion changes.
-  cas-publication:
-    name: CAS complete publication / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-protoc
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-cas-publication-${{ matrix.os }}
-      - name: Kernel boot and CAS publication on the native filesystem
-        run: cargo test -p kernel --test cas_publication --test boot_metastore
-      - name: Batch write results and commit notifications on the native filesystem
-        run: cargo test --locked -p kernel --test batch_write_outcomes
-      - name: Durable CAS ObjectStore composition
-        run: cargo test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend
-      - name: Logical file size across CAS manifest and partial writes
-        run: cargo test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
+          shared-key: ci-native-suites-${{ matrix.os }}
+      - name: "Database bootstrap: cargo test -p lib --features redb-storage redb_storage --lib"
+        run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage redb_storage --lib
+      - name: "Database bootstrap: cargo test -p lib --features redb-storage file_durability::tests --lib"
+        run: cargo --config .github/ci/functional-tests.toml test -p lib --features redb-storage file_durability::tests --lib
+      - name: "Database bootstrap: cargo test -p raft@0.1.0 --lib -- zone_runtime:: raft::storage:: raft::replication_log::tests r"
+        run: 'cargo --config .github/ci/functional-tests.toml test -p raft@0.1.0 --lib -- zone_runtime:: raft::storage:: raft::replication_log::tests raft::zone_persistence::tests'
+      - name: "Database bootstrap: Record I/O lifetime on the native filesystem"
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_io::'
+      - name: "Database bootstrap: Committed record notifications on the native filesystem"
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
+      - name: "Database bootstrap: Owned WAL I/O and background retirement on the native filesystem"
+        run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
+      - name: "CAS publication: Kernel boot and CAS publication on the native filesystem"
+        run: cargo --config .github/ci/functional-tests.toml test -p kernel --test cas_publication --test boot_metastore
+      - name: "CAS publication: Reject malformed content identifiers before filesystem access"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib core::cas::transport::tests::invalid_content_ids_are_refused_before_filesystem_access
+      - name: "CAS publication: Cold peer reads retain their owning zone"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib federation::cold_segment
+      - name: "CAS publication: Concurrent mounts retain complete storage pairs"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --lib kernel::mount::tests
+      - name: "CAS publication: Batch write results and commit notifications on the native filesystem"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p kernel --test batch_write_outcomes
+      - name: "CAS publication: Durable CAS ObjectStore composition"
+        run: cargo --config .github/ci/functional-tests.toml test -p backends --no-default-features --features driver-cas-local --test cas_durable_backend --test zone_cas_local
+      - name: "CAS publication: Trusted Kernel WAL admission and platform refusal"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p nexus-cluster --features driver-cas-local --test owned_wal_storage
+      - name: "CAS publication: Logical file size across CAS manifest and partial writes"
+        run: cargo --config .github/ci/functional-tests.toml test --locked -p backends --no-default-features --features driver-cas-local,driver-path-local,driver-local-connector --lib storage::cas_local::tests::manifest_shaped_content_keeps_its_logical_size_after_partial_writes
+      - name: "Secret file permissions: cargo test -p lib --features transport transport_primitives::secret_file --lib"
+        run: cargo test -p lib --features transport transport_primitives::secret_file --lib
+      - name: "Runtime observations: Real RPC instance, ownership, expiry and partial-directory journeys"
+        run: |
+          cargo --config .github/ci/functional-tests.toml test --locked -p kernel --no-default-features core::agents::registry::runtime_observation::tests:: --lib
+          cargo --config .github/ci/functional-tests.toml test --locked -p transport --all-features --test runtime_observation_rpc --test managed_agent_grpc_auth -- --test-threads=1
+      - name: "Process instances: cargo test -p kernel --no-default-features core::agents --lib"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p kernel --no-default-features core::agents --lib
+      - name: "Process instances: cargo test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume --test local_terminal"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume --test local_terminal
+      - name: "Native terminal admission and OS ownership"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p subprocess --test local_host
 
   durable-runtime-build:
     name: Durable runtime executables / Linux
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    outputs:
+      artifact-id: ${{ steps.runtime-bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.runtime-bundle.outputs.artifact-digest }}
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: '0'
@@ -88,9 +106,10 @@ jobs:
         run: cargo test --locked -p nexus-cluster -p raft@0.1.0 --test user_runtime --test test_protected_zone_metadata required_durable_backend_obeys_build_and_platform_at_startup
       - name: Build and record the shared runtime executables
         run: |
-          cargo test --locked -p nexus-cluster -p raft@0.1.0 --features nexus-cluster/driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test dt_stream_unbounded --test test_protected_zone_metadata --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
+          cargo test --locked -p nexus-cluster -p raft@0.1.0 --features nexus-cluster/driver-cas-local --test user_runtime --test conditional_content --test cas_peer_blob --test zone_content_blob --test dt_stream_unbounded --test test_protected_zone_metadata --no-run --message-format=json > "$RUNNER_TEMP/durable-runtime-artifacts.json"
           python3 scripts/e2e/durable_artifacts.py pack --artifacts "$RUNNER_TEMP/durable-runtime-artifacts.json" --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/upload-artifact@v4
+        id: runtime-bundle
         with:
           name: durable-runtime-executables
           path: ${{ runner.temp }}/durable-runtime-bundle
@@ -102,16 +121,37 @@ jobs:
     needs: durable-runtime-build
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
     env:
       MOSS_RUNTIME_TOOLS_REV: aa02a532fa8067506922102212459720fb421127
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: durable-runtime-executables
-          path: ${{ runner.temp }}/durable-runtime-bundle
+      - name: Download the producer's immutable executable bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_ARTIFACT_ID: ${{ needs.durable-runtime-build.outputs.artifact-id }}
+          RUNTIME_ARCHIVE_DIGEST: ${{ needs.durable-runtime-build.outputs.artifact-digest }}
+        run: >-
+          python3 scripts/e2e/durable_artifacts.py download
+          --repository "$GITHUB_REPOSITORY"
+          --artifact-id "$RUNTIME_ARTIFACT_ID"
+          --archive-digest "$RUNTIME_ARCHIVE_DIGEST"
+          --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - name: Restore the verified executables for this source tree
         run: python3 scripts/e2e/durable_artifacts.py restore --directory "$RUNNER_TEMP/durable-runtime-bundle"
+      - name: Prepare the official previous storage reader
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir "$RUNNER_TEMP/record-guard-prior"
+          gh release download v0.8.29-rc.5 --repo nexi-lab/nexus-vfs --pattern nexusd-cluster-linux-x86_64.tar.gz --dir "$RUNNER_TEMP/record-guard-prior"
+          cd "$RUNNER_TEMP/record-guard-prior"
+          echo 'f8fdfe2b549ad6a34700fde1697daeb77737361f0b4d43faf91963fe2e8f5e6d  nexusd-cluster-linux-x86_64.tar.gz' | sha256sum --check --strict
+          tar --extract --gzip --file nexusd-cluster-linux-x86_64.tar.gz
+          test -x "$PWD/nexusd-cluster-linux-x86_64/nexusd-cluster"
+          echo "NEXUS_RECORD_GUARD_PRIOR_BINARY=$PWD/nexusd-cluster-linux-x86_64/nexusd-cluster" >> "$GITHUB_ENV"
       - name: Verify native owner, peer, content, stream and protected-record recovery
         run: python3 scripts/e2e/durable_artifacts.py native --directory "$RUNNER_TEMP/durable-runtime-bundle"
       - uses: actions/checkout@v4
@@ -148,53 +188,6 @@ jobs:
             ${{ runner.temp }}/durable-runtime-bundle/native-receipt.json
             ${{ runner.temp }}/durable-runtime-bundle/native-*.log
           if-no-files-found: warn
-
-  secret-file-permissions:
-    name: Secret file permissions / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15]
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-secret-file-permissions-${{ matrix.os }}
-      - run: cargo test -p lib --features transport transport_primitives::secret_file --lib
-
-  process-instances:
-    name: Process instance lifecycle / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      CARGO_BUILD_JOBS: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, macos-15]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-process-instances-${{ matrix.os }}
-      # Linux exercises these in the full workspace test job below.
-      - run: cargo --config .github/ci/process-instances.toml test -p kernel --no-default-features core::agents::registry --lib
-      - run: cargo --config .github/ci/process-instances.toml test -p managed-agent --all-features --test session_mailbox --test session_resume --test local_terminal
-      - name: Native terminal admission and OS ownership
-        run: cargo --config .github/ci/process-instances.toml test -p subprocess --test local_host
 
   search-windows:
     name: Search FTS / Windows

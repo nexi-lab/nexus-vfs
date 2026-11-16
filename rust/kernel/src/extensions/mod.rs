@@ -27,6 +27,8 @@
 //!   (reached via `MetaStore::as_conditional_metadata`).
 //! * [`record_protection`] — qualified admission of conditional-only records
 //!   (reached via `MetaStore::as_record_protection`).
+//! * [`guarded_records`] — owner admission, final commit fences and retirement
+//!   (reached via `MetaStore::as_guarded_records`).
 //! * [`llm_streaming`] — `LlmStreamingBackend`, connector-backend SSE
 //!   streaming (reached via `ObjectStore::as_llm_streaming`).
 //!
@@ -36,5 +38,6 @@
 //! `crate::core::metadata_sync`.
 
 pub mod conditional_metadata;
+pub mod guarded_records;
 pub mod llm_streaming;
 pub mod record_protection;

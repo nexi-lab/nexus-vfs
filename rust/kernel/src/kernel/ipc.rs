@@ -141,7 +141,7 @@ impl Kernel {
         if let Some(route) = route {
             self.with_metastore_route(&route, |ms| ms.delete(path))
                 .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
-                .map_err(|e| KernelError::IOError(e.to_string()))?;
+                .map_err(|e| KernelError::from_metastore(&e, e.to_string()))?;
         } else {
             self.metastore_delete(path)?;
         }
@@ -245,7 +245,9 @@ impl Kernel {
     ) -> Result<Option<(Vec<u8>, usize)>, KernelError> {
         self.stream_manager
             .read_at(
-                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                &self
+                    .unscoped_stream_address(path, contracts::ROOT_ZONE_ID)?
+                    .key(),
                 offset,
             )
             .map_err(stream_mgr_err)
@@ -260,7 +262,9 @@ impl Kernel {
     ) -> Result<(Vec<Vec<u8>>, usize), KernelError> {
         self.stream_manager
             .read_batch(
-                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                &self
+                    .unscoped_stream_address(path, contracts::ROOT_ZONE_ID)?
+                    .key(),
                 offset,
                 count,
             )
@@ -276,7 +280,11 @@ impl Kernel {
     /// `check_permission(Read)` for this whole-stream variant), never here.
     pub fn stream_collect_all(&self, path: &str) -> Result<Vec<u8>, KernelError> {
         self.stream_manager
-            .collect_all_payloads(&self.stream_address(path, contracts::ROOT_ZONE_ID).key())
+            .collect_all_payloads(
+                &self
+                    .unscoped_stream_address(path, contracts::ROOT_ZONE_ID)?
+                    .key(),
+            )
             .map_err(stream_mgr_err)
     }
 
@@ -317,7 +325,9 @@ impl Kernel {
     ) -> Result<(Vec<u8>, usize), KernelError> {
         self.stream_manager
             .read_at_blocking(
-                &self.stream_address(path, contracts::ROOT_ZONE_ID).key(),
+                &self
+                    .unscoped_stream_address(path, contracts::ROOT_ZONE_ID)?
+                    .key(),
                 offset,
                 timeout_ms,
             )

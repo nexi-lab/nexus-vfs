@@ -53,6 +53,22 @@ pub fn verify(
         .into_contents();
     let (_, cert) = X509Certificate::from_der(&cert_der)
         .map_err(|e| format!("agent cert does not parse: {e}"))?;
+    verify_x509(message, sig, &cert, ca_pem)
+}
+
+/// Verify message authorship using an already parsed leaf certificate.
+///
+/// This shares the issuer, agent identity and signature checks with [`verify`].
+/// Callers that also enforce credential lifetime or capabilities can inspect
+/// the same leaf without decoding its PEM and DER again.
+pub fn verify_x509(
+    message: &[u8],
+    sig: &[u8],
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+    ca_pem: &[u8],
+) -> Result<String, String> {
+    use x509_parser::prelude::*;
+
     let ca_der = ::pem::parse(ca_pem)
         .map_err(|e| format!("CA cert is not valid PEM: {e}"))?
         .into_contents();
@@ -60,12 +76,12 @@ pub fn verify(
         X509Certificate::from_der(&ca_der).map_err(|e| format!("CA cert does not parse: {e}"))?;
 
     // 1. The cert is a genuine agent cert issued by this cluster CA.
-    if !cert_signed_by(&cert, &ca) {
+    if !cert_signed_by(cert, &ca) {
         return Err("agent cert does not chain to the cluster CA".to_string());
     }
 
     // 2. It names an agent (a `nexus://agent/{name}` SAN).
-    let name = agent_name_from_x509(&cert)
+    let name = agent_name_from_x509(cert)
         .ok_or_else(|| "cert carries no agent identity SAN".to_string())?;
 
     // 3. The signature over `message` is valid under the cert's public key.
@@ -225,6 +241,25 @@ mod tests {
         let msg = b"win-ai\x00hello from win";
         let sig = sign(msg, &key).unwrap();
         assert_eq!(verify(msg, &sig, &cert, &ca).unwrap(), "win-ai");
+    }
+
+    #[test]
+    fn parsed_leaf_keeps_the_issuer_and_message_proof_binding() {
+        use x509_parser::prelude::*;
+
+        let (ca, ca_key) = mint_ca("z");
+        let (cert, key) = mint_agent("win-ai", &ca, &ca_key);
+        let (foreign_ca, _) = mint_ca("other");
+        let (_, other_key) = mint_agent("mac-ai", &ca, &ca_key);
+        let der = ::pem::parse(&cert).unwrap();
+        let (_, leaf) = X509Certificate::from_der(der.contents()).unwrap();
+        let msg = b"hello from win";
+        let sig = sign(msg, &key).unwrap();
+
+        assert_eq!(verify_x509(msg, &sig, &leaf, &ca).unwrap(), "win-ai");
+        assert!(verify_x509(b"changed", &sig, &leaf, &ca).is_err());
+        assert!(verify_x509(msg, &sig, &leaf, &foreign_ca).is_err());
+        assert!(verify_x509(msg, &sign(msg, &other_key).unwrap(), &leaf, &ca).is_err());
     }
 
     #[test]

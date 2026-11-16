@@ -57,7 +57,7 @@ async fn only_an_admin_can_manage_tuples_even_with_a_valid_zone_key() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
     let runtime = tokio::runtime::Handle::current();
-    let consensus = registry.create_zone("control", vec![], &runtime).unwrap();
+    let consensus = registry.create_zone("control", &runtime).unwrap();
     consensus.campaign().await.unwrap();
     let keys = RaftAuthKeyStore::new_arc(consensus.clone(), runtime.clone());
     let tuples = RaftReBACTupleStore::new_arc(consensus, runtime);

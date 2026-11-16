@@ -296,7 +296,8 @@ fn missing_and_corrupt_legacy_content_leave_the_record_unprotected() {
             .as_cas()
             .unwrap()
             .transport()
-            .blob_path(metadata.content_id.as_ref().unwrap());
+            .blob_path(metadata.content_id.as_ref().unwrap())
+            .unwrap();
         if missing {
             std::fs::remove_file(&object).unwrap();
         } else {

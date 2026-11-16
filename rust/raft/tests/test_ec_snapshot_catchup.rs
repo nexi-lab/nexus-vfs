@@ -101,7 +101,7 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
 
     // Founder: 1-voter sharedzone.  Self-elects (quorum=1).
     let zone_founder = zm_founder
-        .create_zone("sharedzone", vec![format!("{id_founder}@{bind_founder}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone");
     for _ in 0..100 {
         if zone_founder.is_leader() {
@@ -115,11 +115,7 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
 
     // Learner A joins — its presence lets the founder's drain reach compaction.
     let _zone_a = zm_a
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_founder}@{bind_founder}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("A local join_zone(learner)");
     let ja = call_join_zone_rpc(
         &endpoint_founder,
@@ -188,11 +184,7 @@ async fn test_ec_snapshot_catchup_late_learner_behind_compacted_wal() {
     // below the founder's earliest.  Incremental replay is impossible; only an
     // anti-entropy snapshot can deliver the compacted keys.
     let _zone_b = zm_b
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_founder}@{bind_founder}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("B local join_zone(learner)");
     let jb = call_join_zone_rpc(
         &endpoint_founder,

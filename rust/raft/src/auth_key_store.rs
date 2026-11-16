@@ -136,7 +136,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = RaftAuthKeyStore::new(node, runtime);
@@ -177,7 +177,7 @@ mod tests {
         assert!(!store.delete("hash-a").expect("re-revoke a"));
         assert_eq!(store.list().expect("list after revoke").len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Records are a kernel-internal primitive, not files: they live in
@@ -195,7 +195,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -219,6 +219,6 @@ mod tests {
             "auth record leaked into a file-metadata listing"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

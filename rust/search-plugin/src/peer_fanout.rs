@@ -42,8 +42,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_search_common::transport::CredentialChannel;
 use nexus_search_common::transport::{DialError, PeerChannelCache, PeerChannelConfig};
-use tonic::transport::Channel;
 
 use crate::peer_registry::PeerRegistry;
 use crate::search_proto::search_service_client::SearchServiceClient;
@@ -122,6 +122,10 @@ impl PeerFanoutError {
     /// shapes aligned.
     fn from_dial(err: DialError) -> Self {
         match err {
+            DialError::CredentialsUnavailable { target, reason } => Self::Unreachable {
+                peer: target,
+                source: tonic::Status::unauthenticated(reason),
+            },
             DialError::TlsRequired { target } => Self::Unreachable {
                 peer: target,
                 source: tonic::Status::unauthenticated("TLS is required"),
@@ -263,7 +267,7 @@ impl PeerFanoutDispatcher {
     async fn get_or_dial(
         &self,
         peer: &crate::peer_registry::PeerAddress,
-    ) -> Result<Channel, PeerFanoutError> {
+    ) -> Result<CredentialChannel, PeerFanoutError> {
         let url = peer.url(self.registry.require_tls());
         self.channels
             .get_or_dial(&url)

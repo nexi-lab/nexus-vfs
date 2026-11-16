@@ -39,8 +39,24 @@
 //! nexus_raft = { version = "0.1", features = ["grpc"] }
 //! ```
 
+/// Bound a generated tonic server or client by the raft message bound
+/// ([`crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES`]) in both
+/// directions. Every endpoint applies the same bound, so whatever one peer
+/// may send, every other accepts. Defined ahead of the submodules, which see
+/// it in textual scope.
+macro_rules! bounded {
+    ($endpoint:expr) => {
+        $endpoint
+            .max_decoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::raft::message_bound::MAX_RAFT_MESSAGE_BYTES)
+    };
+}
+
 mod node_authority;
-pub use node_authority::{current_local_node_certificate, LocalNodeCertificate};
+pub(crate) use node_authority::prepared_local_replication_id;
+pub use node_authority::{
+    current_local_node_certificate, local_node_identity, LocalNodeCertificate,
+};
 
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) mod certgen;
@@ -48,10 +64,12 @@ pub(crate) mod certgen;
 pub(crate) use certgen::verified_csr_key;
 pub use certgen::{
     append_join_token_hash, bootstrap_tls, generate_agent_cert, generate_join_token,
-    generate_node_cert, generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,
-    join_token_hash_path, node_identity_uri, parse_node_identity_uri, prepare_agent_csr_intent,
-    read_join_token_hashes, sign_agent_csr, sign_committed_agent_intent, sign_node_csr,
-    BootstrapTls,
+    generate_node_cert, generate_node_key_request, generate_session_agent_cert,
+    generate_user_replica_cert, generate_user_runtime_cert, generate_zone_ca, join_token_hash_path,
+    node_identity_uri, parse_node_identity_uri, persist_node_identity, prepare_agent_csr_intent,
+    prepare_replica_csr_intent, read_join_token_hashes, sign_agent_csr,
+    sign_committed_agent_intent, sign_committed_replica_intent, sign_node_csr,
+    verify_replica_csr_intent, BootstrapTls,
 };
 /// Re-exported so a caller that already depends on this crate can name a
 /// session subject without taking a direct dependency on `lib` — the cluster
@@ -68,7 +86,11 @@ pub use lib::transport_primitives::{user_runtime_server_name, USER_RUNTIME_MAX_V
 #[cfg(all(feature = "grpc", has_protos))]
 pub use lib::transport_primitives::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
 #[cfg(all(feature = "grpc", has_protos))]
+mod replica_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
 mod session_renewal;
+#[cfg(all(feature = "grpc", has_protos))]
+pub use replica_renewal::{replica_renewal_message, verify_replica_renewal, ReplicaRenewalProof};
 #[cfg(all(feature = "grpc", has_protos))]
 pub use session_renewal::{
     session_renewal_message, verify_session_renewal, VerifiedSessionRenewal,
@@ -80,12 +102,13 @@ pub use crl::{
     add_revoked_serial, add_revoked_serial_with_expiry, crl_revoked_serials, generate_crl,
     prune_expired_serials, read_revoked_entries, read_revoked_serials,
     read_revoked_serials_checked, revoked_serials_path, serial_from_cert_pem,
-    with_unrevoked_serial, RevokedEntry,
+    with_unrevoked_serial, with_unrevoked_serials, RevokedEntry,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 mod client;
 #[cfg(all(feature = "grpc", has_protos))]
 mod server;
+pub(crate) use server::PreparedRaftListener;
 #[cfg(all(feature = "grpc", has_protos))]
 mod transport_loop;
 
@@ -95,11 +118,12 @@ pub use client::{
     call_discover_zones_rpc, call_get_crl, call_join_cluster, call_join_zone_rpc,
     call_list_foreign_cas_rpc, call_list_keys_rpc, call_list_session_minters_rpc,
     call_mint_agent_rpc, call_mint_key_rpc, call_mint_session_agent_rpc,
-    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_session_agent_rpc,
-    call_revoke_agent_cert_rpc, call_revoke_key_rpc, call_unregister_foreign_ca_rpc, ClientConfig,
-    ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinZoneResult, MintAgentResult,
-    MintKeyArgs, MintSessionAgentResult, ProposeResult, QueryResult, RaftApiClient, RaftClient,
-    RaftClientPool, RemoveVoterResult,
+    call_register_foreign_ca_rpc, call_remove_voter_rpc, call_renew_local_node_certificate_rpc,
+    call_renew_node_certificate_rpc, call_renew_session_agent_rpc, call_revoke_agent_cert_rpc,
+    call_revoke_key_rpc, call_unregister_foreign_ca_rpc, call_zone_status_rpc, join_zone_round,
+    zone_api_client, ClientConfig, ClusterInfoResult, DiscoveredZone, JoinClusterResult, JoinRound,
+    JoinZoneResult, MintAgentChannel, MintAgentResult, MintKeyArgs, MintSessionAgentResult,
+    ProposeResult, QueryResult, RaftApiClient, RaftClient, RaftClientPool, RemoveVoterResult,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub use server::{
@@ -114,10 +138,14 @@ pub use transport_loop::TransportLoop;
 /// Serializes the command with bincode and sends as `raw_command` bytes
 /// in `ProposeRequest` — avoids double serialization (bincode→proto→bincode).
 ///
-/// `cached_client` provides a reusable `RaftApiClient` across calls.
-/// On first use (or after eviction), a new connection is established and
-/// cached. On transport error, the cached client is evicted so the next
-/// call reconnects.
+/// `cached_client` holds ONE client per leader endpoint, shared by every
+/// concurrent forward: a tonic channel multiplexes calls and reconnects on
+/// its own. Only a broken channel (`Unavailable`) is dropped; an answer the
+/// leader refused, or a call that ran out of time, leaves it in place.
+///
+/// What a failure says about the proposal follows from where it happened. A
+/// failed dial is [`RaftError::NotSubmitted`]: the dial sends no request. Any
+/// failure of the call itself is [`RaftError::Transport`], an unknown outcome.
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) async fn forward_propose(
     client_pool: &RaftClientPool,
@@ -126,60 +154,160 @@ pub(crate) async fn forward_propose(
     zone_id: &str,
     deadline: tokio::time::Instant,
     cached_client: &tokio::sync::Mutex<Option<(String, RaftApiClient)>>,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
-    let raw_bytes =
-        bincode::serialize(command).map_err(|e| RaftError::Serialization(e.to_string()))?;
-
-    // Get or create a cached API client. Evict if the leader endpoint changed.
+    let request = propose_request(command, zone_id, true, deadline)?;
     let mut api_client = {
-        let mut guard = cached_client.lock().await;
-        match guard.take() {
-            Some((endpoint, client)) if endpoint == leader_addr.endpoint => client,
+        let mut cached = cached_client.lock().await;
+        match cached.as_ref() {
+            Some((endpoint, client))
+                if *endpoint == leader_addr.endpoint
+                    && client.uses_current_credentials(client_pool.config()) =>
+            {
+                client.clone()
+            }
+            // Dialed under the lock: overlapping forwards share the one dial.
             _ => {
-                // Connect with short timeouts — fail fast on unreachable leader.
-                let mut forward_config = client_pool.config().clone();
-                forward_config.connect_timeout = std::time::Duration::from_secs(2);
-                forward_config.request_timeout =
-                    std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
-
-                RaftApiClient::connect(&leader_addr.endpoint, forward_config)
-                    .await
-                    .map_err(|e| RaftError::Transport(e.to_string()))?
+                *cached = None;
+                let client =
+                    connect_api_client(client_pool.config(), &leader_addr.endpoint).await?;
+                *cached = Some((leader_addr.endpoint.clone(), client.clone()));
+                client
             }
         }
     };
+    match api_client
+        .inner_mut()
+        .map_err(|e| RaftError::NotSubmitted {
+            endpoint: leader_addr.endpoint.clone(),
+            reason: e.to_string(),
+        })?
+        .propose(request)
+        .await
+    {
+        Ok(response) => decode_propose_response(response.into_inner()),
+        Err(status) => {
+            // `Unavailable` here is not proof that nothing was sent. The channel
+            // reconnects on its own, and the same code reports a reconnect that
+            // failed before this request was written and a connection that broke
+            // (an HTTP/2 keep-alive timeout, a reset) after it was. Only the
+            // explicit dial above can prove the leader received nothing.
+            if status.code() == tonic::Code::Unavailable {
+                let mut cached = cached_client.lock().await;
+                if cached
+                    .as_ref()
+                    .is_some_and(|(endpoint, _)| *endpoint == leader_addr.endpoint)
+                {
+                    *cached = None;
+                }
+            }
+            Err(RaftError::Transport(status.to_string()))
+        }
+    }
+}
 
+/// Submit `command` to the node at `endpoint` as an original request
+/// (`forwarded=false`): that node admits it as coming from this node and may
+/// forward it to its own leader. One connection per call — for rare control
+/// writes such as a member's self-registration. A failed dial is
+/// [`crate::raft::RaftError::NotSubmitted`]; a failed call is an unknown
+/// outcome.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) async fn propose_to(
+    config: &ClientConfig,
+    endpoint: &str,
+    command: &crate::raft::Command,
+    zone_id: &str,
+    deadline: tokio::time::Instant,
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
+    let request = propose_request(command, zone_id, false, deadline)?;
+    let mut client = connect_api_client(config, endpoint).await?;
+    let response = client
+        .inner_mut()
+        .map_err(|e| crate::raft::RaftError::NotSubmitted {
+            endpoint: endpoint.to_owned(),
+            reason: e.to_string(),
+        })?
+        .propose(request)
+        .await
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
+    decode_propose_response(response.into_inner())
+}
+
+/// A Propose RPC carrying `command` as `raw_command`, bounded by `deadline`.
+#[cfg(all(feature = "grpc", has_protos))]
+fn propose_request(
+    command: &crate::raft::Command,
+    zone_id: &str,
+    forwarded: bool,
+    deadline: tokio::time::Instant,
+) -> crate::raft::Result<tonic::Request<proto::nexus::raft::ProposeRequest>> {
+    let raw_command = bincode::serialize(command)
+        .map_err(|e| crate::raft::RaftError::Serialization(e.to_string()))?;
     let mut request = tonic::Request::new(proto::nexus::raft::ProposeRequest {
         command: None,
         request_id: String::new(),
         zone_id: zone_id.to_string(),
-        raw_command: raw_bytes,
-        forwarded: true,
+        raw_command,
+        forwarded,
     });
     request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    Ok(request)
+}
 
-    let result = api_client
-        .inner_mut()
-        .propose(request)
+/// The member-address records the node at `endpoint` has applied for
+/// `zone_id`, as its `GetClusterInfo` reports them: `(node id, bare
+/// host:port)` for each voter and learner with a record. One connection per
+/// call — for a member whose own state machine keeps no records (a witness)
+/// checking its registration.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) async fn member_addresses_at(
+    config: &ClientConfig,
+    endpoint: &str,
+    zone_id: &str,
+) -> crate::raft::Result<Vec<(u64, String)>> {
+    let info = connect_api_client(config, endpoint)
+        .await?
+        .with_zone_id(zone_id.to_string())
+        .get_cluster_info()
         .await
-        .map_err(|e| RaftError::Transport(e.to_string()));
+        .map_err(|e| crate::raft::RaftError::Transport(e.to_string()))?;
+    let Some(members) = info.config else {
+        return Ok(Vec::new());
+    };
+    Ok(members
+        .voters
+        .iter()
+        .chain(&members.learners)
+        .filter_map(|member| {
+            crate::raft::member_address::canonical(&member.address)
+                .map(|address| (member.id, address))
+        })
+        .collect())
+}
 
-    match result {
-        Ok(response) => {
-            // Success — cache the client for reuse.
-            let mut guard = cached_client.lock().await;
-            *guard = Some((leader_addr.endpoint.clone(), api_client));
-
-            decode_propose_response(response.into_inner())
+/// Connect an API client with short timeouts — fail fast on an unreachable
+/// node.
+///
+/// The connect is explicit: it completes the TCP, TLS and HTTP/2 handshakes
+/// before returning and writes no request. Every way it fails — an unusable
+/// address, a refused or silent peer, a failed handshake — therefore leaves the
+/// request unsent, and is reported as [`crate::raft::RaftError::NotSubmitted`].
+#[cfg(all(feature = "grpc", has_protos))]
+async fn connect_api_client(
+    config: &ClientConfig,
+    endpoint: &str,
+) -> crate::raft::Result<RaftApiClient> {
+    let mut config = config.clone();
+    config.connect_timeout = std::time::Duration::from_secs(2);
+    config.request_timeout = std::time::Duration::from_secs(crate::raft::PROPOSAL_TIMEOUT_SECS);
+    RaftApiClient::connect(endpoint, config).await.map_err(|e| {
+        crate::raft::RaftError::NotSubmitted {
+            endpoint: endpoint.to_string(),
+            reason: e.to_string(),
         }
-        Err(e) => {
-            // Transport error — evict cached client (already taken above).
-            // Next call will reconnect.
-            Err(e)
-        }
-    }
+    })
 }
 
 #[cfg(all(feature = "grpc", has_protos))]
@@ -188,17 +316,20 @@ pub(super) const NOT_LEADER_ERROR: &str = "Not the leader";
 #[cfg(all(feature = "grpc", has_protos))]
 fn decode_propose_response(
     response: proto::nexus::raft::ProposeResponse,
-) -> crate::raft::Result<crate::raft::CommandResult> {
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
     use crate::raft::RaftError;
 
     if response.success {
-        return Ok(proto_result_to_command_result(response.result));
+        return Ok(crate::raft::proposal::Committed {
+            result: proto_result_to_command_result(response.result),
+            index: response.applied_index,
+        });
     }
     match response.error {
         Some(error)
             if error == NOT_LEADER_ERROR
                 && response.result.is_none()
-                && response.applied_index == 0 =>
+                && response.applied_index.is_none() =>
         {
             Err(RaftError::NotLeader {
                 leader_hint: response.leader_address,
@@ -293,31 +424,193 @@ pub(crate) fn open_zone_store(sm_path: std::path::PathBuf) -> Result<crate::stor
     })
 }
 
-/// The transport peer address book for one zone — the dial addresses of the
-/// **other** nodes in the cluster.
+/// A started zone: its route book and the tasks that run it.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) struct StartedZone {
+    pub(crate) peers: SharedPeerMap,
+    pub(crate) tasks: ZoneTasks,
+}
+
+/// The tasks that run one zone on this node: the transport loop, which owns
+/// the zone's driver and with it the raft storage and state machine, and —
+/// when the member registers — its member-address registration.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) struct ZoneTasks {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    transport: tokio::task::JoinHandle<()>,
+    registration: Option<tokio::task::JoinHandle<()>>,
+    completion: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl ZoneTasks {
+    /// Observe task lifetimes before extracting a zone for removal.
+    pub(crate) fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
+    /// Signal shutdown; completion remains observable if a waiter is cancelled.
+    pub(crate) fn stop(self) -> ZonesStopped {
+        let _ = self.shutdown_tx.send(true);
+        let Self {
+            transport,
+            registration,
+            completion,
+            ..
+        } = self;
+        // Dropping JoinHandles detaches the signalled tasks. Their captured
+        // completion senders close only after they release their resources.
+        drop((transport, registration));
+        ZonesStopped::from_completions(vec![completion])
+    }
+}
+
+/// Zones told to stop. Each waiter observes the same task lifetimes, so a
+/// cancelled waiter cannot make another report that live storage is released.
+#[cfg(all(feature = "grpc", has_protos))]
+#[must_use = "await `released()` before reopening the zones' data directories"]
+pub struct ZonesStopped {
+    completions: Vec<tokio::sync::watch::Receiver<bool>>,
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl ZonesStopped {
+    pub(crate) fn from_completions(completions: Vec<tokio::sync::watch::Receiver<bool>>) -> Self {
+        Self { completions }
+    }
+
+    /// Wait until all originally captured tasks and removals have finished.
+    pub async fn released(self) {
+        for mut completion in self.completions {
+            while completion.changed().await.is_ok() {}
+        }
+    }
+}
+
+#[cfg(all(feature = "grpc", has_protos))]
+impl FromIterator<ZonesStopped> for ZonesStopped {
+    fn from_iter<I: IntoIterator<Item = ZonesStopped>>(stopped: I) -> Self {
+        Self::from_completions(
+            stopped
+                .into_iter()
+                .flat_map(|zone| zone.completions)
+                .collect(),
+        )
+    }
+}
+
+/// Run a zone's consensus on this node. Every zone start — data node and
+/// witness alike — goes through here, so every member gets the same parts: a
+/// route book shared by `driver`, the transport loop and the leader
+/// forwarding of `handle`; a transport loop that advertises `advertise`; and,
+/// in a managed zone whose member advertises an address, the member-address
+/// registration (`docs/member-address.md`) with `seeds` as its fallback
+/// `Propose` targets.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
+    handle: &mut crate::raft::ZoneConsensus<S>,
+    mut driver: crate::raft::ZoneConsensusDriver<S>,
+    zone_id: &str,
+    tls: &lib::transport_primitives::SharedTlsConfig,
+    advertise: String,
+    seeds: Vec<NodeAddress>,
+    runtime_handle: &tokio::runtime::Handle,
+) -> StartedZone {
+    let peers: SharedPeerMap =
+        std::sync::Arc::new(std::sync::RwLock::new(PeerMap::new(handle.id())));
+    driver.set_peer_map(peers.clone(), tls.snapshot().uses_tls());
+    let client_config = ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    };
+    handle.set_forward_ctx(
+        RaftClientPool::with_config(client_config.clone()),
+        peers.clone(),
+        zone_id.to_string(),
+    );
+    let transport_loop = TransportLoop::new(
+        driver,
+        peers.clone(),
+        RaftClientPool::with_config(client_config),
+    )
+    .with_zone_id(zone_id.to_string())
+    .with_self_address(advertise.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (task_lifetime, task_completion) = tokio::sync::watch::channel(false);
+    // The fixed local root has no network members.
+    let registration = (handle.config().membership_policy
+        == crate::raft::MembershipPolicy::Managed
+        && !advertise.is_empty())
+    .then(|| {
+        let registration = handle.clone().register_member_address(
+            crate::raft::MemberRegistration { advertise, seeds },
+            shutdown_rx.clone(),
+        );
+        let lifetime = task_lifetime.clone();
+        runtime_handle.spawn(async move {
+            let _lifetime = lifetime;
+            registration.await;
+        })
+    });
+    let transport_handle = runtime_handle.spawn(async move {
+        let _lifetime = task_lifetime;
+        transport_loop.run(shutdown_rx).await;
+    });
+    StartedZone {
+        peers,
+        tasks: ZoneTasks {
+            shutdown_tx,
+            transport: transport_handle,
+            registration,
+            completion: task_completion,
+        },
+    }
+}
+
+/// Record `address`, the advertise address `peer_id` stated on an
+/// authenticated inbound message or registration, in `peers`' observed
+/// layer. A bare `host:port` is schemed by this node's own TLS posture
+/// (`use_tls`): under mTLS a plaintext dial cannot complete the handshake.
+/// Returns `true` if the route changed; an empty address or id changes
+/// nothing.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) fn observe_sender(
+    peers: &SharedPeerMap,
+    peer_id: u64,
+    address: &str,
+    use_tls: bool,
+) -> bool {
+    if address.is_empty() || peer_id == 0 {
+        return false;
+    }
+    let Ok(mut route) = NodeAddress::parse(address, use_tls) else {
+        return false;
+    };
+    route.id = peer_id;
+    peers.write().unwrap().observe(peer_id, route)
+}
+
+/// The transport route book for one zone — how this node dials each OTHER
+/// member. A cache derived from two sources (`docs/member-address.md`):
 ///
-/// ## Invariant: self is never a peer (enforced by construction)
+/// * **registered** — the zone's applied member-address records, replaced
+///   wholesale by the zone's consensus driver from its state machine
+///   ([`Self::set_registered`]); nothing else writes this layer;
+/// * **observed** — the `sender_address` of authenticated inbound Raft
+///   messages ([`Self::observe`]), held in memory only. An id's observation is
+///   cleared when its registered record changes.
 ///
-/// Under the opaque-ID contract (PR #3996) a node is a *member* of its own
-/// ConfState, not a *transport peer* of itself — it never dials itself. Several
-/// independent paths write this map: runtime `learn_peer_address` (from an
-/// inbound message's `sender_address`), `add_peer` (post-ConfChange), and the
-/// raft ConfChange-apply loop in `RaftNode` (which shares this very `Arc`). A
-/// stray self-entry from any of them — a self-`from` message under churn, or
-/// self appearing in a ConfChange context — would round-trip through
-/// `persist_peers` into `identity.json`, and a later restart would then trip
-/// the boot-time self-exclusion.
-///
-/// Rather than repeat an `if id == self.node_id` guard at every writer (fragile
-/// — a new writer silently reintroduces the bug), this type owns `self_id` and
-/// drops a self-entry inside [`PeerMap::insert`]. The invariant then holds no
-/// matter which path writes. Mutation is possible ONLY through `insert`/`remove`;
-/// reads go through a read-only [`Deref`](std::ops::Deref) to the inner map (no
-/// `DerefMut`), so the guard cannot be bypassed.
+/// [`Self::route`] prefers the observation, then the record. Self is never a
+/// peer: this type owns `self_id` and both writers drop a self-entry.
+/// A bound driver supplies its existing applied membership view. Observations
+/// remain routing hints and cannot make a removed member routable again.
 #[derive(Debug)]
 pub struct PeerMap {
     self_id: u64,
-    inner: std::collections::HashMap<u64, NodeAddress>,
+    registered: std::collections::HashMap<u64, NodeAddress>,
+    observed: std::collections::HashMap<u64, NodeAddress>,
+    #[cfg(all(feature = "grpc", has_protos))]
+    membership: Option<std::sync::Arc<parking_lot::RwLock<crate::raft::MembershipSnapshot>>>,
 }
 
 impl PeerMap {
@@ -325,60 +618,121 @@ impl PeerMap {
     pub fn new(self_id: u64) -> Self {
         Self {
             self_id,
-            inner: std::collections::HashMap::new(),
+            registered: std::collections::HashMap::new(),
+            observed: std::collections::HashMap::new(),
+            #[cfg(all(feature = "grpc", has_protos))]
+            membership: None,
         }
     }
 
-    /// Seed the book from an initial peer set. Any self-entry in `peers` is
-    /// dropped, so the invariant holds even for a pre-poisoned seed (e.g. an
-    /// `identity.json` written before this type existed).
-    pub fn with_peers(self_id: u64, peers: std::collections::HashMap<u64, NodeAddress>) -> Self {
-        let mut map = Self::new(self_id);
-        for (id, addr) in peers {
-            map.insert(id, addr);
+    /// The dial address for `id`: its observation, else its record.
+    #[inline]
+    pub fn route(&self, id: u64) -> Option<&NodeAddress> {
+        #[cfg(all(feature = "grpc", has_protos))]
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|view| !view.read().permits_route(id))
+        {
+            return None;
         }
-        map
+        self.cached_route(id)
     }
 
-    /// Insert or update a peer's dial address.
-    ///
-    /// A self-entry (`id == self_id`) is silently dropped — self is not a
-    /// transport peer. Returns `true` if the map changed (a real peer was
-    /// inserted or its address updated), `false` if the entry was self.
-    pub fn insert(&mut self, id: u64, addr: NodeAddress) -> bool {
-        if id == self.self_id {
-            tracing::debug!(
-                self_id = self.self_id,
-                "peer map: dropped self-entry (self is a ConfState member, not a transport peer)"
+    fn cached_route(&self, id: u64) -> Option<&NodeAddress> {
+        self.observed.get(&id).or_else(|| self.registered.get(&id))
+    }
+
+    /// Every routed peer once, as `(id, route)`.
+    pub fn routes(&self) -> impl Iterator<Item = (u64, &NodeAddress)> {
+        let routes = self
+            .observed
+            .iter()
+            .map(|(id, address)| (*id, address))
+            .chain(
+                self.registered
+                    .iter()
+                    .filter(|(id, _)| !self.observed.contains_key(id))
+                    .map(|(id, address)| (*id, address)),
             );
+        #[cfg(all(feature = "grpc", has_protos))]
+        let routes = {
+            let membership = self.membership.as_ref().map(|view| view.read());
+            routes.filter(move |(id, _)| {
+                membership
+                    .as_ref()
+                    .is_none_or(|view| view.permits_route(*id))
+            })
+        };
+        routes
+    }
+
+    /// Whether no peer is routed.
+    pub fn is_empty(&self) -> bool {
+        self.routes().next().is_none()
+    }
+
+    /// Number of routed peers.
+    pub fn len(&self) -> usize {
+        self.routes().count()
+    }
+
+    /// Clone out the routes (self excluded by the invariant).
+    pub fn snapshot(&self) -> std::collections::HashMap<u64, NodeAddress> {
+        self.routes()
+            .map(|(id, address)| (id, address.clone()))
+            .collect()
+    }
+
+    /// Bind the driver's existing read view; do not copy membership into routes.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn set_membership_view(
+        &mut self,
+        membership: std::sync::Arc<parking_lot::RwLock<crate::raft::MembershipSnapshot>>,
+    ) {
+        self.membership = Some(membership);
+    }
+
+    /// Replace the registered layer with `records` — the zone driver's only
+    /// write, made from the applied member-address records. A self-entry is
+    /// dropped, and every id whose record changed loses its observation.
+    pub(crate) fn set_registered(
+        &mut self,
+        mut records: std::collections::HashMap<u64, NodeAddress>,
+    ) {
+        records.remove(&self.self_id);
+        let observed = &mut self.observed;
+        for (id, address) in &records {
+            if self.registered.get(id) != Some(address) {
+                observed.remove(id);
+            }
+        }
+        for id in self.registered.keys() {
+            if !records.contains_key(id) {
+                observed.remove(id);
+            }
+        }
+        self.registered = records;
+    }
+
+    /// Record `address` observed for `id` on an authenticated inbound
+    /// message. Returns `true` if the route changed; a self-entry, or an
+    /// address the route already has, changes nothing.
+    pub fn observe(&mut self, id: u64, address: NodeAddress) -> bool {
+        if id == self.self_id
+            || self
+                .cached_route(id)
+                .is_some_and(|route| route.endpoint == address.endpoint)
+        {
             return false;
         }
-        self.inner.insert(id, addr);
+        self.observed.insert(id, address);
         true
     }
-
-    /// Remove a peer (e.g. on ConfChange `RemoveNode`).
-    pub fn remove(&mut self, id: &u64) -> Option<NodeAddress> {
-        self.inner.remove(id)
-    }
-
-    /// Clone out the inner address book (self already excluded by the invariant).
-    pub fn snapshot(&self) -> std::collections::HashMap<u64, NodeAddress> {
-        self.inner.clone()
-    }
 }
 
-/// Read-only view of the address book. Mutation is intentionally NOT exposed
-/// (no `DerefMut`) so every write funnels through `insert`/`remove` and the
-/// self-exclusion invariant cannot be bypassed.
-impl std::ops::Deref for PeerMap {
-    type Target = std::collections::HashMap<u64, NodeAddress>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// Shared peer map that can be updated at runtime (e.g., when new nodes join via ConfChange).
+/// Shared route book: written by its zone's driver (registered layer) and by
+/// inbound authentication (observed layer), read by every send path.
 ///
 /// Uses `std::sync::RwLock` (not tokio) because:
 /// - Read/write operations are very fast (HashMap insert/lookup)
@@ -422,77 +776,105 @@ pub mod proto {
 #[cfg(test)]
 mod peer_map_tests {
     use super::{NodeAddress, PeerMap};
+    use std::collections::HashMap;
 
     const SELF_ID: u64 = 1001;
 
-    fn addr(id: u64) -> NodeAddress {
-        NodeAddress::new(id, format!("http://node-{id}:9000"))
+    fn addr(id: u64, port: u16) -> NodeAddress {
+        NodeAddress::new(id, format!("http://node-{id}:{port}"))
+    }
+
+    fn records(entries: &[(u64, u16)]) -> HashMap<u64, NodeAddress> {
+        entries
+            .iter()
+            .map(|&(id, port)| (id, addr(id, port)))
+            .collect()
     }
 
     #[test]
-    fn insert_keeps_other_peers() {
+    fn an_observation_outranks_the_record_until_the_record_changes() {
         let mut m = PeerMap::new(SELF_ID);
-        assert!(m.insert(2002, addr(2002)), "a real peer is stored");
-        assert!(m.insert(3003, addr(3003)));
-        assert_eq!(m.len(), 2);
-        assert!(m.get(&2002).is_some());
-        assert!(m.get(&3003).is_some());
+        m.set_registered(records(&[(2002, 9000), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9000)));
+
+        assert!(m.observe(2002, addr(2002, 9100)), "a new address routes");
+        assert_eq!(m.route(2002), Some(&addr(2002, 9100)));
+        assert!(!m.observe(2002, addr(2002, 9100)), "repeat is unchanged");
+        assert_eq!(m.len(), 2, "each peer routes once");
+
+        // Re-installing identical records keeps the observation.
+        m.set_registered(records(&[(2002, 9000), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9100)));
+
+        // A changed record clears that peer's observation, and only that one.
+        assert!(m.observe(3003, addr(3003, 9300)));
+        m.set_registered(records(&[(2002, 9200), (3003, 9000)]));
+        assert_eq!(m.route(2002), Some(&addr(2002, 9200)));
+        assert_eq!(m.route(3003), Some(&addr(3003, 9300)));
+
+        // A removed record clears its observation too.
+        m.set_registered(records(&[(2002, 9200)]));
+        assert_eq!(m.route(3003), None);
+        assert_eq!(m.snapshot(), records(&[(2002, 9200)]));
     }
 
     #[test]
-    fn insert_drops_self() {
+    fn self_is_never_a_peer() {
         let mut m = PeerMap::new(SELF_ID);
-        // Self is a ConfState member, not a transport peer — dropped on insert,
-        // no matter which caller (learn_peer_address, add_peer, ConfChange apply)
-        // hands it to us.
-        assert!(
-            !m.insert(SELF_ID, addr(SELF_ID)),
-            "self returns 'unchanged'"
-        );
-        assert!(m.is_empty(), "self never enters the book");
-        assert!(m.get(&SELF_ID).is_none());
-    }
-
-    #[test]
-    fn with_peers_filters_a_pre_poisoned_seed() {
-        // A seed built from a stale identity.json that already contains self
-        // (written before this invariant existed) must not brick the node.
-        let seed = std::collections::HashMap::from([
-            (SELF_ID, addr(SELF_ID)),
-            (2002, addr(2002)),
-            (3003, addr(3003)),
-        ]);
-        let m = PeerMap::with_peers(SELF_ID, seed);
-        assert_eq!(m.len(), 2, "self filtered out of the seed");
-        assert!(m.get(&SELF_ID).is_none());
-        assert!(m.get(&2002).is_some());
-    }
-
-    #[test]
-    fn remove_and_snapshot() {
-        let mut m = PeerMap::new(SELF_ID);
-        m.insert(2002, addr(2002));
-        m.insert(3003, addr(3003));
-        assert!(m.remove(&2002).is_some());
-        let snap = m.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert!(snap.contains_key(&3003));
-        assert!(!snap.contains_key(&SELF_ID));
-    }
-
-    #[test]
-    fn conf_change_self_add_is_a_noop() {
-        // Mirrors the raft ConfChange-apply path (node.rs): AddNode for self
-        // must not land self in the transport book. The type enforces it — the
-        // apply loop does `peer_map.write().unwrap().insert(id, addr)` with no
-        // self-guard of its own.
-        let mut m = PeerMap::new(SELF_ID);
-        m.insert(2002, addr(2002));
-        let changed = m.insert(SELF_ID, addr(SELF_ID)); // ConfChange::AddNode(self)
-        assert!(!changed);
+        assert!(!m.observe(SELF_ID, addr(SELF_ID, 9000)));
+        m.set_registered(records(&[(SELF_ID, 9000), (2002, 9000)]));
+        assert_eq!(m.route(SELF_ID), None);
         assert_eq!(m.len(), 1);
+        assert!(!m.snapshot().contains_key(&SELF_ID));
+    }
+
+    #[test]
+    fn an_observation_routes_a_peer_without_a_record() {
+        let mut m = PeerMap::new(SELF_ID);
+        assert!(m.is_empty());
+        assert!(m.observe(4004, addr(4004, 9000)));
+        assert!(!m.is_empty());
+        assert_eq!(m.route(4004), Some(&addr(4004, 9000)));
+        // An observation equal to the record adds nothing to hold.
+        m.set_registered(records(&[(5005, 9000)]));
+        assert!(!m.observe(5005, addr(5005, 9000)));
+        assert_eq!(m.len(), 2);
+    }
+
+    /// Data nodes and witnesses observe senders through one function, which
+    /// schemes a bare advertise address by the local TLS posture.
+    #[cfg(all(feature = "grpc", has_protos))]
+    #[test]
+    fn an_observed_sender_is_schemed_by_the_local_tls_posture() {
+        let peers: super::SharedPeerMap =
+            std::sync::Arc::new(std::sync::RwLock::new(PeerMap::new(SELF_ID)));
+        assert!(super::observe_sender(&peers, 7, "nexus-7:2126", true));
+        assert_eq!(
+            peers
+                .read()
+                .unwrap()
+                .route(7)
+                .map(|route| route.endpoint.clone()),
+            Some("https://nexus-7:2126".to_string())
+        );
+        assert!(
+            !super::observe_sender(&peers, 7, "https://nexus-7:2126", true),
+            "the route it already has changes nothing"
+        );
+        assert!(!super::observe_sender(&peers, 0, "nexus-0:2126", true));
+        assert!(!super::observe_sender(&peers, 8, "", true));
+        assert!(!super::observe_sender(
+            &peers,
+            SELF_ID,
+            "nexus-1:2126",
+            true
+        ));
+        assert_eq!(peers.read().unwrap().len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod proposal_client_tests;
 
 #[cfg(all(test, feature = "grpc", has_protos))]
 mod decode_tests {
@@ -538,6 +920,43 @@ mod decode_tests {
         ));
     }
 
+    /// Absence of `applied_index` is "not reported", never index 0: a leader
+    /// that predates the field leaves it off the wire, and a follower that
+    /// read it as 0 would call the write visible before applying it.
+    #[test]
+    fn a_success_without_applied_index_reports_the_index_unknown() {
+        use super::decode_propose_response;
+        use super::proto::nexus::raft::ProposeResponse;
+        use prost::Message as _;
+
+        let success = |applied_index| ProposeResponse {
+            success: true,
+            error: None,
+            leader_address: None,
+            result: Some(RaftResponse {
+                success: true,
+                error: None,
+                result: None,
+            }),
+            applied_index,
+        };
+        assert_eq!(
+            decode_propose_response(success(Some(17))).unwrap().index,
+            Some(17)
+        );
+        assert_eq!(decode_propose_response(success(None)).unwrap().index, None);
+
+        // What a leader that predates the field puts on the wire: the same
+        // response with no field 5 at all.
+        let old_leader = success(None).encode_to_vec();
+        let decoded = ProposeResponse::decode(old_leader.as_slice()).unwrap();
+        assert_eq!(decoded.applied_index, None);
+        assert_eq!(decode_propose_response(decoded).unwrap().index, None);
+        // An explicit 0 is still an index: proto3 `optional` keeps presence.
+        let zero = ProposeResponse::decode(success(Some(0)).encode_to_vec().as_slice()).unwrap();
+        assert_eq!(zero.applied_index, Some(0));
+    }
+
     #[test]
     fn only_a_definite_pre_submission_refusal_can_redirect_a_write() {
         use super::proto::nexus::raft::ProposeResponse;
@@ -549,7 +968,7 @@ mod decode_tests {
             error: Some(NOT_LEADER_ERROR.into()),
             leader_address: Some("127.0.0.1:9000".into()),
             result: None,
-            applied_index: 0,
+            applied_index: None,
         };
         let error = decode_propose_response(refused.clone()).unwrap_err();
         assert!(
@@ -562,7 +981,7 @@ mod decode_tests {
                 ..refused.clone()
             },
             ProposeResponse {
-                applied_index: 42,
+                applied_index: Some(42),
                 ..refused.clone()
             },
             ProposeResponse {
@@ -578,5 +997,78 @@ mod decode_tests {
             assert!(!matches!(error, RaftError::NotLeader { .. }));
             assert!(error.proposal_outcome_unknown());
         }
+    }
+}
+
+#[cfg(all(test, feature = "grpc", has_protos))]
+mod connect_failure_tests {
+    use super::{forward_propose, propose_to, NodeAddress, RaftClientPool};
+    use crate::raft::{Command, RaftError};
+    use std::time::Duration;
+
+    /// An endpoint nothing listens on: bound to learn a free port, then closed.
+    fn closed_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    fn command() -> Command {
+        Command::SetMetadata {
+            key: "/never-sent".into(),
+            value: b"value".to_vec(),
+        }
+    }
+
+    /// A leader whose port refuses the connection received nothing: the forward
+    /// is not submitted, not an unknown outcome, and not a leadership answer.
+    /// Nothing is cached for the next forward to reuse.
+    #[tokio::test]
+    async fn a_forward_whose_connection_never_came_up_was_not_submitted() {
+        let endpoint = closed_endpoint();
+        let leader = NodeAddress::new(2, endpoint.clone());
+        let cached = tokio::sync::Mutex::new(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = forward_propose(
+            &RaftClientPool::new(),
+            &leader,
+            &command(),
+            "zone",
+            deadline,
+            &cached,
+        )
+        .await
+        .unwrap_err();
+        match &error {
+            RaftError::NotSubmitted {
+                endpoint: dialed, ..
+            } => assert_eq!(*dialed, endpoint),
+            other => panic!("a refused connection must be not submitted, got {other:?}"),
+        }
+        assert!(!error.proposal_outcome_unknown(), "{error}");
+        assert!(error.to_string().contains("nothing was sent"), "{error}");
+        assert!(cached.lock().await.is_none(), "no channel was established");
+    }
+
+    /// The control-write path dials the same way and reports the same fact.
+    #[tokio::test]
+    async fn a_direct_proposal_whose_connection_never_came_up_was_not_submitted() {
+        let endpoint = closed_endpoint();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = propose_to(
+            &super::ClientConfig::default(),
+            &endpoint,
+            &command(),
+            "zone",
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RaftError::NotSubmitted { .. }),
+            "a refused connection must be not submitted, got {error:?}"
+        );
+        assert!(!error.proposal_outcome_unknown(), "{error}");
     }
 }

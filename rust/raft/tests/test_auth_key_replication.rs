@@ -113,7 +113,7 @@ async fn revocation_on_the_founder_propagates_to_the_joiner() {
 
     // ── Cluster: founder self-elects on a 1-voter zone ───────────────
     let zone_founder = zm_founder
-        .create_zone("sharedzone", vec![format!("{id_founder}@{bind_founder}")])
+        .create_zone("sharedzone")
         .expect("create sharedzone on founder");
     for _ in 0..100 {
         if zone_founder.is_leader() {
@@ -130,11 +130,7 @@ async fn revocation_on_the_founder_propagates_to_the_joiner() {
     let endpoint_joiner = format!("http://{bind_joiner}");
 
     let _zone_joiner_local = zm_joiner
-        .join_zone(
-            "sharedzone",
-            vec![format!("{id_founder}@{bind_founder}")],
-            /* learner */ true,
-        )
+        .join_zone("sharedzone", /* learner */ true)
         .expect("local join_zone(learner) on joiner");
 
     let join_resp = call_join_zone_rpc(

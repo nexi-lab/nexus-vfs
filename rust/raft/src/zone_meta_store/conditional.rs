@@ -18,6 +18,39 @@ pub(super) fn map_error(error: RaftError) -> ConditionalMetadataError {
     }
 }
 
+/// One decoder for ordinary and owner-guarded conditional metadata results.
+/// An explicit apply refusal has a known outcome; transport loss does not.
+pub(super) fn decode_result(
+    result: CommandResult,
+) -> Result<ConditionalMetadataResult, ConditionalMetadataError> {
+    match result {
+        CommandResult::ConditionalMetadata {
+            committed: true,
+            current,
+        } => {
+            let version = current.version.ok_or_else(|| {
+                ConditionalMetadataError::Unknown(
+                    "committed metadata response has no revision".into(),
+                )
+            })?;
+            Ok(ConditionalMetadataResult::Committed { version })
+        }
+        CommandResult::ConditionalMetadata {
+            committed: false,
+            current,
+        } => Ok(ConditionalMetadataResult::Conflict {
+            current_version: current.version,
+        }),
+        CommandResult::ConditionalMetadataUnsupported => Err(ConditionalMetadataError::Unsupported),
+        CommandResult::Error(message) => Err(ConditionalMetadataError::Failed(
+            MetaStoreError::IOError(message),
+        )),
+        _ => Err(ConditionalMetadataError::Unknown(
+            "conditional metadata response has an unexpected result".into(),
+        )),
+    }
+}
+
 impl ZoneMetaStore {
     pub(super) fn conditional_metadata(&self) -> Option<&dyn ConditionalMetadata> {
         let node = match &self.binding {
@@ -90,28 +123,7 @@ impl ConditionalMetadata for ZoneMetaStore {
             ),
         )
         .map_err(map_error)?;
-        match result {
-            CommandResult::ConditionalMetadata { committed, current } => {
-                if committed {
-                    let version = current.version.ok_or_else(|| {
-                        ConditionalMetadataError::Unknown(
-                            "committed metadata response has no revision".into(),
-                        )
-                    })?;
-                    Ok(ConditionalMetadataResult::Committed { version })
-                } else {
-                    Ok(ConditionalMetadataResult::Conflict {
-                        current_version: current.version,
-                    })
-                }
-            }
-            CommandResult::ConditionalMetadataUnsupported => {
-                Err(ConditionalMetadataError::Unsupported)
-            }
-            _ => Err(ConditionalMetadataError::Unknown(
-                "conditional metadata response has an unexpected result".into(),
-            )),
-        }
+        decode_result(result)
     }
 }
 

@@ -1,13 +1,15 @@
-//! AgentMinter — trait abstracting agent identity-cert signing so the Raft
-//! gRPC server can serve `MintAgent` without depending on the `auth` crate,
-//! the kernel, or `transport::peer_identity`.
+//! CaIssuer — the CA holder's issuance interface, so the Raft gRPC server can
+//! serve every certificate the cluster CA issues to remote callers without
+//! depending on the `auth` crate, the kernel, or `transport::peer_identity`.
 //!
-//! `MintAgent` lets an agent on ANY cluster node obtain a CA-signed identity
-//! cert from the CA holder (founder), so a joiner's `auth mint --subject-type
-//! agent` just-works without hand-carrying a private key. The raft crate only
-//! sees this trait; the cluster profile provides the impl — it holds the CA key
-//! and the auth store, and gates the caller to a trusted NODE peer. Mirrors
-//! [`crate::blob_fetcher`]: a late-bound slot the founder installs at boot.
+//! The CA holder (founder) issues agent identities (`MintAgent`, caller-owned
+//! agent CSRs, session and user-runtime credentials, their renewal and
+//! revocation) and re-issues Node certificates (`RenewNodeCertificate`), so a
+//! node anywhere in the cluster obtains them without hand-carrying a private
+//! key. The raft crate only sees this trait; the cluster profile provides the
+//! impl — it holds the CA key and the auth store, and gates each caller. Mirrors
+//! [`crate::blob_fetcher`]: a late-bound slot the founder installs at boot; any
+//! other node leaves it empty and answers [`NOT_CA_HOLDER`].
 
 #![cfg(all(feature = "grpc", has_protos))]
 
@@ -76,22 +78,47 @@ pub struct SessionRenewal<'a> {
     pub proof: &'a [u8],
 }
 
-/// The CA holder's credential operations for remote callers: issue, and
-/// withdraw.
+/// The CA holder's credential operations for remote callers: issue agent
+/// identities, re-issue Node certificates, and withdraw.
 ///
-/// Revocation lives here rather than in a second trait behind a second slot
-/// because it needs exactly what minting needs — the CA, the data dir, and the
-/// same "only the CA holder is armed" install gate. A parallel slot would
-/// duplicate that whole install path to express the same precondition.
-///
-/// Signs an agent identity cert on the CA holder for a remote caller.
+/// They share one trait behind one slot because each needs exactly the same
+/// thing — the CA, the data dir, and the "only the CA holder is armed" install
+/// gate. A parallel slot would duplicate that whole install path to express the
+/// same precondition.
 ///
 /// `caller_cert_der` is the requester's verified mTLS client leaf cert (DER),
 /// forwarded opaquely so the impl can gate to a trusted NODE peer (an agent
 /// must not mint agents). The raft transport applies no auth logic itself —
 /// the gate + the CA + the store all live in the impl (cluster profile).
 #[tonic::async_trait]
-pub trait AgentMinter: Send + Sync {
+pub trait CaIssuer: Send + Sync {
+    /// Allocation-bound issuance shares the configured CA holder. The request
+    /// contains public intent/proof bytes; caller identity comes from mTLS.
+    async fn replica_control_v1(
+        &self,
+        _caller_cert_der: Option<Vec<u8>>,
+        _request: crate::transport::proto::ReplicaControlRequest,
+    ) -> crate::transport::proto::ReplicaControlResponse {
+        crate::transport::proto::ReplicaControlResponse {
+            state: crate::transport::proto::ReplicaControlState::Refused as i32,
+            error: Some("replica lifecycle controller is unavailable".into()),
+            ..Default::default()
+        }
+    }
+
+    async fn replica_csr_v1(
+        &self,
+        _caller_cert_der: Option<Vec<u8>>,
+        _request: crate::transport::proto::ReplicaCsrRequest,
+        _query_only: bool,
+    ) -> crate::transport::proto::ReplicaCsrResponse {
+        crate::transport::proto::ReplicaCsrResponse {
+            state: crate::transport::proto::ReplicaCsrState::Refused as i32,
+            error: Some("allocation-bound replica issuer is unavailable".into()),
+            ..Default::default()
+        }
+    }
+
     /// No second issuer slot: compositions opt into the I/F coordinator here.
     fn csr_capabilities(&self) -> crate::transport::proto::AgentCsrCapabilitiesResponse {
         crate::transport::proto::AgentCsrCapabilitiesResponse::default()
@@ -154,6 +181,7 @@ pub trait AgentMinter: Send + Sync {
     /// Preserve the signed session owner and actor, with a fresh key and serial.
     /// The allow-listed minter must also prove possession of the current key;
     /// expiry or revocation closes renewal. No execution state is persisted.
+    /// Replica credentials require their allocation-bound issuer operation.
     async fn renew_session(
         &self,
         caller_cert_der: Option<Vec<u8>>,
@@ -176,14 +204,47 @@ pub trait AgentMinter: Send + Sync {
         caller_cert_der: Option<Vec<u8>>,
         agent_cert_pem: &[u8],
     ) -> Result<(), String>;
+
+    /// Re-issue the calling Node's certificate for the key `csr_pem` proves.
+    ///
+    /// The impl MUST take the Node ID and zone from `caller_cert_der` — a
+    /// current leaf of this cluster's CA that is not revoked — and nothing from
+    /// the CSR but its verified public key. Returns the new certificate (PEM).
+    async fn renew_node(
+        &self,
+        caller_cert_der: Option<Vec<u8>>,
+        csr_pem: &[u8],
+    ) -> Result<Vec<u8>, String>;
+}
+
+/// The refusal every CA-holder operation returns on a node that does not hold
+/// the cluster CA. Callers looking for the CA holder ask their next candidate
+/// on seeing it; every other refusal is authoritative.
+pub const NOT_CA_HOLDER: &str = "this node does not hold the cluster CA";
+
+/// Renews this daemon's own Node certificate on request — the operator's
+/// trigger for the same renewal the daemon schedules. The cluster profile
+/// binds it; the raft server only routes the caller to it.
+#[tonic::async_trait]
+pub trait LocalNodeRenewer: Send + Sync {
+    /// Renew now and serve the result; returns the new leaf's notAfter (Unix
+    /// seconds).
+    async fn renew_now(&self) -> Result<i64, String>;
+}
+
+/// Late-bindable slot for [`LocalNodeRenewer`]; empty under `--no-tls`.
+pub type LocalNodeRenewerSlot = Arc<parking_lot::RwLock<Option<Arc<dyn LocalNodeRenewer>>>>;
+
+pub fn new_local_node_renewer_slot() -> LocalNodeRenewerSlot {
+    Arc::new(parking_lot::RwLock::new(None))
 }
 
 /// Late-bindable slot. Installed ONLY on the CA holder (founder); left empty on
-/// a joiner, so `MintAgent` there returns success=false ("not the CA holder").
-pub type AgentMinterSlot = Arc<parking_lot::RwLock<Option<Arc<dyn AgentMinter>>>>;
+/// a joiner, so its issuance RPCs there answer [`NOT_CA_HOLDER`].
+pub type CaIssuerSlot = Arc<parking_lot::RwLock<Option<Arc<dyn CaIssuer>>>>;
 
 /// Construct an unbound slot — spelt once here so callers don't import
 /// parking_lot (mirrors [`crate::blob_fetcher::new_blob_fetcher_slot`]).
-pub fn new_agent_minter_slot() -> AgentMinterSlot {
+pub fn new_ca_issuer_slot() -> CaIssuerSlot {
     Arc::new(parking_lot::RwLock::new(None))
 }

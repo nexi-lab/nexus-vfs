@@ -6,6 +6,8 @@ import sys
 
 pending = None
 permission_id = 0
+new_count = 0
+load_count = 0
 
 
 def emit(message):
@@ -19,7 +21,19 @@ for line in sys.stdin:
     if method == 'initialize':
         emit({'id': message['id'], 'result': {'protocolVersion': 1, 'agentCapabilities': {}, '_meta': {'nativePid': os.getpid()}}})
     elif method == 'session/new':
+        new_count += 1
         emit({'id': message['id'], 'result': {'sessionId': 'durable-fixture-session'}})
+    elif method == 'session/load':
+        load_count += 1
+        sid = message['params']['sessionId']
+        if sid == 'durable-fixture-session':
+            emit({'id': message['id'], 'result': {}})
+        elif sid == 'wrong-load-result':
+            emit({'id': message['id'], 'result': {'sessionId': 'different-transcript'}})
+        else:
+            emit({'id': message['id'], 'error': {'code': -32002, 'message': 'not found', 'data': {'sessionId': sid}}})
+    elif method == 'test/counts':
+        emit({'id': message['id'], 'result': {'new': new_count, 'load': load_count}})
     elif method == 'session/prompt':
         assert pending is None
         pending = message['id']

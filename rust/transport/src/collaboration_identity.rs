@@ -497,7 +497,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(directory.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+            .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
             .unwrap();
         node.campaign().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -792,8 +792,7 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
         drop(registry);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

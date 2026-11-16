@@ -118,9 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Create registry.  The witness's own advertise address is
-        // the entry in NEXUS_PEERS that matches its node_id — recorded
-        // so it can be carried in outbound StepMessage.sender_address
-        // (peer-map runtime SSOT under the opaque-ID contract).
+        // the entry in NEXUS_PEERS that matches its node_id — carried in
+        // outbound StepMessage.sender_address and registered as this
+        // witness's member address in every zone it joins.
         let mut registry = WitnessZoneRegistry::new(data_path.clone(), node_id, tls_config.clone());
         registry.set_peers(peers.clone());
         let self_advertise = peers
@@ -133,8 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Start the gRPC server FIRST so the witness can receive
         // inbound traffic the moment AddNode commits on the leader.
-        // The JoinZone-bootstrap loop runs in parallel after the
-        // server is up.
+        // The boot joins run in parallel with it.
         let server_config = ServerConfig {
             bind_address: bind_addr,
             tls: tls_config,
@@ -179,36 +178,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Witness server starting on {}", bind_addr);
 
-        // Spawn the JoinZone-bootstrap loop in parallel with the gRPC
-        // server.  The loop sends `JoinZone` RPCs against NEXUS_PEERS
-        // until a leader accepts; under the opaque-ID contract the
-        // witness's id is hostname-derived (well-known) but the data
-        // plane's ids are random, so the witness must JoinZone like
-        // any other late-arriving voter rather than self-bootstrapping.
-        let join_registry = registry.clone();
+        // Join every boot zone in parallel with the gRPC server, each on its
+        // own task: a zone held on disk resumes at once, then JoinZone against
+        // NEXUS_PEERS re-asserts the voter role until a leader accepts. Under
+        // the opaque-ID contract the witness's id is hostname-derived but the
+        // data plane's ids are random, so the witness joins like any other
+        // late-arriving voter and never founds a zone.
         let join_zones: Vec<String> = std::iter::once(contracts::ROOT_ZONE_ID.to_string())
             .chain(federation_zones.iter().cloned())
             .collect();
-        tokio::spawn(async move {
-            for zone_id in join_zones {
-                let result = join_registry
-                    .bootstrap_or_join_zone(
-                        &zone_id,
-                        /* as_learner */ false,
-                        /* timeout_secs */ 5,
-                        std::time::Duration::from_secs(2),
-                    )
-                    .await;
-                match result {
-                    Ok(_) => tracing::info!(zone = %zone_id, "Witness joined zone"),
-                    Err(e) => tracing::error!(
-                        zone = %zone_id,
-                        error = %e,
-                        "Witness JoinZone failed permanently",
-                    ),
-                }
-            }
-        });
+        registry.join_at_boot(join_zones, std::time::Duration::from_secs(2));
 
         let shutdown_registry = registry.clone();
         let shutdown = async move {
@@ -216,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .expect("Failed to install Ctrl+C handler");
             tracing::info!("Shutdown signal received");
-            shutdown_registry.shutdown_all();
+            shutdown_registry.shutdown().released().await;
         };
 
         server
@@ -269,7 +248,10 @@ async fn tls_bootstrap_loop(
     tls_dir: &std::path::Path,
     password: &str,
 ) {
-    use nexus_raft::transport::call_join_cluster;
+    use nexus_raft::transport::{call_join_cluster, generate_node_key_request};
+
+    // The witness's key never leaves it: the leader certifies this CSR.
+    let (csr_pem, key_pem) = generate_node_key_request().expect("generate witness key");
 
     // Wait a bit for leader election
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -295,6 +277,7 @@ async fn tls_bootstrap_loop(
                 node_address,
                 contracts::ROOT_ZONE_ID,
                 password,
+                &csr_pem,
                 10, // timeout
             )
             .await
@@ -303,14 +286,12 @@ async fn tls_bootstrap_loop(
                     // Save certs to disk
                     std::fs::create_dir_all(tls_dir).expect("create tls dir");
                     std::fs::write(tls_dir.join("ca.pem"), &result.ca_pem).expect("write CA");
-                    std::fs::write(tls_dir.join("node.pem"), &result.node_cert_pem)
-                        .expect("write cert");
-
-                    lib::transport_primitives::write_secret(
-                        &tls_dir.join("node-key.pem"),
-                        &result.node_key_pem,
+                    nexus_raft::transport::persist_node_identity(
+                        tls_dir,
+                        &result.node_cert_pem,
+                        &key_pem,
                     )
-                    .expect("write node key (owner-only)");
+                    .expect("write node certificate and owner-only key");
 
                     tracing::info!(
                         "TLS bootstrap: received signed cert from peer {} — restart to enable mTLS",

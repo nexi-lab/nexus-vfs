@@ -74,6 +74,17 @@ fn reserve_port() -> u16 {
     panic!("no free port in {PORT_BAND_START}..{PORT_BAND_END} — is something holding the band?");
 }
 
+/// A fixed mTLS server identity for `tls`, admitting clients of its CA only —
+/// for a test listener that serves one Node identity for its whole life.
+pub fn cluster_server_identity(
+    tls: &lib::transport_primitives::TlsConfig,
+) -> std::sync::Arc<lib::transport_primitives::ReloadableServerIdentity> {
+    let verifier = lib::transport_primitives::FederatedClientCertVerifier::new(&tls.ca_pem)
+        .expect("cluster CA verifier");
+    lib::transport_primitives::ReloadableServerIdentity::from_tls(verifier, tls)
+        .expect("server identity")
+}
+
 /// Kept deliberately cheap: `mod common;` is compiled into all fifteen test
 /// binaries, so everything here runs fifteen times. A self-test that claimed a
 /// big slice of the band would compete with the very suites it exists to

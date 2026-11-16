@@ -73,7 +73,7 @@ pub(super) fn validate(common: &CommonArgs) -> Result<()> {
 pub(super) fn service_decls(
     common: &CommonArgs,
     _ctx: &ServiceBootCtx,
-    _tls: Option<&nexus_raft::transport::TlsConfig>,
+    _zm: &nexus_raft::ZoneManager,
     _ready: Arc<DataPlaneReady>,
 ) -> Result<Vec<ServiceDecl>> {
     #[cfg(feature = "rebac")]
@@ -120,7 +120,6 @@ pub(super) fn service_decls(
                     bail!("HTTP bearer authentication requires NEXUS_API_KEY_SECRET; the certificate-only auth posture cannot authenticate HTTP callers");
                 }
                 use nexus_search_common::transport::{PeerChannelCache, PeerChannelConfig};
-                use tonic::transport::{Certificate, ClientTlsConfig, Identity};
                 let grpc = common.effective_bind_addr();
                 let mut grpc: std::net::SocketAddr = grpc.parse()?;
                 if grpc.ip().is_unspecified() {
@@ -130,22 +129,26 @@ pub(super) fn service_decls(
                         std::net::Ipv6Addr::LOCALHOST.into()
                     });
                 }
-                let (scheme, channels) = match _tls {
-                    Some(tls) => (
-                        "https",
-                        PeerChannelCache::with_tls(
+                let credentials = _zm.registry().shared_tls();
+                let (scheme, channels) = match _zm.node_tls().map_err(anyhow::Error::msg)? {
+                    Some(_) => {
+                        let channels = Arc::new(PeerChannelCache::with_tls(
                             PeerChannelConfig::default(),
-                            ClientTlsConfig::new()
-                                .domain_name(nexus_raft::transport::TlsConfig::CLUSTER_SERVER_NAME)
-                                .ca_certificate(Certificate::from_pem(&tls.ca_pem))
-                                .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem)),
-                        ),
+                            credentials,
+                        ));
+                        ("https", channels)
+                    }
+                    None => (
+                        "http",
+                        Arc::new(PeerChannelCache::with_credentials(
+                            PeerChannelConfig::default(),
+                            credentials,
+                        )),
                     ),
-                    None => ("http", PeerChannelCache::new(PeerChannelConfig::default())),
                 };
                 let search = nexus_http_api::SearchBackend::with_channels(
                     format!("{scheme}://{grpc}"),
-                    Arc::new(channels),
+                    channels,
                 );
                 services.push(nexus_http_api::service_decl(
                     addr,

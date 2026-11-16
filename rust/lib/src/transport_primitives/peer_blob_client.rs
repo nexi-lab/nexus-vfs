@@ -6,11 +6,9 @@
 //! `shared/transport-primitives` lets every consumer name the trait
 //! without closing a Cargo cycle through any peer crate.
 //!
-//! Store-and-forward: the trait carries a single ``fetch`` method
-//! taking an opaque ``content_id`` string. The caller does not
-//! pre-classify whether ``content_id`` is a VFS path, a CAS hash, or
-//! some backend-specific handle — bytes forward to the peer, whose
-//! own data-plane (VFSRouter / CAS pillar) resolves them.
+//! Callers with an owning data zone use `fetch_in_zone`. Object identifiers
+//! stay opaque; the peer resolves them within the selected content namespace.
+//! `fetch` is the separate cluster-wide administrator surface.
 
 /// Result type used by the peer-blob fetch method.
 ///
@@ -40,6 +38,17 @@ pub trait PeerBlobClient: Send + Sync {
     ///
     /// Returns the blob bytes or an error string.
     fn fetch(&self, addr: &str, content_id: &str) -> PeerBlobResult<Vec<u8>>;
+
+    /// Fetch within the named data zone using the peer's admitted namespace.
+    /// Implementations without scoped reads return an error.
+    fn fetch_in_zone(
+        &self,
+        _addr: &str,
+        _zone_id: &str,
+        _content_id: &str,
+    ) -> PeerBlobResult<Vec<u8>> {
+        Err("zone-scoped peer content is unavailable".into())
+    }
 
     /// Install TLS config (PEM bundle). Default impl no-ops so
     /// non-TLS callers (tests, Noop fallback) skip the burden.

@@ -15,7 +15,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{cli, free_port, Daemon};
+use common::{cli, free_port, Daemon, LOG_FILTER};
 
 const SECRET: &str = "e2e-offline-lock-secret";
 
@@ -31,15 +31,16 @@ async fn offline_auth_against_a_running_daemon_fails_cleanly_not_panics() {
         ("NEXUS_IDENTITY_DIR", ident.as_ref()),
         ("NEXUS_API_KEY_SECRET", SECRET),
         ("NEXUS_NO_TLS", "true"),
+        ("RUST_LOG", LOG_FILTER),
     ];
 
     // Daemon up → it holds the exclusive redb lock on the data dir.
     let port = free_port();
     let bind = format!("127.0.0.1:{port}");
     let mut d = Daemon::spawn(&["--bind-addr", &bind, "--no-tls"], &env);
-    d.wait_tcp(port, Duration::from_secs(90))
+    d.wait_ready(Duration::from_secs(90))
         .await
-        .expect("daemon serves (holds the data-dir lock)");
+        .expect("daemon finishes boot (holds the data-dir lock)");
 
     // Offline `auth mint` against the SAME locked data dir must FAIL LOUD with
     // an actionable error — never the old "Cannot drop a runtime" panic.
@@ -67,5 +68,9 @@ async fn offline_auth_against_a_running_daemon_fails_cleanly_not_panics() {
     assert!(
         err.contains("daemon is running") || err.to_lowercase().contains("lock"),
         "the error should point at the running daemon / exclusive lock:\n{err}"
+    );
+    assert!(
+        err.contains("stop the daemon, re-run this command, and start it again"),
+        "offline auth must give the same actionable storage guidance as other offline commands:\n{err}"
     );
 }

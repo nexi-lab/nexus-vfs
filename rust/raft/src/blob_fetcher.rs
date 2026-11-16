@@ -23,6 +23,12 @@ pub trait BlobFetcher: Send + Sync {
     /// Return the raw bytes for ``content_id`` or a ``String`` error
     /// (e.g. ``"not found"``). Transport framing is the caller's job.
     async fn read(&self, content_id: &str) -> Result<Vec<u8>, String>;
+
+    /// Read exclusively from an admitted data zone's content namespace.
+    /// A missing scoped reader never falls back to cluster-wide object lookup.
+    async fn read_in_zone(&self, _zone_id: &str, _content_id: &str) -> Result<Vec<u8>, String> {
+        Err("zone content storage is unavailable".into())
+    }
 }
 
 /// Late-bindable slot for the fetcher.

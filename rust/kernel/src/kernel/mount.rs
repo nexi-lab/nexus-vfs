@@ -44,14 +44,13 @@ impl Kernel {
         raft_backend: Option<Box<dyn std::any::Any + Send + Sync>>,
         is_external: bool,
     ) -> Result<(), KernelError> {
-        self.vfs_router
-            .add_mount(mount_point, zone_id, backend.clone(), is_external);
-        // Install per-mount metastore if provided. Must come AFTER the
-        // entry is inserted so `install_metastore` finds it.
-        if let Some(ms) = metastore {
-            let canonical = canonicalize(mount_point, zone_id);
-            self.vfs_router.install_metastore(&canonical, ms);
-        }
+        self.vfs_router.add_mount_with_metastore(
+            mount_point,
+            zone_id,
+            backend.clone(),
+            metastore,
+            is_external,
+        );
         // Boot-order fix: on restart,
         // `RaftDistributedCoordinator::replay_mounts_for_zone` runs
         // before Python mounts root, so every federation mount it
@@ -134,3 +133,6 @@ impl Kernel {
         self.vfs_router.canonical_keys()
     }
 }
+
+#[cfg(test)]
+mod tests;

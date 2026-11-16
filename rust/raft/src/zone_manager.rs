@@ -23,6 +23,18 @@ use crate::transport::{
 use crate::zone_handle::ZoneHandle;
 use lib::rt::block_on_via as bridge_block_on;
 use lib::rt::OwnedRuntime;
+use lib::transport_primitives::SharedTlsConfig;
+
+/// Preserve storage admission failures across eager, lazy and join opens.
+fn zone_open_error(
+    error: crate::transport::TransportError,
+    context: impl std::fmt::Display,
+) -> RaftError {
+    match error {
+        crate::transport::TransportError::DataDirLocked(path) => RaftError::DataDirLocked(path),
+        other => RaftError::Raft(format!("{context}: {other}")),
+    }
+}
 
 // ── Federation mount helpers ─────────────────────────────────────────
 
@@ -212,6 +224,12 @@ pub struct ClusterStatus {
     pub applied_index: u64,
     pub voter_count: usize,
     pub witness_count: usize,
+    /// Milliseconds since this node last heard from its current leader —
+    /// 0 on the leader, `None` before the first contact. Memory only.
+    pub leader_contact_age_ms: Option<u64>,
+    /// Replication progress: per-peer on the leader, the leader's commit
+    /// index and this replica's stall on a follower. Memory only.
+    pub replication: crate::raft::ReplicationStatus,
 }
 
 /// Local presence ladder for a zone — see [`ZoneManager::zone_presence`].
@@ -240,6 +258,28 @@ pub struct TlsFiles {
     /// SHA-256 hash of the join token password for verifying
     /// incoming `JoinCluster` requests.
     pub join_token_hash: Option<String>,
+}
+
+impl TlsFiles {
+    fn load(&self) -> Result<TlsConfig> {
+        let read = |path: &std::path::Path, kind| {
+            std::fs::read(path).map_err(|error| {
+                RaftError::Config(format!(
+                    "Failed to read TLS {kind} '{}': {error}",
+                    path.display()
+                ))
+            })
+        };
+        Ok(TlsConfig {
+            cert_pem: read(&self.cert_path, "cert")?,
+            key_pem: read(&self.key_path, "key")?,
+            ca_pem: read(&self.ca_path, "CA")?,
+        })
+    }
+}
+
+fn load_tls_source(files: Option<&TlsFiles>) -> Result<SharedTlsConfig> {
+    Ok(SharedTlsConfig::new(files.map(TlsFiles::load).transpose()?))
 }
 
 /// Is this bind failure "somebody else already has the address"?
@@ -271,14 +311,10 @@ pub struct ZoneManager {
     /// paths, which drop it before there is a `ZoneManager` to have a `Drop` impl.
     runtime: OwnedRuntime,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// The gRPC server task, joined by [`Self::shutdown`]: its in-flight
+    /// handlers hold zone handles, and its listener holds the bind address.
+    server_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     node_id: u64,
-    use_tls: bool,
-    /// Remembered peer list (the `peers` arg from construction), in
-    /// `host:port` form. Used when `get_or_create_zone` auto-creates
-    /// a zone during `sys_setattr(DT_MOUNT)` — every zone in a
-    /// federation shares the same raft peer topology, so the peer
-    /// list is cluster-wide, not per-zone.
-    default_peers: Vec<String>,
     /// Late-bindable slot the kernel populates with a `BlobFetcher`
     /// once its root mount backend is ready. Shared with the gRPC
     /// server so `ZoneApiService::read_blob` serves once the kernel
@@ -287,9 +323,9 @@ pub struct ZoneManager {
     blob_fetcher_slot: crate::blob_fetcher::BlobFetcherSlot,
     search_capabilities_slot: crate::search_capabilities::SearchCapabilitiesSlot,
     /// Shared with the gRPC server so `ZoneApiService::mint_agent` can sign
-    /// agent certs once the founder installs an `AgentMinter`. Empty on a
+    /// agent certs once the founder installs an `CaIssuer`. Empty on a
     /// joiner (not the CA holder) — the RPC returns success=false there.
-    agent_minter_slot: crate::agent_minter::AgentMinterSlot,
+    ca_issuer_slot: crate::ca_issuer::CaIssuerSlot,
     /// Shared with the gRPC server so `ZoneApiService::mint_key`/`revoke_key`
     /// can mint/revoke sk- credentials once the daemon installs a `KeyMinter`.
     /// Empty under `--no-tls` (no sk- plane).
@@ -305,20 +341,386 @@ pub struct ZoneManager {
     /// cross-org apply-observer calls `set_foreign_cas`); the SAME `Arc` is
     /// shared with the gRPC serve path and that observer. `None` under `--no-tls`.
     foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    /// Holders outside this manager that present the Node identity, told of
+    /// every installed replacement.
+    node_identity_holders: parking_lot::Mutex<Vec<NodeIdentityHolder>>,
+    local_node_renewer_slot: crate::ca_issuer::LocalNodeRenewerSlot,
     /// Static topology mounts staged by `bootstrap_static`, drained
     /// incrementally by `apply_topology` as parent + target zones'
     /// leaders settle. BTreeMap so parent paths process before children.
     /// Empty when no static topology is configured.
     pending_mounts: parking_lot::Mutex<BTreeMap<String, MountDecl>>,
+    local_zone_operation: parking_lot::Mutex<()>,
 }
+
+/// A holder of this Node's TLS identity outside the `ZoneManager` (an outbound
+/// client with its own channel cache), handed each renewed identity.
+pub type NodeIdentityHolder = Box<dyn Fn(&TlsConfig) + Send + Sync>;
 
 #[derive(Clone, Copy)]
 enum RuntimeProfile {
     Networked,
+    NetworkedLocalRoot,
     IsolatedRoot,
 }
 
+/// Validated transport and a reserved listener, ready to open durable zones.
+/// Dropping this value releases its socket. Opening consumes that same socket
+/// and credential source, allowing callers to prepare before their own storage.
+pub struct PreparedZoneManager {
+    hostname: String,
+    node_id: u64,
+    peers: Vec<String>,
+    tls: SharedTlsConfig,
+    tls_config: Option<TlsConfig>,
+    self_address: Option<String>,
+    load_policy: ZoneLoadPolicy,
+    profile: RuntimeProfile,
+    bind_socket: std::net::SocketAddr,
+    foreign_ca_verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    prepared_listener: Option<(
+        crate::transport::PreparedRaftListener,
+        std::net::TcpListener,
+    )>,
+}
+
+impl PreparedZoneManager {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        hostname: &str,
+        node_id: u64,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+        load_policy: ZoneLoadPolicy,
+        profile: RuntimeProfile,
+    ) -> Result<Self> {
+        // Initialize tracing once.
+        static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+        TRACING_INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("info".parse().unwrap()),
+                )
+                .try_init();
+        });
+
+        let initial = tls.snapshot();
+        let tls_config = match profile {
+            RuntimeProfile::NetworkedLocalRoot => initial.configured_material(),
+            RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => initial.config(),
+        }
+        .map_err(|e| RaftError::Config(e.into()))?
+        .cloned();
+        if let Some(t) = &tls_config {
+            let certificate_id = match profile {
+                RuntimeProfile::NetworkedLocalRoot => {
+                    let cert_der =
+                        lib::transport_primitives::first_certificate_der(&t.cert_pem, "peer")
+                            .map_err(RaftError::Config)?;
+                    let ca_der =
+                        lib::transport_primitives::first_certificate_der(&t.ca_pem, "cluster CA")
+                            .map_err(RaftError::Config)?;
+                    crate::transport::prepared_local_replication_id(&cert_der, &ca_der)
+                }
+                RuntimeProfile::Networked | RuntimeProfile::IsolatedRoot => {
+                    crate::transport::local_node_identity(&t.cert_pem, &t.ca_pem)
+                        .map(|identity| identity.node_id)
+                }
+            }
+            .map_err(RaftError::Config)?;
+            if certificate_id != node_id {
+                return Err(RaftError::Config(format!(
+                    "peer certificate identifies {certificate_id}, but the configured Raft Node ID is {node_id}"
+                )));
+            }
+        }
+
+        let bind_socket: std::net::SocketAddr = bind_addr.parse().map_err(|e| {
+            RaftError::Config(format!("Invalid bind address '{}': {}", bind_addr, e))
+        })?;
+
+        // Prepare one trust snapshot and reserve the socket before storage opens.
+        // Withdrawal after preparation is enforced by handshake and RPC admission.
+        let foreign_ca_verifier = tls_config
+            .as_ref()
+            .map(|t| lib::transport_primitives::FederatedClientCertVerifier::new(&t.ca_pem))
+            .transpose()
+            .map_err(|e| RaftError::Config(format!("build client-cert verifier: {e}")))?;
+        let prepared_listener = if matches!(profile, RuntimeProfile::IsolatedRoot) {
+            None
+        } else {
+            let prepared = RaftGrpcServer::prepare_listener(
+                tls.clone(),
+                tls_config.as_ref(),
+                foreign_ca_verifier.clone(),
+            )
+            .map_err(|e| RaftError::Config(format!("prepare gRPC listener: {e}")))?;
+            let listener = std::net::TcpListener::bind(bind_socket)
+                .and_then(|listener| {
+                    listener.set_nonblocking(true)?;
+                    Ok(listener)
+                })
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AddrInUse => {
+                        RaftError::ListenerAddressInUse(bind_addr.to_owned())
+                    }
+                    _ => RaftError::Config(format!("bind gRPC listener {bind_addr}: {e}")),
+                })?;
+            Some((prepared, listener))
+        };
+
+        Ok(Self {
+            hostname: hostname.to_owned(),
+            node_id,
+            peers,
+            tls,
+            tls_config,
+            self_address,
+            load_policy,
+            profile,
+            bind_socket,
+            foreign_ca_verifier,
+            prepared_listener,
+        })
+    }
+
+    /// Open storage and serve the prepared transport with the supplied services.
+    pub fn open(
+        self,
+        base_path: &str,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<ZoneManager>> {
+        let Self {
+            hostname,
+            node_id,
+            peers,
+            tls,
+            tls_config,
+            self_address,
+            load_policy,
+            profile,
+            bind_socket,
+            foreign_ca_verifier,
+            prepared_listener,
+        } = self;
+        let bind_addr = bind_socket.to_string();
+        // This runtime hosts BOTH the tonic gRPC server (accept loop +
+        // per-connection HTTP/2 handshakes for raft and VFS) and every
+        // zone's `transport_loop` (which does synchronous redb disk I/O
+        // in `advance`). A hardcoded 2-worker pool starves the
+        // accept/handshake path under load — new connections finish the
+        // TCP handshake but never get an HTTP/2 SETTINGS frame, so peers
+        // see most join/replication dials time out while heartbeats on
+        // established connections survive. Size to the host like the
+        // outer daemon runtime, with a floor that keeps the accept path
+        // live even on small multi-zone hosts.
+        let worker_threads =
+            contracts::recommended_worker_threads(contracts::MIN_SERVER_RUNTIME_WORKERS);
+        // Owned from birth, not from `Ok(...)`: every `?` below this line is a path an
+        // operator can reach (a data dir another process has open, unreadable TLS
+        // material, a bind address that is not on this host), and each one drops this
+        // runtime while unwinding — which must not panic over the error it carries.
+        let runtime = OwnedRuntime::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .thread_name("nexus-zone-mgr")
+                .build()
+                .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
+        );
+
+        let registry = Arc::new(match profile {
+            RuntimeProfile::Networked => {
+                ZoneRaftRegistry::with_shared_tls(PathBuf::from(base_path), node_id, tls.clone())
+            }
+            RuntimeProfile::NetworkedLocalRoot => {
+                let root_node_id = crate::distributed_coordinator::read_or_mint_node_id(base_path)
+                    .map_err(RaftError::Config)?;
+                ZoneRaftRegistry::with_local_root(
+                    PathBuf::from(base_path),
+                    node_id,
+                    root_node_id,
+                    tls.clone(),
+                )
+            }
+            RuntimeProfile::IsolatedRoot => {
+                ZoneRaftRegistry::isolated_root(PathBuf::from(base_path), node_id)
+            }
+        });
+        if let Some(ref addr) = self_address {
+            registry.set_self_address(addr.clone());
+        }
+        // Seeds are RPC targets (JoinZone, member-address registration),
+        // never zone routes: those derive from member-address records.
+        registry.set_seeds(
+            peers
+                .iter()
+                .map(|s| {
+                    NodeAddress::parse(s.trim(), tls_config.is_some())
+                        .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let config = ServerConfig {
+            bind_address: bind_socket,
+            tls: tls_config.clone(),
+            ..Default::default()
+        };
+        let use_tls = tls_config.is_some();
+
+        // Index what this node hosts BEFORE the gRPC server accepts traffic,
+        // so an arriving vote / append / VFS call can never be told "no such
+        // zone" about a zone that is sitting right there on disk. Opening it
+        // is a separate question, answered on first access — see
+        // `ZoneRaftRegistry::index_persisted_zones`. Boot therefore costs one
+        // readdir instead of one raft-group opening per persisted zone, which
+        // is what decouples restart time from zones-accumulated-over-a-year.
+        //
+        // Sync (no campaign, no nested runtime): calling it directly avoids the
+        // `Handle::block_on` panic that hit `nexusd-cluster`'s `#[tokio::main]`
+        // async path — the worker thread driving `ZoneManager::new` would
+        // otherwise be parked on the inner runtime's block_on, which tokio
+        // rejects to prevent deadlock.
+        registry
+            .index_persisted_zones()
+            .map_err(|e| RaftError::Raft(format!("Failed to enumerate zones on startup: {}", e)))?;
+        registry.arm_materialization(runtime.handle().clone(), load_policy.clone());
+        // The zones that must be resident before anything can be served at
+        // all: `root`, whose DT_MOUNT entries define the namespace, and — for
+        // offline tooling — exactly the zone it was told to touch.
+        let eager: Vec<String> = match &load_policy {
+            ZoneLoadPolicy::OnDemand => vec![contracts::ROOT_ZONE_ID.to_string()],
+            ZoneLoadPolicy::Only(zone_ids) => zone_ids.clone(),
+        };
+        registry
+            .materialize_now(&eager, runtime.handle())
+            .map_err(|e| {
+                zone_open_error(e, format!("Failed to open zones {eager:?} on startup"))
+            })?;
+
+        let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
+        let search_capabilities_slot = crate::search_capabilities::new_search_capabilities_slot();
+        let ca_issuer_slot = crate::ca_issuer::new_ca_issuer_slot();
+        let key_minter_slot = crate::key_minter::new_key_minter_slot();
+        let foreign_ca_registrar_slot =
+            crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
+        let session_mint_admin_slot = crate::session_mint_admin::new_session_mint_admin_slot();
+        let local_node_renewer_slot = crate::ca_issuer::new_local_node_renewer_slot();
+        let mut server = RaftGrpcServer::new(registry.clone(), config)
+            .with_blob_fetcher_slot(blob_fetcher_slot.clone())
+            .with_search_capabilities_slot(search_capabilities_slot.clone())
+            .with_ca_issuer_slot(ca_issuer_slot.clone())
+            .with_key_minter_slot(key_minter_slot.clone())
+            .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
+            .with_session_mint_admin_slot(session_mint_admin_slot.clone())
+            .with_local_node_renewer_slot(local_node_renewer_slot.clone())
+            .with_foreign_ca_verifier(foreign_ca_verifier.clone());
+        // Node enrollment (JoinCluster cert provisioning) is NOT served here —
+        // this bind is strict mTLS, which a certless joiner cannot reach. The
+        // cluster daemon runs it on a separate plaintext listener via
+        // `transport::serve_node_enrollment` when `--enroll-listen` is set.
+        if let Some(extra) = extra_grpc_services {
+            server = server.with_extra_services(extra);
+        }
+        let shutdown_rx_server = shutdown_rx.clone();
+        // Owned: the failure message below names the address, and the task outlives
+        // this borrow.
+        let bind_for_error = bind_addr.to_string();
+        let server_task = prepared_listener.map(|(prepared, listener)| {
+            let shutdown = async move {
+                let mut rx = shutdown_rx_server;
+                let _ = rx.changed().await;
+            };
+            let serving = server.serve_prepared(prepared, listener, shutdown);
+            runtime.spawn(async move {
+                if let Err(e) = serving.await {
+                    // gRPC bind failure (port in use, IP not assigned to any
+                    // interface — e.g. Tailscale in NoState — TLS cert
+                    // mismatch, etc.) leaves the daemon half-alive: raft
+                    // driver + FUSE plugin + LocalConnector all up, but no
+                    // one can talk to us over the wire.  Operators observed
+                    // this as "everything looks fine locally, but peers
+                    // never see me" for 30+ minutes before diagnosis.
+                    //
+                    // Fail loud: log at ERROR (visible in every launcher
+                    // stdout) and exit(1) so the process supervisor / CI
+                    // gate / operator's `echo $?` sees non-zero.  gRPC
+                    // server startup is a strict prerequisite for
+                    // federation and there is no recovery from within the
+                    // process — bind is either possible or not.
+                    // Name the one cause an operator can act on. "Someone else has this
+                    // address" is a different instruction from "this address is not on any
+                    // interface", and a one-shot subcommand hitting the first one used to
+                    // read this daemon-shaped sentence and conclude its own federation was
+                    // broken (#328).
+                    if addr_in_use(&e) {
+                        tracing::error!(
+                            error = %e,
+                            bind = %bind_for_error,
+                            "another process already holds {bind_for_error}. This process has to \
+                             be reachable THERE — a zone with other voters delivers their \
+                             append/vote responses to the address its peers were told to \
+                             dial, so an ephemeral port would leave it waiting forever. \
+                             Stop whatever holds it, or run this against the data dir whose \
+                             node owns that address",
+                        );
+                    } else {
+                        tracing::error!(
+                            error = %e,
+                            bind = %bind_for_error,
+                            "gRPC bind on {bind_for_error} failed for a reason other than the \
+                             address being taken — an IP not assigned to any interface (a \
+                             Tailscale address while the tunnel is down does this) or a TLS \
+                             material mismatch. Nothing can reach this process until it \
+                             binds, so there is no degraded mode to continue in",
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            })
+        });
+
+        tracing::info!(
+            "ZoneManager local_node_id={} hostname={} started (bind={}, tls={})",
+            node_id,
+            hostname,
+            bind_addr,
+            use_tls,
+        );
+
+        Ok(Arc::new(ZoneManager {
+            registry,
+            runtime,
+            shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
+            server_task: parking_lot::Mutex::new(server_task),
+            node_id,
+            blob_fetcher_slot,
+            search_capabilities_slot,
+            ca_issuer_slot,
+            key_minter_slot,
+            foreign_ca_registrar_slot,
+            session_mint_admin_slot,
+            foreign_ca_verifier,
+            node_identity_holders: parking_lot::Mutex::new(Vec::new()),
+            local_node_renewer_slot,
+            pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
+            local_zone_operation: parking_lot::Mutex::new(()),
+        }))
+    }
+}
+
 impl ZoneManager {
+    /// Execution ownership for the process holding this local root store.
+    pub(crate) fn try_local_zone_operation(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.local_zone_operation.try_lock()
+    }
+
     /// Create a new `ZoneManager`.
     ///
     /// Starts a tokio runtime + gRPC server. Indexes every previously-persisted
@@ -348,11 +750,11 @@ impl ZoneManager {
     ///
     /// Used by `RaftDistributedCoordinator::init_from_env` to bind the
     /// node ID returned by `read_or_mint_node_id` (opaque random u64
-    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` is the
-    /// hostname → endpoint **address book** parsed from `NEXUS_PEERS`;
-    /// it seeds the transport peer map for raft messaging but is **not**
-    /// the source of truth for ConfState — ConfState is mutated only
-    /// by ConfChange (AddNode / RemoveNode) driven by JoinZone.  The
+    /// persisted at `<NEXUS_DATA_DIR>/.node_id`).  `peers` are the
+    /// operator seed addresses (`NEXUS_PEERS` / `--peers`): RPC targets for
+    /// JoinZone and for self-registration, never zone routes and never
+    /// ConfState — ConfState is mutated only by ConfChange driven by
+    /// JoinZone.
     /// Callers that supply an explicit ID also supply its matching TLS identity.
     /// `self_address` is this node's advertise address (e.g.,
     /// `"http://10.0.0.3:2126"` or `"10.0.0.3:2126"`).  Carried in every
@@ -360,8 +762,7 @@ impl ZoneManager {
     /// `(self.node_id -> self_address)` from inbound messages — the
     /// runtime SSOT for transport routing under the opaque-ID contract.
     /// `None` disables sender-address advertisement; use only for
-    /// tests / sync-only deployments where peers already have the
-    /// address via env seeding.
+    /// tests / sync-only deployments.
     #[allow(clippy::too_many_arguments)]
     pub fn with_node_id(
         hostname: &str,
@@ -410,11 +811,90 @@ impl ZoneManager {
             base_path,
             peers,
             bind_addr,
-            tls,
+            load_tls_source(tls.as_ref())?,
             self_address,
             extra_grpc_services,
             load_policy,
             RuntimeProfile::Networked,
+        )
+    }
+
+    /// Host data-zone replicas alongside a root with fixed local membership.
+    /// The root uses its existing `.node_id`; `node_id` identifies the network
+    /// replica and never replaces the root's committed membership.
+    /// The existing TLS, control authorization and per-zone Raft paths apply.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: Option<TlsFiles>,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            load_tls_source(tls.as_ref())?,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Host a fixed local root and admitted data zones using the credential
+    /// owner's live installation. Listener and Raft clients retain this source.
+    /// The owner validates replacements against the same peer and trust anchor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_root_shared(
+        hostname: &str,
+        node_id: u64,
+        base_path: &str,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+        extra_grpc_services: Option<tonic::service::Routes>,
+    ) -> Result<Arc<Self>> {
+        Self::with_node_id_profile(
+            hostname,
+            node_id,
+            base_path,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            extra_grpc_services,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
+        )
+    }
+
+    /// Validate the local-root transport and reserve its listener before the
+    /// caller opens storage. `open` consumes the same prepared transport.
+    pub fn prepare_local_root_shared(
+        hostname: &str,
+        node_id: u64,
+        peers: Vec<String>,
+        bind_addr: &str,
+        tls: SharedTlsConfig,
+        self_address: Option<String>,
+    ) -> Result<PreparedZoneManager> {
+        PreparedZoneManager::prepare(
+            hostname,
+            node_id,
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            ZoneLoadPolicy::OnDemand,
+            RuntimeProfile::NetworkedLocalRoot,
         )
     }
 
@@ -429,7 +909,7 @@ impl ZoneManager {
             base_path,
             Vec::new(),
             "127.0.0.1:0",
-            None,
+            SharedTlsConfig::default(),
             None,
             None,
             ZoneLoadPolicy::Only(vec![contracts::ROOT_ZONE_ID.to_string()]),
@@ -444,286 +924,23 @@ impl ZoneManager {
         base_path: &str,
         peers: Vec<String>,
         bind_addr: &str,
-        tls: Option<TlsFiles>,
+        tls: SharedTlsConfig,
         self_address: Option<String>,
         extra_grpc_services: Option<tonic::service::Routes>,
         load_policy: ZoneLoadPolicy,
         profile: RuntimeProfile,
     ) -> Result<Arc<Self>> {
-        // Initialize tracing once.
-        static TRACING_INIT: std::sync::Once = std::sync::Once::new();
-        TRACING_INIT.call_once(|| {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("info".parse().unwrap()),
-                )
-                .try_init();
-        });
-
-        let tls_config = if let Some(ref t) = tls {
-            let cert_pem = std::fs::read(&t.cert_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS cert '{}': {}",
-                    t.cert_path.display(),
-                    e
-                ))
-            })?;
-            let key_pem = std::fs::read(&t.key_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS key '{}': {}",
-                    t.key_path.display(),
-                    e
-                ))
-            })?;
-            let ca_pem = std::fs::read(&t.ca_path).map_err(|e| {
-                RaftError::Config(format!(
-                    "Failed to read TLS CA '{}': {}",
-                    t.ca_path.display(),
-                    e
-                ))
-            })?;
-            let cert_der = lib::transport_primitives::first_certificate_der(&cert_pem, "Node")
-                .map_err(RaftError::Config)?;
-            let ca_der = lib::transport_primitives::first_certificate_der(&ca_pem, "cluster CA")
-                .map_err(RaftError::Config)?;
-            let identity = crate::transport::current_local_node_certificate(&cert_der, &ca_der)
-                .map_err(RaftError::Config)?;
-            if identity.node_id != node_id {
-                return Err(RaftError::Config(format!(
-                    "Node certificate identifies {}, but the configured Raft Node ID is {node_id}; \
-                     renew the certificate with `enroll` against the founder using this data directory",
-                    identity.node_id
-                )));
-            }
-            Some(TlsConfig {
-                cert_pem,
-                key_pem,
-                ca_pem,
-            })
-        } else {
-            None
-        };
-
-        let bind_socket: std::net::SocketAddr = bind_addr.parse().map_err(|e| {
-            RaftError::Config(format!("Invalid bind address '{}': {}", bind_addr, e))
-        })?;
-
-        // This runtime hosts BOTH the tonic gRPC server (accept loop +
-        // per-connection HTTP/2 handshakes for raft and VFS) and every
-        // zone's `transport_loop` (which does synchronous redb disk I/O
-        // in `advance`). A hardcoded 2-worker pool starves the
-        // accept/handshake path under load — new connections finish the
-        // TCP handshake but never get an HTTP/2 SETTINGS frame, so peers
-        // see most join/replication dials time out while heartbeats on
-        // established connections survive. Size to the host like the
-        // outer daemon runtime, with a floor that keeps the accept path
-        // live even on small multi-zone hosts.
-        let worker_threads =
-            contracts::recommended_worker_threads(contracts::MIN_SERVER_RUNTIME_WORKERS);
-        // Owned from birth, not from `Ok(...)`: every `?` below this line is a path an
-        // operator can reach (a data dir another process has open, unreadable TLS
-        // material, a bind address that is not on this host), and each one drops this
-        // runtime while unwinding — which must not panic over the error it carries.
-        let runtime = OwnedRuntime::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .thread_name("nexus-zone-mgr")
-                .build()
-                .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
-        );
-
-        let registry = Arc::new(match profile {
-            RuntimeProfile::Networked => {
-                ZoneRaftRegistry::with_tls(PathBuf::from(base_path), node_id, tls_config.clone())
-            }
-            RuntimeProfile::IsolatedRoot => {
-                ZoneRaftRegistry::isolated_root(PathBuf::from(base_path), node_id)
-            }
-        });
-        if let Some(ref addr) = self_address {
-            registry.set_self_address(addr.clone());
-        }
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        let config = ServerConfig {
-            bind_address: bind_socket,
-            tls: tls_config.clone(),
-            ..Default::default()
-        };
-        let use_tls = tls_config.is_some();
-
-        // Enumerate + reopen local zone storage BEFORE gRPC accepts
-        // traffic. Otherwise a vote/heartbeat arriving during restart
-        // could silently drop messages or re-bootstrap with peers=0.
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Index what this node hosts BEFORE the gRPC server accepts traffic,
-        // so an arriving vote / append / VFS call can never be told "no such
-        // zone" about a zone that is sitting right there on disk. Opening it
-        // is a separate question, answered on first access — see
-        // `ZoneRaftRegistry::index_persisted_zones`. Boot therefore costs one
-        // readdir instead of one raft-group opening per persisted zone, which
-        // is what decouples restart time from zones-accumulated-over-a-year.
-        //
-        // Sync (no campaign, no nested runtime): calling it directly avoids the
-        // `Handle::block_on` panic that hit `nexusd-cluster`'s `#[tokio::main]`
-        // async path — the worker thread driving `ZoneManager::new` would
-        // otherwise be parked on the inner runtime's block_on, which tokio
-        // rejects to prevent deadlock.
-        registry
-            .index_persisted_zones()
-            .map_err(|e| RaftError::Raft(format!("Failed to enumerate zones on startup: {}", e)))?;
-        registry.arm_materialization(
-            peer_addrs.clone(),
-            runtime.handle().clone(),
-            load_policy.clone(),
-        );
-        // The zones that must be resident before anything can be served at
-        // all: `root`, whose DT_MOUNT entries define the namespace, and — for
-        // offline tooling — exactly the zone it was told to touch.
-        let eager: Vec<String> = match &load_policy {
-            ZoneLoadPolicy::OnDemand => vec![contracts::ROOT_ZONE_ID.to_string()],
-            ZoneLoadPolicy::Only(zone_ids) => zone_ids.clone(),
-        };
-        registry
-            .materialize_now(&eager, peer_addrs.clone(), runtime.handle())
-            .map_err(|e| match e {
-                // Kept typed rather than folded into the message: the caller's
-                // response to "someone else has this data dir" is a different one,
-                // and a CLI should not have to read prose to tell.
-                crate::transport::TransportError::DataDirLocked(path) => {
-                    RaftError::DataDirLocked(path)
-                }
-                other => RaftError::Raft(format!(
-                    "Failed to open zones {:?} on startup: {}",
-                    eager, other
-                )),
-            })?;
-
-        let blob_fetcher_slot = crate::blob_fetcher::new_blob_fetcher_slot();
-        let search_capabilities_slot = crate::search_capabilities::new_search_capabilities_slot();
-        let agent_minter_slot = crate::agent_minter::new_agent_minter_slot();
-        let key_minter_slot = crate::key_minter::new_key_minter_slot();
-        let foreign_ca_registrar_slot =
-            crate::foreign_ca_registrar::new_foreign_ca_registrar_slot();
-        let session_mint_admin_slot = crate::session_mint_admin::new_session_mint_admin_slot();
-        // Build the federated client-cert verifier eagerly from the cluster CA
-        // when TLS is on, so the serve path (below) and the cross-org
-        // apply-observer (cluster profile, via `foreign_ca_verifier()`) share ONE
-        // Arc — the observer's `set_foreign_cas` then reaches the live serving
-        // verifier with no restart. Empty roots beyond the cluster CA until then,
-        // so this is byte-equivalent to the old `client_ca_root(cluster_ca)`.
-        let foreign_ca_verifier = match &tls_config {
-            Some(t) => Some(
-                lib::transport_primitives::FederatedClientCertVerifier::new(&t.ca_pem)
-                    .map_err(|e| RaftError::Config(format!("build client-cert verifier: {e}")))?,
-            ),
-            None => None,
-        };
-        let mut server = RaftGrpcServer::new(registry.clone(), config)
-            .with_blob_fetcher_slot(blob_fetcher_slot.clone())
-            .with_search_capabilities_slot(search_capabilities_slot.clone())
-            .with_agent_minter_slot(agent_minter_slot.clone())
-            .with_key_minter_slot(key_minter_slot.clone())
-            .with_foreign_ca_registrar_slot(foreign_ca_registrar_slot.clone())
-            .with_session_mint_admin_slot(session_mint_admin_slot.clone())
-            .with_foreign_ca_verifier(foreign_ca_verifier.clone());
-        // Node enrollment (JoinCluster cert provisioning) is NOT served here —
-        // this bind is strict mTLS, which a certless joiner cannot reach. The
-        // cluster daemon runs it on a separate plaintext listener via
-        // `transport::serve_node_enrollment` when `--enroll-listen` is set.
-        if let Some(extra) = extra_grpc_services {
-            server = server.with_extra_services(extra);
-        }
-        let shutdown_rx_server = shutdown_rx.clone();
-        // Owned: the failure message below names the address, and the task outlives
-        // this borrow.
-        let bind_for_error = bind_addr.to_string();
-        if matches!(profile, RuntimeProfile::Networked) {
-            runtime.spawn(async move {
-                let shutdown = async move {
-                    let mut rx = shutdown_rx_server;
-                    let _ = rx.changed().await;
-                };
-                if let Err(e) = server.serve_with_shutdown(shutdown).await {
-                    // gRPC bind failure (port in use, IP not assigned to any
-                    // interface — e.g. Tailscale in NoState — TLS cert
-                    // mismatch, etc.) leaves the daemon half-alive: raft
-                    // driver + FUSE plugin + LocalConnector all up, but no
-                    // one can talk to us over the wire.  Operators observed
-                    // this as "everything looks fine locally, but peers
-                    // never see me" for 30+ minutes before diagnosis.
-                    //
-                    // Fail loud: log at ERROR (visible in every launcher
-                    // stdout) and exit(1) so the process supervisor / CI
-                    // gate / operator's `echo $?` sees non-zero.  gRPC
-                    // server startup is a strict prerequisite for
-                    // federation and there is no recovery from within the
-                    // process — bind is either possible or not.
-                    // Name the one cause an operator can act on. "Someone else has this
-                    // address" is a different instruction from "this address is not on any
-                    // interface", and a one-shot subcommand hitting the first one used to
-                    // read this daemon-shaped sentence and conclude its own federation was
-                    // broken (#328).
-                    if addr_in_use(&e) {
-                        tracing::error!(
-                            error = %e,
-                            bind = %bind_for_error,
-                            "another process already holds {bind_for_error}. This process has to \
-                             be reachable THERE — a zone with other voters delivers their \
-                             append/vote responses to the address its peers were told to \
-                             dial, so an ephemeral port would leave it waiting forever. \
-                             Stop whatever holds it, or run this against the data dir whose \
-                             node owns that address",
-                        );
-                    } else {
-                        tracing::error!(
-                            error = %e,
-                            bind = %bind_for_error,
-                            "gRPC bind on {bind_for_error} failed for a reason other than the \
-                             address being taken — an IP not assigned to any interface (a \
-                             Tailscale address while the tunnel is down does this) or a TLS \
-                             material mismatch. Nothing can reach this process until it \
-                             binds, so there is no degraded mode to continue in",
-                        );
-                    }
-                    std::process::exit(1);
-                }
-            });
-        }
-
-        tracing::info!(
-            "ZoneManager local_node_id={} hostname={} started (bind={}, tls={})",
-            node_id,
+        PreparedZoneManager::prepare(
             hostname,
-            bind_addr,
-            use_tls,
-        );
-
-        Ok(Arc::new(Self {
-            registry,
-            runtime,
-            shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
             node_id,
-            use_tls,
-            default_peers: peers,
-            blob_fetcher_slot,
-            search_capabilities_slot,
-            agent_minter_slot,
-            key_minter_slot,
-            foreign_ca_registrar_slot,
-            session_mint_admin_slot,
-            foreign_ca_verifier,
-            pending_mounts: parking_lot::Mutex::new(BTreeMap::new()),
-        }))
+            peers,
+            bind_addr,
+            tls,
+            self_address,
+            load_policy,
+            profile,
+        )?
+        .open(base_path, extra_grpc_services)
     }
 
     /// Hand the shared `BlobFetcher` slot back to the kernel so it
@@ -737,10 +954,10 @@ impl ZoneManager {
         self.search_capabilities_slot.clone()
     }
 
-    /// Hand the shared `AgentMinter` slot back so the cluster profile can
+    /// Hand the shared `CaIssuer` slot back so the cluster profile can
     /// install a concrete minter on the founder (CA holder). Clone-cheap.
-    pub fn agent_minter_slot(&self) -> crate::agent_minter::AgentMinterSlot {
-        self.agent_minter_slot.clone()
+    pub fn ca_issuer_slot(&self) -> crate::ca_issuer::CaIssuerSlot {
+        self.ca_issuer_slot.clone()
     }
 
     /// Hand the shared `KeyMinter` slot back so the cluster profile can install a
@@ -773,46 +990,110 @@ impl ZoneManager {
         self.foreign_ca_verifier.clone()
     }
 
-    /// Cluster-wide peer list remembered from construction, in
-    /// `host:port` form. Used by `sys_setattr(DT_MOUNT)`'s
-    /// leader-side create-on-mount path so zone auto-creation picks
-    /// up the federation's peer topology without re-parsing env vars.
-    pub fn default_peers(&self) -> &[String] {
-        &self.default_peers
+    /// This Node's current TLS identity (`None` under `--no-tls`).
+    pub fn node_tls(&self) -> std::result::Result<Option<TlsConfig>, String> {
+        self.registry.tls_config()
     }
 
-    /// Current cluster-wide peer roster in `host:port` form.
-    ///
-    /// The env-derived `default_peers` are only the cold-start seed. Once
-    /// root membership changes through wipe-rejoin rotation, root's live
-    /// peer map is the authoritative address roster for newly-created
-    /// zones.
-    pub fn current_peer_strings(&self) -> Vec<String> {
-        if let Some(peers) = self.registry.get_peers("root") {
-            if !peers.is_empty() {
-                let mut out: Vec<String> =
-                    peers.values().map(NodeAddress::to_raft_peer_str).collect();
-                out.sort();
-                return out;
-            }
+    /// Serve and present a renewed Node identity everywhere, without a restart:
+    /// the gRPC server's new connections, every pooled Raft client, then each
+    /// registered [`NodeIdentityHolder`]. The bundle must name this Node and
+    /// chain to the cluster CA it already uses, whose verifier is unchanged.
+    pub fn install_node_identity(&self, tls: TlsConfig) -> std::result::Result<(), String> {
+        let original = self.registry.shared_tls().snapshot();
+        self.install_node_identity_from(&original, tls)
+    }
+
+    fn install_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: TlsConfig,
+    ) -> std::result::Result<(), String> {
+        self.check_node_identity_from(original, &tls)?;
+        let verifier = self
+            .foreign_ca_verifier
+            .as_ref()
+            .ok_or("a plaintext node has no TLS identity to replace")?;
+        // Validate the key/certificate pair before publishing the shared installation.
+        lib::transport_primitives::server_config(
+            Arc::clone(verifier),
+            &tls.cert_pem,
+            &tls.key_pem,
+        )?;
+        if !self.registry.shared_tls().replace_if_current(
+            original,
+            lib::transport_primitives::TlsPolicy::Configured(tls.clone()),
+        ) {
+            return Err("Node credential installation changed during renewal validation".into());
         }
-        self.default_peers.clone()
+        for holder in self.node_identity_holders.lock().iter() {
+            holder(&tls);
+        }
+        tracing::info!(
+            local_node_id = self.node_id,
+            "renewed Node identity installed"
+        );
+        Ok(())
     }
 
-    /// Get an existing zone handle, or create one with the current
-    /// root-zone peer roster and return a handle to it. Called from
-    /// `Kernel::sys_setattr(DT_MOUNT)` leader path so the caller
-    /// doesn't have to specify peers (same federation = same peers).
-    /// Idempotent: subsequent calls for an existing zone skip the
-    /// raft ConfState bootstrap and return the cached node.
+    /// Whether `tls` may replace this Node's identity: a current leaf naming
+    /// this Node, chained to the cluster CA it already uses.
+    pub fn check_node_identity(&self, tls: &TlsConfig) -> std::result::Result<(), String> {
+        self.check_node_identity_from(&self.registry.shared_tls().snapshot(), tls)
+    }
+
+    fn check_node_identity_from(
+        &self,
+        original: &lib::transport_primitives::TlsSnapshot,
+        tls: &TlsConfig,
+    ) -> std::result::Result<(), String> {
+        let current = original
+            .config()?
+            .ok_or("a plaintext node has no TLS identity to replace")?;
+        if tls.ca_pem != current.ca_pem {
+            return Err("a renewed Node identity must chain to the same cluster CA".into());
+        }
+        let named = crate::transport::local_node_identity(&tls.cert_pem, &tls.ca_pem)?;
+        if named.node_id != self.node_id {
+            return Err(format!(
+                "the renewed certificate names Node {}, not this Node {}",
+                named.node_id, self.node_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Register a holder outside this manager that presents the Node identity
+    /// (an outbound client with its own channels); it receives each identity
+    /// [`Self::install_node_identity`] installs.
+    pub fn on_node_identity(&self, holder: NodeIdentityHolder) {
+        self.node_identity_holders.lock().push(holder);
+    }
+
+    /// Hand back the slot the daemon binds its own Node certificate renewer into.
+    pub fn local_node_renewer_slot(&self) -> crate::ca_issuer::LocalNodeRenewerSlot {
+        self.local_node_renewer_slot.clone()
+    }
+
+    /// The operator seed addresses this node was started with, parsed with
+    /// this node's TLS posture. A seed's `id` is derived from its hostname,
+    /// which identifies only a witness.
+    pub fn seed_peers(&self) -> Vec<NodeAddress> {
+        self.registry.seeds()
+    }
+
+    /// Get an existing zone handle, or create the zone and return a handle to
+    /// it. Called from `Kernel::sys_setattr(DT_MOUNT)` leader path.
+    /// Idempotent: subsequent calls for an existing zone skip the raft
+    /// ConfState bootstrap and return the cached node.
     pub fn get_or_create_zone(&self, zone_id: &str) -> Result<Arc<ZoneHandle>> {
         if let Some(h) = self.get_zone(zone_id) {
             return Ok(h);
         }
-        self.create_zone(zone_id, self.current_peer_strings())
+        self.create_zone(zone_id)
     }
 
-    /// This node's ID.
+    /// The network replica ID. Per-zone status reports the root's local ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
     }
@@ -928,76 +1209,23 @@ impl ZoneManager {
         if !self.registry.hosts(zone_id) {
             return ZonePresence::LocalNotFound;
         }
-        if self
-            .registry
-            .resident_zones()
-            .contains(&zone_id.to_string())
-        {
+        if self.registry.is_resident(zone_id) {
             ZonePresence::Resident
         } else {
             ZonePresence::HostedNotResident
         }
     }
 
-    /// Create a new zone (raft group) on this node.
-    ///
-    /// Idempotent — calling `create_zone` for an existing zone with
-    /// the **same** address book (same set of `(hostname, port)`
-    /// tuples) returns the existing handle.  A **different** address
-    /// book returns
-    /// [`RaftError::ZoneAlreadyExistsWithDifferentMembership`] so
-    /// operator config drift surfaces loudly instead of silently
-    /// re-bootstrapping the local replica.  The address book carries
-    /// no role in ConfState (which is mutated only by ConfChange via
-    /// JoinZone) so two callers passing equivalent peer lists are
-    /// genuinely equivalent.
-    pub fn create_zone(&self, zone_id: &str, peers: Vec<String>) -> Result<Arc<ZoneHandle>> {
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), self.use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Idempotency: zone already loaded.  Compare existing
-        // address-book entries by `(hostname, port)` ignoring the
-        // raft-id prefix — under the opaque-ID contract two parses of
-        // the same NEXUS_PEERS entry can carry different witness-derived
-        // ids but represent the same physical peer.
-        if self.get_zone(zone_id).is_some() {
-            let existing = self
-                .registry
-                .get_peers(zone_id)
-                .map(|map| {
-                    let mut set: std::collections::BTreeSet<(String, u16)> = map
-                        .values()
-                        .map(|addr| (addr.hostname.clone(), addr.port))
-                        .collect();
-                    set.remove(&(String::new(), 0));
-                    set
-                })
-                .unwrap_or_default();
-            let requested: std::collections::BTreeSet<(String, u16)> = peer_addrs
-                .iter()
-                .map(|a| (a.hostname.clone(), a.port))
-                .collect();
-            if existing == requested {
-                return Ok(self.get_zone(zone_id).expect("re-checked above"));
-            }
-            let to_strs = |set: &std::collections::BTreeSet<(String, u16)>| -> Vec<String> {
-                set.iter().map(|(h, p)| format!("{h}:{p}")).collect()
-            };
-            return Err(RaftError::ZoneAlreadyExistsWithDifferentMembership {
-                actual: to_strs(&existing),
-                requested: to_strs(&requested),
-            });
+    /// Create a new zone (raft group) on this node, founded with this node
+    /// as its sole voter. Idempotent — an existing zone returns its handle.
+    pub fn create_zone(&self, zone_id: &str) -> Result<Arc<ZoneHandle>> {
+        if let Some(existing) = self.get_zone(zone_id) {
+            return Ok(existing);
         }
-
         let node = self
             .registry
-            .create_zone(zone_id, peer_addrs, self.rt().handle())
-            .map_err(|e| RaftError::Raft(format!("Failed to create zone: {}", e)))?;
+            .create_zone(zone_id, self.rt().handle())
+            .map_err(|e| zone_open_error(e, "Failed to create zone"))?;
 
         Ok(ZoneHandle::new(
             node,
@@ -1009,16 +1237,11 @@ impl ZoneManager {
     /// Join an existing zone as a Voter (learner=false) or Learner (learner=true).
     ///
     /// Sets up the local Raft state machine with skip_bootstrap=true so the
-    /// leader's snapshot installs the correct ConfState. The caller is
-    /// responsible for sending a JoinZone RPC to the leader (via
-    /// PyFederationClient::request_join_zone) with the same learner flag so
-    /// the leader proposes AddNode vs AddLearnerNode accordingly.
-    pub fn join_zone(
-        &self,
-        zone_id: &str,
-        peers: Vec<String>,
-        learner: bool,
-    ) -> Result<Arc<ZoneHandle>> {
+    /// leader's snapshot installs the correct ConfState. Membership itself is
+    /// requested with the same learner flag through
+    /// [`crate::distributed_coordinator::join_zone_via_peers`], so the leader
+    /// proposes AddNode vs AddLearnerNode accordingly.
+    pub fn join_zone(&self, zone_id: &str, learner: bool) -> Result<Arc<ZoneHandle>> {
         // R12: the join path can never resurrect a deprovisioned zone —
         // a deletion epoch that outranks this replica's creation epoch
         // refuses the join outright (auto-rejoin against a stale identity
@@ -1034,18 +1257,10 @@ impl ZoneManager {
                  override."
             )));
         }
-        let peer_addrs: Vec<NodeAddress> = peers
-            .iter()
-            .map(|s| {
-                NodeAddress::parse(s.trim(), self.use_tls)
-                    .map_err(|e| RaftError::Config(format!("Invalid peer '{}': {}", s, e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let node = self
             .registry
-            .join_zone(zone_id, peer_addrs, learner, self.rt().handle())
-            .map_err(|e| RaftError::Raft(format!("Failed to join zone: {}", e)))?;
+            .join_zone(zone_id, learner, self.rt().handle())
+            .map_err(|e| zone_open_error(e, "Failed to join zone"))?;
 
         Ok(ZoneHandle::new(
             node,
@@ -1080,7 +1295,6 @@ impl ZoneManager {
     pub fn bootstrap_static(
         &self,
         zones: &[String],
-        peers: Vec<String>,
         mounts: &BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         // Zones skipped by the D9 guard below — mounts pointing at them are
@@ -1117,7 +1331,7 @@ impl ZoneManager {
                 deprovisioned.insert(zone_id.clone());
                 continue;
             }
-            self.create_zone(zone_id, peers.clone())?;
+            self.create_zone(zone_id)?;
         }
         let mut pending = self.pending_mounts.lock();
         pending.clear();
@@ -1456,10 +1670,9 @@ impl ZoneManager {
 
     /// Linearizable twin of [`Self::get_links_count`]: the ReadIndex barrier
     /// guarantees the value observes every write committed cluster-wide
-    /// before the call (a plain local read on a FOLLOWER host lags the
-    /// leader's apply by a raft tick — the same lag `poll_until_visible`
-    /// exists for), so a guard decision made on it cannot miss an
-    /// already-committed mount. One leader heartbeat round-trip, no log
+    /// before the call, including writes submitted through OTHER nodes that
+    /// a local read on a follower may not have applied yet, so a guard
+    /// decision made on it cannot miss an already-committed mount. One leader heartbeat round-trip, no log
     /// write — the same primitive `ControlStateStore::read_barrier` uses.
     pub fn get_links_count_linearizable(&self, zone_id: &str) -> Result<Option<i64>> {
         let Some(node) = self.registry.get_node(zone_id) else {
@@ -1483,6 +1696,80 @@ impl ZoneManager {
     /// `i_links_count > 0` (i.e. the zone is still mounted somewhere).
     /// Mirrors Python `ZoneManager.remove_zone(force=...)`.
     pub fn remove_zone(&self, zone_id: &str, force: bool) -> Result<()> {
+        self.check_zone_removal(zone_id, force)?;
+
+        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
+        let self_id = self.registry.node_id();
+        bridge_block_on(self.rt().handle(), async {
+            for (peer_id, peer) in peers {
+                if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
+                    continue;
+                }
+                let tls = self.registry.tls_config().map_err(RaftError::Config)?;
+                call_delete_zone(&peer.endpoint, zone_id, force, tls, 10)
+                    .await
+                    .map_err(|e| {
+                        RaftError::Raft(format!(
+                            "Failed to remove zone '{zone_id}' from peer {}: {e}",
+                            peer.endpoint
+                        ))
+                    })?;
+            }
+            Ok::<(), RaftError>(())
+        })?;
+
+        self.remove_local_zone(zone_id)
+    }
+
+    /// R12 deprovision leg 1: best-effort peer fan-out of the local-destroy
+    /// `DeleteZone` RPC. Unlike [`Self::remove_zone`]'s fail-hard fan-out,
+    /// an unreachable peer is EXPECTED — a replica that was down when the
+    /// zone was deprovisioned self-cleans at boot from the deletion epoch
+    /// (the epoch is the authority; this call is only the fast path).
+    pub(crate) fn fan_out_delete_best_effort(&self, zone_id: &str, force: bool) {
+        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
+        let self_id = self.registry.node_id();
+        let zid = zone_id.to_string();
+        let handle = self.rt().handle().clone();
+        bridge_block_on(&handle, async move {
+            for (peer_id, peer) in peers {
+                if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
+                    continue;
+                }
+                let tls = match self.registry.tls_config() {
+                    Ok(tls) => tls,
+                    Err(error) => {
+                        tracing::warn!(zone = %zid, error = %error, "deprovision credentials unavailable");
+                        return;
+                    }
+                };
+                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls, 10).await {
+                    tracing::warn!(
+                        zone = %zid,
+                        peer = %peer.endpoint,
+                        error = %e,
+                        "deprovision fan-out missed a peer (it self-cleans from the \
+                         deletion epoch at next boot)",
+                    );
+                }
+            }
+        });
+    }
+
+    /// Remove this node's replica, enforcing the reference guard unless forced.
+    /// Other members keep their storage and committed membership.
+    pub fn remove_local_replica(&self, zone_id: &str, force: bool) -> Result<()> {
+        self.check_zone_removal(zone_id, force)?;
+        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
+            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+    }
+
+    /// Local teardown after the caller has authorized forced removal.
+    pub fn remove_local_zone(&self, zone_id: &str) -> Result<()> {
+        self.remove_local_replica(zone_id, true)
+    }
+
+    fn check_zone_removal(&self, zone_id: &str, force: bool) -> Result<()> {
         // R12 entry guard — the registry's `remove_zone` re-checks this
         // (defense in depth), but refusing HERE keeps the reserved zone's
         // peer fan-out from ever starting.
@@ -1503,71 +1790,7 @@ impl ZoneManager {
             }
         }
 
-        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
-        let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
-        bridge_block_on(self.rt().handle(), async {
-            for (peer_id, peer) in peers {
-                if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
-                    continue;
-                }
-                call_delete_zone(&peer.endpoint, zone_id, force, tls.clone(), 10)
-                    .await
-                    .map_err(|e| {
-                        RaftError::Raft(format!(
-                            "Failed to remove zone '{zone_id}' from peer {}: {e}",
-                            peer.endpoint
-                        ))
-                    })?;
-            }
-            Ok::<(), RaftError>(())
-        })?;
-
-        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
-            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
-    }
-
-    /// R12 deprovision leg 1: best-effort peer fan-out of the local-destroy
-    /// `DeleteZone` RPC. Unlike [`Self::remove_zone`]'s fail-hard fan-out,
-    /// an unreachable peer is EXPECTED — a replica that was down when the
-    /// zone was deprovisioned self-cleans at boot from the deletion epoch
-    /// (the epoch is the authority; this call is only the fast path).
-    pub(crate) fn fan_out_delete_best_effort(&self, zone_id: &str, force: bool) {
-        let peers = self.registry.get_peers(zone_id).unwrap_or_default();
-        let self_id = self.registry.node_id();
-        let tls = self.registry.tls_config();
-        let zid = zone_id.to_string();
-        let handle = self.rt().handle().clone();
-        bridge_block_on(&handle, async move {
-            for (peer_id, peer) in peers {
-                if peer_id == self_id || peer.hostname.to_ascii_lowercase().starts_with("witness") {
-                    continue;
-                }
-                if let Err(e) = call_delete_zone(&peer.endpoint, &zid, force, tls.clone(), 10).await
-                {
-                    tracing::warn!(
-                        zone = %zid,
-                        peer = %peer.endpoint,
-                        error = %e,
-                        "deprovision fan-out missed a peer (it self-cleans from the \
-                         deletion epoch at next boot)",
-                    );
-                }
-            }
-        });
-    }
-
-    /// R12 deprovision leg 2: LOCAL teardown only — no peer fan-out (the
-    /// deprovision path fans out separately and best-effort, so an offline
-    /// peer can never block the founder's own teardown).
-    pub fn remove_local_zone(&self, zone_id: &str) -> Result<()> {
-        if contracts::RESERVED_ZONE_IDS.contains(&zone_id) {
-            return Err(RaftError::InvalidState(format!(
-                "Zone '{zone_id}' is reserved and cannot be removed"
-            )));
-        }
-        bridge_block_on(self.rt().handle(), self.registry.remove_zone(zone_id))
-            .map_err(|e| RaftError::Raft(format!("Failed to remove zone: {}", e)))
+        Ok(())
     }
 
     /// Peer roster for a zone: `(id, hostname, endpoint, is_witness)`.
@@ -1592,7 +1815,7 @@ impl ZoneManager {
         let Some(node) = self.registry.get_node(zone_id) else {
             return ClusterStatus {
                 zone_id: zone_id.to_string(),
-                node_id: self.node_id,
+                node_id: self.registry.node_id_for_zone(zone_id),
                 has_store: false,
                 is_leader: false,
                 leader_id: 0,
@@ -1601,6 +1824,8 @@ impl ZoneManager {
                 applied_index: 0,
                 voter_count: 0,
                 witness_count: 0,
+                leader_contact_age_ms: None,
+                replication: Default::default(),
             };
         };
         // Membership SSOT is raft's ConfState (the authoritative voter set),
@@ -1626,7 +1851,7 @@ impl ZoneManager {
         }
         ClusterStatus {
             zone_id: zone_id.to_string(),
-            node_id: self.node_id,
+            node_id: node.id(),
             has_store: true,
             is_leader: node.is_leader(),
             leader_id: node.leader_id().unwrap_or(0),
@@ -1635,6 +1860,8 @@ impl ZoneManager {
             applied_index: node.applied_index(),
             voter_count,
             witness_count,
+            leader_contact_age_ms: node.leader_contact_age().map(|age| age.as_millis() as u64),
+            replication: node.replication(),
         }
     }
 
@@ -2090,12 +2317,25 @@ impl ZoneManager {
 
     /// Gracefully shut down all zones and the gRPC server.
     pub fn shutdown(&self) {
-        self.registry.shutdown_all();
-        if let Some(tx) = bridge_block_on(self.rt().handle(), async {
-            self.shutdown_tx.lock().await.take()
-        }) {
-            let _ = tx.send(true);
-        }
+        // Zones first: an in-flight handler of a stopped zone fails at once
+        // instead of holding the server's drain open on a live proposal.
+        let stopped = self.registry.shutdown();
+        // Keep the shutdown owner until the server releases its resources.
+        // Concurrent callers must wait for that same completion.
+        let mut server_owner = self.server_task.lock();
+        let server = server_owner.take();
+        bridge_block_on(self.rt().handle(), async {
+            stopped.released().await;
+            if let Some(tx) = self.shutdown_tx.lock().await.take() {
+                let _ = tx.send(true);
+            }
+            if let Some(server) = server {
+                if let Err(error) = server.await {
+                    tracing::warn!(%error, "gRPC server task did not finish cleanly");
+                }
+            }
+        });
+        drop(server_owner);
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
@@ -2172,14 +2412,10 @@ impl ZoneManager {
     }
 
     /// Async wrapper for [`Self::create_zone`].
-    pub async fn create_zone_async(
-        self: &Arc<Self>,
-        zone_id: &str,
-        peers: Vec<String>,
-    ) -> Result<Arc<ZoneHandle>> {
+    pub async fn create_zone_async(self: &Arc<Self>, zone_id: &str) -> Result<Arc<ZoneHandle>> {
         let this = Arc::clone(self);
         let zone_id = zone_id.to_string();
-        tokio::task::spawn_blocking(move || this.create_zone(&zone_id, peers))
+        tokio::task::spawn_blocking(move || this.create_zone(&zone_id))
             .await
             .map_err(|e| RaftError::InvalidState(format!("create_zone_async task panicked: {e}")))?
     }
@@ -2206,11 +2442,10 @@ impl ZoneManager {
     pub async fn bootstrap_static_async(
         self: &Arc<Self>,
         zones: Vec<String>,
-        peers: Vec<String>,
         mounts: BTreeMap<String, MountDecl>,
     ) -> Result<()> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, peers, &mounts))
+        tokio::task::spawn_blocking(move || this.bootstrap_static(&zones, &mounts))
             .await
             .map_err(|e| {
                 RaftError::InvalidState(format!("bootstrap_static_async task panicked: {e}"))
@@ -2231,7 +2466,8 @@ impl ZoneManager {
 
 impl Drop for ZoneManager {
     fn drop(&mut self) {
-        self.registry.shutdown_all();
+        // Signal only: the owned runtime's own drop ends the zones' tasks.
+        let _ = self.registry.shutdown();
         // Best-effort shutdown signal.
         if let Ok(mut guard) = self.shutdown_tx.try_lock() {
             if let Some(tx) = guard.take() {
@@ -2245,10 +2481,11 @@ impl Drop for ZoneManager {
 
 // ── Join-cluster helper (pre-ZoneManager-exists TLS bootstrap) ────────
 
-/// K3s-style join: connect to leader with TOFU TLS, verify CA
-/// fingerprint from the join token, write `ca.pem` / `node.pem` /
-/// `node-key.pem` into `<data_dir>/tls`. Enrollment and ZoneManager use the same
-/// persisted opaque Node ID. Called BEFORE ZoneManager exists.
+/// K3s-style join: generate this node's key, have the leader certify it for
+/// the persisted opaque Node ID (token-authorized), verify the CA fingerprint
+/// from the join token, and write `ca.pem` / `node.pem` / `node-key.pem` into
+/// `<data_dir>/tls`. The key never leaves this node. Called BEFORE ZoneManager
+/// exists.
 pub fn join_cluster_and_provision_tls(
     peer_address: &str,
     join_token: &str,
@@ -2308,9 +2545,11 @@ pub fn join_cluster_and_provision_tls(
             .map_err(|e| RaftError::Config(format!("Failed to create runtime: {}", e)))?,
     );
 
+    let (csr_pem, key_pem) =
+        crate::transport::generate_node_key_request().map_err(RaftError::Config)?;
     let result = runtime
         .block_on(call_join_cluster(
-            &endpoint, node_id, "", "root", password, 30,
+            &endpoint, node_id, "", "root", password, &csr_pem, 30,
         ))
         .map_err(|e| RaftError::Raft(format!("JoinCluster RPC failed: {}", e)))?;
 
@@ -2329,11 +2568,8 @@ pub fn join_cluster_and_provision_tls(
 
     std::fs::write(dir.join("ca.pem"), &result.ca_pem)
         .map_err(|e| RaftError::Config(format!("Failed to write ca.pem: {}", e)))?;
-    std::fs::write(dir.join("node.pem"), &result.node_cert_pem)
-        .map_err(|e| RaftError::Config(format!("Failed to write node.pem: {}", e)))?;
-
-    lib::transport_primitives::write_secret(&dir.join("node-key.pem"), &result.node_key_pem)
-        .map_err(|e| RaftError::Config(format!("Failed to write node-key.pem: {}", e)))?;
+    crate::transport::persist_node_identity(&dir, &result.node_cert_pem, &key_pem)
+        .map_err(RaftError::Config)?;
 
     // Persist the cluster API-key secret (if the founder served one) to the
     // single SSOT `tls/api-key-secret`, so this joiner authenticates
@@ -2351,6 +2587,99 @@ pub fn join_cluster_and_provision_tls(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn renewal_fixture() -> (TempDir, Arc<ZoneManager>, TlsConfig, TlsConfig) {
+        let directory = TempDir::new().unwrap();
+        let (ca, ca_key) = crate::transport::generate_zone_ca("root").unwrap();
+        let identity = || {
+            let (cert_pem, key_pem) =
+                crate::transport::generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+            TlsConfig {
+                cert_pem,
+                key_pem,
+                ca_pem: ca.clone(),
+            }
+        };
+        let initial = identity();
+        let files = TlsFiles {
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node-key.pem"),
+            ca_path: directory.path().join("ca.pem"),
+            ca_key_path: None,
+            join_token_hash: None,
+        };
+        std::fs::write(&files.cert_path, &initial.cert_pem).unwrap();
+        lib::transport_primitives::write_secret(&files.key_path, &initial.key_pem).unwrap();
+        std::fs::write(&files.ca_path, &initial.ca_pem).unwrap();
+        let manager = ZoneManager::with_node_id(
+            "test-host",
+            7,
+            directory.path().join("data").to_str().unwrap(),
+            Vec::new(),
+            "127.0.0.1:0",
+            Some(files),
+            None,
+            None,
+        )
+        .unwrap();
+        (directory, manager, initial, identity())
+    }
+
+    #[test]
+    fn renewal_publishes_one_shared_installation_after_key_validation() {
+        let (_directory, manager, initial, next) = renewal_fixture();
+        let credentials = manager.registry().shared_tls();
+        let original = credentials.snapshot();
+        let mut wrong_key = next.clone();
+        wrong_key.key_pem = initial.key_pem;
+        assert!(manager.install_node_identity(wrong_key).is_err());
+        assert!(credentials.is_current(&original));
+
+        manager.install_node_identity(next.clone()).unwrap();
+        assert!(!credentials.is_current(&original));
+        assert_eq!(manager.node_tls().unwrap(), Some(next.clone()));
+        assert_eq!(credentials.snapshot().config().unwrap(), Some(&next));
+        credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+        assert!(manager.install_node_identity(next).is_err());
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+    }
+
+    #[test]
+    fn renewal_preserves_rejection_or_replacement_during_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_directory, manager, initial, next) = renewal_fixture();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        manager.on_node_identity(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let credentials = manager.registry().shared_tls();
+        let original = credentials.snapshot();
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(
+            initial.clone(),
+        ));
+        let reinstalled = credentials.snapshot();
+        assert_eq!(
+            manager.install_node_identity_from(&original, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert!(credentials.is_current(&reinstalled));
+        assert_eq!(manager.node_tls().unwrap(), Some(initial.clone()));
+        credentials.replace(lib::transport_primitives::TlsPolicy::Rejected("revoked"));
+        assert_eq!(
+            manager.install_node_identity_from(&reinstalled, next.clone()),
+            Err("Node credential installation changed during renewal validation".into())
+        );
+        assert_eq!(manager.node_tls(), Err("revoked".into()));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        credentials.replace(lib::transport_primitives::TlsPolicy::Configured(initial));
+        manager.install_node_identity(next.clone()).unwrap();
+        assert_eq!(manager.node_tls().unwrap(), Some(next));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn mismatched_node_certificate_is_refused_before_opening_zone_storage() {
@@ -2411,38 +2740,17 @@ mod tests {
     }
 
     #[test]
-    fn test_create_zone_repeated_same_peers_is_noop() {
-        // Calling create_zone twice with the same address book must be
-        // idempotent — second call returns the existing handle, does
-        // NOT re-bootstrap or shadow the original raft group.
+    fn test_create_zone_repeated_is_noop() {
+        // A second create_zone returns the existing handle; it never
+        // re-bootstraps or shadows the original raft group.
         let (zm, _dir) = make_zm(1);
-        let peers = vec!["nexus-2:2126".to_string(), "nexus-3:2126".to_string()];
-        let h1 = zm.create_zone("z1", peers.clone()).expect("first create");
-        let h2 = zm
-            .create_zone("z1", peers)
-            .expect("second create idempotent");
+        let h1 = zm.create_zone("z1").expect("first create");
+        let h2 = zm.create_zone("z1").expect("second create idempotent");
         assert_eq!(h1.zone_id(), h2.zone_id());
-    }
-
-    #[test]
-    fn test_create_zone_with_different_peers_errors() {
-        // Calling create_zone twice with a different address book is
-        // an operator-config error — surface it explicitly so config
-        // drift doesn't silently mutate ConfState.
-        let (zm, _dir) = make_zm(1);
-        zm.create_zone("z1", vec!["nexus-2:2126".to_string()])
-            .expect("first create");
-        let result = zm.create_zone(
-            "z1",
-            vec!["nexus-2:2126".to_string(), "nexus-3:2126".to_string()],
+        assert_eq!(
+            h1.consensus_node().coherence_id(),
+            h2.consensus_node().coherence_id()
         );
-        match result {
-            Err(RaftError::ZoneAlreadyExistsWithDifferentMembership { .. }) => {}
-            Err(other) => {
-                panic!("expected ZoneAlreadyExistsWithDifferentMembership, got {other:?}")
-            }
-            Ok(_) => panic!("expected ZoneAlreadyExistsWithDifferentMembership, got Ok"),
-        }
     }
 
     #[test]
@@ -2463,7 +2771,7 @@ mod tests {
         // share copies something non-trivial — the propose path against
         // ``new_zone`` is what we're really exercising.
         let parent = zm
-            .create_zone(contracts::ROOT_ZONE_ID, vec![])
+            .create_zone(contracts::ROOT_ZONE_ID)
             .expect("root create");
         assert!(
             parent.wait_for_leader(std::time::Duration::from_secs(5)),
@@ -2480,8 +2788,7 @@ mod tests {
         // Fresh shared zone — created immediately before the share call
         // so the raft tick driver has had no time to elect.  Under the
         // old contract this raced and returned NotLeader.
-        zm.create_zone("sharedzone", vec![])
-            .expect("shared zone create");
+        zm.create_zone("sharedzone").expect("shared zone create");
         let copied = zm
             .share_subtree_core(contracts::ROOT_ZONE_ID, "/shared", "sharedzone")
             .expect("share_subtree_core must wait for new_zone leader internally");
@@ -2501,7 +2808,7 @@ mod tests {
             let zm =
                 ZoneManager::with_node_id("h1", 1, &path, vec![], "127.0.0.1:0", None, None, None)
                     .expect("zm-1");
-            zm.create_zone("z1", vec![]).expect("create");
+            zm.create_zone("z1").expect("create");
             // Drop zm — runtime + gRPC server shut down, redb files
             // remain on disk.
         }
@@ -2511,11 +2818,13 @@ mod tests {
         // with the persisted ConfState; create_zone with identical
         // (empty) peer list must hit the idempotency branch.
         assert!(zm.get_zone("z1").is_some(), "zone reloaded from disk");
-        let _ = zm
-            .create_zone("z1", vec![])
-            .expect("create idempotent on restart");
+        let _ = zm.create_zone("z1").expect("create idempotent on restart");
     }
 }
+
+#[cfg(test)]
+#[path = "zone_manager/shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod bind_failure_tests {

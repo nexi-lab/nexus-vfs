@@ -23,7 +23,7 @@ impl Runtime {
     }
 
     fn store(&self, mount: &str, subtree: &str) -> Arc<dyn MetaStore> {
-        let root = self.0.create_zone("root", vec![]).unwrap();
+        let root = self.0.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(10)));
         Arc::new(ZoneMetaStore::new_with_subtree(
             root.consensus_node().clone(),
@@ -279,6 +279,10 @@ fn legacy_images_and_unsupported_namespaces_fail_without_replacement() {
         .unwrap()
         .as_conditional_metadata()
         .is_none());
+    assert!(LocalMetaStore::in_memory()
+        .unwrap()
+        .as_guarded_records()
+        .is_none());
 }
 
 #[test]
@@ -298,7 +302,7 @@ fn managed_membership_keeps_the_optional_operations_closed() {
         )
         .unwrap(),
     );
-    let root = runtime.0.create_zone("root", vec![]).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     let store = ZoneMetaStore::new_with_subtree(
         root.consensus_node().clone(),
         runtime.0.runtime_handle(),
@@ -306,6 +310,24 @@ fn managed_membership_keeps_the_optional_operations_closed() {
         MANAGED.into(),
     );
     assert!(store.as_conditional_metadata().is_none());
+    assert!(store.as_guarded_records().is_none());
+    let deferred = ZoneMetaStore::deferred_arc(
+        runtime.0.registry(),
+        "root",
+        runtime.0.runtime_handle(),
+        "/deferred".into(),
+        MANAGED.into(),
+    );
+    assert!(matches!(
+        deferred.as_guarded_records().unwrap().bind_record_guard(
+            "/deferred/record",
+            None,
+            "/deferred/owner",
+            &[1; 24]
+        ),
+        Err(ConditionalMetadataError::Unsupported)
+    ));
+    assert!(deferred.as_guarded_records().is_none());
     assert!(matches!(
         kernel::meta_store::ConditionalMetadata::read_versioned(&store, "/readers/file"),
         Err(ConditionalMetadataError::Unsupported)
@@ -326,7 +348,7 @@ fn managed_membership_keeps_the_optional_operations_closed() {
 fn isolated_metadata_adapter_keeps_generic_conditional_proposals_closed() {
     let dir = TempDir::new().unwrap();
     let runtime = Runtime::open(&dir);
-    let root = runtime.0.create_zone("root", vec![]).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(10)));
     let node = root.consensus_node();
     runtime

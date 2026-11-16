@@ -40,14 +40,12 @@ pub fn user_runtime_name_from_x509(cert: &X509Certificate<'_>) -> Result<Option<
         .ok_or("missing runtime SAN")?
         .value
         .general_names;
-    let dns: Vec<&str> = names
-        .iter()
-        .filter_map(|entry| match entry {
-            GeneralName::DNSName(name) => Some(*name),
-            _ => None,
-        })
-        .collect();
-    if dns != [name.as_str()]
+    let mut dns = names.iter().filter_map(|entry| match entry {
+        GeneralName::DNSName(name) => Some(*name),
+        _ => None,
+    });
+    if dns.next() != Some(name.as_str())
+        || dns.next().is_some()
         || names
             .iter()
             .any(|entry| !matches!(entry, GeneralName::URI(_) | GeneralName::DNSName(_)))

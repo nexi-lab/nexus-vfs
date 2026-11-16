@@ -22,14 +22,14 @@ pub async fn read_versioned(
     let response = client
         .read_versioned(request)
         .await
-        .map_err(|status| {
-            if status.code() == tonic::Code::Unimplemented {
-                ConditionalContentError::Unsupported
-            } else {
-                failed(status.to_string())
-            }
-        })?
+        .map_err(read_error)?
         .into_inner();
+    decode_read(response)
+}
+
+pub(super) fn decode_read(
+    response: vfs_proto::ReadVersionedResponse,
+) -> Result<Option<VersionedContent>, ConditionalContentError> {
     match response.outcome {
         Some(read_versioned_response::Outcome::Snapshot(snapshot))
             if !snapshot.version.is_empty() =>
@@ -51,27 +51,18 @@ pub async fn write_if_version(
     client: &mut NexusVfsServiceClient<Channel>,
     request: Request<vfs_proto::WriteIfVersionRequest>,
 ) -> Result<ConditionalContentResult, ConditionalContentError> {
-    if request
-        .get_ref()
-        .expected_version
-        .as_deref()
-        .is_some_and(<[u8]>::is_empty)
-    {
-        return Err(failed(
-            "expected version must be a nonempty token or absent".into(),
-        ));
-    }
+    validate_expected_version(request.get_ref().expected_version.as_deref())?;
     let response = client
         .write_if_version(request)
         .await
-        .map_err(|status| {
-            if status.code() == tonic::Code::Unimplemented {
-                ConditionalContentError::Unsupported
-            } else {
-                ConditionalContentError::Unknown(status.to_string())
-            }
-        })?
+        .map_err(write_error)?
         .into_inner();
+    decode_write(response)
+}
+
+pub(super) fn decode_write(
+    response: vfs_proto::WriteIfVersionResponse,
+) -> Result<ConditionalContentResult, ConditionalContentError> {
     match response.outcome {
         Some(write_if_version_response::Outcome::CommittedVersion(version))
             if !version.is_empty() =>
@@ -137,6 +128,34 @@ fn decode_failure(error: vfs_proto::ConditionalContentFailure) -> ConditionalCon
     }
 }
 
-fn failed(message: String) -> ConditionalContentError {
+pub(super) fn failed(message: String) -> ConditionalContentError {
     ConditionalContentError::Failed(KernelError::BackendError(message))
+}
+
+pub(super) fn validate_expected_version(
+    version: Option<&[u8]>,
+) -> Result<(), ConditionalContentError> {
+    if version.is_some_and(<[u8]>::is_empty) {
+        Err(failed(
+            "expected version must be a nonempty token or absent".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn read_error(status: tonic::Status) -> ConditionalContentError {
+    if status.code() == tonic::Code::Unimplemented {
+        ConditionalContentError::Unsupported
+    } else {
+        failed(status.to_string())
+    }
+}
+
+pub(super) fn write_error(status: tonic::Status) -> ConditionalContentError {
+    if status.code() == tonic::Code::Unimplemented {
+        ConditionalContentError::Unsupported
+    } else {
+        ConditionalContentError::Unknown(status.to_string())
+    }
 }

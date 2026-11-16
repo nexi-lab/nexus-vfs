@@ -50,7 +50,7 @@
 mod common;
 
 use nexus_raft::distributed_coordinator::bootstrap_or_join_zone;
-use nexus_raft::raft::RaftStorage;
+use nexus_raft::raft::{RaftStorage, StateMachine};
 use nexus_raft::transport::NodeAddress;
 use nexus_raft::ZoneManager;
 use raft::Storage;
@@ -83,19 +83,15 @@ async fn offline_join_persists_confstate_before_returning() {
         vec![],
         &founder_bind,
         None,
-        // Production nexusd-cluster always passes Some(self_address).
-        // Pre-populating registry.self_address() is what the bootstrap
-        // entry's `context` field reads from — without it the entry
-        // ships with empty context, joiner replay learns ConfState but
-        // not the founder's address, and the L1 cross-machine read
-        // milestone wedges (see RaftConfig::bootstrap_self_address).
+        // Production nexusd-cluster always passes Some(self_address): it
+        // is the address the founder registers as its member address.
         Some(founder_self_addr.clone()),
         None,
     )
     .expect("founder ZoneManager::with_node_id");
 
     founder_zm
-        .create_zone(ZONE_ID, vec![])
+        .create_zone(ZONE_ID)
         .expect("founder create_zone");
 
     // Give raft-rs's default election timer (~150 ms) plus a margin
@@ -165,7 +161,8 @@ async fn offline_join_persists_confstate_before_returning() {
             &joiner_self_addr_for_task,
             &peer_addrs,
             /* bootstrap_new */ false,
-            /* max_attempts  */ Some(15),
+            /* max_attempts  */
+            Some(nexus_raft::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
             /* as_learner    */ true,
         )
     })
@@ -203,6 +200,36 @@ async fn offline_join_persists_confstate_before_returning() {
          on-disk ConfState was still the skip_bootstrap stub"
     );
 
+    // Both members' addresses are replicated records: the founder's from
+    // its self-registration, the joiner's from the AddLearnerNode context.
+    // A restarted joiner routes to the founder from this record.
+    let joiner_node = joiner_handle.consensus_node();
+    let expected = {
+        let mut records = vec![
+            (founder_node_id, founder_self_addr.clone()),
+            (joiner_node_id, joiner_self_addr.clone()),
+        ];
+        records.sort();
+        records
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut records = joiner_node
+            .with_state_machine(|sm| sm.member_addresses().unwrap().unwrap())
+            .await;
+        records.sort();
+        if records == expected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "joiner's state machine must hold both member addresses; observed {records:?}, \
+             expected {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(joiner_node);
+
     // Capture the joiner's zone path BEFORE shutdown so we can re-open
     // the RaftStorage in isolation.
     let joiner_zone_raft_path = joiner_dir.path().join(ZONE_ID).join("raft");
@@ -239,26 +266,10 @@ async fn offline_join_persists_confstate_before_returning() {
     //    learners=[joiner] — no rejection, ConfState is consistent
     //    with the leader's authoritative view.
     // -------------------------------------------------------------
-    // `shutdown()` signals the transport loop + registry workers but the
-    // underlying redb file lock is released only when the last
-    // `Arc<RaftStorage>` drops on the worker threads.  A fixed-duration
-    // sleep here would be flaky — instead, poll until the file is
-    // openable or a generous deadline elapses.  If the deadline trips,
-    // that's a real shutdown bug to surface, not a timing flake.
-    let lock_release_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let joiner_storage = loop {
-        match RaftStorage::open(&joiner_zone_raft_path) {
-            Ok(s) => break s,
-            Err(e) if std::time::Instant::now() < lock_release_deadline => {
-                let _ = e;
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => panic!(
-                "joiner raft storage still locked 5s after ZoneManager::shutdown() — \
-                 likely a shutdown bug, not a test timing issue: {e}",
-            ),
-        }
-    };
+    // `shutdown()` returns once the zones' tasks — the owners of the raft
+    // storage — have finished, so the store reopens at once.
+    let joiner_storage = RaftStorage::open(&joiner_zone_raft_path)
+        .unwrap_or_else(|e| panic!("joiner raft storage still locked after shutdown(): {e}"));
     let persisted = joiner_storage
         .initial_state()
         .expect("read joiner initial state");
@@ -286,18 +297,9 @@ async fn offline_join_persists_confstate_before_returning() {
     );
 
     // -------------------------------------------------------------
-    // 6. Stronger contract — the founder's bootstrap log entry at
-    //    index 1 must carry the founder's advertise address in its
-    //    `context` field.  On daemon restart the joiner re-runs the
-    //    apply loop over all committed entries (raft-rs's default
-    //    `applied = first_index - 1 = 0`) which calls
-    //    `node_address_from_conf_context` per entry to repopulate
-    //    `peer_map`.  Without the address in context the joiner
-    //    finishes restart with ConfState=[founder, joiner-learner]
-    //    but no way to dial the founder; the transport loop has no
-    //    heartbeat target and `leader_id` never stabilises locally —
-    //    exactly the symptom the L1 cross-machine read milestone
-    //    was failing on before this commit.
+    // 6. The founder's bootstrap entry at index 1 is pre-applied on the
+    //    founder and never reaches its state machine, so it carries no
+    //    address: a joiner replaying it writes no record the founder lacks.
     // -------------------------------------------------------------
     let log_entries = joiner_storage
         .entries(1, 2, None, raft::GetEntriesContext::empty(false))
@@ -318,11 +320,9 @@ async fn offline_join_persists_confstate_before_returning() {
         "bootstrap entry must add the founder — observed node_id: {}",
         cc.node_id,
     );
-    let cc_address = std::str::from_utf8(&cc.context).expect("context must be valid UTF-8");
     assert!(
-        cc_address.contains(&founder_self_addr),
-        "bootstrap entry's context must carry the founder's advertise address ({founder_self_addr:?}) \
-         so a joiner's apply populates its peer_map with (founder_id -> founder_address) via \
-         node_address_from_conf_context.  Observed context: {cc_address:?}",
+        cc.context.is_empty(),
+        "the bootstrap entry must carry no address; observed context: {:?}",
+        cc.context,
     );
 }

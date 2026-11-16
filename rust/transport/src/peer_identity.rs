@@ -337,6 +337,29 @@ mod tests {
     /// with both its CN and its pinned node id — this is the contract
     /// the peer identity plane rests on.
     #[test]
+    fn owner_replica_remains_an_owner_agent_on_the_existing_vfs_surface() {
+        let (ca, key) = generate_zone_ca("root").unwrap();
+        let (leaf, _) = nexus_raft::transport::generate_user_replica_cert(
+            "session-replica",
+            "alice",
+            19,
+            300,
+            &ca,
+            &key,
+        )
+        .unwrap();
+        let peer = classify_peer_cert_pem(&leaf, &ca, &[]).unwrap();
+        assert_eq!(peer.owner.as_deref(), Some("alice"));
+        assert_eq!(peer.agent_name.as_deref(), Some("session-replica"));
+        assert_eq!(peer.node_id, None);
+        assert!(!peer.is_cluster_node());
+        assert_eq!(
+            peer.runtime_server_name,
+            Some(lib::transport_primitives::user_runtime_server_name("alice").unwrap())
+        );
+    }
+
+    #[test]
     fn from_der_recovers_cn_and_node_id_from_a_certgen_cert() {
         let (ca_pem, ca_key_pem) = generate_zone_ca("sharedzone").unwrap();
         let (cert_pem, _key) =

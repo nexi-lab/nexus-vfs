@@ -92,6 +92,53 @@ of unneeded remote gateway code from the local binary. The workflow retains
 approximately 3% headroom around the measured artifact. Its per-target limits
 remain the source of truth in `.github/workflows/cluster-binary-build.yml`.
 
+### Runtime observation contract
+
+With the same pinned Rust 1.99.0 toolchain, the initial runtime observation
+candidate adds 265–315 KB (1.4–1.6%) over protected main. The earlier fixed
+caps had only 576–166,816 bytes left on these targets; their documented
+approximately 3% headroom had already been consumed by subsequent changes.
+
+| Target | Protected main bytes | Initial observation bytes | Increase | Refreshed cap bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x86_64 | 20,764,096 | 21,079,232 | 315,136 | 21,757,952 |
+| macOS ARM64 | 17,921,120 | 18,186,000 | 264,880 | 18,743,296 |
+| macOS x86_64 | 19,116,120 | 19,419,520 | 303,400 | 20,054,016 |
+| Windows x86_64 | 19,893,248 | 20,176,896 | 283,648 | 20,840,448 |
+
+Protected main is `d31d41926` ([run 42607500666](https://github.com/nexi-lab/nexus-vfs/actions/runs/42607500666)).
+The initial observation source is `288e5f9a3`, tested in merge source `53e301661`
+([run 42612820952](https://github.com/nexi-lab/nexus-vfs/actions/runs/42612820952)).
+These are measurements of that initial candidate, not a claim that a later
+revision has the same bytes or that its functional checks passed. Every new
+revision still builds and measures all four native artifacts in source CI.
+Caps are fixed at 103% of these observations, rounded up to 64 KiB; the compiler,
+optimization flags, required runtime behavior and size-failure checks remain
+part of the same measurement policy. The workflow limits above remain the SSOT.
+
+### Managed-agent cleanup latch and bootstrap
+
+With the same pinned Rust 1.99.0 toolchain, the managed-agent candidate adds
+40?56 KB (0.2?0.3%) over protected main. That candidate is the host cleanup
+latch, the shared bootstrap frame and the pending-stop response. Protected main
+had 12,288?131,576 bytes left under the previous caps (0.06?0.6%), so the
+documented approximately 3% headroom had again been consumed by subsequent
+changes.
+
+| Target | Protected main bytes | Managed-agent candidate bytes | Increase | Refreshed cap bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x86_64 | 21,626,376 | 21,670,904 | 44,528 | 22,347,776 |
+| macOS ARM64 | 18,637,232 | 18,693,392 | 56,160 | 19,267,584 |
+| macOS x86_64 | 19,928,704 | 19,968,320 | 39,616 | 20,578,304 |
+| Windows x86_64 | 20,828,160 | 20,879,360 | 51,200 | 21,561,344 |
+
+Protected main is `b8cb48403` ([run 43808625881](https://github.com/nexi-lab/nexus-vfs/actions/runs/43808625881)).
+The candidate source is `0a05ccc10` ([run 43812542070](https://github.com/nexi-lab/nexus-vfs/actions/runs/43812542070)).
+These are measurements of that candidate, not a claim that a later revision has
+the same bytes. Every new revision still builds and measures all four native
+artifacts in source CI. Caps are fixed at 103% of these observations, rounded up
+to 64 KiB. The workflow limits above remain the SSOT.
+
 ## Adding a new dependency
 
 Add it to **`profiles/cluster/Cargo.toml`** only. It flows to every binary

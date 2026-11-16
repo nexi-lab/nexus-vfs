@@ -133,7 +133,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = RaftReBACTupleStore::new(node, runtime);
@@ -205,7 +205,7 @@ mod tests {
             .expect("re-revoke grant"));
         assert_eq!(store.list().expect("list after revoke").len(), 1);
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Tuples are a kernel-internal control-plane record, not files:
@@ -226,7 +226,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -252,7 +252,7 @@ mod tests {
             "rebac tuple leaked into a file-metadata listing"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// Two typed views over the same consensus reach two disjoint
@@ -270,7 +270,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -304,7 +304,7 @@ mod tests {
             "deleting from rebac namespace must not touch auth namespace",
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// A warm graph is reused, then a committed revoke invalidates it. Snapshot
@@ -316,7 +316,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
-        let node = registry.create_zone("root", vec![], &runtime).unwrap();
+        let node = registry.create_zone("root", &runtime).unwrap();
         node.campaign().await.unwrap();
         let store = Arc::new(RaftReBACTupleStore::new(node.clone(), runtime));
         let tuple = lib::types::ReBACTuple {
@@ -383,6 +383,6 @@ mod tests {
             &restored,
             &cache.graph_for_zone("root").unwrap()
         ));
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

@@ -7,6 +7,12 @@ mod rpc;
 #[path = "conditional_content/protection.rs"]
 mod protection;
 
+#[path = "conditional_content/guarded.rs"]
+mod guarded;
+
+#[path = "conditional_content/owner_control.rs"]
+mod owner_control;
+
 #[path = "conditional_content/rename.rs"]
 mod rename;
 
@@ -60,7 +66,7 @@ impl Fixture {
         is_deferred: bool,
     ) -> Self {
         let manager = ZoneManager::isolated(root.path().join("raft").to_str().unwrap()).unwrap();
-        let zone = manager.create_zone("root", vec![]).unwrap();
+        let zone = manager.create_zone("root").unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         let kernel = Arc::new(Kernel::new());
         let backend = Arc::new(CasLocalBackend::new_durable(&root.path().join("cas")).unwrap());
@@ -313,7 +319,8 @@ fn corrupt_and_missing_immutable_objects_are_failures_instead_of_absence() {
         .as_cas()
         .unwrap()
         .transport()
-        .blob_path(metadata.content_id.as_ref().unwrap());
+        .blob_path(metadata.content_id.as_ref().unwrap())
+        .unwrap();
     std::fs::write(&object, b"corrupted").unwrap();
     assert!(matches!(
         fixture

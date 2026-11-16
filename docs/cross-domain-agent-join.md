@@ -314,7 +314,7 @@ Preparation performs no issuer RPC, activates no runtime credential and grants
 no space. `issue_v1`, `query_v1` and `publish_v1` accept the same PID/operation
 shape and re-resolve the real owner and host binding. They load the original
 key/request; none implicitly prepares a missing request. The native profile
-supplies its selected TLS identity and its existing `AgentMinterSlot`, not a
+supplies its selected TLS identity and its existing `CaIssuerSlot`, not a
 certificate or URL supplied by the caller. Issuance is an in-process call to
 that same current Node-gated I/F coordinator, not a second issuer or a claim
 that public DER alone is proof of mTLS possession.

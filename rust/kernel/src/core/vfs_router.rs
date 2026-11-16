@@ -112,9 +112,8 @@ pub struct MountEntry {
 }
 
 impl MountEntry {
-    /// Construct a new entry. `metastore` always starts `None`; the metastore
-    /// slot is owned by `VFSRouter::install_metastore` and never set through
-    /// `add` / `add_mount` / `add_federation_mount` (orthogonal-slot contract).
+    /// Construct a backend entry. Bootstrap may attach its metastore separately;
+    /// a caller supplying both storage pillars publishes them together.
     pub fn new(backend: Option<Arc<dyn ObjectStore>>) -> Self {
         let is_cas = backend.as_ref().is_some_and(|b| b.as_cas().is_some());
         Self {
@@ -486,13 +485,20 @@ impl VFSRouter {
             "VFSRouter::add ignores the metastore slot; callers must use \
              install_metastore (orthogonal-slot contract)",
         );
+        self.publish_mount(mount_point, zone_id, entry);
+    }
+
+    /// Publish one captured route. An omitted metastore preserves bootstrap's
+    /// existing slot; an explicit metastore replaces it with the backend under
+    /// the same entry lock, so readers always capture a complete storage pair.
+    fn publish_mount(&self, mount_point: &str, zone_id: &str, mut entry: MountEntry) {
         let canonical = canonicalize_mount_path(mount_point, zone_id);
         match self.entries.entry(canonical) {
             Entry::Occupied(mut occ) => {
-                let preserved_metastore = occ.get().metastore.clone();
-                let mut new_entry = entry;
-                new_entry.metastore = preserved_metastore;
-                *occ.get_mut() = new_entry;
+                if entry.metastore.is_none() {
+                    entry.metastore = occ.get().metastore.clone();
+                }
+                *occ.get_mut() = entry;
             }
             Entry::Vacant(vac) => {
                 vac.insert(entry);
@@ -500,9 +506,7 @@ impl VFSRouter {
         }
     }
 
-    /// Convenience: build a `MountEntry` from flat args and insert it.
-    /// Used by `Kernel::add_mount` so callers don't have to import
-    /// `MountEntry` just to register a mount.
+    /// Register backend-side mount fields while preserving the metastore slot.
     pub fn add_mount(
         &self,
         mount_point: &str,
@@ -515,6 +519,20 @@ impl VFSRouter {
             zone_id,
             MountEntry::new(backend).with_is_external(is_external),
         );
+    }
+
+    /// Install a caller-supplied storage pair as one routing-table update.
+    pub(crate) fn add_mount_with_metastore(
+        &self,
+        mount_point: &str,
+        zone_id: &str,
+        backend: Option<Arc<dyn ObjectStore>>,
+        metastore: Option<Arc<dyn MetaStore>>,
+        is_external: bool,
+    ) {
+        let mut entry = MountEntry::new(backend).with_is_external(is_external);
+        entry.metastore = metastore;
+        self.publish_mount(mount_point, zone_id, entry);
     }
 
     /// Federation variant: install a mount that carries an explicit

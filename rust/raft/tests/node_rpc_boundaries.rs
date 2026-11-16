@@ -2,6 +2,24 @@
 //! consensus data are isolated; no fleet endpoint or model is used.
 #![cfg(all(feature = "grpc", has_protos))]
 mod common;
+#[path = "node_rpc_boundaries/enrollment.rs"]
+mod enrollment;
+#[path = "node_rpc_boundaries/listener_start.rs"]
+mod listener_start;
+#[path = "node_rpc_boundaries/member_preparation.rs"]
+mod member_preparation;
+#[path = "node_rpc_boundaries/reader_capability.rs"]
+mod reader_capability;
+#[path = "node_rpc_boundaries/reader_preparation.rs"]
+mod reader_preparation;
+#[path = "node_rpc_boundaries/replica_join.rs"]
+mod replica_join;
+#[path = "node_rpc_boundaries/replica_transport.rs"]
+mod replica_transport;
+#[path = "node_rpc_boundaries/revocation.rs"]
+mod revocation;
+#[path = "node_rpc_boundaries/storage_transport.rs"]
+mod storage_transport;
 
 use lib::transport_primitives::{FederatedClientCertVerifier, ForeignCaAnchor};
 use nexus_raft::transport::proto::{
@@ -14,12 +32,12 @@ use nexus_raft::{
     prelude::Command,
     raft::ZoneRaftRegistry,
     transport::{
-        generate_agent_cert, generate_node_cert, generate_zone_ca, RaftGrpcServer,
-        RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
+        generate_agent_cert, generate_node_cert, generate_user_replica_cert, generate_zone_ca,
+        RaftGrpcServer, RaftWitnessServer, ServerConfig, TlsConfig, WitnessZoneRegistry,
     },
 };
 use protobuf::Message as _;
-use std::{sync::Arc, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 async fn connect(address: &str, ca: &[u8], cert: Vec<u8>, key: Vec<u8>) -> Channel {
@@ -50,6 +68,641 @@ async fn listener_ready(address: &str) {
     .await
     .expect("isolated listener must bind");
 }
+
+async fn admit_root_learners_without_routes(registry: &ZoneRaftRegistry, node_ids: &[u64]) {
+    let node = registry.get_node("root").unwrap();
+    for &node_id in node_ids {
+        node.propose_conf_change(
+            raft::eraftpb::ConfChangeType::AddLearnerNode,
+            node_id,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!registry.get_peers("root").unwrap().contains_key(&node_id));
+    }
+}
+
+struct PeerServer {
+    _directory: tempfile::TempDir,
+    registry: Arc<ZoneRaftRegistry>,
+    endpoint: String,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PeerServer {
+    async fn start(tls: TlsConfig) -> Self {
+        lib::transport_primitives::ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ZoneRaftRegistry::with_tls(
+            directory.path().to_path_buf(),
+            7,
+            Some(tls.clone()),
+        ));
+        let root = registry
+            .create_zone("root", &tokio::runtime::Handle::current())
+            .unwrap();
+        root.campaign().await.unwrap();
+        let address = common::node_bind_addr();
+        let server = RaftGrpcServer::new(
+            registry.clone(),
+            ServerConfig {
+                bind_address: address.parse().unwrap(),
+                tls: Some(tls),
+                ..Default::default()
+            },
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        listener_ready(&address).await;
+        Self {
+            _directory: directory,
+            registry,
+            endpoint: format!("http://{address}"),
+            stop,
+            task,
+        }
+    }
+
+    async fn shutdown(self) {
+        drop(self.shutdown_preserving_storage().await);
+    }
+
+    async fn shutdown_preserving_storage(self) -> tempfile::TempDir {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap();
+        self.registry.shutdown().released().await;
+        drop(self.registry);
+        self._directory
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PeerRefusal {
+    Identity(&'static str),
+    Issuer,
+}
+
+/// Preserve the TLS cause through tonic, hyper and the I/O error wrapper.
+/// A timeout, closed socket or unrelated certificate error cannot pass here.
+fn assert_peer_refusal(error: &lib::transport_primitives::TransportError, refusal: PeerRefusal) {
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            let matches = match (refusal, tls) {
+                (PeerRefusal::Identity(expected), rustls::Error::General(actual)) => {
+                    actual == expected
+                }
+                (
+                    PeerRefusal::Issuer,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer
+                        | rustls::CertificateError::BadSignature,
+                    ),
+                ) => true,
+                _ => false,
+            };
+            assert!(matches, "unexpected peer refusal: {error:?}");
+            return;
+        }
+        cause = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn Error + 'static)),
+            None => current.source(),
+        };
+    }
+    panic!("connection did not fail at TLS peer validation: {error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_peer_tls_binds_node_and_owner_replica_before_any_rpc() {
+    use lib::transport_primitives::{create_peer_channel, ClientConfig};
+    use nexus_raft::transport::{generate_user_runtime_cert, proto::GetClusterInfoRequest};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (foreign_ca, foreign_key) = generate_zone_ca("root").unwrap();
+    let (other_named_ca, other_named_key) = generate_zone_ca("other-root").unwrap();
+    let (client_cert, client_key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let config = ClientConfig {
+        tls: Some(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem: client_cert,
+            key_pem: client_key,
+        }),
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "node",
+            generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap(),
+            None,
+        ),
+        (
+            "replica",
+            generate_user_replica_cert("peer", "alice", 7, 300, &ca, &ca_key).unwrap(),
+            None,
+        ),
+        (
+            "other node",
+            generate_node_cert(8, "root", &ca, &ca_key, &[], None).unwrap(),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
+        ),
+        (
+            "other replica",
+            generate_user_replica_cert("peer", "alice", 8, 300, &ca, &ca_key).unwrap(),
+            Some(PeerRefusal::Identity(
+                "server certificate does not name the expected replication peer",
+            )),
+        ),
+        (
+            "runtime without replica",
+            generate_user_runtime_cert("peer", "alice", 300, &ca, &ca_key).unwrap(),
+            Some(PeerRefusal::Identity(
+                "Node certificate must carry exactly one Nexus identity",
+            )),
+        ),
+        (
+            "other issuer with the same distinguished name",
+            generate_node_cert(7, "root", &foreign_ca, &foreign_key, &[], None).unwrap(),
+            Some(PeerRefusal::Issuer),
+        ),
+        (
+            "other issuer with a different distinguished name",
+            generate_node_cert(7, "root", &other_named_ca, &other_named_key, &[], None).unwrap(),
+            Some(PeerRefusal::Issuer),
+        ),
+    ];
+    for (label, (cert_pem, key_pem), refusal) in cases {
+        let server = PeerServer::start(TlsConfig {
+            ca_pem: ca.clone(),
+            cert_pem,
+            key_pem,
+        })
+        .await;
+        let channel = create_peer_channel(&server.endpoint, &config, 7.try_into().unwrap()).await;
+        if let Some(refusal) = refusal {
+            let error = channel.expect_err("unexpected peer must fail before any RPC");
+            assert_peer_refusal(&error, refusal);
+        } else {
+            let mut rpc = ZoneApiServiceClient::new(channel.unwrap());
+            let info = rpc
+                .get_cluster_info(GetClusterInfoRequest {
+                    zone_id: "root".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(info.node_id, 7, "{label}");
+            drop(rpc);
+        }
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_pool_rechecks_changed_routes_and_tls_before_reusing_a_channel() {
+    use nexus_raft::transport::{ClientConfig, NodeAddress, RaftClientPool};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let expected = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let (cert_pem, key_pem) = generate_node_cert(8, "root", &ca, &ca_key, &[], None).unwrap();
+    let other = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let tls = lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
+        ca_pem: ca,
+        cert_pem,
+        key_pem,
+    }));
+    let pool = RaftClientPool::with_config(ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    });
+    let address = NodeAddress::new(7, expected.endpoint.clone());
+    drop(
+        pool.get(&address)
+            .await
+            .expect("the expected peer connects"),
+    );
+    for address in [
+        NodeAddress::new(7, other.endpoint.clone()),
+        NodeAddress::new(8, expected.endpoint.clone()),
+    ] {
+        let error = pool
+            .get(&address)
+            .await
+            .err()
+            .expect("changed route or requested identity must be rechecked");
+        assert_peer_refusal(
+            &error,
+            PeerRefusal::Identity("server certificate does not name the expected replication peer"),
+        );
+    }
+    let mut replacement = tls.snapshot().config().unwrap().unwrap().clone();
+    replacement.ca_pem = generate_zone_ca("root").unwrap().0;
+    tls.replace(lib::transport_primitives::TlsPolicy::Configured(
+        replacement,
+    ));
+    let error = pool
+        .get(&address)
+        .await
+        .err()
+        .expect("changed trust roots must invalidate an established channel");
+    assert_peer_refusal(&error, PeerRefusal::Issuer);
+    drop(pool);
+    expected.shutdown().await;
+    other.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_pool_rejects_an_in_flight_dial_after_credentials_change() {
+    use nexus_raft::transport::{ClientConfig, NodeAddress, RaftClientPool};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert_pem, key_pem) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let server = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    })
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = NodeAddress::new(7, format!("http://{}", listener.local_addr().unwrap()));
+    let backend = server.endpoint.strip_prefix("http://").unwrap().to_owned();
+    let (connected, accepted) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut incoming, _) = listener.accept().await.unwrap();
+        connected.send(()).unwrap();
+        released.await.unwrap();
+        let mut outgoing = tokio::net::TcpStream::connect(backend).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+    });
+    let (cert_pem, key_pem) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let tls = lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem,
+        key_pem,
+    }));
+    let pool = RaftClientPool::with_config(ClientConfig {
+        tls: tls.clone(),
+        ..Default::default()
+    });
+    let old_pool = pool.clone();
+    let dial = tokio::spawn(async move { old_pool.get(&address).await });
+    tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !dial.is_finished(),
+        "the old TLS handshake must still be pending"
+    );
+    let (cert_pem, key_pem) = generate_node_cert(3, "root", &ca, &ca_key, &[], None).unwrap();
+    tls.replace(lib::transport_primitives::TlsPolicy::Configured(
+        TlsConfig {
+            ca_pem: ca,
+            cert_pem,
+            key_pem,
+        },
+    ));
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), dial)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("a dial under the previous identity cannot publish a connection");
+    assert!(
+        error
+            .to_string()
+            .contains("TLS configuration changed while connecting"),
+        "{error}"
+    );
+    assert_eq!(pool.connection_count().await, 0);
+    drop(pool);
+    proxy.abort();
+    let _ = proxy.await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_local_root_refuses_incremental_ec_and_state_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = nexus_raft::ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+    let root = manager.create_zone_async("root").await.unwrap();
+    assert!(root.wait_for_leader(Duration::from_secs(5)));
+    let node = root.consensus_node();
+    node.propose(Command::SetMetadata {
+        key: "/private-root".into(),
+        value: b"local durable value".to_vec(),
+    })
+    .await
+    .unwrap();
+    node.read_linearizable(|_| ()).await.unwrap();
+    let original_index = node.last_index();
+    let original_wal = node.ec_wal_bounds();
+    let address = common::node_bind_addr();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_node_cert(manager.node_id(), "root", &ca, &ca_key, &[], None).unwrap();
+    let server_tls = TlsConfig {
+        cert_pem: cert,
+        key_pem: key,
+        ca_pem: ca.clone(),
+    };
+    manager
+        .registry()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
+    let server = RaftGrpcServer::new(
+        manager.registry(),
+        ServerConfig {
+            bind_address: address.parse().unwrap(),
+            tls: Some(server_tls),
+            ..Default::default()
+        },
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(server.serve_with_shutdown(async move {
+        let _ = stopped.await;
+    }));
+    listener_ready(&address).await;
+    let (cert, key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let channel = connect(&address, &ca, cert, key).await;
+    let mut client = ZoneTransportServiceClient::new(channel);
+    let entry = EcReplicationEntry {
+        seq: 1,
+        command: bincode::serialize(&Command::SetMetadata {
+            key: "/private-root".into(),
+            value: b"remote overwrite".to_vec(),
+        })
+        .unwrap(),
+        timestamp: u64::MAX,
+        node_id: 2,
+    };
+    let incremental = client
+        .replicate_entries(ReplicateEntriesRequest {
+            zone_id: "root".into(),
+            sender_node_id: 2,
+            entries: vec![entry.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!incremental.success);
+    assert_eq!(incremental.applied_up_to, 0);
+    let snapshot = client
+        .snapshot_ec_state(SnapshotEcStateRequest {
+            zone_id: "root".into(),
+            sender_node_id: 2,
+            entries: vec![entry],
+            covering_seq: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!snapshot.success);
+    assert_eq!(snapshot.acked_up_to, 0);
+    assert_eq!(node.last_index(), original_index);
+    assert_eq!(node.ec_wal_bounds(), original_wal);
+    assert_eq!(
+        node.with_state_machine(|state| state.get_metadata("/private-root"))
+            .await
+            .unwrap(),
+        Some(b"local durable value".to_vec())
+    );
+    drop(client);
+    stop.send(()).unwrap();
+    listener.await.unwrap().unwrap();
+    manager.shutdown();
+}
+
+async fn assert_owner_replica_data_scope(
+    registry: &Arc<ZoneRaftRegistry>,
+    address: &str,
+    ca: &[u8],
+    ca_key: &[u8],
+) {
+    use nexus_raft::transport::proto::{GetClusterInfoRequest, JoinZoneRequest, QueryRequest};
+    use raft::eraftpb::{ConfChangeType, Entry, EntryType, MessageType};
+    const ZONE: &str = "owner-replica-data";
+    let node = registry
+        .create_zone(ZONE, &tokio::runtime::Handle::current())
+        .unwrap();
+    node.campaign().await.unwrap();
+    let membership = node
+        .propose_conf_change(ConfChangeType::AddLearnerNode, 4, Vec::new())
+        .await
+        .unwrap();
+    assert!(membership.learners.contains(&4));
+    let (cert, key) =
+        generate_user_replica_cert("session-member", "alice", 4, 300, ca, ca_key).unwrap();
+    let channel = connect(address, ca, cert, key).await;
+    let mut member = ZoneApiServiceClient::new(channel.clone());
+    let mut proposal = put("member-data");
+    proposal.zone_id = ZONE.into();
+    assert!(member.propose(proposal).await.unwrap().into_inner().success);
+    assert_eq!(
+        node.read_linearizable(|sm| sm.get_control_state("node-boundary-fixture", "member-data"))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(b"private fixture value".to_vec())
+    );
+    assert!(member
+        .get_cluster_info(GetClusterInfoRequest {
+            zone_id: ZONE.into()
+        })
+        .await
+        .is_ok());
+    assert_eq!(
+        member
+            .join_zone(JoinZoneRequest {
+                zone_id: ZONE.into(),
+                node_id: 5,
+                node_address: String::new(),
+                as_learner: true
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut member_transport = ZoneTransportServiceClient::new(channel);
+    let mut entry = metadata_entry("/member-ec");
+    entry.node_id = 4;
+    let applied = member_transport
+        .replicate_entries(ReplicateEntriesRequest {
+            zone_id: ZONE.into(),
+            entries: vec![entry],
+            sender_node_id: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(applied.success);
+    assert_eq!(applied.applied_up_to, 1);
+    assert!(node
+        .read_linearizable(|sm| sm.get_metadata("/member-ec"))
+        .await
+        .unwrap()
+        .unwrap()
+        .is_some());
+    let mut membership_proposal = raft::eraftpb::Message {
+        from: 4,
+        to: 1,
+        ..Default::default()
+    };
+    membership_proposal.set_msg_type(MessageType::MsgPropose);
+    let mut change = Entry::default();
+    change.set_entry_type(EntryType::EntryConfChangeV2);
+    membership_proposal.entries.push(change);
+    assert_eq!(
+        member_transport
+            .step_message(StepMessageRequest {
+                zone_id: ZONE.into(),
+                message: membership_proposal.write_to_bytes().unwrap(),
+                sender_address: String::new(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let (cert, key) =
+        generate_user_replica_cert("session-outsider", "charlie", 5, 300, ca, ca_key).unwrap();
+    let channel = connect(address, ca, cert, key).await;
+    let mut outsider = ZoneApiServiceClient::new(channel.clone());
+    let mut attempted = put("outsider-data");
+    attempted.zone_id = ZONE.into();
+    assert_eq!(
+        outsider.propose(attempted).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        outsider
+            .query(QueryRequest {
+                zone_id: ZONE.into(),
+                query: None,
+                read_from_leader: false
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        outsider
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: ZONE.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut transport = ZoneTransportServiceClient::new(channel);
+    assert_eq!(
+        transport
+            .replicate_entries(ReplicateEntriesRequest {
+                zone_id: ZONE.into(),
+                sender_node_id: 5,
+                entries: vec![metadata_entry("/outsider-ec")]
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        transport
+            .snapshot_ec_state(SnapshotEcStateRequest {
+                zone_id: ZONE.into(),
+                sender_node_id: 5,
+                covering_seq: 73,
+                entries: vec![metadata_entry("/outsider-snapshot")]
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut snapshot = raft::eraftpb::Message {
+        from: 5,
+        to: 1,
+        term: 1,
+        ..Default::default()
+    };
+    snapshot.set_msg_type(MessageType::MsgSnapshot);
+    snapshot.mut_snapshot().mut_metadata().index = 10;
+    snapshot.mut_snapshot().mut_metadata().term = 1;
+    snapshot
+        .mut_snapshot()
+        .mut_metadata()
+        .mut_conf_state()
+        .voters = vec![1, 5];
+    for zone in [ZONE, "unadmitted-data"] {
+        assert_eq!(
+            transport
+                .step_message(StepMessageRequest {
+                    zone_id: zone.into(),
+                    message: snapshot.write_to_bytes().unwrap(),
+                    sender_address: "127.0.0.1:19997".into()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+    assert!(!registry.hosts("unadmitted-data"));
+    assert!(!registry.get_peers(ZONE).unwrap().contains_key(&5));
+    for path in ["/outsider-ec", "/outsider-snapshot"] {
+        assert!(node
+            .read_linearizable(|sm| sm.get_metadata(path))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
+    node.propose_conf_change(ConfChangeType::RemoveNode, 4, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        member
+            .get_cluster_info(GetClusterInfoRequest {
+                zone_id: ZONE.into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
 fn put(key: &str) -> ProposeRequest {
     ProposeRequest {
         zone_id: "root".into(),
@@ -80,6 +733,136 @@ fn metadata_entry(path: &str) -> EcReplicationEntry {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ec_decode_failures_preserve_replication_positions_until_complete_retry() {
+    use nexus_raft::transport::{ClientConfig, RaftClient, TransportError};
+
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (server_cert, server_key) = generate_node_cert(7, "root", &ca, &ca_key, &[], None).unwrap();
+    let server = PeerServer::start(TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    })
+    .await;
+    let node = server.registry.get_node("root").unwrap();
+    let (cert, key) = generate_node_cert(2, "root", &ca, &ca_key, &[], None).unwrap();
+    let channel = connect(
+        server.endpoint.strip_prefix("http://").unwrap(),
+        &ca,
+        cert.clone(),
+        key.clone(),
+    )
+    .await;
+    let mut wire = ZoneTransportServiceClient::new(channel);
+    let mut sender = RaftClient::connect(
+        &server.endpoint,
+        ClientConfig {
+            tls: lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
+                ca_pem: ca,
+                cert_pem: cert,
+                key_pem: key,
+            })),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for snapshot in [false, true] {
+        for corruption in ["unknown-command", "truncated", "trailing-fields"] {
+            let paths: Vec<_> = ["before", "failed", "after"]
+                .map(|part| format!("/{snapshot}/{corruption}/{part}"))
+                .into();
+            let good: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| EcReplicationEntry {
+                    seq: index as u64 + 1,
+                    ..metadata_entry(path)
+                })
+                .collect();
+            let mut broken = good.clone();
+            match corruption {
+                "unknown-command" => broken[1].command = u32::MAX.to_le_bytes().to_vec(),
+                "truncated" => {
+                    broken[1].command.pop();
+                }
+                "trailing-fields" => broken[1].command.extend_from_slice(b"unread fields"),
+                _ => unreachable!(),
+            }
+            if snapshot {
+                let result = wire
+                    .snapshot_ec_state(SnapshotEcStateRequest {
+                        zone_id: "root".into(),
+                        sender_node_id: 2,
+                        entries: broken.clone(),
+                        covering_seq: 100,
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(!result.success, "{corruption}");
+                assert_eq!(result.acked_up_to, 0);
+                assert!(result.error.unwrap().contains("decode EC entry 2"));
+            } else {
+                let result = wire
+                    .replicate_entries(ReplicateEntriesRequest {
+                        zone_id: "root".into(),
+                        sender_node_id: 2,
+                        entries: broken.clone(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(!result.success, "{corruption}");
+                assert_eq!(result.applied_up_to, 1);
+                assert!(result.error.unwrap().contains("decode EC entry 2"));
+            }
+            // The production client must expose a failure to the completion
+            // loop, which retains its WAL cursor and retries with backoff.
+            let failed = if snapshot {
+                sender
+                    .snapshot_ec_state("root".into(), broken, 100, 2)
+                    .await
+            } else {
+                sender.replicate_entries("root".into(), broken, 2).await
+            };
+            assert!(matches!(failed, Err(TransportError::Rpc(ref error))
+                if error.contains("decode EC entry 2")));
+            for (index, path) in paths.iter().enumerate() {
+                let path = path.clone();
+                let value = node
+                    .with_state_machine(move |state| state.get_metadata(&path))
+                    .await
+                    .unwrap();
+                assert_eq!(value.is_some(), index == 0);
+            }
+
+            // Replaying the complete compatible batch retains the prefix and
+            // applies every missing item before acknowledging the transfer.
+            let acknowledged = if snapshot {
+                sender.snapshot_ec_state("root".into(), good, 100, 2).await
+            } else {
+                sender.replicate_entries("root".into(), good, 2).await
+            }
+            .unwrap();
+            assert_eq!(acknowledged, if snapshot { 100 } else { 3 });
+            for path in paths {
+                assert_eq!(
+                    node.with_state_machine(move |state| state.get_metadata(&path))
+                        .await
+                        .unwrap(),
+                    Some(br#"{"fixture":"node sender boundary"}"#.to_vec())
+                );
+            }
+        }
+    }
+    drop(wire);
+    drop(sender);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
     let (foreign, foreign_key) = generate_zone_ca("root").unwrap();
@@ -91,19 +874,29 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     let private = tempfile::tempdir().unwrap();
     let registry = Arc::new(ZoneRaftRegistry::new(private.path().to_path_buf(), 1));
     let node = registry
-        .create_zone("root", vec![], &tokio::runtime::Handle::current())
+        .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
+    // Include the forged sender and relayed origin so membership filtering
+    // cannot hide an incorrect identity check or address attribution.
+    admit_root_learners_without_routes(&registry, &[2, 3, 7]).await;
     let address = common::node_bind_addr();
+    let server_tls = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    };
+    registry
+        .clone()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
     let server = RaftGrpcServer::new(
         registry.clone(),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                ca_pem: ca.clone(),
-                cert_pem: server_cert,
-                key_pem: server_key,
-            }),
+            tls: Some(server_tls),
             ..ServerConfig::default()
         },
     )
@@ -321,10 +1114,13 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
     }
 
     let domestic = generate_agent_cert("domestic-agent", &ca, &ca_key).unwrap();
+    let replica =
+        generate_user_replica_cert("session-replica", "alice", 19, 300, &ca, &ca_key).unwrap();
     let foreign_agent = generate_agent_cert("foreign-agent", &foreign, &foreign_key).unwrap();
     let foreign_node = generate_node_cert(2, "root", &foreign, &foreign_key, &[], None).unwrap();
     for (label, (cert, key)) in [
         ("domestic-agent", domestic),
+        ("owner-replica", replica),
         ("foreign-agent", foreign_agent),
         ("foreign-node", foreign_node),
     ] {
@@ -365,12 +1161,12 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
             assert!(!reply.success);
         }
     }
+    assert_owner_replica_data_scope(&registry, &address, &ca, &ca_key).await;
     stop.send(()).unwrap();
     running.await.unwrap();
     drop(node);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -407,8 +1203,9 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
             .unwrap();
     });
     listener_ready(&address).await;
-    let (cert, key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
-    let mut transport = ZoneTransportServiceClient::new(connect(&address, &ca, cert, key).await);
+    let (cert, node_key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
+    let mut transport =
+        ZoneTransportServiceClient::new(connect(&address, &ca, cert, node_key).await);
     let mut message = raft::eraftpb::Message::default();
     message.set_msg_type(raft::eraftpb::MessageType::MsgHeartbeatResponse);
     message.set_from(7);
@@ -427,6 +1224,22 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
     assert!(registry.get_node(refused_zone).is_none());
     assert!(!private.path().join(refused_zone).exists());
     message.set_from(2);
+    let (cert, replica_key) =
+        generate_user_replica_cert("session-replica", "alice", 2, 300, &ca, &key).unwrap();
+    let mut replica =
+        ZoneTransportServiceClient::new(connect(&address, &ca, cert, replica_key).await);
+    let refused_zone = "owner-replica-witness-zone";
+    let refusal = replica
+        .step_message(StepMessageRequest {
+            message: message.write_to_bytes().unwrap(),
+            zone_id: refused_zone.into(),
+            sender_address: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    assert!(registry.get_node(refused_zone).is_none());
+    assert!(!private.path().join(refused_zone).exists());
     let accepted_zone = "accepted-witness-zone";
     transport
         .step_message(StepMessageRequest {
@@ -437,9 +1250,46 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
         .await
         .unwrap();
     assert!(registry.get_node(accepted_zone).is_some());
+    let versioned_zone = "versioned-witness-zone";
+    transport
+        .step_storage_v1(StepMessageRequest {
+            message: message.write_to_bytes().unwrap(),
+            zone_id: versioned_zone.into(),
+            sender_address: "127.0.0.1:19998".into(),
+        })
+        .await
+        .unwrap();
+    assert!(registry.get_node(versioned_zone).is_some());
+    message.set_from(7);
+    let refused_zone = "versioned-forged-witness-zone";
+    assert_eq!(
+        transport
+            .step_storage_v1(StepMessageRequest {
+                message: message.write_to_bytes().unwrap(),
+                zone_id: refused_zone.into(),
+                sender_address: "127.0.0.1:19999".into(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(registry.get_node(refused_zone).is_none());
+    assert!(!private.path().join(refused_zone).exists());
+    assert_eq!(
+        replica
+            .step_storage_v1(StepMessageRequest {
+                message: vec![0xff],
+                zone_id: versioned_zone.into(),
+                sender_address: String::new(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
     stop.send(()).unwrap();
     running.await.unwrap();
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }

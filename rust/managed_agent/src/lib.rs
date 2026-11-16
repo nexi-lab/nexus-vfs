@@ -48,8 +48,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use contracts::{resolve_agent_owner, resolve_agent_zone, AgentContextError, OperationContext};
+use kernel::core::agents::host_cleanup::{HostCleanupOutcome, ManagedHostCleanup};
 use kernel::core::agents::registry::{
-    AgentDescriptor, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
+    AgentDescriptor, AgentError, AgentInstance, AgentKind, AgentRegistry, AgentState, RepoMount,
 };
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::service_registry::{RustCallError, RustService};
@@ -59,6 +60,10 @@ use kernel::service_registry::{RustCallError, RustService};
 #[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
 
+#[cfg(feature = "subprocess-host")]
+mod durable_session;
+
+pub mod bootstrap;
 pub mod credential_binding;
 pub(crate) mod proc_entry;
 mod runtime_discovery;
@@ -143,14 +148,6 @@ const MODEL_LABEL: &str = "model";
 
 use session::{alloc_pid, now_ms};
 
-fn valid_durable_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-}
-
 // ── Public request / response shapes ────────────────────────────────────
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -183,7 +180,7 @@ pub(crate) struct StartSessionRequest {
     /// Mutually exclusive with daemon-owned `spawn_spec`.
     #[serde(default)]
     pub local_host: Option<contracts::local_host::LocalHostOffer>,
-    /// Durable transcript to restore in an in-process runtime. This is NOT
+    /// Durable transcript to restore in a supporting hosted runtime. This is NOT
     /// the pid-valued `session_id` accepted by get/cancel.
     #[serde(default)]
     pub resume_session_id: Option<String>,
@@ -218,7 +215,7 @@ pub(crate) struct StartSessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_endpoint: Option<a2a::session::SessionEndpoint>,
     /// Runtime-owned transcript ID, when the spawn provider supports persistence.
-    /// Absent for raw subprocesses and providers without durable sessions.
+    /// Raw subprocesses report it through get/list only after original ACP establishment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_session_id: Option<String>,
     pub workspace_path: String,
@@ -250,7 +247,7 @@ pub(crate) struct GetSessionResponse {
     /// nobody can check.
     pub owner_id: String,
     /// Runtime-owned transcript ID, when the spawn provider supports persistence.
-    /// Absent for raw subprocesses and providers without durable sessions.
+    /// Raw subprocesses report it only after original ACP establishment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_session_id: Option<String>,
     pub workspace_path: String,
@@ -287,7 +284,11 @@ pub(crate) struct GetSessionRequest {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CancelResponse {
+    /// The request reached the captured instance; this is not a joined-cleanup receipt.
     pub cancelled: bool,
+    /// Original host cleanup or its terminal callback is still outstanding.
+    #[serde(default)]
+    pub stopping: bool,
 }
 
 #[derive(Debug)]
@@ -327,8 +328,8 @@ impl std::error::Error for ManagedAgentError {}
 /// impls (e.g. the sudocode-runtime adapter) hold whatever
 /// in-process state the spawn body needs (worker thread join handle,
 /// abort signal, future tokio task handle). The services-tier sees
-/// only the abort capability — that's what the on_terminate observer
-/// needs to tear the loop down on session termination.
+/// the stop signal. The separate original-host cleanup latch carries the
+/// provider's joined outcome; abort alone never proves teardown.
 pub trait SpawnHandle: Send + Sync {
     /// Signal the spawn body to stop. Implementations MUST be
     /// idempotent — the on_terminate observer can fire concurrently
@@ -345,12 +346,74 @@ pub trait SpawnHandle: Send + Sync {
     }
 }
 
+/// Native custody of a handle belongs to its registry incarnation, not a PID
+/// lookup alone. Providers keep the existing trait; the service binds them.
+pub(crate) struct HostedSession {
+    instance: AgentInstance,
+    handle: Arc<dyn SpawnHandle>,
+    cleanup: Option<ManagedHostCleanup>,
+}
+
+type HostedSessions = Arc<dashmap::DashMap<String, HostedSession>>;
+
+fn store_host_handle(
+    registry: &AgentRegistry,
+    handles: &HostedSessions,
+    pid: String,
+    instance: AgentInstance,
+    handle: Box<dyn SpawnHandle>,
+    cleanup: Option<&kernel::core::agents::host_cleanup::ManagedHostCleanup>,
+) -> Result<Arc<dyn SpawnHandle>, String> {
+    let handle: Arc<dyn SpawnHandle> = handle.into();
+    // All host insertions use the same map guard before the incarnation check.
+    // A late old attach cannot overwrite a replacement handle. An occupied
+    // stale slot also needs explicit cleanup; it is not replacement permission.
+    let reason = match handles.entry(pid) {
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            // A provider may complete all joins and publish Terminated before
+            // returning its handle. Its terminate callback has already run, so
+            // accepting that handle now would retain it without another cleanup
+            // callback. Check both incarnation and non-terminal state while the
+            // sidecar guard prevents a later callback from missing insertion.
+            if registry
+                .get_instance_descriptor(&instance)
+                .is_some_and(|descriptor| !descriptor.state.is_terminal())
+            {
+                let hosted = slot.insert(HostedSession {
+                    instance,
+                    handle: Arc::clone(&handle),
+                    cleanup: cleanup.cloned(),
+                });
+                drop(hosted);
+                if let Some(cleanup) = cleanup {
+                    let weak = Arc::downgrade(&handle);
+                    cleanup.set_stop_handler(Arc::new(move || {
+                        if let Some(handle) = weak.upgrade() {
+                            handle.abort();
+                        }
+                    }))?;
+                }
+                return Ok(handle);
+            }
+            "host incarnation retired before handle attachment"
+        }
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            "host handle already attached or cleanup unresolved"
+        }
+    };
+    // Abort can call the registry again, so release the sidecar guard first.
+    handle.abort();
+    Err(reason.into())
+}
+
 /// Optional runtime session selection. Existing providers retain their spawn
 /// implementation and explicitly reject recovery until they implement it.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnOptions {
     pub resume_session_id: Option<String>,
     pub session_endpoint: Option<a2a::session::SessionEndpoint>,
+    /// Exact host-owned instance. Binding only exposes engine facts.
+    pub runtime_observation: Option<Arc<dyn contracts::runtime_status::RuntimeObservationHost>>,
 }
 
 /// Spawn-task provider. `start_session` calls
@@ -360,6 +423,24 @@ pub struct SpawnOptions {
 /// keeps the spawn body monomorphised against the same kernel
 /// concrete that the service holds.
 pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
+    /// Start an in-process host which owns a native cleanup completion latch.
+    /// The provider must drive all existing writer/receiver/retirement joins,
+    /// complete the latch, and only then publish Closed/Terminated on success.
+    /// A spawn refusal may complete Ok only if no runtime resources were made.
+    /// Partial startup or teardown errors must retain an unconfirmed outcome.
+    /// Older providers are refused before their spawn method is called.
+    fn spawn_with_cleanup(
+        &self,
+        _kernel: Arc<K>,
+        _desc: AgentDescriptor,
+        _options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        _state_observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        cleanup.complete(Ok(())); // The default has not started anything.
+        Err("this runtime does not support joined host cleanup completion".into())
+    }
+
     /// Spawn the per-pid runtime body. Returns an opaque handle the
     /// service stores in its `spawn_handles` sidecar; the
     /// on_terminate observer aborts via the handle on session
@@ -428,7 +509,21 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
 pub(crate) trait RawSpawn: Send + Sync {
     /// Launch before registry insertion so the descriptor uses the actual child
     /// OS PID. Dropping an unattached launch terminates the child.
-    fn prepare(&self, spec: ProcessLaunch) -> Result<Box<dyn PreparedRawSpawn>, String>;
+    fn prepare(
+        &self,
+        spec: ProcessLaunch,
+        resume_session_id: Option<String>,
+    ) -> Result<Box<dyn PreparedRawSpawn>, String>;
+}
+
+/// Shared lexical contract for a runtime transcript, never an alias or path.
+fn valid_durable_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !matches!(id, "latest" | "last" | "recent")
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
 type StateObserver = Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>;
@@ -447,6 +542,7 @@ pub(crate) trait PreparedRawSpawn: Send {
 }
 
 pub(crate) struct ManagedAgentService<K: KernelSyscall> {
+    runtime_directory: Option<kernel::core::agents::registry::RuntimeDirectoryLookup>,
     /// Shared kernel handle for `start_session` to stamp the per-pid
     /// procfs subtree (`/proc/{pid}/`, `/proc/{pid}/workspace/`,
     /// workspace shortcut DT_LINK, per-repo alias DT_LINKs) and for
@@ -466,7 +562,7 @@ pub(crate) struct ManagedAgentService<K: KernelSyscall> {
     /// on_terminate observer (registered in `install_returning`) removes
     /// and aborts the handle on session termination so the worker /
     /// supervisor leaves cleanly.
-    spawn_handles: Arc<dashmap::DashMap<String, Box<dyn SpawnHandle>>>,
+    spawn_handles: HostedSessions,
     /// Optional raw-subprocess control-plane spawner for the `spawn_spec`
     /// path. `Some` only when `install_returning` wired the Kernel-concrete
     /// [`raw_spawn::KernelRawSpawn`] (`subprocess-host`); `None`
@@ -484,6 +580,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// land in the same metastore the assertion helpers read back.
     pub(crate) fn new(kernel: Arc<K>, agent_registry: Arc<AgentRegistry>) -> Self {
         Self {
+            runtime_directory: None,
             kernel,
             agent_registry,
             spawn_provider: None,
@@ -504,6 +601,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         spawn_provider: Arc<dyn SpawnTask<K>>,
     ) -> Self {
         Self {
+            runtime_directory: None,
             kernel,
             agent_registry,
             spawn_provider: Some(spawn_provider),
@@ -627,15 +725,16 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 .map_err(|error| ManagedAgentError::InvalidArgument(error.into()))?;
         }
         if let Some(id) = req.resume_session_id.as_deref() {
-            if !valid_durable_session_id(id) {
+            if !valid_durable_id(id) {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id must be a durable ID, not a path".into(),
                 ));
             }
-            if req.spawn_spec.is_some() || req.local_host.is_some() || self.spawn_provider.is_none()
+            if req.local_host.is_some()
+                || (req.spawn_spec.is_none() && self.spawn_provider.is_none())
             {
                 return Err(ManagedAgentError::InvalidArgument(
-                    "resume_session_id requires an in-process runtime provider".into(),
+                    "resume_session_id requires a hosted runtime provider".into(),
                 ));
             }
         }
@@ -682,7 +781,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     "process launch requires the subprocess-host feature".into(),
                 )
             })?;
-            Some(spawner.prepare(spec).map_err(ManagedAgentError::Internal)?)
+            Some(
+                spawner
+                    .prepare(spec, req.resume_session_id.clone())
+                    .map_err(ManagedAgentError::Internal)?,
+            )
         } else {
             None
         };
@@ -782,18 +885,39 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         ManagedAgentError::Internal(error)
                     })?;
             } else if let Some(provider) = self.spawn_provider.as_ref() {
-                // A refusal here is the session NOT starting: unwind the registration
-                // rather than leaving a pid whose runtime never existed, so a caller
-                // that retries after fixing the cause is not told the agent is
-                // already running.
+                let cleanup = self
+                    .agent_registry
+                    .arm_host_cleanup(&instance)
+                    .ok_or_else(|| {
+                        ManagedAgentError::Internal(
+                            "host incarnation retired before cleanup ownership was established"
+                                .into(),
+                        )
+                    })?;
+                // A provider may refuse before creating anything or fail after
+                // partial startup. Only its native completion latch can authorize
+                // retirement; an error string alone cannot distinguish those cases.
                 let handle = provider
-                    .spawn_with_options(
+                    .spawn_with_cleanup(
                         Arc::clone(&self.kernel),
                         desc,
                         SpawnOptions {
                             resume_session_id: req.resume_session_id.clone(),
                             session_endpoint: session_endpoint.clone(),
+                            runtime_observation:
+                                kernel::core::agents::registry::RuntimeRegistryHost::new(
+                                    Arc::clone(&self.agent_registry),
+                                    instance.clone(),
+                                    self.runtime_directory.clone(),
+                                )
+                                .map(|host| {
+                                    Arc::new(host)
+                                        as Arc<
+                                            dyn contracts::runtime_status::RuntimeObservationHost,
+                                        >
+                                }),
                         },
+                        cleanup.clone(),
                         observer,
                     )
                     .map_err(|e| {
@@ -807,6 +931,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         // message the refusal carries.
                         ManagedAgentError::Internal(format!("spawn agent runtime: {e}"))
                     })?;
+                // Retain even a malformed provider handle until its original
+                // cleanup finishes. Validation failure is not retirement.
+                let handle = store_host_handle(
+                    &self.agent_registry,
+                    &self.spawn_handles,
+                    pid.clone(),
+                    instance.clone(),
+                    handle,
+                    Some(&cleanup),
+                )
+                .map_err(ManagedAgentError::Internal)?;
                 if req.resume_session_id.as_deref().is_some_and(|requested| {
                     handle.durable_session_id().as_deref() != Some(requested)
                 }) {
@@ -835,7 +970,11 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         "managed runtime incarnation retired before host binding".into(),
                     ));
                 }
-                self.spawn_handles.insert(pid.clone(), handle);
+                if self.agent_registry.host_stop_requested(&instance) {
+                    return Err(ManagedAgentError::Internal(
+                        "host stop requested during startup; cleanup outcome unconfirmed".into(),
+                    ));
+                }
             }
         }
 
@@ -855,10 +994,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
     /// mechanism it picks (channel, atomic flag, …) — kernel doesn't
     /// know about turn boundaries.
     ///
-    /// `Session` — terminate: transition AgentRegistry to `Terminated`.
-    /// The on_terminate observer registered at install time tears down
-    /// the per-pid procfs dirent.  The runtime crate observes the state
-    /// transition and shuts down the agent task.
+    /// `Session` requests stop of the captured runtime. A hosted session reports
+    /// `stopping` until its original cleanup and terminal observer finish.
+    /// Only that confirmation permits `Terminated` and releases host custody.
     pub(crate) fn cancel(
         &self,
         session_id: &str,
@@ -881,12 +1019,23 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "turn cancellation uses session/cancel on the session mailbox".into(),
             )),
             CancelMode::Session => {
-                let cancelled = self
-                    .agent_registry
-                    .kill_instance(instance, 0)
-                    .map_err(|error| ManagedAgentError::Internal(error.to_string()))?
-                    .is_some();
-                Ok(CancelResponse { cancelled })
+                match self.agent_registry.kill_instance(instance, 0) {
+                    Ok(updated) => Ok(CancelResponse {
+                        cancelled: updated.is_some(),
+                        stopping: false,
+                    }),
+                    // kill_instance already requested stop on this incarnation.
+                    // Its original host may finish between signalling and this
+                    // outcome snapshot; neither branch is a terminal receipt.
+                    Err(AgentError::CleanupUnconfirmed {
+                        outcome: HostCleanupOutcome::Pending | HostCleanupOutcome::Joined,
+                        ..
+                    }) => Ok(CancelResponse {
+                        cancelled: true,
+                        stopping: true,
+                    }),
+                    Err(error) => Err(ManagedAgentError::Internal(error.to_string())),
+                }
             }
         }
     }
@@ -901,6 +1050,9 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             .agent_registry
             .get_instance(session_id)
             .ok_or_else(|| ManagedAgentError::UnknownSession(session_id.to_string()))?;
+        if descriptor.kind != AgentKind::Managed {
+            return Err(ManagedAgentError::UnknownSession(session_id.to_string()));
+        }
         Self::authorize_session_descriptor(&descriptor, ctx)?;
         Ok((instance, descriptor))
     }
@@ -966,20 +1118,56 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         instance: &AgentInstance,
         desc: AgentDescriptor,
     ) -> Result<GetSessionResponse, ManagedAgentError> {
-        let (session_endpoint, durable_session_id) = self
+        let (mut session_endpoint, durable_session_id, stop_outcome) = self
             .spawn_handles
             .get(&desc.pid)
-            .map(|handle| {
-                (
-                    handle.session_endpoint().cloned(),
-                    handle.durable_session_id(),
-                )
+            .map(|host| {
+                if host.instance.incarnation() != instance.incarnation() {
+                    return Err(ManagedAgentError::UnknownSession(desc.pid.clone()));
+                }
+                Ok((
+                    host.handle.session_endpoint().cloned(),
+                    host.handle.durable_session_id(),
+                    host.cleanup
+                        .as_ref()
+                        .and_then(ManagedHostCleanup::stop_outcome),
+                ))
             })
+            .transpose()?
             .unwrap_or_default();
         // Never combine an authorized PCB with another incarnation's handle.
-        if !self.agent_registry.is_current_instance(instance) {
-            return Err(ManagedAgentError::UnknownSession(desc.pid));
+        let desc = self
+            .agent_registry
+            .get_instance_descriptor(instance)
+            .ok_or(ManagedAgentError::UnknownSession(desc.pid))?;
+        // Stop can be requested while the provider is still constructing its
+        // handle. Without the original attachment, do not advertise readiness
+        // or invent a cleanup outcome from the descriptor alone.
+        if !desc.state.is_terminal()
+            && stop_outcome.is_none()
+            && self.agent_registry.host_stop_requested(instance)
+        {
+            return Err(ManagedAgentError::Internal(
+                "host stopping before original cleanup attachment".into(),
+            ));
         }
+        let state = match stop_outcome {
+            Some(HostCleanupOutcome::Unconfirmed(error)) => {
+                return Err(ManagedAgentError::Internal(format!(
+                    "host cleanup unconfirmed: {error}; original custody retained"
+                )));
+            }
+            Some(_) if !desc.state.is_terminal() => {
+                session_endpoint = None;
+                "stopping".to_string()
+            }
+            _ => {
+                if desc.state.is_terminal() {
+                    session_endpoint = None;
+                }
+                desc.state.as_str().to_lowercase()
+            }
+        };
         let workspace_path = format!("/proc/{}/workspace/", desc.pid);
         let model = desc.labels.get(MODEL_LABEL).cloned().unwrap_or_default();
         Ok(GetSessionResponse {
@@ -990,7 +1178,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             owner_id: desc.owner_id.clone(),
             workspace_path,
             model,
-            state: desc.state.as_str().to_lowercase(),
+            state,
             reason: desc.reason.clone(),
         })
     }
@@ -1119,8 +1307,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         // control-plane spawner can share the SAME `agent_registry` +
         // `spawn_handles` the service and its on_terminate observer use.
         let agent_registry = Arc::clone(kernel.agent_registry());
-        let spawn_handles: Arc<dashmap::DashMap<String, Box<dyn SpawnHandle>>> =
-            Arc::new(dashmap::DashMap::new());
+        let spawn_handles: HostedSessions = Arc::new(dashmap::DashMap::new());
 
         // Raw ACP subprocess control-plane spawner (memory-DT_STREAM byte
         // tunnel). Kernel-concrete — built here because it drives
@@ -1136,7 +1323,22 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         #[cfg(not(feature = "subprocess-host"))]
         let raw_spawn: Option<Arc<dyn RawSpawn>> = None;
 
+        let weak_kernel = Arc::downgrade(kernel);
+        let runtime_directory: kernel::core::agents::registry::RuntimeDirectoryLookup =
+            Arc::new(move |owner, zone| {
+                let kernel = weak_kernel.upgrade().ok_or("runtime host retired")?;
+                let ctx = contracts::OperationContext::new(owner, zone, false, None, false);
+                let payload =
+                    serde_json::to_vec(&contracts::runtime_status::ListRuntimesRequest::default())
+                        .map_err(|error| error.to_string())?;
+                let result = kernel
+                    .dispatch_rust_call_ctx(&ctx, "runtime_directory", "list_v1", &payload)
+                    .ok_or("runtime directory is unavailable")?
+                    .map_err(|error| error.to_string())?;
+                serde_json::from_slice(&result).map_err(|error| error.to_string())
+            });
         let svc = Arc::new(ManagedAgentService {
+            runtime_directory: Some(runtime_directory),
             kernel: Arc::clone(kernel),
             agent_registry,
             spawn_provider,
@@ -1168,10 +1370,12 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         kernel.agent_registry().register_on_terminate(
             Self::NAME,
             Arc::new(move |pid: &str| {
-                if let Some((_, handle)) = spawn_handles_for_cb.remove(pid) {
-                    handle.abort();
-                }
-                if let Some(desc) = registry_for_cb.get(pid) {
+                if let Some((instance, desc)) = registry_for_cb.get_instance(pid) {
+                    if let Some((_, host)) = spawn_handles_for_cb.remove_if(pid, |_, host| {
+                        host.instance.incarnation() == instance.incarnation()
+                    }) {
+                        host.handle.abort();
+                    }
                     unregister_proc_entry(kernel_for_cb.as_ref(), &desc);
                 }
             }),
@@ -1436,17 +1640,20 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
                     ));
                 }
                 let is_current_channel =
-                    self.spawn_handles
-                        .get(&req.session_id)
-                        .is_some_and(|handle| {
-                            handle
+                    self.spawn_handles.get(&req.session_id).is_some_and(|host| {
+                        host.instance.incarnation() == instance.incarnation()
+                            && host
+                                .handle
                                 .session_endpoint()
                                 .is_some_and(|endpoint| endpoint.channel_id == req.channel_id)
-                        });
+                    });
                 let resp = if is_current_channel {
                     self.cancel_instance(&instance, CancelMode::Session)?
                 } else {
-                    CancelResponse { cancelled: false }
+                    CancelResponse {
+                        cancelled: false,
+                        stopping: false,
+                    }
                 };
                 serde_json::to_vec(&resp).map_err(|e| RustCallError::Internal(e.to_string()))
             }
@@ -1517,6 +1724,23 @@ mod tests {
         }
     }
     impl SpawnTask<Kernel> for ScriptedSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,
@@ -1547,6 +1771,23 @@ mod tests {
     /// host directory — refuses the session instead of dying on the daemon's thread.
     struct RefusingSpawn;
     impl SpawnTask<Kernel> for RefusingSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,
@@ -1687,6 +1928,23 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<(usize, String, bool)>>>,
     }
     impl SpawnTask<Kernel> for ProbingSpawn {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn_with_options(
             &self,
             kernel: Arc<Kernel>,

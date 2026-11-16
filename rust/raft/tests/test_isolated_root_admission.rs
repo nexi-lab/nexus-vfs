@@ -29,7 +29,7 @@ fn open(dir: &TempDir) -> LocalRuntime {
 fn isolated_root_refuses_membership_changes() {
     let dir = TempDir::new().unwrap();
     let runtime = open(&dir);
-    let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(10)));
     let node = root.consensus_node();
     runtime
@@ -51,7 +51,7 @@ fn isolated_root_refuses_membership_changes() {
 fn isolated_root_refuses_peer_ingress() {
     let dir = TempDir::new().unwrap();
     let runtime = open(&dir);
-    let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     let node = root.consensus_node();
     let peer = if runtime.0.node_id() == 1 { 2 } else { 1 };
     let mut heartbeat = Message::default();
@@ -70,7 +70,7 @@ fn isolated_root_reopens_its_durable_metadata() {
     let dir = TempDir::new().unwrap();
     let id = {
         let runtime = open(&dir);
-        let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+        let root = runtime.0.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(10)));
         root.set_metadata("/saved", b"durable".to_vec(), nexus_raft::Consistency::Sc)
             .unwrap();
@@ -78,7 +78,7 @@ fn isolated_root_reopens_its_durable_metadata() {
     };
     let runtime = open(&dir);
     assert_eq!(runtime.0.node_id(), id);
-    let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+    let root = runtime.0.create_zone("root").unwrap();
     assert!(root.wait_for_leader(Duration::from_secs(10)));
     let value = runtime
         .0
@@ -97,7 +97,7 @@ fn isolated_restart_refuses_a_pending_membership_change() {
     let dir = TempDir::new().unwrap();
     let id = {
         let runtime = open(&dir);
-        let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+        let root = runtime.0.create_zone("root").unwrap();
         assert!(root.wait_for_leader(Duration::from_secs(10)));
         runtime.0.node_id()
     };
@@ -137,11 +137,10 @@ fn isolated_restart_refuses_a_pending_membership_change() {
 fn isolated_registry_keeps_only_its_local_root() {
     let dir = TempDir::new().unwrap();
     let runtime = open(&dir);
-    let result =
-        runtime
-            .0
-            .registry()
-            .create_zone("another-zone", Vec::new(), &runtime.0.runtime_handle());
+    let result = runtime
+        .0
+        .registry()
+        .create_zone("another-zone", &runtime.0.runtime_handle());
     assert!(
         result.is_err(),
         "isolated registry created an additional zone"
@@ -150,14 +149,14 @@ fn isolated_registry_keeps_only_its_local_root() {
     assert!(runtime
         .0
         .registry()
-        .join_zone("root", Vec::new(), false, &runtime.0.runtime_handle())
+        .join_zone("root", false, &runtime.0.runtime_handle())
         .is_err());
     assert!(!dir.path().join("root").exists());
-    runtime.0.create_zone("root", Vec::new()).unwrap();
+    runtime.0.create_zone("root").unwrap();
     assert!(runtime
         .0
         .registry()
-        .join_zone("root", Vec::new(), false, &runtime.0.runtime_handle())
+        .join_zone("root", false, &runtime.0.runtime_handle())
         .is_err());
 }
 
@@ -167,7 +166,7 @@ fn isolated_restart_refuses_nonlocal_restored_membership() {
         let dir = TempDir::new().unwrap();
         let id = {
             let runtime = open(&dir);
-            let root = runtime.0.create_zone("root", Vec::new()).unwrap();
+            let root = runtime.0.create_zone("root").unwrap();
             assert!(root.wait_for_leader(Duration::from_secs(10)));
             runtime.0.node_id()
         };

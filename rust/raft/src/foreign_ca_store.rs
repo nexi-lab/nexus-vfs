@@ -128,7 +128,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
         let store = RaftForeignCaStore::new(node, runtime);
@@ -191,7 +191,7 @@ mod tests {
         ));
         assert_eq!(find(&scoped.fingerprint_hex()), Some(scoped));
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 
     /// A corrupt/undecodable record under our namespace makes `list` fail LOUD
@@ -205,7 +205,7 @@ mod tests {
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
         let node = registry
-            .create_zone("root", vec![], &runtime)
+            .create_zone("root", &runtime)
             .expect("create test zone");
         node.campaign().await.expect("campaign test zone");
 
@@ -223,6 +223,6 @@ mod tests {
             "a corrupt anchor must surface as Corrupt, not be dropped"
         );
 
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

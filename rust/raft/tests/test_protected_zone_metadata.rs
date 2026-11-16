@@ -15,12 +15,21 @@ use std::time::Duration;
 
 const PATH: &str = "/conversations/stable-cid/readers/agent-a";
 
+#[path = "protected_zone_metadata/record_guard.rs"]
+mod record_guard;
+#[path = "protected_zone_metadata/record_io.rs"]
+mod record_io;
+#[path = "protected_zone_metadata/record_wakeup.rs"]
+mod record_wakeup;
+#[path = "protected_zone_metadata/record_wal.rs"]
+mod record_wal;
+
 struct Runtime(Arc<ZoneManager>);
 
 impl Runtime {
     fn open(directory: &std::path::Path) -> Self {
         let manager = ZoneManager::isolated(directory.to_str().unwrap()).unwrap();
-        let zone = manager.create_zone("root", vec![]).unwrap();
+        let zone = manager.create_zone("root").unwrap();
         assert!(zone.wait_for_leader(Duration::from_secs(10)));
         Self(manager)
     }
@@ -682,9 +691,8 @@ fn ec_origin_peer_ingress_and_export_preserve_the_adopted_image() {
             runtime
                 .0
                 .runtime_handle()
-                .block_on(node.apply_ec_from_peer(mutation.clone(), u64::MAX))
-                .unwrap(),
-            CommandResult::Success
+                .block_on(node.apply_ec_from_peer(mutation.clone(), u64::MAX)),
+            Err(nexus_raft::raft::RaftError::Config(_))
         ));
         assert!(matches!(
             runtime

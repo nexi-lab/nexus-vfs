@@ -16,7 +16,7 @@ impl Command {
     /// Fixed on every replica, including one that has not applied a first SC
     /// create. EC must never publish either managed metadata or its allocator.
     pub(crate) fn requires_conditional_sc(&self) -> bool {
-        if self.requires_fixed_local_storage() {
+        if self.storage_protocol().is_some() {
             return true;
         }
         if let Some(key) = self.ordinary_metadata_key() {
@@ -52,7 +52,15 @@ impl FullStateMachine {
     /// reads preserve their existing observation-only semantics.
     pub fn get_versioned_metadata(&self, key: &str) -> Result<VersionedMetadata> {
         let txn = self.metadata.raw_db().begin_read().map_err(storage_error)?;
-        if !is_managed_key(key) && !self.protected_in_read(&txn, key)? {
+        self.versioned_metadata_in_read(&txn, key)
+    }
+
+    pub(super) fn versioned_metadata_in_read(
+        &self,
+        txn: &redb::ReadTransaction,
+        key: &str,
+    ) -> Result<VersionedMetadata> {
+        if !is_managed_key(key) && !self.protected_in_read(txn, key)? {
             Self::require_managed_key(key)?;
         }
         let metadata = txn
@@ -121,7 +129,11 @@ impl FullStateMachine {
         Ok(value)
     }
 
-    fn revision_in_txn(&self, txn: &redb::WriteTransaction, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(super) fn revision_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let table = txn
             .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
                 self.control_state.name(),

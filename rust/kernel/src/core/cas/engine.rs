@@ -189,11 +189,6 @@ impl CASEngine {
     ///
     /// The shared transport owns presence across engine instances and restarts.
     pub fn content_exists(&self, content_id: &str) -> bool {
-        if content_id.len() != blake3::OUT_LEN * 2
-            || !content_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return false;
-        }
         self.transport.exists(content_id)
     }
 

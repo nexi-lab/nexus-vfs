@@ -1,5 +1,5 @@
 use super::*;
-use crate::{managed_csr::tests::LoseReply, FounderAgentMinter};
+use crate::{managed_csr::tests::LoseReply, FounderCaIssuer};
 use kernel::kernel::vfs_proto::{nexus_vfs_service_client::NexusVfsServiceClient, CallRequest};
 use managed_agent::{SpawnHandle, SpawnOptions, SpawnTask};
 use nexus_raft::{
@@ -7,6 +7,7 @@ use nexus_raft::{
     raft::ZoneRaftRegistry,
     transport::{
         generate_agent_cert, generate_node_cert, generate_session_agent_cert, generate_zone_ca,
+        TlsConfig,
     },
 };
 use std::time::Duration;
@@ -28,6 +29,23 @@ impl SpawnHandle for Handle {
     }
 }
 impl SpawnTask<Kernel> for Host {
+    // This fixture starts no threads, receivers or writers. Its synchronous
+    // body is fully finished before reporting joined cleanup.
+    fn spawn_with_cleanup(
+        &self,
+        kernel: Arc<Kernel>,
+        desc: kernel::core::agents::registry::AgentDescriptor,
+        options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        observer: Arc<
+            dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+        >,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        let result = self.spawn_with_options(kernel, desc, options, observer);
+        assert!(cleanup.complete(Ok(())));
+        result
+    }
+
     fn spawn(
         &self,
         _: Arc<Kernel>,
@@ -137,10 +155,12 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
         cert_pem: node_cert.clone(),
         key_pem: node_key.clone(),
     };
+    let native_tls = tls.clone();
+    let credentials = SharedTlsConfig::new(Some(tls.clone()));
     let runtime = tokio::runtime::Handle::current();
     let zones = Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1));
     let node = zones
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -157,12 +177,13 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
     let verifier = lib::transport_primitives::FederatedClientCertVerifier::new(&ca).unwrap();
     let verifier_slot = Arc::new(std::sync::OnceLock::new());
     verifier_slot.set(verifier).unwrap();
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
-    *slot.write() = Some(Arc::new(FounderAgentMinter {
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
+    *slot.write() = Some(Arc::new(FounderCaIssuer {
         store: store.clone(),
         tls_dir: tls_dir.clone(),
         data_dir: private.path().to_path_buf(),
         session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        replica_store: crate::replica_rpc::new_store_slot(),
         peer_verifier: verifier_slot.clone(),
     }));
     let kernel = Arc::new(Kernel::new());
@@ -172,7 +193,14 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
             service_decl(
                 tls_dir.clone(),
                 true,
-                Some(NativeIssuer::from_tls(slot.clone(), &tls, runtime.clone()).unwrap()),
+                Some(
+                    NativeIssuer::from_shared_tls(
+                        slot.clone(),
+                        credentials.clone(),
+                        runtime.clone(),
+                    )
+                    .unwrap(),
+                ),
             )
             .unwrap(),
         ])
@@ -384,13 +412,22 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
             .count(),
         2
     );
+    live_tls::LiveTlsFixture {
+        slot: &slot,
+        credentials: &credentials,
+        tls: &native_tls,
+        tls_dir: &tls_dir,
+        store: &store,
+    }
+    .exercise_withdrawn_reply(&mut owner, &pid, op)
+    .await;
     drop((owner, other, admin, issued_agent));
     stop.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), serving)
         .await
         .unwrap()
         .unwrap();
-    zones.shutdown_all();
+    zones.shutdown().released().await;
 }
 
 #[test]
@@ -398,14 +435,24 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
     let runtime = lib::rt::OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap());
     let (ca, ca_key) = generate_zone_ca("local").unwrap();
     let (agent, key) = generate_agent_cert("ordinary", &ca, &ca_key).unwrap();
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
     let tls = TlsConfig {
         ca_pem: ca.clone(),
         cert_pem: agent,
         key_pem: key,
     };
-    assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
-    assert!(NativeIssuer::for_host(slot.clone(), &tls, runtime.handle().clone()).is_none());
+    assert!(NativeIssuer::from_shared_tls(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls.clone())),
+        runtime.handle().clone()
+    )
+    .is_err());
+    assert!(NativeIssuer::for_host(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls)),
+        runtime.handle().clone()
+    )
+    .is_none());
     let (foreign, foreign_key) = generate_zone_ca("foreign").unwrap();
     let (node, key) = generate_node_cert(9, "root", &foreign, &foreign_key, &[], None).unwrap();
     let tls = TlsConfig {
@@ -413,8 +460,18 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
         cert_pem: node,
         key_pem: key,
     };
-    assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
-    assert!(NativeIssuer::for_host(slot, &tls, runtime.handle().clone()).is_none());
+    assert!(NativeIssuer::from_shared_tls(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls.clone())),
+        runtime.handle().clone()
+    )
+    .is_err());
+    assert!(NativeIssuer::for_host(
+        slot,
+        SharedTlsConfig::new(Some(tls)),
+        runtime.handle().clone()
+    )
+    .is_none());
 }
 
 #[test]
@@ -437,8 +494,8 @@ fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_fai
         key_pem: key,
     };
     let native = NativeIssuer::for_host(
-        nexus_raft::agent_minter::new_agent_minter_slot(),
-        &tls,
+        nexus_raft::ca_issuer::new_ca_issuer_slot(),
+        SharedTlsConfig::new(Some(tls)),
         runtime.handle().clone(),
     );
     assert!(
@@ -484,3 +541,5 @@ fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_fai
         json!(Sha256::digest(first_certificate_der(&issuer, "original issuer").unwrap()).to_vec())
     );
 }
+
+mod live_tls;

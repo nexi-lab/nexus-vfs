@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
-use crate::agent_minter::agent_csr_request_digest;
+use crate::ca_issuer::agent_csr_request_digest;
 use crate::transport::proto::{AgentCsrRequest, AgentCsrResponse, AgentCsrState};
 
 /// Resolved by the native owner-checked deployment path, never a frontend's

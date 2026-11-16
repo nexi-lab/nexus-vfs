@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::abc::meta_store::MetaStore;
+use crate::abc::meta_store::{MetaStore, MetaStoreError, StreamSegment};
+use crate::extensions::conditional_metadata::ConditionalMetadataError;
+use crate::extensions::guarded_records::RecordIoGuard;
 use crate::stream::{StreamBackend, StreamError};
 
 /// Side-table key prefix for wal-stream entries. Every entry is keyed
@@ -80,9 +82,11 @@ pub trait ColdSegmentStore: Send + Sync {
 
     /// Read a sealed segment blob by `content_id`: local content store first,
     /// else a whole-blob peer fetch from `origin` (the node that sealed it).
+    /// `base` identifies the existing committed index entry on that peer.
     fn read_segment(
         &self,
         stream_id: &str,
+        base: u64,
         content_id: &str,
         origin: &str,
     ) -> Result<Vec<u8>, String>;
@@ -223,6 +227,9 @@ pub struct WalStreamCore {
     /// this, the seal thread drops the oldest segments and advances `earliest`.
     /// From the stream's inode capacity.
     retention: u64,
+    /// An explicitly admitted storage revision, captured once by the service.
+    /// It is never refreshed from a path or PID after retirement.
+    record_owner: Option<RecordOwner>,
     /// Unix-ms of the last successful push, stamped locally on each
     /// commit.  `0` sentinel = never appended locally (this replica
     /// may have received frames via raft replay before ever taking a
@@ -241,6 +248,23 @@ pub struct WalStreamCore {
 /// cache and an in-flight extract can hold it without a copy.
 type CachedSegment = (u64, u64, Arc<Vec<u8>>);
 
+#[derive(Clone)]
+struct RecordOwner {
+    /// Caller-facing path in the captured store view; `stream_id` stays canonical.
+    path: String,
+    version: Vec<u8>,
+}
+
+fn record_storage_error(error: ConditionalMetadataError) -> MetaStoreError {
+    match error {
+        ConditionalMetadataError::Unsupported => {
+            MetaStoreError::IOError("WAL record ownership is unsupported".into())
+        }
+        ConditionalMetadataError::Failed(error) => error,
+        ConditionalMetadataError::Unknown(error) => MetaStoreError::OutcomeUnknown(error),
+    }
+}
+
 impl WalStreamCore {
     /// Hot-only WAL core — no cold tier, so it never seals (the pre-P1
     /// unbounded-in-raft behaviour). Used by non-federated callers and by every
@@ -258,6 +282,7 @@ impl WalStreamCore {
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
             retention: 0,
+            record_owner: None,
             last_append_ms: AtomicI64::new(0),
         }
     }
@@ -285,8 +310,55 @@ impl WalStreamCore {
             known_floor: Arc::new(AtomicU64::new(0)),
             seg_cache: Arc::new(Mutex::new(None)),
             retention,
+            record_owner: None,
             last_append_ms: AtomicI64::new(0),
         }
+    }
+
+    /// Capture an already bound and I/O-enrolled owner for this WAL handle.
+    /// This mechanism does not authorize a caller, enroll old consumers, bind
+    /// metadata, or qualify a Session service. Its caller owns those decisions.
+    /// `path` names the record in the captured store view. It must resolve to
+    /// this core's canonical `stream_id`; mount aliases never become WAL keys.
+    /// Idle handles retain no I/O guard, so retirement needs no process exit.
+    pub fn with_record_owner(
+        mut self,
+        path: &str,
+        owner_version: Vec<u8>,
+    ) -> Result<Self, ConditionalMetadataError> {
+        let records = self
+            .store
+            .as_guarded_records()
+            .ok_or(ConditionalMetadataError::Unsupported)?;
+        if records.record_storage_key(path) != self.stream_id {
+            return Err(ConditionalMetadataError::Failed(MetaStoreError::IOError(
+                "WAL owner path identifies a different canonical stream".into(),
+            )));
+        }
+        self.record_owner = Some(RecordOwner {
+            path: path.to_owned(),
+            version: owner_version,
+        });
+        let _io = self.record_io()?;
+        Ok(self)
+    }
+
+    fn record_io(&self) -> Result<Option<Box<dyn RecordIoGuard>>, ConditionalMetadataError> {
+        if self.record_owner.is_none() {
+            crate::extensions::guarded_records::check_unscoped_record_io(
+                self.store.as_ref(),
+                &self.stream_id,
+            )?;
+        }
+        self.record_owner
+            .as_ref()
+            .map(|owner| {
+                self.store
+                    .as_guarded_records()
+                    .ok_or(ConditionalMetadataError::Unsupported)?
+                    .begin_record_io(&owner.path, &owner.version)
+            })
+            .transpose()
     }
 
     fn key(&self, seq: u64) -> String {
@@ -301,13 +373,34 @@ impl WalStreamCore {
     /// reading the same store sees it. This is the sole write path; a wal
     /// DT_STREAM exists to REPLICATE, so a write that can't commit fails loud
     /// rather than buffering and dropping.
-    pub fn write_sync(&self, data: &[u8]) -> Result<u64, String> {
+    pub fn write_sync(&self, data: &[u8]) -> Result<u64, MetaStoreError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(format!("WAL stream {} is closed", self.stream_id));
+            return Err(MetaStoreError::IOError(format!(
+                "WAL stream {} is closed",
+                self.stream_id
+            )));
         }
+        let _io = self.record_io().map_err(record_storage_error)?;
+        if let Some(owner) = self.record_owner.as_ref() {
+            return self
+                .store
+                .as_guarded_records()
+                .ok_or_else(|| record_storage_error(ConditionalMetadataError::Unsupported))?
+                .append_guarded_record(&owner.path, data, &owner.version)
+                .map_err(record_storage_error);
+        }
+        // Keep the store's error kind: whether the entry may have committed
+        // is what the caller acts on.
+        let at = |why: String| format!("append_stream_entry({}): {why}", self.prefix);
         self.store
             .append_stream_entry(&self.prefix, data)
-            .map_err(|e| format!("append_stream_entry({}): {e:?}", self.prefix))
+            .map_err(|e| match e {
+                MetaStoreError::OutcomeUnknown(why) => MetaStoreError::OutcomeUnknown(at(why)),
+                MetaStoreError::IOError(why) => MetaStoreError::IOError(at(why)),
+                other @ MetaStoreError::NotFound(_) => {
+                    MetaStoreError::IOError(at(other.to_string()))
+                }
+            })
     }
 
     /// Read the entry at `seq`.  `Ok(Some(bytes))` if present;
@@ -324,6 +417,7 @@ impl WalStreamCore {
     /// Storage read independent of lifecycle state. The StreamBackend adapter
     /// translates a genuine miss to Empty/ClosedEmpty, retaining I/O errors.
     fn read_committed(&self, seq: u64) -> Result<Option<Vec<u8>>, String> {
+        let _io = self.record_io().map_err(|error| error.to_string())?;
         let key = self.key(seq);
         // Hot path unchanged: try the entry row first (local, O(1), drives
         // wakeup). A hit returns immediately — no floor/segment lookup.
@@ -373,7 +467,8 @@ impl WalStreamCore {
             Some(seg) => seg,
             None => return Ok(None), // trimmed by retention
         };
-        let blob = Arc::new(cold.read_segment(&self.stream_id, &seg.content_id, &seg.origin)?);
+        let blob =
+            Arc::new(cold.read_segment(&self.stream_id, seg.base, &seg.content_id, &seg.origin)?);
         let out = extract_frame(blob.as_slice(), seg.base, seq)?;
         *self.seg_cache.lock() = Some((seg.base, seg.end, blob));
         Ok(Some(out))
@@ -400,23 +495,33 @@ impl WalStreamCore {
         if self.seal_in_flight.swap(true, Ordering::AcqRel) {
             return; // a seal is already running for this stream
         }
+        let io = match self.record_io() {
+            Ok(io) => io,
+            Err(_) => {
+                self.seal_in_flight.store(false, Ordering::Release);
+                return; // Retirement prevents starting new background I/O.
+            }
+        };
         let store = Arc::clone(&self.store);
         let cold = Arc::clone(cold);
-        let prefix = self.prefix.clone();
         let stream_id = self.stream_id.clone();
+        let record_owner = self.record_owner.clone();
         let policy = self.policy;
         let in_flight = Arc::clone(&self.seal_in_flight);
         let known_floor = Arc::clone(&self.known_floor);
         let retention = self.retention;
         std::thread::spawn(move || {
+            // Request cancellation or dropping the WAL handle cannot release
+            // exclusion while this thread still stages or publishes content.
+            let _io = io;
             seal_loop(
                 &store,
                 cold.as_ref(),
-                &prefix,
                 &stream_id,
                 policy,
                 &known_floor,
                 retention,
+                record_owner.as_ref(),
             );
             in_flight.store(false, Ordering::Release);
         });
@@ -460,12 +565,14 @@ impl WalStreamCore {
 fn seal_loop(
     store: &Arc<dyn MetaStore>,
     cold: &dyn ColdSegmentStore,
-    prefix: &str,
     stream_id: &str,
     policy: SealPolicy,
     known_floor: &AtomicU64,
     retention: u64,
+    record_owner: Option<&RecordOwner>,
 ) {
+    let prefix = wal_stream_prefix(stream_id);
+    let prefix = prefix.as_str();
     loop {
         let floor = match store.stream_floor(prefix) {
             Ok(f) => f,
@@ -509,8 +616,29 @@ fn seal_loop(
             }
         };
         let origin = cold.self_origin().unwrap_or_default();
-        match store.seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64)
-        {
+        let result = match record_owner {
+            Some(owner) => store
+                .as_guarded_records()
+                .ok_or(ConditionalMetadataError::Unsupported)
+                .and_then(|records| {
+                    records.seal_guarded_record(
+                        &owner.path,
+                        &StreamSegment {
+                            base,
+                            end,
+                            content_id,
+                            origin,
+                            size: blob.len() as u64,
+                        },
+                        &owner.version,
+                    )
+                })
+                .map_err(|error| error.to_string()),
+            None => store
+                .seal_stream_segment(prefix, base, end, &content_id, &origin, blob.len() as u64)
+                .map_err(|error| error.to_string()),
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     stream_id,
@@ -523,7 +651,7 @@ fn seal_loop(
                 // Retention: after adding cold bytes, drop the oldest segments
                 // if the stream is over its cold-storage budget.
                 if retention > 0 {
-                    maybe_trim(store, prefix, stream_id, retention);
+                    maybe_trim(store, prefix, stream_id, retention, record_owner);
                 }
                 // Loop: seal the next batch if the tail is still past the window.
             }
@@ -547,7 +675,13 @@ fn seal_loop(
 /// carries the dropped blobs' refs so each node's trim-GC observer reclaims the
 /// blobs it owns). The trimmer only proposes — it does NOT delete blobs itself,
 /// so single- and multi-origin streams reclaim uniformly via the observers.
-fn maybe_trim(store: &Arc<dyn MetaStore>, prefix: &str, stream_id: &str, retention: u64) {
+fn maybe_trim(
+    store: &Arc<dyn MetaStore>,
+    prefix: &str,
+    stream_id: &str,
+    retention: u64,
+    record_owner: Option<&RecordOwner>,
+) {
     let segs = match store.list_stream_segments(prefix) {
         Ok(s) => s,
         Err(_) => return,
@@ -572,7 +706,19 @@ fn maybe_trim(store: &Arc<dyn MetaStore>, prefix: &str, stream_id: &str, retenti
         return; // nothing whole to drop
     }
     let dropped = trimmed.len();
-    match store.trim_stream_segments(prefix, up_to, trimmed) {
+    let result = match record_owner {
+        Some(owner) => store
+            .as_guarded_records()
+            .ok_or(ConditionalMetadataError::Unsupported)
+            .and_then(|records| {
+                records.trim_guarded_record(&owner.path, up_to, trimmed, &owner.version)
+            })
+            .map_err(|error| error.to_string()),
+        None => store
+            .trim_stream_segments(prefix, up_to, trimmed)
+            .map_err(|error| error.to_string()),
+    };
+    match result {
         Ok(()) => tracing::info!(
             stream_id,
             up_to,
@@ -606,6 +752,9 @@ impl StreamBackend for WalStreamCore {
         // `last_append_ms`, silently violating the trait doc every other
         // impl honours.
         if data.is_empty() {
+            let _io = self.record_io().map_err(|error| {
+                StreamError::NotReplicated(record_storage_error(error).to_string())
+            })?;
             return Ok(self.tail() as usize);
         }
         // Durable + fail-loud. A wal DT_STREAM exists to REPLICATE, so a push
@@ -634,17 +783,26 @@ impl StreamBackend for WalStreamCore {
                 Ok(seq as usize)
             }
             Err(e) => {
+                // The error says which: refused (nothing appended), or sent and
+                // unanswered (outcome UNKNOWN; reconcile before retry).
                 tracing::warn!(
                     stream_id = %self.stream_id,
                     error = %e,
-                    "wal DT_STREAM push failed to replicate — write rejected (fail-loud)"
+                    "wal DT_STREAM append not confirmed"
                 );
                 // The reason goes to the CALLER, not only to this log. It used
                 // to be replaced here by a canned "no reachable leader?" and
                 // reported as `Closed`, so a client learned neither what
-                // happened nor that the stream was still open — see
-                // `StreamError::NotReplicated`.
-                Err(StreamError::NotReplicated(e))
+                // happened nor that the stream was still open. Whether the
+                // entry may have committed travels with it — see
+                // `StreamError::OutcomeUnknown`.
+                Err(match e {
+                    MetaStoreError::OutcomeUnknown(why) => StreamError::OutcomeUnknown(why),
+                    MetaStoreError::IOError(why) => StreamError::NotReplicated(why),
+                    other @ MetaStoreError::NotFound(_) => {
+                        StreamError::NotReplicated(other.to_string())
+                    }
+                })
             }
         }
     }
@@ -786,10 +944,9 @@ mod tests {
 
     struct MemKvStore {
         inner: Mutex<StreamKv>,
-        /// When set, `append_stream_entry` fails with this message — the store
-        /// side of "the propose did not commit", which is the only way to reach
-        /// the failing branch of `push` without a raft cluster.
-        append_error: Option<String>,
+        /// When set, `append_stream_entry` fails as `(reason, outcome_unknown)`,
+        /// exercising the failing branch of `push` without a raft cluster.
+        append_error: Option<(String, bool)>,
     }
 
     impl MetaStore for MemKvStore {
@@ -816,8 +973,12 @@ mod tests {
             stream_prefix: &str,
             data: &[u8],
         ) -> Result<u64, MetaStoreError> {
-            if let Some(why) = &self.append_error {
-                return Err(MetaStoreError::IOError(why.clone()));
+            if let Some((why, outcome_unknown)) = &self.append_error {
+                return Err(if *outcome_unknown {
+                    MetaStoreError::OutcomeUnknown(why.clone())
+                } else {
+                    MetaStoreError::IOError(why.clone())
+                });
             }
             let mut i = self.inner.lock().unwrap();
             let seq = *i.tails.get(stream_prefix).unwrap_or(&0);
@@ -974,6 +1135,7 @@ mod tests {
         fn read_segment(
             &self,
             _stream_id: &str,
+            _base: u64,
             content_id: &str,
             _origin: &str,
         ) -> Result<Vec<u8>, String> {
@@ -996,7 +1158,14 @@ mod tests {
     fn store_that_refuses_appends(why: &str) -> Arc<dyn MetaStore> {
         Arc::new(MemKvStore {
             inner: Mutex::new(StreamKv::default()),
-            append_error: Some(why.to_string()),
+            append_error: Some((why.to_string(), false)),
+        })
+    }
+
+    fn store_whose_appends_go_unanswered(why: &str) -> Arc<dyn MetaStore> {
+        Arc::new(MemKvStore {
+            inner: Mutex::new(StreamKv::default()),
+            append_error: Some((why.to_string(), true)),
         })
     }
 
@@ -1015,7 +1184,7 @@ mod tests {
     #[test]
     fn a_refused_append_says_why_and_leaves_the_stream_open() {
         let c = WalStreamCore::new(
-            store_that_refuses_appends("propose timed out after 5s"),
+            store_that_refuses_appends("not leader, leader hint: None"),
             "mbox".into(),
         );
 
@@ -1025,15 +1194,34 @@ mod tests {
         };
         match &err {
             StreamError::NotReplicated(why) => assert!(
-                why.contains("propose timed out after 5s"),
+                why.contains("not leader, leader hint: None"),
                 "the store's own reason must reach the caller: {why}"
             ),
-            other => panic!("a failed append must not be reported as {other:?}"),
+            other => panic!("a refused append must not be reported as {other:?}"),
         }
         assert!(
             !StreamBackend::is_closed(&c),
             "only this append failed — the stream still takes the next one"
         );
+    }
+
+    /// An append that was sent and never answered may have committed. It must
+    /// say so, not report a refusal the caller would safely retry: that retry
+    /// is how a committed entry gets appended twice.
+    #[test]
+    fn an_unanswered_append_says_it_may_have_committed() {
+        let c = WalStreamCore::new(
+            store_whose_appends_go_unanswered("transport error: Timeout expired"),
+            "mbox".into(),
+        );
+        match StreamBackend::push(&c, b"hello") {
+            Err(StreamError::OutcomeUnknown(why)) => assert!(
+                why.contains("transport error: Timeout expired"),
+                "the store's own reason must reach the caller: {why}"
+            ),
+            other => panic!("an unanswered append must not be reported as {other:?}"),
+        }
+        assert!(!StreamBackend::is_closed(&c));
     }
 
     /// The core keeps NO local cursor — the store owns it. A fresh instance
@@ -1327,7 +1515,7 @@ mod tests {
         // Seal synchronously: drains [0,3) then [3,6); [6,10) stays hot
         // (10 - 6 = 4 < hot_window + seal_batch = 6).
         let kf = AtomicU64::new(0);
-        seal_loop(&store, cold.as_ref(), &prefix, "coldtest", policy, &kf, 0);
+        seal_loop(&store, cold.as_ref(), "coldtest", policy, &kf, 0, None);
         assert_eq!(store.stream_floor(&prefix).unwrap(), 6, "floor after seal");
         assert_eq!(kf.load(Ordering::Relaxed), 6);
 
@@ -1387,7 +1575,7 @@ mod tests {
             c.write_sync(format!("v{i}").as_bytes()).unwrap();
         }
         let kf = AtomicU64::new(0);
-        seal_loop(&store, cold.as_ref(), &prefix, "corrupt", policy, &kf, 0);
+        seal_loop(&store, cold.as_ref(), "corrupt", policy, &kf, 0, None);
         assert!(store.stream_floor(&prefix).unwrap() >= 2);
         // Corrupt every stored blob.
         for v in cold_impl.blobs.lock().unwrap().values_mut() {
@@ -1423,11 +1611,11 @@ mod tests {
             seal_loop(
                 &store,
                 cold.as_ref(),
-                &prefix,
                 "read-failure",
                 policy,
                 &AtomicU64::new(0),
                 0,
+                None,
             );
             let seg = store
                 .find_stream_segment(&prefix, failed_base)
@@ -1581,15 +1769,7 @@ mod tests {
         }
         // Seal (+trim) synchronously for determinism.
         let kf = AtomicU64::new(0);
-        seal_loop(
-            &store,
-            cold.as_ref(),
-            &prefix,
-            "trim",
-            policy,
-            &kf,
-            retention,
-        );
+        seal_loop(&store, cold.as_ref(), "trim", policy, &kf, retention, None);
 
         let earliest = store.stream_earliest(&prefix).unwrap();
         assert!(

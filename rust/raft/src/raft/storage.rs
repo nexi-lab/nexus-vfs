@@ -24,6 +24,12 @@ const KEY_HARD_STATE: &[u8] = b"hard_state";
 const KEY_CONF_STATE: &[u8] = b"conf_state";
 const KEY_SNAPSHOT: &[u8] = b"snapshot";
 const KEY_FIRST_INDEX: &[u8] = b"first_index";
+/// `(index, term)` of the entry just before the log, written by [`RaftStorage::compact`]:
+/// raft-rs's `Storage::term` contract keeps `term(first_index - 1)` answerable
+/// after compaction. Valid only while its index is `first_index - 1`. An
+/// additive key: earlier readers ignore it, and an older binary's own
+/// compaction leaves it stale, which that check then rejects.
+const KEY_LOG_BOUNDARY_TERM: &[u8] = b"log_boundary_term";
 
 /// Raft storage backed by redb.
 ///
@@ -69,9 +75,12 @@ impl RaftStorage {
             state,
         };
 
-        // Initialize first_index if not set
-        if storage.state.get(KEY_FIRST_INDEX)?.is_none() {
-            storage.state.set(KEY_FIRST_INDEX, &1u64.to_be_bytes())?;
+        // Existing stores need only a read. Initialization checks the current
+        // value again inside its transaction so it preserves a concurrent upgrade.
+        if let Some(bytes) = storage.state.get(KEY_FIRST_INDEX)? {
+            reader_format::LogBoundary::decode(Some(&bytes))?;
+        } else {
+            storage.update_log_boundary(None, false)?;
         }
 
         Ok(storage)
@@ -99,16 +108,7 @@ impl RaftStorage {
 
     /// Get the first index in the log.
     pub fn first_index_impl(&self) -> Result<u64> {
-        match self.state.get(KEY_FIRST_INDEX)? {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| RaftError::Storage("invalid first_index".into()))?;
-                Ok(u64::from_be_bytes(arr))
-            }
-            None => Ok(1),
-        }
+        Ok(reader_format::LogBoundary::decode(self.state.get(KEY_FIRST_INDEX)?.as_deref())?.index)
     }
 
     /// Get the last index in the log.
@@ -138,19 +138,9 @@ impl RaftStorage {
         Ok(last_key)
     }
 
-    /// Append entries to the log.
+    /// Replace the uncommitted suffix and append its new entries atomically.
     pub fn append(&self, entries: &[Entry]) -> Result<()> {
-        let mut batch = self.entries.batch();
-
-        for entry in entries {
-            let key = entry.index.to_be_bytes();
-            let value = protobuf::Message::write_to_bytes(entry)
-                .map_err(|e| RaftError::Serialization(e.to_string()))?;
-            batch.insert(&key, &value);
-        }
-
-        batch.apply()?;
-        Ok(())
+        self.replace_suffix(entries)
     }
 
     /// Set the hard state.
@@ -305,8 +295,16 @@ impl RaftStorage {
             let mut state_table = write_txn
                 .open_table(state_def)
                 .map_err(|e| RaftError::Storage(e.to_string()))?;
+            let first_bytes = self.first_index_bytes(
+                state_table
+                    .get(KEY_FIRST_INDEX)
+                    .map_err(|e| RaftError::Storage(e.to_string()))?
+                    .as_ref()
+                    .map(|value| value.value()),
+                new_first,
+            )?;
             state_table
-                .insert(KEY_FIRST_INDEX, new_first.to_be_bytes().as_slice())
+                .insert(KEY_FIRST_INDEX, first_bytes.as_slice())
                 .map_err(|e| RaftError::Storage(e.to_string()))?;
             state_table
                 .insert(KEY_SNAPSHOT, snapshot_bytes.as_slice())
@@ -357,12 +355,26 @@ impl RaftStorage {
 
     /// Compact the log up to the given index.
     ///
-    /// Removes all entries before `compact_index` and updates first_index.
+    /// Removes all entries before `compact_index` and updates first_index,
+    /// keeping the term of the entry at `compact_index - 1` answerable.
     pub fn compact(&self, compact_index: u64) -> Result<()> {
         let first = self.first_index_impl()?;
         if compact_index <= first {
             return Ok(()); // Nothing to compact
         }
+
+        // Record the new boundary's term before anything is removed. A crash
+        // before `first_index` moves leaves the record for an index that is
+        // not yet `first_index - 1`, so it is not consulted.
+        let boundary = compact_index - 1;
+        let term = self
+            .get_entry(boundary)?
+            .map(|entry| entry.term)
+            .ok_or_else(|| RaftError::Storage(format!("compact: entry {boundary} is absent")))?;
+        let mut record = [0u8; 16];
+        record[..8].copy_from_slice(&boundary.to_be_bytes());
+        record[8..].copy_from_slice(&term.to_be_bytes());
+        self.state.set(KEY_LOG_BOUNDARY_TERM, &record)?;
 
         // Remove entries [first, compact_index)
         let mut batch = self.entries.batch();
@@ -372,8 +384,7 @@ impl RaftStorage {
         batch.apply()?;
 
         // Update first_index
-        self.state
-            .set(KEY_FIRST_INDEX, &compact_index.to_be_bytes())?;
+        self.set_first_index(compact_index)?;
 
         Ok(())
     }
@@ -396,6 +407,9 @@ impl RaftStorage {
         }
     }
 }
+
+mod append;
+mod reader_format;
 
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
@@ -462,6 +476,23 @@ impl Storage for RaftStorage {
         let first = self.first_index_impl().map_err(to_raft_error)?;
 
         if idx < first {
+            // The entry just before the log: its term is kept by `compact`.
+            if idx + 1 == first {
+                if let Some(record) = self
+                    .state
+                    .get(KEY_LOG_BOUNDARY_TERM)
+                    .map_err(to_raft_error)?
+                {
+                    if let Ok(record) = <[u8; 16]>::try_from(record.as_slice()) {
+                        let index = u64::from_be_bytes(record[..8].try_into().expect("8 bytes"));
+                        if index == idx {
+                            return Ok(u64::from_be_bytes(
+                                record[8..].try_into().expect("8 bytes"),
+                            ));
+                        }
+                    }
+                }
+            }
             // Check if it matches snapshot
             if let Ok(snap) = self.snapshot(0, 0) {
                 if snap.get_metadata().index == idx {
@@ -713,6 +744,49 @@ mod tests {
             storage.term(14),
             Err(RaftCoreError::Store(RaftStorageError::Compacted))
         ));
+    }
+
+    /// A compaction that keeps entries below the snapshot (a leader keeping a
+    /// lagging peer's entries) still answers `term(first_index - 1)`. A
+    /// boundary record that a later compaction did not refresh (an older
+    /// binary's) is never consulted.
+    #[test]
+    fn compact_below_the_snapshot_keeps_the_boundary_term() {
+        let (storage, _dir) = create_test_storage();
+        let entries: Vec<Entry> = (1..=20)
+            .map(|i| Entry {
+                index: i,
+                term: if i <= 12 { 3 } else { 4 },
+                ..Default::default()
+            })
+            .collect();
+        storage.append(&entries).unwrap();
+
+        storage.store_snapshot(&make_snapshot(18, 4, &[1])).unwrap();
+        storage.compact(13).unwrap();
+
+        assert_eq!(storage.first_index().unwrap(), 13);
+        assert_eq!(storage.last_index().unwrap(), 20);
+        assert_eq!(
+            storage.term(12).unwrap(),
+            3,
+            "the boundary keeps its own term"
+        );
+        assert_eq!(storage.term(18).unwrap(), 4);
+        assert!(matches!(
+            storage.term(11),
+            Err(RaftCoreError::Store(RaftStorageError::Compacted))
+        ));
+
+        // An older binary's compaction moves first_index without the record.
+        storage.set_first_index(16).unwrap();
+        assert!(
+            matches!(
+                storage.term(15),
+                Err(RaftCoreError::Store(RaftStorageError::Compacted))
+            ),
+            "a stale boundary record is not consulted"
+        );
     }
 
     /// `conf_state()` round-trips the persisted membership.

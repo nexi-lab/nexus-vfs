@@ -86,11 +86,14 @@ pub const USER_RUNTIME_MAX_VALIDITY_SECS: u64 = 300;
 /// `zone-ops`           — zone-mutation operation journal (`raft::zone_op_journal`).
 /// `zone-registry`      — zone deletion epochs/tombstone registry (`raft::zone_deletion_registry`).
 /// `boot-sync`          — per-node boot catch-up markers (`profiles/cluster` boot).
+/// `member-address`     — zone member id → dial address (`raft::raft::member_address`).
 pub const CONTROL_NS_AUTH: &str = "auth";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_FOREIGN_CA: &str = "foreign-ca";
 /// Immutable collaboration-space bindings and irreversible revocations.
 pub const CONTROL_NS_COLLABORATION: &str = "collaboration";
+/// Native replica allocation bindings and their committed operation receipts.
+pub const CONTROL_NS_REPLICA: &str = "replica-binding";
 /// See [`CONTROL_NS_AUTH`].
 pub const CONTROL_NS_SESSION_MINT_ALLOW: &str = "session-mint-allow";
 /// See [`CONTROL_NS_AUTH`].
@@ -103,6 +106,10 @@ pub const CONTROL_NS_ZONE_REGISTRY: &str = "zone-registry";
 /// crates" guideline at the top of this file — same trade-off as
 /// `CONTROL_NS_ZONE_OPS`/`CONTROL_NS_ZONE_REGISTRY`.
 pub const CONTROL_NS_BOOT_SYNC: &str = "boot-sync";
+/// Every zone member's advertise address, keyed by its decimal Raft node id.
+/// Single-crate owner (`raft`), registered here for the same collision-
+/// prevention reason as [`CONTROL_NS_BOOT_SYNC`].
+pub const CONTROL_NS_MEMBER_ADDRESS: &str = "member-address";
 
 /// Zone IDs that can never be deleted — the replicated-control substrate
 /// itself. Deletion guards (`ZoneManager::remove_zone`, the registry's
@@ -243,12 +250,16 @@ pub mod env {
     pub const BIND_ADDR: &str = "NEXUS_BIND_ADDR";
 }
 
-/// Maximum gRPC message size (bytes) for the unified VFS service.
+/// Maximum gRPC message size (bytes) on the data-plane port.
 ///
 /// Applies to every client/server that talks to `NexusVFSService`:
 /// Python server (`grpc.aio.server(options=...)`), Python client
 /// (`nexus.grpc.defaults.build_channel_options`), and the Rust peer-
-/// blob client (`tonic` `max_decoding/encoding_message_size`).
+/// blob client (`tonic` `max_decoding/encoding_message_size`) — and to
+/// the raft transport co-hosted on the same port, whose message, append
+/// and entry bounds derive from it (`raft::message_bound`). Every endpoint
+/// applying the same bound is what makes a message one node can send one
+/// every other node accepts.
 ///
 /// 64 MiB accommodates files above the 16 MiB CDC chunk threshold —
 /// both single-blob content reads and scatter-gather `ReadBlob`

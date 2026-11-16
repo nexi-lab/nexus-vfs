@@ -2,14 +2,17 @@
 //! to one namespace of the [`crate::prelude::Command::PutControlState`] key
 //! space.
 //!
-//! This is the one place the propose + read-your-writes + local read boilerplate
-//! lives. Typed stores are thin wrappers that pick a namespace and map the error:
+//! This is the one place the propose + local read boilerplate lives. Typed
+//! stores are thin wrappers that pick a namespace and map the error:
 //! [`crate::auth_key_store::RaftAuthKeyStore`] (`contracts::CONTROL_NS_AUTH`) and
 //! the cross-org foreign-CA anchor registry (`contracts::CONTROL_NS_FOREIGN_CA`).
 //!
 //! Same shape as [`crate::zone_meta_store::ZoneMetaStore`]: writes go through
-//! `propose` (Raft consensus, majority ACK) so they reach every replica; reads
-//! hit the locally-applied state machine directly, no consensus round-trip.
+//! `propose` (Raft consensus, majority ACK) so they reach every replica, and
+//! succeed only once this replica has applied them; reads hit the
+//! locally-applied state machine directly, no consensus round-trip, after
+//! this node's own writes are applied here
+//! ([`ZoneConsensus::own_writes_visible`]).
 
 use crate::prelude::{Command, CommandResult, FullStateMachine, ZoneConsensus};
 use lib::rt::block_on_via as bridge_block_on;
@@ -49,11 +52,23 @@ impl ControlStateStore {
     #[inline]
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         let ns = self.namespace;
+        self.own_writes_visible()
+            .map_err(|e| format!("get({ns}/{key}): {e}"))?;
         let k = key.to_string();
         let fut = self
             .node
             .with_state_machine(move |sm: &FullStateMachine| sm.get_control_state(ns, &k));
         bridge_block_on(&self.runtime, fut).map_err(|e| format!("get({ns}/{key}): {e}"))
+    }
+
+    /// Read-your-writes for a local read: two atomic loads when this
+    /// replica has applied every write this node submitted, else a bounded
+    /// wait that reports the replica's lag.
+    fn own_writes_visible(&self) -> Result<(), crate::raft::RaftError> {
+        if self.node.own_writes_applied() {
+            return Ok(());
+        }
+        bridge_block_on(&self.runtime, self.node.own_writes_visible())
     }
 
     /// Read related control records at one consensus read point. Unlike a
@@ -92,6 +107,8 @@ impl ControlStateStore {
     #[inline]
     pub fn list(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
         let ns = self.namespace;
+        self.own_writes_visible()
+            .map_err(|e| format!("list({ns}): {e}"))?;
         let fut = self
             .node
             .with_state_machine(move |sm: &FullStateMachine| sm.list_control_state(ns));
@@ -114,33 +131,42 @@ impl ControlStateStore {
         self.put_inner(key, value, /* if_absent */ true)
     }
 
+    /// Typed stores submit their owning command through the same consensus
+    /// handle. A proposal error may follow a commit and remains unknown.
+    pub(crate) fn propose(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.propose(command))
+            .map_err(|e| format!("control proposal({}): {e}", self.namespace))
+    }
+
+    pub(crate) fn supports_replica_binding(&self) -> Result<bool, String> {
+        bridge_block_on(&self.runtime, self.node.supports_replica_binding())
+            .map_err(|error| format!("replica activation observation: {error}"))
+    }
+
+    pub(crate) fn commit_replica_control(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.commit_replica_control(command))
+            .map_err(|e| format!("replica binding proposal: {e}"))
+    }
+
     fn put_inner(&self, key: &str, value: &[u8], if_absent: bool) -> Result<bool, String> {
         let ns = self.namespace;
-        let result = bridge_block_on(
-            &self.runtime,
-            self.node.propose(Command::PutControlState {
-                namespace: ns.to_string(),
-                key: key.to_string(),
-                value: value.to_vec(),
-                if_absent,
-            }),
-        )
-        .map_err(|e| format!("put({ns}/{key}): {e}"))?;
+        let result = self.propose(Command::PutControlState {
+            namespace: ns.to_string(),
+            key: key.to_string(),
+            value: value.to_vec(),
+            if_absent,
+        })?;
         if let CommandResult::Error(msg) = result {
             // The only expected rejection is the CAS conflict; surface anything
-            // else (an upsert must never be refused).
+            // else (an upsert must never be refused). The losing CAS was
+            // applied here, so the winner's earlier insert is visible to a
+            // caller that reads the record back right away (the journal's
+            // begin does).
             if if_absent {
-                // The winner's insert is committed, but on a follower the
-                // local apply lags the returned leader result — barrier
-                // before reporting the loss so a caller that reads the
-                // record back right away (the journal's begin does) sees
-                // the winner instead of a stale miss.
-                self.read_barrier()?;
                 return Ok(false);
             }
             return Err(format!("put({ns}/{key}) rejected: {msg}"));
         }
-        self.read_barrier()?;
         Ok(true)
     }
 
@@ -151,24 +177,19 @@ impl ControlStateStore {
     pub fn delete(&self, key: &str) -> Result<bool, String> {
         let ns = self.namespace;
         let existed = self.get(key)?.is_some();
-        let result = bridge_block_on(
-            &self.runtime,
-            self.node.propose(Command::DeleteControlState {
-                namespace: ns.to_string(),
-                key: key.to_string(),
-            }),
-        )
-        .map_err(|e| format!("delete({ns}/{key}): {e}"))?;
+        let result = self.propose(Command::DeleteControlState {
+            namespace: ns.to_string(),
+            key: key.to_string(),
+        })?;
         if let CommandResult::Error(msg) = result {
             return Err(format!("delete({ns}/{key}) rejected: {msg}"));
         }
-        self.read_barrier()?;
         Ok(existed)
     }
 
-    /// Wait for the local replica to apply all preceding commits through Raft
-    /// ReadIndex. Applies equally to grants and revocations, including writes
-    /// forwarded by followers. Errors are returned to the management caller.
+    /// Wait for the local replica to apply everything committed cluster-wide
+    /// before this call, through Raft ReadIndex — for a read that must observe
+    /// OTHER nodes' writes too. Errors are returned to the management caller.
     pub(crate) fn read_barrier(&self) -> Result<(), String> {
         bridge_block_on(&self.runtime, async {
             tokio::time::timeout(

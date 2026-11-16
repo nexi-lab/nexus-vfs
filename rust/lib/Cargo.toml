@@ -8,11 +8,16 @@ description = "Shared Rust utilities — bloom, hash, search, trigram, ReBAC, pa
 name = "lib"
 crate-type = ["rlib"]
 
+[[test]]
+name = "runtime_bridge"
+required-features = ["runtime-bridge"]
+
 [features]
 # Brings `lib::transport_primitives` (TLS, pool, addressing, TOFU trust
 # store, PeerBlobClient trait). Enabled by every peer crate that speaks
 # raft or VFS gRPC. WASM / pure-algo callers skip it.
 transport = [
+    "dep:http-body",
     "dep:tonic",
     "dep:tokio",
     "dep:dashmap",
@@ -65,6 +70,7 @@ tempfile = { version = "3", optional = true }
 
 # Transport-primitives module deps (gated by the `transport` feature).
 tonic = { workspace = true, optional = true }
+http-body = { version = "1", optional = true }
 # Pin the process-level rustls crypto provider explicitly (ring, matching
 # tonic's `tls-ring`). rustls 0.23's auto-selecting config builder panics
 # when zero OR multiple provider features are compiled in, and on Linux the
@@ -76,8 +82,7 @@ tokio = { version = "1", features = ["rt", "net", "sync", "time"], optional = tr
 # `tls-ring` tokio-rustls so its `Connected for TlsStream` bridge — which
 # populates `TlsConnectInfo::peer_certs()` — applies to our accepted streams).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
-# `ReceiverStream` adapts the accept loop into the `impl Stream` tonic's
-# `serve_with_incoming` consumes.
+# Stream traits for the TLS listener consumed by tonic's `serve_with_incoming`.
 tokio-stream = { version = "0.1", optional = true }
 # Atomic hot-swap of the client-cert trust roots when a foreign CA is
 # registered / revoked, with no rebuild of the running server.

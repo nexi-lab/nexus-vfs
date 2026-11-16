@@ -1,0 +1,9 @@
+# Functional CI compiles workspace and dependency crates without optimization.
+# Debug assertions and the original test deadlines remain enabled.
+[profile.test]
+opt-level = 0
+debug = 0
+incremental = false
+
+[profile.test.package."*"]
+opt-level = 0

@@ -9,7 +9,7 @@
 //! [`crate::foreign_ca_registrar::ForeignCaRegistrar`], which administers the
 //! other cross-org trust decision the same way and for the same reasons.
 //!
-//! Separate from [`crate::agent_minter::AgentMinter`] on purpose: issuing a
+//! Separate from [`crate::ca_issuer::CaIssuer`] on purpose: issuing a
 //! credential and deciding who may issue one are different authorities with
 //! different gates. Minting a session is reachable by an allow-listed AGENT;
 //! changing the allow-list is node-only, because an agent that could edit it

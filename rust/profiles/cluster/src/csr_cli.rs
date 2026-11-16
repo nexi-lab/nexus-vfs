@@ -8,13 +8,11 @@ use anyhow::{Context, Result};
 use lib::transport_primitives::{create_channel, first_certificate_der, ClientConfig, TlsConfig};
 use nexus_raft::{
     agent_csr_client::{AgentCsrBinding, PendingAgentCsr},
-    agent_minter::agent_csr_request_digest,
+    ca_issuer::agent_csr_request_digest,
     transport::{
-        current_local_node_certificate,
-        proto::{
-            zone_api_service_client::ZoneApiServiceClient, AgentCsrCapabilitiesRequest,
-            AgentCsrState,
-        },
+        local_node_identity,
+        proto::{AgentCsrCapabilitiesRequest, AgentCsrState},
+        zone_api_client,
     },
 };
 use serde_json::{json, Value};
@@ -126,10 +124,7 @@ fn node_tls(common: &CommonArgs, endpoint: &str) -> Result<TlsConfig> {
             .context("read local Node certificate")?,
         key_pem: std::fs::read(directory.join("node-key.pem")).context("read local Node key")?,
     };
-    let ca = first_certificate_der(&tls.ca_pem, "local issuer CA").map_err(anyhow::Error::msg)?;
-    let leaf = first_certificate_der(&tls.cert_pem, "local Node certificate")
-        .map_err(anyhow::Error::msg)?;
-    current_local_node_certificate(&leaf, &ca).map_err(anyhow::Error::msg)?;
+    local_node_identity(&tls.cert_pem, &tls.ca_pem).map_err(anyhow::Error::msg)?;
     Ok(tls)
 }
 
@@ -180,7 +175,7 @@ async fn execute(
     let channel = create_channel(&args.endpoint, &config)
         .await
         .map_err(Failure::preflight)?;
-    let mut client = ZoneApiServiceClient::new(channel);
+    let mut client = zone_api_client(channel);
     // Read-only preflight is not permission or authoritative-store readiness.
     // A later refusal/Unknown never causes another issue or another key.
     let caps = client

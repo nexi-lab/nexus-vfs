@@ -14,25 +14,27 @@ use super::proto::nexus::raft::{
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     AllowSessionMinterRequest, AllowSessionMinterResponse, ClusterConfig as ProtoClusterConfig,
     DeleteZoneRequest, DeleteZoneResponse, DenySessionMinterRequest, DenySessionMinterResponse,
-    DiscoverZonesRequest, DiscoverZonesResponse, FederationZoneInfo, ForeignCaEntry,
-    GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
+    DiscoverZonesRequest, DiscoverZonesResponse, EcReplicationEntry, FederationZoneInfo,
+    ForeignCaEntry, GetClusterInfoRequest, GetClusterInfoResponse, GetCrlRequest, GetCrlResponse,
     GetMetadataResult, GetSearchCapabilitiesRequest, JoinClusterRequest, JoinClusterResponse,
     JoinZoneRequest, JoinZoneResponse, ListForeignCasRequest, ListForeignCasResponse,
     ListKeysRequest, ListKeysResponse, ListMetadataResult, ListSessionMintersRequest,
     ListSessionMintersResponse, ListedKey, LockInfoResult, LockResult, MintAgentRequest,
     MintAgentResponse, MintKeyRequest, MintKeyResponse, MintSessionAgentRequest,
-    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, ProposeRequest, ProposeResponse,
-    QueryRequest, QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest,
-    ReadBlobResponse, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
-    RemoveVoterResponse, RenewSessionAgentRequest, ReplicateEntriesRequest,
-    ReplicateEntriesResponse, RevokeAgentCertRequest, RevokeAgentCertResponse, RevokeKeyRequest,
-    RevokeKeyResponse, SearchCapabilities, SnapshotEcStateRequest, SnapshotEcStateResponse,
-    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
-    UnregisterForeignCaResponse,
+    MintSessionAgentResponse, NodeInfo as ProtoNodeInfo, PrepareReplicaControlReaderRequest,
+    PrepareReplicaControlReaderResponse, ProposeRequest, ProposeResponse, QueryRequest,
+    QueryResponse, RaftCommand, RaftQueryResponse, RaftResponse, ReadBlobRequest, ReadBlobResponse,
+    ReadZoneBlobRequest, RegisterForeignCaRequest, RegisterForeignCaResponse, RemoveVoterRequest,
+    RemoveVoterResponse, RenewLocalNodeCertificateRequest, RenewLocalNodeCertificateResponse,
+    RenewNodeCertificateRequest, RenewNodeCertificateResponse, RenewSessionAgentRequest,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
+    RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
+    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
-use crate::agent_minter::{AgentBundle, AgentMinterSlot};
 use crate::blob_fetcher::BlobFetcherSlot;
+use crate::ca_issuer::{AgentBundle, CaIssuerSlot, LocalNodeRenewerSlot, NOT_CA_HOLDER};
 use crate::foreign_ca_registrar::ForeignCaRegistrarSlot;
 use crate::key_minter::{KeyMinterSlot, MintKeyParams};
 
@@ -59,17 +61,17 @@ fn session_credential_response(
     })
 }
 use crate::raft::{
-    reconcile_peers_with_conf_state, Command, CommandResult, FullStateMachine, RaftError,
-    WitnessStateMachine, ZoneConsensus, ZoneRaftRegistry,
+    Command, CommandResult, FullStateMachine, RaftError, WitnessStateMachine, ZoneConsensus,
+    ZoneRaftRegistry,
 };
-use bincode;
+use bincode::Options;
 use dashmap::DashMap;
 use prost::Message;
 use protobuf::Message as ProtobufV2Message;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
@@ -80,8 +82,6 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Maximum message size in bytes.
-    pub max_message_size: usize,
     /// Optional TLS configuration for mTLS. None = plain HTTP/2.
     pub tls: Option<super::TlsConfig>,
 }
@@ -91,7 +91,6 @@ impl Default for ServerConfig {
         Self {
             bind_address: "0.0.0.0:2026".parse().unwrap(),
             max_connections: 100,
-            max_message_size: 64 * 1024 * 1024, // 64MB
             tls: None,
         }
     }
@@ -113,10 +112,10 @@ pub struct RaftGrpcServer {
     /// `ReadBlob` returns `NotFound` until the kernel installs one.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Slot the cluster profile binds an `AgentMinter` into on the founder
+    /// Slot the cluster profile binds an `CaIssuer` into on the founder
     /// (CA holder) at boot. `None` on a joiner — `MintAgent` returns
     /// success=false there ("not the CA holder").
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Slot the cluster profile binds a `KeyMinter` into on every auth-on
     /// daemon at boot. `None` under `--no-tls` — `MintKey`/`RevokeKey` return
     /// success=false there (auth-off has no sk- plane).
@@ -126,6 +125,7 @@ pub struct RaftGrpcServer {
     /// return success=false there (no cross-org trust plane).
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
     session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
+    local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
     /// Federated mTLS client-cert verifier — the client-auth trust roots as a
     /// hot-swappable set (cluster CA + any runtime-registered foreign CAs), so a
     /// cross-org CA registered live is trusted without a restart. Shared with the
@@ -145,13 +145,56 @@ type GuardedRaftService =
 type GuardedApiService =
     super::node_authority::NodeControlService<ZoneApiServiceServer<ZoneApiServiceImpl>>;
 
+pub(crate) struct PreparedRaftListener {
+    policy: super::node_authority::NodeControlPolicy,
+    tls: Option<lib::transport_primitives::SharedTlsListener>,
+}
+
+fn listener_credentials(
+    source: lib::transport_primitives::SharedTlsConfig,
+    configured: Option<&super::TlsConfig>,
+) -> Result<lib::transport_primitives::SharedTlsConfig> {
+    let snapshot = source.snapshot();
+    let current = snapshot
+        .configured_material()
+        .map_err(|e| TransportError::Connection(e.into()))?;
+    if current != configured {
+        return Err(TransportError::Connection(
+            "listener and registry TLS configuration differ".into(),
+        ));
+    }
+    Ok(source)
+}
+
 impl RaftGrpcServer {
-    fn guarded_services(&self) -> Result<(GuardedRaftService, GuardedApiService)> {
-        use super::node_authority::{
-            NodeControlPolicy, NodeControlService, AGENT_CREDENTIAL_METHODS,
-        };
-        let policy = NodeControlPolicy::from_tls(self.config.tls.as_ref())
+    pub(crate) fn prepare_listener(
+        credentials: lib::transport_primitives::SharedTlsConfig,
+        configured: Option<&super::TlsConfig>,
+        verifier: Option<Arc<lib::transport_primitives::FederatedClientCertVerifier>>,
+    ) -> Result<PreparedRaftListener> {
+        let original = credentials.snapshot();
+        listener_credentials(credentials.clone(), configured)?;
+        let policy = super::node_authority::NodeControlPolicy::from_shared_tls(credentials.clone())
             .map_err(TransportError::Connection)?;
+        let tls = configured
+            .map(|_| {
+                lib::transport_primitives::SharedTlsListener::prepare(credentials.clone(), verifier)
+                    .map_err(TransportError::Connection)
+            })
+            .transpose()?;
+        if !credentials.snapshot().same_installation(&original) {
+            return Err(TransportError::Connection(
+                "listener credentials changed during preparation".into(),
+            ));
+        }
+        Ok(PreparedRaftListener { policy, tls })
+    }
+
+    fn guarded_services(
+        &self,
+        policy: super::node_authority::NodeControlPolicy,
+    ) -> (GuardedRaftService, GuardedApiService) {
+        use super::node_authority::{NodeControlService, AGENT_CREDENTIAL_METHODS};
         let raft = ZoneTransportServiceImpl {
             registry: self.registry.clone(),
         };
@@ -159,19 +202,26 @@ impl RaftGrpcServer {
             registry: self.registry.clone(),
             blob_fetcher_slot: self.blob_fetcher_slot.clone(),
             search_capabilities_slot: self.search_capabilities_slot.clone(),
-            agent_minter_slot: self.agent_minter_slot.clone(),
+            ca_issuer_slot: self.ca_issuer_slot.clone(),
             key_minter_slot: self.key_minter_slot.clone(),
             foreign_ca_registrar_slot: self.foreign_ca_registrar_slot.clone(),
             session_mint_admin_slot: self.session_mint_admin_slot.clone(),
+            local_node_renewer_slot: self.local_node_renewer_slot.clone(),
         };
-        Ok((
-            NodeControlService::new(ZoneTransportServiceServer::new(raft), policy.clone(), &[]),
+        (
             NodeControlService::new(
-                ZoneApiServiceServer::new(api),
+                bounded!(ZoneTransportServiceServer::new(raft)),
+                policy.clone(),
+                &[],
+            )
+            .with_owner_replica_data(),
+            NodeControlService::new(
+                bounded!(ZoneApiServiceServer::new(api)),
                 policy,
                 AGENT_CREDENTIAL_METHODS,
-            ),
-        ))
+            )
+            .with_owner_replica_data(),
+        )
     }
     pub fn new(registry: Arc<ZoneRaftRegistry>, config: ServerConfig) -> Self {
         Self {
@@ -179,10 +229,11 @@ impl RaftGrpcServer {
             registry,
             blob_fetcher_slot: None,
             search_capabilities_slot: None,
-            agent_minter_slot: None,
+            ca_issuer_slot: None,
             key_minter_slot: None,
             foreign_ca_registrar_slot: None,
             session_mint_admin_slot: None,
+            local_node_renewer_slot: None,
             foreign_ca_verifier: None,
             extra_services: None,
         }
@@ -205,11 +256,11 @@ impl RaftGrpcServer {
         self
     }
 
-    /// Attach the late-bindable `AgentMinter` slot so `ZoneApiService::mint_agent`
+    /// Attach the late-bindable `CaIssuer` slot so `ZoneApiService::mint_agent`
     /// can sign agent certs once the founder installs an impl. Installed only on
     /// the CA holder; a joiner leaves it empty and rejects `MintAgent`.
-    pub fn with_agent_minter_slot(mut self, slot: AgentMinterSlot) -> Self {
-        self.agent_minter_slot = Some(slot);
+    pub fn with_ca_issuer_slot(mut self, slot: CaIssuerSlot) -> Self {
+        self.ca_issuer_slot = Some(slot);
         self
     }
 
@@ -242,6 +293,13 @@ impl RaftGrpcServer {
         self
     }
 
+    /// Attach the late-bindable renewer of this daemon's own Node certificate,
+    /// so `RenewLocalNodeCertificate` serves once the daemon installs it.
+    pub fn with_local_node_renewer_slot(mut self, slot: LocalNodeRenewerSlot) -> Self {
+        self.local_node_renewer_slot = Some(slot);
+        self
+    }
+
     /// Attach the shared federated client-cert verifier (from `ZoneManager`), so
     /// the serve path's mTLS client-auth roots are the same `Arc` the cross-org
     /// apply-observer hot-swaps. `None` → the serve path builds a cluster-only
@@ -270,83 +328,58 @@ impl RaftGrpcServer {
         self.config.bind_address
     }
 
-    /// Start the gRPC server.
-    pub async fn serve(self) -> Result<()> {
-        let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
-        tracing::info!(
-            "Starting Raft gRPC server on {} (zones={}, tls={})",
-            addr,
-            self.registry.list_zones().len(),
-            tls_enabled,
-        );
-
-        let (raft_service, client_service) = self.guarded_services()?;
-
-        let mut builder =
-            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-
-        // If extra services are provided, add them first via add_routes
-        // (which returns a Router), then add the raft services.
-        // Otherwise, add raft services directly.
-        let router = if let Some(extra) = self.extra_services {
-            builder
-                .add_routes(extra)
-                .add_service(raft_service)
-                .add_service(client_service)
-        } else {
-            builder
-                .add_service(raft_service)
-                .add_service(client_service)
-        };
-
-        // mTLS via a custom acceptor whose client-cert verifier is HOT-SWAPPABLE
-        // (cluster CA + runtime-registered foreign CAs), so a cross-org CA
-        // registered live is trusted without a restart — the SAME Arc the
-        // cross-org apply-observer swaps via `set_foreign_cas`. All rustls /
-        // tokio-rustls / bind assembly lives in `transport_primitives`
-        // (`federated_mtls_incoming`), so server.rs names no TLS types. With no
-        // foreign CAs registered it is byte-equivalent to the prior
-        // `client_ca_root(cluster_ca)` mandatory-client-auth config.
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
-                    tls,
-                    self.foreign_ca_verifier.clone(),
-                )
-                .await
-                .map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming(incoming)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            None => router.serve(addr).await.map_err(TransportError::Tonic)?,
-        }
-
-        Ok(())
+    /// Prepare the listener and run it until termination.
+    pub fn serve(self) -> impl std::future::Future<Output = Result<()>> + Send {
+        self.serve_with_shutdown(std::future::pending())
     }
 
-    /// Start the gRPC server with graceful shutdown.
-    pub async fn serve_with_shutdown(
+    /// Prepare trust and service policy before the returned future is scheduled.
+    /// Live credential replacement remains visible to handshakes and requests.
+    pub fn serve_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
-        let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
-        tracing::info!(
-            "Starting Raft gRPC server on {} (zones={}, tls={}, with shutdown signal)",
-            addr,
-            self.registry.list_zones().len(),
-            tls_enabled,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let prepared = Self::prepare_listener(
+            self.registry.shared_tls(),
+            self.config.tls.as_ref(),
+            self.foreign_ca_verifier.clone(),
         );
+        async move {
+            let prepared = prepared?;
+            let listener = tokio::net::TcpListener::bind(self.config.bind_address)
+                .await
+                .map_err(|e| TransportError::Connection(e.to_string()))?;
+            self.serve_listener(prepared, listener, shutdown).await
+        }
+    }
 
-        let (raft_service, client_service) = self.guarded_services()?;
+    /// Serve a socket and trust policy prepared before opening runtime storage.
+    pub(crate) async fn serve_prepared(
+        self,
+        prepared: PreparedRaftListener,
+        listener: std::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| TransportError::Connection(e.to_string()))?;
+        self.serve_listener(prepared, listener, shutdown).await
+    }
 
+    async fn serve_listener(
+        self,
+        prepared: PreparedRaftListener,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let (raft_service, client_service) = self.guarded_services(prepared.policy);
+        tracing::info!(
+            "Starting Raft gRPC server on {} (zones={}, tls={})",
+            self.config.bind_address,
+            self.registry.list_zones().len(),
+            prepared.tls.is_some(),
+        );
         let mut builder =
             lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-
         let router = if let Some(extra) = self.extra_services {
             builder
                 .add_routes(extra)
@@ -357,31 +390,19 @@ impl RaftGrpcServer {
                 .add_service(raft_service)
                 .add_service(client_service)
         };
-
-        // Hot-swappable federated mTLS acceptor — see `serve` for the rationale
-        // (client-auth roots = cluster CA + runtime-registered foreign CAs, the
-        // shared verifier the cross-org observer swaps; assembly lives in
-        // `transport_primitives::federated_mtls_incoming`).
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(
-                    addr,
-                    tls,
-                    self.foreign_ca_verifier.clone(),
-                )
+        if let Some(tls) = prepared.tls {
+            router
+                .serve_with_incoming_shutdown(tls.incoming(listener), shutdown)
                 .await
-                .map_err(TransportError::Connection)?;
-                router
-                    .serve_with_incoming_shutdown(incoming, shutdown)
-                    .await
-                    .map_err(TransportError::Tonic)?;
-            }
-            None => router
-                .serve_with_shutdown(addr, shutdown)
+                .map_err(TransportError::Tonic)?;
+        } else {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
                 .await
-                .map_err(TransportError::Tonic)?,
+                .map_err(TransportError::Tonic)?;
         }
-
         Ok(())
     }
 }
@@ -520,6 +541,7 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
     mut msg: raft::eraftpb::Message,
     zone_id: &str,
     log_prefix: &str,
+    protocol: crate::raft::RaftMessageProtocol,
 ) -> std::result::Result<Response<StepMessageResponse>, Status> {
     tracing::trace!(
         "{} StepMessage [zone={}]: type={:?}, from={}, to={}, term={}",
@@ -537,6 +559,13 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
     // but ordinary heartbeats/appends may arrive first. Clamp the commit hint
     // to the highest index this message/local handle can actually account for;
     // the later snapshot or append will advance commit normally.
+    //
+    // A clamp alone is not news: a learner of a zone whose voters commit
+    // without it sees the leader's commit ahead of its own log on every
+    // message while entries are in flight. It is news once this replica's
+    // applied index has stood still behind the leader for
+    // `REPLICATION_STALL` — the stall `doctor --live` reports as
+    // REPLICA_LAGGING — so only then is it a warning.
     if matches!(
         msg.get_msg_type(),
         raft::eraftpb::MessageType::MsgAppend | raft::eraftpb::MessageType::MsgHeartbeat
@@ -545,22 +574,38 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
         let msg_last = msg.get_entries().last().map(|e| e.index).unwrap_or(0);
         let safe_commit = local_last.max(msg_last).max(node.applied_index());
         if msg.get_commit() > safe_commit {
-            tracing::warn!(
-                zone = %zone_id,
-                from = msg.from,
-                to = msg.to,
-                msg_type = ?msg.get_msg_type(),
-                leader_commit = msg.get_commit(),
-                safe_commit,
-                local_last,
-                msg_last,
-                "Clamping inbound raft commit hint until follower catches up",
-            );
+            let stalled_for = node.replication().stalled_for;
+            if stalled_for >= crate::raft::REPLICATION_STALL {
+                tracing::warn!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    to = msg.to,
+                    msg_type = ?msg.get_msg_type(),
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    stalled_secs = stalled_for.as_secs(),
+                    "Clamping inbound raft commit hint: this replica has applied nothing \
+                     behind the leader's commit for {}s, so it is not receiving entries",
+                    stalled_for.as_secs(),
+                );
+            } else {
+                tracing::debug!(
+                    zone = %zone_id,
+                    from = msg.from,
+                    leader_commit = msg.get_commit(),
+                    safe_commit,
+                    local_last,
+                    msg_last,
+                    "Clamping inbound raft commit hint while entries are in flight",
+                );
+            }
             msg.set_commit(safe_commit);
         }
     }
 
-    if let Err(e) = node.step(msg).await {
+    if let Err(e) = node.step_transport(msg, protocol).await {
         return Ok(Response::new(StepMessageResponse {
             success: false,
             error: Some(format!("Failed to step message: {}", e)),
@@ -577,6 +622,20 @@ async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>
 // ZoneTransportService (internal node-to-node transport)
 // =============================================================================
 
+/// Full nodes and witnesses acknowledge the same durable driver operation.
+async fn prepare_replica_control_reader<S: crate::raft::StateMachine + Send + Sync + 'static>(
+    node: ZoneConsensus<S>,
+) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+    node.prepare_replica_control_reader()
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!("reader preparation failed: {error}"))
+        })?;
+    Ok(Response::new(PrepareReplicaControlReaderResponse {
+        replica_control_transport_v1: true,
+    }))
+}
+
 /// Zone-routed implementation of the ZoneTransportService gRPC trait.
 ///
 /// All raft-rs message types (~15 types including votes, heartbeats, appends)
@@ -586,8 +645,101 @@ struct ZoneTransportServiceImpl {
     registry: Arc<ZoneRaftRegistry>,
 }
 
+/// Both EC transfer paths acknowledge only commands this reader understood and
+/// applied. A refusal retains the sender's position for a compatible retry.
+async fn apply_ec_entry(
+    node: &ZoneConsensus<FullStateMachine>,
+    entry: &EcReplicationEntry,
+) -> std::result::Result<(), String> {
+    let command = bincode::options()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(&entry.command)
+        .map_err(|error| format!("decode EC entry {}: {error}", entry.seq))?;
+    match node.apply_ec_from_peer(command, entry.timestamp).await {
+        Ok(CommandResult::Error(error)) => Err(format!("apply EC entry {}: {error}", entry.seq)),
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("apply EC entry {}: {error}", entry.seq)),
+    }
+}
+
+impl ZoneTransportServiceImpl {
+    // Zone creation is synchronous setup. Keep its allocations and error paths
+    // outside the future polled for every Raft message on both wire versions.
+    #[cold]
+    #[inline(never)]
+    fn join_step_zone(
+        &self,
+        zone_id: &str,
+    ) -> std::result::Result<ZoneConsensus<FullStateMachine>, Status> {
+        if !self.registry.permits_automatic_zone_join() {
+            return Err(Status::not_found("zone is not admitted on this runtime"));
+        }
+        if self.registry.is_auto_join_suppressed(zone_id) {
+            return Err(Status::not_found(format!(
+                "zone '{zone_id}' was recently removed on this node"
+            )));
+        }
+        if !self.registry.is_resident(contracts::ROOT_ZONE_ID) {
+            return Err(Status::not_found(format!(
+                "zone '{zone_id}' not found on this node"
+            )));
+        }
+        // The transport authenticates the sender; the registry applies zone
+        // admission and membership rules.
+        let handle = tokio::runtime::Handle::current();
+        self.registry
+            .join_zone(zone_id, false, &handle)
+            .map_err(|e| Status::internal(format!("failed to auto-join zone '{zone_id}': {e}")))
+    }
+
+    async fn dispatch_step(
+        &self,
+        request: Request<StepMessageRequest>,
+        protocol: crate::raft::RaftMessageProtocol,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(request.extensions())?;
+        }
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        let message = match parse_raft_message(&request.get_ref().message) {
+            Ok(message) => message,
+            Err(response) => return Ok(Response::new(response)),
+        };
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
+        let req = request.into_inner();
+        let node = match self.registry.get_node(&req.zone_id) {
+            Some(n) => n,
+            None => self.join_step_zone(&req.zone_id)?,
+        };
+
+        // Observe the connected peer's address before stepping. Relayed
+        // requests retain their logical origin in `from`; that origin does not
+        // own the forwarder's advertised address. Authentication is the
+        // transport layer's job (mTLS when enabled); the observation is a
+        // route only, never membership.
+        self.registry
+            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
+
+        step_raft_message(&node, message, &req.zone_id, "", protocol).await
+    }
+}
+
 #[tonic::async_trait]
 impl ZoneTransportService for ZoneTransportServiceImpl {
+    async fn prepare_replica_control_reader_v1(
+        &self,
+        request: Request<PrepareReplicaControlReaderRequest>,
+    ) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+        super::node_authority::require_authenticated_control_node(request.extensions())?;
+        let node = get_zone_node(&self.registry, &request.get_ref().zone_id)?;
+        prepare_replica_control_reader(node).await
+    }
+
     /// Handle a raw raft-rs message forwarded from another node.
     ///
     /// Routes by zone_id to the correct Raft group's ZoneConsensus.
@@ -601,65 +753,24 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        let message = match parse_raft_message(&request.get_ref().message) {
-            Ok(message) => message,
-            Err(response) => return Ok(Response::new(response)),
-        };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
-        let req = request.into_inner();
-        let node = match self.registry.get_node(&req.zone_id) {
-            Some(n) => n,
-            None => {
-                if self.registry.is_auto_join_suppressed(&req.zone_id) {
-                    return Err(Status::not_found(format!(
-                        "zone '{}' was recently removed on this node",
-                        req.zone_id
-                    )));
-                }
-                let root_peers = self
-                    .registry
-                    .get_peers(contracts::ROOT_ZONE_ID)
-                    .ok_or_else(|| {
-                        Status::not_found(format!("zone '{}' not found on this node", req.zone_id))
-                    })?;
-                // Auto-join membership is gated by the transport
-                // layer's mTLS (when enabled).  Sender address is
-                // learned from `req.sender_address` after the
-                // join — under the opaque-ID contract the
-                // peer-map is the runtime SSOT (populated by inbound
-                // StepMessage), so a static "is sender in root
-                // peer-map" check was self-defeating: it rejected
-                // legit fresh joiners whose addresses had not yet
-                // been learned.
-                let peers: Vec<NodeAddress> = root_peers.values().cloned().collect();
-                let handle = tokio::runtime::Handle::current();
-                self.registry
-                    .join_zone(&req.zone_id, peers, false, &handle)
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "failed to auto-join zone '{}': {}",
-                            req.zone_id, e
-                        ))
-                    })?
-            }
-        };
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
 
-        // Learn the connected peer's address before stepping. Relayed requests
-        // retain their logical origin in `from`; that origin does not own the
-        // forwarder's advertised address.
-        //
-        // No separate membership check: the peer-map *is* the
-        // membership SSOT (populated via inbound StepMessage +
-        // ConfChange apply).  The OLD env-seeded `peer_map` was
-        // strict-fail under random data-plane ids — a legit
-        // post-JoinZone follower would have its leader's first
-        // heartbeat rejected before it could install ConfState.
-        // Authentication is the transport layer's job (mTLS when
-        // enabled).
-        self.registry
-            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
 
-        step_raft_message(&node, message, &req.zone_id, "").await
+    async fn step_replica_control_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::ReplicaControlV1)
+            .await
     }
 
     /// Handle EC replication entries from a peer (Phase C).
@@ -670,7 +781,15 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<ReplicateEntriesRequest>,
     ) -> std::result::Result<Response<ReplicateEntriesResponse>, Status> {
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -683,43 +802,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         let mut max_applied: u64 = 0;
 
         for entry in &req.entries {
-            let command: Command = match bincode::deserialize(&entry.command) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    // A bincode deserialize failure means the sender shipped
-                    // bytes this build cannot decode (version skew / corruption).
-                    // The entry is UNAPPLIABLE here — no build-local action can
-                    // ever make it decode — so the only choices are (a) halt the
-                    // whole peer's EC stream until the mismatch is fixed, or
-                    // (b) skip THIS entry and keep replicating the rest.
-                    //
-                    // We skip-LOUD (advance past it, warn), because for the EC
-                    // (AP) data plane availability wins: one undecodable entry
-                    // must not head-of-line-block a peer's entire mailbox
-                    // stream, and stalling would not "preserve" the entry — it
-                    // is unappliable regardless.  This is NOT silent: every drop
-                    // is warned with its seq, so a systematic skew shows up as a
-                    // flood of warns.  The SYSTEMATIC fix (make undecodable
-                    // entries impossible — a version-gate at JoinZone rejecting
-                    // mismatched builds, or a forward-compatible command
-                    // encoding) is the tracked follow-up; skip-loud is the
-                    // agreed interim.  Apply failures (below) stay hard-fail —
-                    // those may be transient and are worth a backed-off retry.
-                    tracing::warn!(
-                        seq = entry.seq,
-                        sender = req.sender_node_id,
-                        error = %e,
-                        "EC entry undecodable (version skew / corruption) — \
-                         QUARANTINED (skipped) so the peer's stream keeps flowing; \
-                         a flood here means a build mismatch to fix"
-                    );
-                    max_applied = max_applied.max(entry.seq);
-                    continue;
-                }
-            };
-
-            match node.apply_ec_from_peer(command, entry.timestamp).await {
-                Ok(_) => {
+            match apply_ec_entry(&node, entry).await {
+                Ok(()) => {
                     max_applied = max_applied.max(entry.seq);
                     tracing::trace!(
                         seq = entry.seq,
@@ -758,31 +842,21 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         &self,
         request: Request<SnapshotEcStateRequest>,
     ) -> std::result::Result<Response<SnapshotEcStateResponse>, Status> {
-        super::node_authority::authorize_ec_sender(&request, request.get_ref().sender_node_id)?;
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        super::node_authority::authorize_ec_sender(
+            request.extensions(),
+            request.get_ref().sender_node_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
         for entry in &req.entries {
-            let command: Command = match bincode::deserialize(&entry.command) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    // Same skip-loud posture as ReplicateEntries: an undecodable
-                    // snapshot entry is unappliable here, so skip it (loud) and
-                    // keep applying the rest rather than fail the whole catch-up.
-                    tracing::warn!(
-                        seq = entry.seq,
-                        sender = req.sender_node_id,
-                        error = %e,
-                        "EC snapshot entry undecodable — QUARANTINED (skipped)"
-                    );
-                    continue;
-                }
-            };
-            if let Err(e) = node.apply_ec_from_peer(command, entry.timestamp).await {
-                // A snapshot apply failure (not a decode/skew issue) is real:
-                // fail the transfer so the sender retries the whole snapshot
-                // rather than leaving the peer half-caught-up.
-                tracing::warn!(seq = entry.seq, "EC snapshot apply failed: {}", e);
+            if let Err(e) = apply_ec_entry(&node, entry).await {
+                tracing::warn!(seq = entry.seq, "EC snapshot refused: {}", e);
                 return Ok(Response::new(SnapshotEcStateResponse {
                     success: false,
                     error: Some(format!("snapshot apply failed at seq {}: {}", entry.seq, e)),
@@ -815,6 +889,50 @@ fn peer_cert_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
         .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()))
 }
 
+/// Each member's dial endpoint from the zone's member-address records — the
+/// one source for addresses reported to clients, the local node's included.
+fn member_endpoints(records: Vec<(u64, String)>, use_tls: bool) -> HashMap<u64, String> {
+    records
+        .into_iter()
+        .filter_map(|(id, address)| {
+            crate::raft::member_address::endpoint(id, &address, use_tls)
+                .map(|route| (id, route.endpoint))
+        })
+        .collect()
+}
+
+async fn recorded_endpoints(
+    node: &ZoneConsensus<FullStateMachine>,
+    use_tls: bool,
+) -> std::result::Result<HashMap<u64, String>, Status> {
+    use crate::raft::StateMachine;
+    let records = node
+        .with_state_machine(|sm| sm.member_addresses())
+        .await
+        .map_err(|e| Status::unavailable(format!("read member addresses: {e}")))?
+        .unwrap_or_default();
+    Ok(member_endpoints(records, use_tls))
+}
+
+/// Voters and learners with their recorded addresses; a member without a
+/// record carries an empty address.
+fn cluster_config(
+    addresses: &HashMap<u64, String>,
+    voters: &[u64],
+    learners: &[u64],
+) -> ProtoClusterConfig {
+    let info = |id: u64, role: i32| ProtoNodeInfo {
+        id,
+        address: addresses.get(&id).cloned().unwrap_or_default(),
+        role,
+    };
+    ProtoClusterConfig {
+        voters: voters.iter().map(|&id| info(id, 0)).collect(),
+        learners: learners.iter().map(|&id| info(id, 1)).collect(),
+        witnesses: vec![],
+    }
+}
+
 /// Zone-routed implementation of the ZoneApiService gRPC trait.
 ///
 /// This is the strict-mTLS DATA plane. Node enrollment (cert provisioning) is
@@ -827,9 +945,9 @@ struct ZoneApiServiceImpl {
     /// (or `None` here) → `read_blob` returns `NotFound`.
     blob_fetcher_slot: Option<BlobFetcherSlot>,
     search_capabilities_slot: Option<crate::search_capabilities::SearchCapabilitiesSlot>,
-    /// Optional late-bound `AgentMinter` for `MintAgent`. Present only on the
+    /// Optional late-bound `CaIssuer` for `MintAgent`. Present only on the
     /// CA holder (founder); `None` → `mint_agent` returns success=false.
-    agent_minter_slot: Option<AgentMinterSlot>,
+    ca_issuer_slot: Option<CaIssuerSlot>,
     /// Optional late-bound `KeyMinter` for `MintKey`/`RevokeKey`. Present on
     /// every auth-on daemon; `None` (auth-off) → both return success=false.
     key_minter_slot: Option<KeyMinterSlot>,
@@ -838,19 +956,77 @@ struct ZoneApiServiceImpl {
     /// return success=false.
     foreign_ca_registrar_slot: Option<ForeignCaRegistrarSlot>,
     session_mint_admin_slot: Option<crate::session_mint_admin::SessionMintAdminSlot>,
+    /// Late-bound renewer of this daemon's own Node certificate; `None` (or
+    /// empty) → `RenewLocalNodeCertificate` refuses.
+    local_node_renewer_slot: Option<LocalNodeRenewerSlot>,
 }
 
+#[path = "server/replica_join.rs"]
+mod replica_join;
+
 impl ZoneApiServiceImpl {
+    async fn blob_response(
+        &self,
+        zone_id: Option<&str>,
+        content_id: &str,
+    ) -> Response<ReadBlobResponse> {
+        let fetcher = self
+            .blob_fetcher_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let Some(fetcher) = fetcher else {
+            return Response::new(ReadBlobResponse {
+                content: Vec::new(),
+                error: "blob fetcher not installed".to_string(),
+            });
+        };
+        let result = match zone_id {
+            Some(zone) => fetcher.read_in_zone(zone, content_id).await,
+            None => fetcher.read(content_id).await,
+        };
+        Response::new(match result {
+            Ok(content) => ReadBlobResponse {
+                content,
+                error: String::new(),
+            },
+            Err(error) => ReadBlobResponse {
+                content: Vec::new(),
+                error,
+            },
+        })
+    }
+
+    async fn replica_csr_response(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+        query_only: bool,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        let caller = peer_cert_der(&request);
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().clone());
+        let Some(minter) = minter else {
+            return Ok(Response::new(super::proto::ReplicaCsrResponse {
+                state: super::proto::ReplicaCsrState::Refused as i32,
+                error: Some("allocation-bound replica issuer is unarmed on this node".into()),
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(
+            minter
+                .replica_csr_v1(caller, request.into_inner(), query_only)
+                .await,
+        ))
+    }
+
     async fn agent_csr_response(
         &self,
         request: Request<super::proto::AgentCsrRequest>,
         query_only: bool,
     ) -> std::result::Result<Response<super::proto::AgentCsrResponse>, Status> {
         let caller = peer_cert_der(&request);
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         let Some(minter) = minter else {
             return Ok(Response::new(super::proto::AgentCsrResponse {
                 state: super::proto::AgentCsrState::NotSubmitted as i32,
@@ -868,14 +1044,48 @@ impl ZoneApiServiceImpl {
 
 #[tonic::async_trait]
 impl ZoneApiService for ZoneApiServiceImpl {
+    async fn control_replica_v1(
+        &self,
+        request: Request<super::proto::ReplicaControlRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaControlResponse>, Status> {
+        let caller = peer_cert_der(&request);
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().clone());
+        let Some(minter) = minter else {
+            return Ok(Response::new(super::proto::ReplicaControlResponse {
+                state: super::proto::ReplicaControlState::Refused as i32,
+                error: Some("replica lifecycle controller is unarmed on this node".into()),
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(
+            minter
+                .replica_control_v1(caller, request.into_inner())
+                .await,
+        ))
+    }
+
+    async fn issue_replica_csr_v1(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        self.replica_csr_response(request, false).await
+    }
+
+    async fn query_replica_csr_v1(
+        &self,
+        request: Request<super::proto::ReplicaCsrRequest>,
+    ) -> std::result::Result<Response<super::proto::ReplicaCsrResponse>, Status> {
+        self.replica_csr_response(request, true).await
+    }
+
     async fn get_agent_csr_capabilities(
         &self,
         _request: Request<super::proto::AgentCsrCapabilitiesRequest>,
     ) -> std::result::Result<Response<super::proto::AgentCsrCapabilitiesResponse>, Status> {
-        let minter = self
-            .agent_minter_slot
-            .as_ref()
-            .and_then(|s| s.read().clone());
+        let minter = self.ca_issuer_slot.as_ref().and_then(|s| s.read().clone());
         Ok(Response::new(
             minter.map_or_else(Default::default, |m| m.csr_capabilities()),
         ))
@@ -900,6 +1110,12 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<ProposeRequest>,
     ) -> std::result::Result<Response<ProposeResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        let caller = super::node_authority::authenticated_node_id(request.extensions())?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -921,7 +1137,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some(format!("Failed to deserialize raw command: {}", e)),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -934,7 +1150,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("No command provided".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             };
@@ -947,7 +1163,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         error: Some("Unsupported command type".to_string()),
                         leader_address: None,
                         result: None,
-                        applied_index: 0,
+                        applied_index: None,
                     }));
                 }
             }
@@ -956,10 +1172,23 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // raw_command is also reachable over the generic public Propose RPC.
         // A missing dedicated file RPC does not isolate an enum variant. Return
         // a definite refusal before either direct or forwarded submission.
-        if cmd.requires_fixed_local_storage() {
+        if cmd.storage_protocol().is_some() {
             return Err(Status::unimplemented(
                 "conditional metadata proposals are not activated",
             ));
+        }
+        crate::raft::member_address::admit_rpc(&cmd, req.forwarded, caller, |id| {
+            node.is_replication_member(id)
+        })
+        .map_err(Status::permission_denied)?;
+        // An admitted original registration is the caller's own statement of
+        // how to reach it: route to it now, so members that restarted without
+        // records can elect the leader that will commit them.
+        if !req.forwarded {
+            if let Some((node_id, address)) = crate::raft::member_address::registration(&cmd) {
+                self.registry
+                    .learn_peer_address(&req.zone_id, node_id, address);
+            }
         }
 
         // Use submit_to_channel (leader-only, no forwarding) for forwarded
@@ -986,15 +1215,26 @@ impl ZoneApiService for ZoneApiServiceImpl {
             node.propose(cmd).await
         };
 
-        match result {
-            Ok(result) => {
+        // A success names the index this node had applied when the command
+        // resolved, which covers the command's own entry: a forwarding
+        // follower waits for its replica to apply through it before it tells
+        // its caller the write is visible.
+        let committed = match result {
+            Ok(result) => Ok((result, Some(node.applied_index()))),
+            // Relayed by this node for its caller: the commit is the answer;
+            // this node's own replica lag is not the caller's.
+            Err(RaftError::CommittedNotVisible { index, result, .. }) => Ok((*result, index)),
+            Err(error) => Err(error),
+        };
+        match committed {
+            Ok((result, applied_index)) => {
                 let proto_result = command_result_to_proto(&result);
                 Ok(Response::new(ProposeResponse {
                     success: true,
                     error: None,
                     leader_address: None,
                     result: Some(proto_result),
-                    applied_index: 0,
+                    applied_index,
                 }))
             }
             Err(RaftError::NotLeader { leader_hint }) => {
@@ -1006,7 +1246,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     error: Some(super::NOT_LEADER_ERROR.to_string()),
                     leader_address: leader_hint,
                     result: None,
-                    applied_index: 0,
+                    applied_index: None,
                 }))
             }
             Err(e) => Ok(Response::new(ProposeResponse {
@@ -1014,7 +1254,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 error: Some(format!("Proposal failed: {}", e)),
                 leader_address: None,
                 result: None,
-                applied_index: 0,
+                applied_index: None,
             })),
         }
     }
@@ -1024,6 +1264,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<QueryRequest>,
     ) -> std::result::Result<Response<QueryResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
         let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
@@ -1181,56 +1426,38 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetClusterInfoRequest>,
     ) -> std::result::Result<Response<GetClusterInfoResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-        let node_id = self.registry.node_id();
+        let node_id = node.id();
 
         let is_leader = node.is_leader();
         let leader_id = node.leader_id().unwrap_or(0);
         let term = node.term();
-        let leader_addr = peers.get(&leader_id).map(|a| a.endpoint.clone());
 
-        // Reuse the driver's membership query so voters and learners come
-        // from one ProgressTracker view. Do NOT union with `peers` — the
-        // peer address book is a superset (learners, witnesses,
-        // ghosts from wipe-rejoins), and unioning with a hand-added
-        // self entry produced the "leader appears twice in voters
-        // list" issue #7.  `peers` is used only to resolve id →
-        // endpoint address for each authoritative member. This is membership,
-        // not proof of reachability, feature support or a ReadIndex barrier.
+        // Voters and learners come from one ProgressTracker view; their
+        // addresses come from the zone's member-address records, so every
+        // member — this node included — reports the address the zone
+        // replicates for it, and a member without a record reports an
+        // empty one. This is membership, not proof of reachability,
+        // feature support or a ReadIndex barrier.
         let membership = node
             .membership()
             .await
             .map_err(|e| Status::unavailable(format!("read zone membership: {e}")))?;
-        let member_info = |id, role| ProtoNodeInfo {
-            id,
-            address: peers
-                .get(&id)
-                .map(|a| a.endpoint.clone())
-                .unwrap_or_default(),
-            role,
-        };
-        let voters = membership
-            .voters
-            .into_iter()
-            .map(|id| member_info(id, 0))
-            .collect();
-        let learners = membership
-            .learners
-            .into_iter()
-            .map(|id| member_info(id, 1))
-            .collect();
+        let addresses = recorded_endpoints(&node, self.registry.tls_enabled()).await?;
+        let leader_addr = addresses.get(&leader_id).cloned();
+        let config = cluster_config(&addresses, &membership.voters, &membership.learners);
 
         Ok(Response::new(GetClusterInfoResponse {
             node_id,
             leader_id,
             term,
-            config: Some(ProtoClusterConfig {
-                voters,
-                learners,
-                witnesses: vec![],
-            }),
+            config: Some(config),
             is_leader,
             leader_address: leader_addr,
         }))
@@ -1240,6 +1467,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<JoinZoneRequest>,
     ) -> std::result::Result<Response<JoinZoneResponse>, Status> {
+        if let Some(replica_id) = super::node_authority::current_replica_id(request.extensions())? {
+            return self.read_replica_join(request, replica_id).await;
+        }
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
@@ -1293,33 +1523,24 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // lives at the DT_MOUNT entry, not here.)
         use raft::eraftpb::ConfChangeType;
 
-        // Peer map is stable across this handler; fetch once and build
-        // response configs from it. Closure captures `peers` by ref and
-        // takes id slices, so it needs no `Membership` type in scope and
-        // is safe to reuse across the awaits below.
-        // How far the leader has replicated to one learner. Takes the pairs as a
-        // slice for the same reason `make_config` takes id slices — no
-        // `Membership` type in scope here.
+        // How far the leader has replicated to one learner. Takes the pairs as
+        // a slice — no `Membership` type in scope here.
         fn matched_for(learner_matched: &[(u64, u64)], node_id: u64) -> u64 {
             learner_matched
                 .iter()
                 .find(|(id, _)| *id == node_id)
                 .map_or(0, |(_, matched)| *matched)
         }
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
-        let make_config = |voters: &[u64], learners: &[u64]| {
-            let info = |id: u64, role: i32| ProtoNodeInfo {
-                id,
-                address: peers
-                    .get(&id)
-                    .map(|a| a.endpoint.clone())
-                    .unwrap_or_default(),
-                role,
-            };
-            ProtoClusterConfig {
-                voters: voters.iter().map(|&id| info(id, 0)).collect(),
-                learners: learners.iter().map(|&id| info(id, 1)).collect(),
-                witnesses: vec![],
+        // Response configs carry the recorded member addresses, read after
+        // any membership change this handler commits (the change writes the
+        // joiner's record at its own index).
+        let use_tls = self.registry.tls_enabled();
+        let make_config = |voters: Vec<u64>, learners: Vec<u64>| {
+            let node = node.clone();
+            async move {
+                recorded_endpoints(&node, use_tls)
+                    .await
+                    .map(|addresses| cluster_config(&addresses, &voters, &learners))
             }
         };
         // Turn a raft error into the redirect/failure response shape.
@@ -1359,7 +1580,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 success: true,
                 error: None,
                 leader_address: None,
-                config: Some(make_config(&membership.voters, &membership.learners)),
+                config: Some(
+                    make_config(membership.voters.clone(), membership.learners.clone()).await?,
+                ),
                 catching_up: false,
                 commit_index: 0,
                 applied_index: 0,
@@ -1388,7 +1611,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 success: true,
                 error: None,
                 leader_address: None,
-                config: Some(make_config(&m.voters, &m.learners)),
+                config: Some(make_config(m.voters.clone(), m.learners.clone()).await?),
                 catching_up: false,
                 commit_index: 0,
                 applied_index: 0,
@@ -1430,7 +1653,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     req.zone_id, req.node_address
                 )),
                 leader_address: None,
-                config: Some(make_config(&m.voters, &m.learners)),
+                config: Some(make_config(m.voters.clone(), m.learners.clone()).await?),
                 // Progress, not misconfiguration — see JoinZoneResponse.catching_up.
                 catching_up: true,
                 commit_index: m.commit_index,
@@ -1460,7 +1683,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                         success: true,
                         error: None,
                         leader_address: None,
-                        config: Some(make_config(&conf_state.voters, &learners)),
+                        config: Some(make_config(conf_state.voters.clone(), learners).await?),
                         catching_up: false,
                         commit_index: 0,
                         applied_index: 0,
@@ -1483,7 +1706,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     req.zone_id, req.node_address
                 )),
                 leader_address: None,
-                config: Some(make_config(&membership.voters, &membership.learners)),
+                config: Some(
+                    make_config(membership.voters.clone(), membership.learners.clone()).await?,
+                ),
                 catching_up: true,
                 commit_index: membership.commit_index,
                 applied_index: matched_for(&membership.learner_matched, req.node_id),
@@ -1636,6 +1861,11 @@ impl ZoneApiService for ZoneApiServiceImpl {
         &self,
         request: Request<GetSearchCapabilitiesRequest>,
     ) -> std::result::Result<Response<SearchCapabilities>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
         let zone_id = request.into_inner().zone_id;
         if !self.registry.hosts(&zone_id) {
             return Err(Status::not_found(format!("Zone '{}' not found", zone_id)));
@@ -1666,32 +1896,31 @@ impl ZoneApiService for ZoneApiServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
         let req = request.into_inner();
-        let fetcher = self
-            .blob_fetcher_slot
-            .as_ref()
-            .and_then(|slot| slot.read().as_ref().cloned());
-        let Some(fetcher) = fetcher else {
-            return Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: "blob fetcher not installed".to_string(),
-            }));
-        };
-        match fetcher.read(&req.content_id).await {
-            Ok(bytes) => Ok(Response::new(ReadBlobResponse {
-                content: bytes,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(ReadBlobResponse {
-                content: Vec::new(),
-                error: e,
-            })),
-        }
+        Ok(self.blob_response(None, &req.content_id).await)
+    }
+
+    async fn read_zone_blob(
+        &self,
+        request: Request<ReadZoneBlobRequest>,
+    ) -> std::result::Result<Response<ReadBlobResponse>, Status> {
+        super::node_authority::authorize_data_zone(
+            request.extensions(),
+            &self.registry,
+            &request.get_ref().zone_id,
+        )?;
+        let req = request.into_inner();
+        contracts::validate_zone_id_for(contracts::ZoneIdUse::TenantCreate, &req.zone_id)
+            .map_err(|_| Status::invalid_argument("invalid data zone"))?;
+        get_zone_node(&self.registry, &req.zone_id)?;
+        Ok(self
+            .blob_response(Some(&req.zone_id), &req.content_id)
+            .await)
     }
 
     /// Sign an agent identity cert on the CA holder (founder) for a remote
     /// caller — the server half of a joiner's `auth mint --subject-type agent`
     /// routing to the founder. The verified mTLS client leaf cert is forwarded
-    /// to the injected `AgentMinter`, which gates it to a NODE peer (an agent
+    /// to the injected `CaIssuer`, which gates it to a NODE peer (an agent
     /// may not mint agents) before signing; raft applies no auth logic. A node
     /// with no minter installed (a joiner — not the CA holder) returns
     /// success=false so the caller can try the founder.
@@ -1711,14 +1940,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(err_resp(
-                "this node does not hold the cluster CA; mint agents against the founder"
-                    .to_string(),
-            ));
+            return Ok(err_resp(format!(
+                "{NOT_CA_HOLDER}; mint agents against the founder"
+            )));
         };
         match minter
             .mint(
@@ -1754,13 +1982,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(session_credential_response(Err(
-                "this node does not hold the cluster CA; mint against the founder".to_string(),
-            )));
+            return Ok(session_credential_response(Err(format!(
+                "{NOT_CA_HOLDER}; mint against the founder"
+            ))));
         };
         Ok(session_credential_response(
             minter
@@ -1777,7 +2005,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1786,7 +2014,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     .mint_user_runtime(caller_cert_der, &req.owner_id, req.validity_secs)
                     .await
             }
-            None => Err("this node does not hold the cluster CA; mint against the founder".into()),
+            None => Err(format!("{NOT_CA_HOLDER}; mint against the founder")),
         };
         Ok(session_credential_response(result))
     }
@@ -1799,7 +2027,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         let caller_cert_der = peer_cert_der(&request);
         let req = request.into_inner();
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let result = match minter {
@@ -1807,7 +2035,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                 minter
                     .renew_session(
                         caller_cert_der,
-                        crate::agent_minter::SessionRenewal {
+                        crate::ca_issuer::SessionRenewal {
                             cert_pem: &req.agent_cert_pem,
                             validity_secs: req.validity_secs,
                             issued_at_unix_ms: req.issued_at_unix_ms,
@@ -1816,7 +2044,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
                     )
                     .await
             }
-            None => Err("this node does not hold the cluster CA; renew against the founder".into()),
+            None => Err(format!("{NOT_CA_HOLDER}; renew against the founder")),
         };
         Ok(session_credential_response(result))
     }
@@ -1835,13 +2063,13 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })
         };
         let minter = self
-            .agent_minter_slot
+            .ca_issuer_slot
             .as_ref()
             .and_then(|slot| slot.read().as_ref().cloned());
         let Some(minter) = minter else {
-            return Ok(err_resp(
-                "this node does not hold the cluster CA; revoke against the founder".to_string(),
-            ));
+            return Ok(err_resp(format!(
+                "{NOT_CA_HOLDER}; revoke against the founder"
+            )));
         };
         match minter
             .revoke_cert(caller_cert_der, &req.agent_cert_pem)
@@ -1853,6 +2081,67 @@ impl ZoneApiService for ZoneApiServiceImpl {
             })),
             Err(e) => Ok(err_resp(e)),
         }
+    }
+
+    /// Re-issue the calling Node's certificate; the CA holder alone signs.
+    async fn renew_node_certificate(
+        &self,
+        request: Request<RenewNodeCertificateRequest>,
+    ) -> std::result::Result<Response<RenewNodeCertificateResponse>, Status> {
+        let caller_cert_der = peer_cert_der(&request);
+        let req = request.into_inner();
+        let minter = self
+            .ca_issuer_slot
+            .as_ref()
+            .and_then(|slot| slot.read().as_ref().cloned());
+        let result = match minter {
+            Some(minter) => minter.renew_node(caller_cert_der, &req.csr_pem).await,
+            None => Err(format!("{NOT_CA_HOLDER}; renew against the founder")),
+        };
+        Ok(Response::new(match result {
+            Ok(node_cert_pem) => RenewNodeCertificateResponse {
+                success: true,
+                error: None,
+                node_cert_pem,
+            },
+            Err(error) => RenewNodeCertificateResponse {
+                success: false,
+                error: Some(error),
+                node_cert_pem: Vec::new(),
+            },
+        }))
+    }
+
+    /// Renew this daemon's own certificate now, for this same Node's operator.
+    async fn renew_local_node_certificate(
+        &self,
+        request: Request<RenewLocalNodeCertificateRequest>,
+    ) -> std::result::Result<Response<RenewLocalNodeCertificateResponse>, Status> {
+        let caller = super::node_authority::authenticated_node_id(request.extensions())?;
+        let result = if caller != Some(self.registry.node_id()) {
+            Err("only this Node may ask its daemon to renew its certificate".to_string())
+        } else {
+            let renewer = self
+                .local_node_renewer_slot
+                .as_ref()
+                .and_then(|slot| slot.read().as_ref().cloned());
+            match renewer {
+                Some(renewer) => renewer.renew_now().await,
+                None => Err("this daemon serves no renewable Node certificate".to_string()),
+            }
+        };
+        Ok(Response::new(match result {
+            Ok(not_after_unix_s) => RenewLocalNodeCertificateResponse {
+                success: true,
+                error: None,
+                not_after_unix_s,
+            },
+            Err(error) => RenewLocalNodeCertificateResponse {
+                success: false,
+                error: Some(error),
+                not_after_unix_s: 0,
+            },
+        }))
     }
 
     async fn allow_session_minter(
@@ -2191,7 +2480,7 @@ struct NodeEnrollmentServiceImpl {
     ca_key_pem: Option<Vec<u8>>,
     /// Path to the accepted join-token hash SET (`tls/join-token-hash`, one
     /// SHA-256 hex per line). Read LIVE per `JoinCluster` (like
-    /// `revoked_serials_path` below is for `GetCrl`), so an offline
+    /// the current revoked membership is for `GetCrl`), so an offline
     /// `enroll-token` that appended a hash is accepted WITHOUT a founder
     /// restart. `None` ⇒ this node accepts no join requests.
     join_token_hash_path: Option<PathBuf>,
@@ -2202,18 +2491,15 @@ struct NodeEnrollmentServiceImpl {
     /// the response omits it and the joiner stays auth-off. Read once at
     /// construction from `tls/api-key-secret` (the single SSOT).
     api_key_secret: Option<String>,
-    /// Path to the founder's revoked-serial file (`tls/revoked-serials`). The
-    /// `GetCrl` handler reads it live and CA-signs a fresh CRL, so an offline
-    /// `auth revoke` that appended a serial is served without a restart. `None`
-    /// on a node holding no CA key — it never serves a CRL.
-    revoked_serials_path: Option<PathBuf>,
+    /// Current revoked membership and durable CA-scoped CRL issuance receipts.
+    crl_issuer: Option<Arc<super::crl::CrlIssuer>>,
 }
 
 #[tonic::async_trait]
 impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
-    /// Provision a joining node: verify the join token, sign a node cert with
-    /// the cluster CA, return CA + cert + key. The CA private key never leaves
-    /// this process.
+    /// Provision a joining node: verify the join token, certify the key in its
+    /// CSR with the cluster CA, return CA + cert. Neither private key — the CA's
+    /// nor the joiner's — crosses this channel.
     async fn join_cluster(
         &self,
         request: Request<JoinClusterRequest>,
@@ -2225,7 +2511,6 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
                 error: Some(msg.to_string()),
                 ca_pem: Vec::new(),
                 node_cert_pem: Vec::new(),
-                node_key_pem: Vec::new(),
                 api_key_secret: None,
             })
         };
@@ -2279,7 +2564,9 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             }
         };
 
-        // --- Sign node certificate ---
+        // --- Certify the joiner's own key ---
+        // The token authorizes the requested Node ID; the CSR contributes only
+        // the proven public key. The joiner's private key never leaves it.
         let zone_id = if req.zone_id.is_empty() {
             contracts::ROOT_ZONE_ID
         } else {
@@ -2287,7 +2574,8 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
         };
         let extra_hostnames = super::certgen::extract_hostnames(&req.node_address);
         let peer_hostname = extra_hostnames.first().map(|s| s.as_str());
-        let (node_cert_pem, node_key_pem) = match super::certgen::generate_node_cert(
+        let node_cert_pem = match super::certgen::sign_node_csr(
+            &req.csr_pem,
             req.node_id,
             zone_id,
             &ca_pem,
@@ -2295,10 +2583,10 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             &extra_hostnames,
             peer_hostname,
         ) {
-            Ok(pair) => pair,
+            Ok(cert) => cert,
             Err(e) => {
-                tracing::error!("Failed to generate node cert: {}", e);
-                return Ok(err_resp(&format!("Failed to generate node cert: {}", e)));
+                tracing::warn!(peer_node_id = req.node_id, error = %e, "JoinCluster: CSR refused");
+                return Ok(err_resp(&format!("JoinCluster CSR refused: {e}")));
             }
         };
 
@@ -2313,31 +2601,24 @@ impl NodeEnrollmentService for NodeEnrollmentServiceImpl {
             error: None,
             ca_pem,
             node_cert_pem,
-            node_key_pem,
             api_key_secret: self.api_key_secret.clone(),
         }))
     }
 
-    /// Serve the cluster's current CRL: read the revoked-serial file live and
-    /// CA-sign a fresh CRL over it. No token — the CRL is a public, CA-signed
-    /// artifact, so any node may fetch it to refresh its revocation view.
+    /// Serve the cluster's current signed CRL after its issuance receipt commits.
+    /// The public CA signature lets nodes verify the refreshed revocation view.
     async fn get_crl(
         &self,
         _request: Request<GetCrlRequest>,
     ) -> std::result::Result<Response<GetCrlResponse>, Status> {
-        let (Some(ca_pem), Some(ca_key_pem)) = (&self.ca_pem, &self.ca_key_pem) else {
-            return Err(Status::failed_precondition("CA material not configured"));
-        };
-        let serials = self
-            .revoked_serials_path
-            .as_deref()
-            .map(super::crl::read_revoked_serials)
-            .unwrap_or_default();
-        // The count grows monotonically (revocation is append-only), so it is a
-        // fine crl_number: a stale CRL never carries a higher one.
-        let crl_number = serials.len() as u64;
-        let crl_pem = super::crl::generate_crl(&serials, crl_number, ca_pem, ca_key_pem)
-            .map_err(|e| Status::internal(format!("build CRL: {e}")))?;
+        let issuer = self
+            .crl_issuer
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("durable CRL authority not configured"))?;
+        let crl_pem = tokio::task::spawn_blocking(move || issuer.issue())
+            .await
+            .map_err(|e| Status::unavailable(format!("CRL issuance worker: {e}")))?
+            .map_err(Status::unavailable)?;
         Ok(Response::new(GetCrlResponse { crl_pem }))
     }
 }
@@ -2358,19 +2639,25 @@ pub async fn serve_node_enrollment(
     revoked_serials_path: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let crl_issuer = revoked_serials_path
+        .as_deref()
+        .map(|path| super::crl::CrlIssuer::open(path, &ca_pem, &ca_key_pem))
+        .transpose()
+        .map_err(TransportError::Rpc)?
+        .map(Arc::new);
     let svc = NodeEnrollmentServiceImpl {
         ca_pem: Some(ca_pem),
         ca_key_pem: Some(ca_key_pem),
         join_token_hash_path: Some(join_token_hash_path),
         api_key_secret,
-        revoked_serials_path,
+        crl_issuer,
     };
     tracing::info!(
         %addr,
         "node-enrollment listener up (plaintext, token-gated, JoinCluster only)"
     );
     lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder())
-        .add_service(NodeEnrollmentServiceServer::new(svc))
+        .add_service(bounded!(NodeEnrollmentServiceServer::new(svc)))
         .serve_with_shutdown(addr, shutdown)
         .await
         .map_err(TransportError::Tonic)?;
@@ -2385,15 +2672,11 @@ pub async fn serve_node_enrollment(
 /// A single witness zone entry.
 struct WitnessZoneEntry {
     node: ZoneConsensus<WitnessStateMachine>,
-    /// Per-zone peer map — kept here so ``auto_join_zone`` can seed
-    /// new child zones from root's *current* peer map (which has
-    /// applied conf_change rotations) rather than the cold-start
-    /// ``self.peers`` snapshot.  Per-zone autonomy stays intact: a
-    /// child zone's later conf_change Removes only affect its own
-    /// peer_map, never another zone's.
+    /// Per-zone route book. A witness state machine holds no member-address
+    /// records, so its routes are the observed senders.
     peers: SharedPeerMap,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    _transport_handle: JoinHandle<()>,
+    /// The transport loop and member-address registration running the zone.
+    tasks: super::ZoneTasks,
 }
 
 /// Multi-zone registry for witness nodes.
@@ -2405,11 +2688,13 @@ pub struct WitnessZoneRegistry {
     zones: DashMap<String, WitnessZoneEntry>,
     base_path: PathBuf,
     node_id: u64,
-    tls: Arc<RwLock<Option<super::TlsConfig>>>,
-    /// Cluster peer addresses — used by auto_join_zone() for transport routing.
+    tls: lib::transport_primitives::SharedTlsConfig,
+    /// Operator seed addresses: JoinZone and member-address registration targets.
     peers: Vec<NodeAddress>,
     /// This node's advertise address — carried in outbound StepMessage.
     self_address: String,
+    /// Set by [`Self::shutdown`]: no zone opens, and boot joins stop.
+    closed: std::sync::atomic::AtomicBool,
     /// Serializes ``auto_join_zone`` so concurrent step_messages from
     /// multiple data nodes for the same fresh zone don't both pass the
     /// ``zones.get()`` check, both call ``setup_witness_zone``, and
@@ -2427,15 +2712,20 @@ pub struct WitnessZoneRegistry {
 }
 
 impl WitnessZoneRegistry {
+    pub fn shared_tls(&self) -> lib::transport_primitives::SharedTlsConfig {
+        self.tls.clone()
+    }
+
     /// Create a new empty witness zone registry.
     pub fn new(base_path: PathBuf, node_id: u64, tls: Option<super::TlsConfig>) -> Self {
         Self {
             zones: DashMap::new(),
             base_path,
             node_id,
-            tls: Arc::new(RwLock::new(tls)),
+            tls: lib::transport_primitives::SharedTlsConfig::new(tls),
             peers: Vec::new(),
             self_address: String::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
             auto_join_lock: parking_lot::Mutex::new(()),
         }
     }
@@ -2457,71 +2747,29 @@ impl WitnessZoneRegistry {
         &self.self_address
     }
 
-    /// Record a peer's advertise address learned from an inbound
-    /// `StepMessage`.  Mirrors `ZoneRaftRegistry::learn_peer_address`
-    /// so the witness peer-map converges via the network SSOT under
-    /// the opaque-ID contract.  Returns `true` if the map changed.
+    /// Record a peer's advertise address observed on an inbound
+    /// `StepMessage`, as `ZoneRaftRegistry::learn_peer_address` does.
+    /// A witness holds no member-address records, so these observations
+    /// are its routes.  Returns `true` if the route changed.
     pub fn learn_peer_address(&self, zone_id: &str, peer_id: u64, endpoint: &str) -> bool {
-        if endpoint.is_empty() || peer_id == 0 {
-            return false;
-        }
-        // Self-exclusion is enforced structurally by `PeerMap::insert` (see
-        // `PeerMap`); the insert below returns `false` for a self-entry.
         let Some(entry) = self.zones.get(zone_id) else {
             return false;
         };
-        let mut peers = entry.peers.write().unwrap();
-        if let Some(existing) = peers.get(&peer_id) {
-            if existing.endpoint == endpoint {
-                return false;
-            }
-        }
-        let use_tls = endpoint.starts_with("https://");
-        let parsed = match NodeAddress::parse(endpoint, use_tls) {
-            Ok(mut p) => {
-                p.id = peer_id;
-                p
-            }
-            Err(_) => return false,
-        };
-        // `PeerMap::insert` returns `false` iff the entry was self.
-        peers.insert(peer_id, parsed)
-    }
-
-    /// Create a witness Raft group for a zone (static bootstrap).
-    ///
-    /// Opens zone-specific storage at `{base_path}/{zone_id}/`, creates a
-    /// `ZoneConsensus<WitnessStateMachine>`, and spawns a `TransportLoop` task.
-    #[allow(clippy::result_large_err)]
-    pub fn create_zone(
-        &self,
-        zone_id: &str,
-        peers: Vec<NodeAddress>,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use crate::raft::RaftConfig;
-
-        if self.zones.contains_key(zone_id) {
-            return Err(TransportError::Connection(format!(
-                "Witness zone '{}' already exists",
-                zone_id
-            )));
-        }
-
-        // Witness RaftConfig (no replication log, cannot become leader)
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
-        let config = RaftConfig::witness(self.node_id, peer_ids);
-
-        self.setup_witness_zone(zone_id, config, peers, runtime_handle)
+        super::observe_sender(
+            &entry.peers,
+            peer_id,
+            endpoint,
+            self.tls.snapshot().uses_tls(),
+        )
     }
 
     /// Bootstrap or join a zone at boot time under the opaque-ID
-    /// contract.  Sends `JoinZone` RPC against each configured peer
-    /// until one succeeds, then locally registers the zone with
-    /// `skip_bootstrap=true` so the leader's snapshot installs the
-    /// authoritative ConfState.  Looping is indefinite — misconfig
-    /// (no reachable peer) surfaces as "witness stays up retrying"
-    /// rather than a silent exit.
+    /// contract.  A zone this witness holds on disk resumes first (see
+    /// [`Self::auto_join_zone`]).  Then sends `JoinZone` RPC against each
+    /// configured peer until one succeeds, and registers the zone locally
+    /// if it is not yet.  Looping is indefinite — misconfig (no reachable
+    /// peer) surfaces as "witness stays up retrying" rather than a silent
+    /// exit.
     ///
     /// Witness joins as a **voter** (`as_learner=false`) by default,
     /// matching TiKV's witness-as-voter pattern: votes in elections
@@ -2538,88 +2786,87 @@ impl WitnessZoneRegistry {
         timeout_secs: u64,
         retry_interval: std::time::Duration,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
-        use super::call_join_zone_rpc;
-
-        if let Some(existing) = self.zones.get(zone_id) {
-            return Ok(existing.node.clone());
+        // A zone this witness already holds resumes from its own raft
+        // storage before the JoinZone below re-asserts its voter role: its
+        // vote can be what elects the leader that answers, and the resumed
+        // zone registers this witness's member address.
+        if self.holds_zone(zone_id) {
+            self.auto_join_zone(zone_id, &tokio::runtime::Handle::current())?;
         }
 
-        let peers = self.peers.clone();
-        let self_address = self.self_address.clone();
-        // Snapshot the TLS config once (owned) — a live read guard must not
-        // be held across the `.await` below (RwLockReadGuard is not Send).
-        let tls = self.tls.read().unwrap().clone();
+        // Its own entry in NEXUS_PEERS (a hostname-derived id) is never a target.
+        let endpoints: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|peer| peer.id != self.node_id)
+            .map(|peer| peer.endpoint.clone())
+            .collect();
         loop {
-            for peer in &peers {
-                if peer.id == self.node_id {
-                    continue;
-                }
-                let mut endpoint = peer.endpoint.clone();
-                let mut redirected_once = false;
-                loop {
-                    match call_join_zone_rpc(
-                        &endpoint,
-                        zone_id,
-                        self.node_id,
-                        &self_address,
-                        as_learner,
-                        tls.clone(),
-                        timeout_secs,
-                    )
-                    .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                zone = %zone_id,
-                                endpoint = %endpoint,
-                                witness_id = self.node_id,
-                                "Witness joined zone via leader",
-                            );
-                            return self
-                                .auto_join_zone(zone_id, &tokio::runtime::Handle::current());
-                        }
-                        Ok(result) => {
-                            if let Some(addr) = result.leader_address.as_ref() {
-                                if !redirected_once && !addr.is_empty() && addr != &endpoint {
-                                    tracing::info!(
-                                        from = %endpoint,
-                                        to = %addr,
-                                        "Witness JoinZone redirect to leader",
-                                    );
-                                    endpoint = addr.clone();
-                                    redirected_once = true;
-                                    continue;
-                                }
-                            }
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = ?result.error,
-                                "Witness JoinZone non-success; trying next peer",
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                endpoint = %endpoint,
-                                error = %e,
-                                "Witness JoinZone RPC error; trying next peer",
-                            );
-                            break;
-                        }
-                    }
-                }
+            if self.is_closed() {
+                return Err(TransportError::Connection(format!(
+                    "witness shut down before zone '{zone_id}' joined"
+                )));
+            }
+            if let super::JoinRound::Admitted { endpoint } = super::join_zone_round(
+                endpoints.iter().cloned(),
+                zone_id,
+                self.node_id,
+                &self.self_address,
+                as_learner,
+                &self.tls,
+                timeout_secs,
+            )
+            .await
+            {
+                tracing::info!(
+                    zone = %zone_id,
+                    endpoint = %endpoint,
+                    witness_id = self.node_id,
+                    "Witness joined zone via leader",
+                );
+                return self.auto_join_zone(zone_id, &tokio::runtime::Handle::current());
             }
             tokio::time::sleep(retry_interval).await;
         }
     }
 
-    /// Auto-join a zone when receiving Raft messages for an unknown zone.
+    /// Join each of `zones` at boot, one task per zone: each resumes and
+    /// retries on its own (see [`Self::bootstrap_or_join_zone`]), so a zone
+    /// whose leader cannot be reached delays no other.
+    pub fn join_at_boot(
+        self: &Arc<Self>,
+        zones: Vec<String>,
+        retry_interval: std::time::Duration,
+    ) -> Vec<JoinHandle<()>> {
+        zones
+            .into_iter()
+            .map(|zone_id| {
+                let registry = Arc::clone(self);
+                tokio::spawn(async move {
+                    match registry
+                        .bootstrap_or_join_zone(&zone_id, false, 5, retry_interval)
+                        .await
+                    {
+                        Ok(_) => tracing::info!(zone = %zone_id, "Witness joined zone"),
+                        Err(_) if registry.is_closed() => {}
+                        Err(error) => tracing::error!(
+                            zone = %zone_id,
+                            %error,
+                            "Witness JoinZone failed permanently",
+                        ),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Open a witness replica of `zone_id` — on an inbound Raft message for a
+    /// zone not yet open, and for the boot join.
     ///
-    /// Creates a witness Raft group with `skip_bootstrap=true` (empty ConfState).
-    /// The leader will send a snapshot with the correct ConfState — this is the
-    /// standard raft-rs contract for late-joining nodes.
-    ///
-    /// Used by step_message() handler for dynamic zone support.
+    /// A witness never founds a zone: the replica starts with
+    /// `skip_bootstrap=true`, so its membership is the ConfState it stored
+    /// for a zone it holds on disk, else empty until the leader's log or
+    /// snapshot brings it — the raft-rs contract for a late-joining node.
     #[allow(clippy::result_large_err)]
     pub fn auto_join_zone(
         &self,
@@ -2648,54 +2895,31 @@ impl WitnessZoneRegistry {
         if let Some(existing) = self.zones.get(zone_id) {
             return Ok(existing.node.clone());
         }
-
-        let peers = self.current_auto_join_peers();
-        let peer_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
-        let config = if peer_ids.is_empty() {
-            // No known roster yet: start uninitialized and wait for a
-            // snapshot to carry ConfState.
-            RaftConfig {
-                id: self.node_id,
-                peers: vec![],
-                is_witness: true,
-                skip_bootstrap: true,
-                election_tick: 10_000_000, // witness never initiates election
-                ..Default::default()
-            }
-        } else {
-            // Dynamic federation zones are initially bootstrapped from a
-            // static voter roster; that ConfState is not a log entry. If the
-            // witness auto-joins with an empty ConfState it can replay appends
-            // but never learn that it may vote, so failover loses quorum.
-            RaftConfig::witness(self.node_id, peer_ids)
-        };
-        self.setup_witness_zone(zone_id, config, peers, runtime_handle)
-    }
-
-    fn current_auto_join_peers(&self) -> Vec<NodeAddress> {
-        if let Some(root) = self.zones.get(contracts::ROOT_ZONE_ID) {
-            let peers = root.peers.read().unwrap();
-            if !peers.is_empty() {
-                return peers.values().cloned().collect();
-            }
+        // Under the same lock `shutdown` drains under: no zone opens after it.
+        if self.is_closed() {
+            return Err(TransportError::Connection(format!(
+                "witness is shut down; zone '{zone_id}' does not open"
+            )));
         }
-        self.peers.clone()
+
+        self.setup_witness_zone(zone_id, RaftConfig::witness(self.node_id), runtime_handle)
     }
 
-    /// Internal: open storage, create ZoneConsensus + driver, spawn transport loop, register zone.
-    ///
-    /// Shared by `create_zone()` (static bootstrap) and `auto_join_zone()` (dynamic federation).
+    /// Whether this witness holds `zone_id`'s raft state on disk.
+    fn holds_zone(&self, zone_id: &str) -> bool {
+        self.base_path.join(zone_id).join("raft").exists()
+    }
+
+    /// Internal: open storage, create ZoneConsensus + driver, start the zone
+    /// (transport loop and member-address registration), register it.
     #[allow(clippy::result_large_err)]
     fn setup_witness_zone(
         &self,
         zone_id: &str,
         config: crate::raft::RaftConfig,
-        mut peers: Vec<NodeAddress>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Result<ZoneConsensus<WitnessStateMachine>> {
         use crate::raft::RaftStorage;
-        use crate::transport::{ClientConfig, RaftClientPool, TransportLoop};
-        use raft::Storage;
 
         // Zone-specific storage
         let zone_path = self.base_path.join(zone_id);
@@ -2703,42 +2927,27 @@ impl WitnessZoneRegistry {
         let raft_storage = RaftStorage::open(zone_path.join("raft")).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
-        if let Ok(initial_state) = raft_storage.initial_state() {
-            reconcile_peers_with_conf_state(zone_id, &mut peers, &initial_state.conf_state);
-        }
         let state_machine = WitnessStateMachine::new(&store).map_err(|e| {
             TransportError::Connection(format!("Failed to create witness state machine: {}", e))
         })?;
 
-        let (handle, mut driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
+        let (mut handle, driver) = ZoneConsensus::new(config, raft_storage, state_machine, None)
             .map_err(|e| {
                 TransportError::Connection(format!("Failed to create witness ZoneConsensus: {}", e))
             })?;
 
-        // Shared peer map — `PeerMap::with_peers` drops any self-entry in the
-        // seed (self is a ConfState member, not a transport peer).
-        let peer_map: HashMap<u64, NodeAddress> = peers.into_iter().map(|p| (p.id, p)).collect();
-        let shared_peers: super::SharedPeerMap = Arc::new(RwLock::new(super::PeerMap::with_peers(
-            self.node_id,
-            peer_map,
-        )));
-        driver.set_peer_map(shared_peers.clone(), self.tls.read().unwrap().is_some());
-
-        // Spawn transport loop with zone_id routing
-        let client_config = ClientConfig {
-            tls: self.tls.clone(),
-            ..Default::default()
-        };
-        let transport_loop = TransportLoop::new(
+        let super::StartedZone {
+            peers: shared_peers,
+            tasks,
+        } = super::start_zone(
+            &mut handle,
             driver,
-            shared_peers.clone(),
-            RaftClientPool::with_config(client_config),
-        )
-        .with_zone_id(zone_id.to_string())
-        .with_self_address(self.self_address.clone());
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let transport_handle = runtime_handle.spawn(transport_loop.run(shutdown_rx));
+            zone_id,
+            &self.tls,
+            self.self_address.clone(),
+            self.peers.clone(),
+            runtime_handle,
+        );
 
         tracing::info!(
             "Witness zone '{}' registered (node_id={})",
@@ -2751,8 +2960,7 @@ impl WitnessZoneRegistry {
             WitnessZoneEntry {
                 node: handle.clone(),
                 peers: shared_peers,
-                shutdown_tx,
-                _transport_handle: transport_handle,
+                tasks,
             },
         );
 
@@ -2769,13 +2977,25 @@ impl WitnessZoneRegistry {
         self.zones.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Shutdown all zones.
-    pub fn shutdown_all(&self) {
-        for entry in self.zones.iter() {
-            let _ = entry.shutdown_tx.send(true);
-        }
-        self.zones.clear();
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stop every open zone; no zone opens afterwards and boot joins end.
+    /// Await [`super::ZonesStopped::released`] to know the zones' tasks — and
+    /// with them the registry's hold on their storage — are gone.
+    pub fn shutdown(&self) -> super::ZonesStopped {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _guard = self.auto_join_lock.lock();
+        let open: Vec<String> = self.zones.iter().map(|e| e.key().clone()).collect();
+        let stopped = open
+            .iter()
+            .filter_map(|zone_id| self.zones.remove(zone_id))
+            .map(|(_, entry)| entry.tasks.stop())
+            .collect();
         tracing::info!("All witness zones shut down");
+        stopped
     }
 }
 
@@ -2803,56 +3023,56 @@ impl RaftWitnessServer {
         self.config.bind_address
     }
 
-    /// Start the gRPC server with graceful shutdown.
-    pub async fn serve_with_shutdown(
+    /// Prepare trust and service policy before scheduling the witness listener.
+    pub fn serve_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let addr = self.config.bind_address;
-        let tls_enabled = self.config.tls.is_some();
-        let zone_count = self.registry.list_zones().len();
-        tracing::info!(
-            "Starting Raft Witness gRPC server on {} (tls={}, zones={})",
-            addr,
-            tls_enabled,
-            zone_count,
-        );
-
-        let service = WitnessServiceImpl {
-            registry: self.registry.clone(),
-        };
-
-        let mut builder =
-            lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
-        let policy = super::node_authority::NodeControlPolicy::from_tls(self.config.tls.as_ref())
-            .map_err(TransportError::Connection)?;
-        let router = builder.add_service(super::node_authority::NodeControlService::new(
-            ZoneTransportServiceServer::new(service),
-            policy,
-            &[],
-        ));
-
-        // The witness mTLS bind is CLUSTER-ONLY: it is a raft tie-breaker, never
-        // a target for foreign agents (those write mailboxes on the broker), so
-        // it passes `None` and `federated_mtls_incoming` builds a verifier with
-        // just the cluster CA — byte-equivalent to the prior client_ca_root.
-        match &self.config.tls {
-            Some(tls) => {
-                let incoming = lib::transport_primitives::federated_mtls_incoming(addr, tls, None)
-                    .await
+        let prepared = (|| {
+            let credentials =
+                listener_credentials(self.registry.shared_tls(), self.config.tls.as_ref())?;
+            let policy =
+                super::node_authority::NodeControlPolicy::from_shared_tls(credentials.clone())
                     .map_err(TransportError::Connection)?;
+            let incoming =
+                self.config.tls.is_some().then(|| {
+                    lib::transport_primitives::shared_mtls_incoming(addr, credentials, None)
+                });
+            Ok::<_, TransportError>((policy, incoming))
+        })();
+        async move {
+            let (policy, incoming) = prepared?;
+            tracing::info!(
+                "Starting Raft Witness gRPC server on {} (tls={}, zones={})",
+                addr,
+                incoming.is_some(),
+                self.registry.list_zones().len(),
+            );
+            let service = WitnessServiceImpl {
+                registry: self.registry.clone(),
+            };
+            let mut builder =
+                lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
+            let router = builder.add_service(super::node_authority::NodeControlService::new(
+                bounded!(ZoneTransportServiceServer::new(service)),
+                policy,
+                &[],
+            ));
+            if let Some(incoming) = incoming {
+                let incoming = incoming.await.map_err(TransportError::Connection)?;
                 router
                     .serve_with_incoming_shutdown(incoming, shutdown)
                     .await
                     .map_err(TransportError::Tonic)?;
+            } else {
+                router
+                    .serve_with_shutdown(addr, shutdown)
+                    .await
+                    .map_err(TransportError::Tonic)?;
             }
-            None => router
-                .serve_with_shutdown(addr, shutdown)
-                .await
-                .map_err(TransportError::Tonic)?,
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
@@ -2861,21 +3081,20 @@ struct WitnessServiceImpl {
     registry: Arc<WitnessZoneRegistry>,
 }
 
-#[tonic::async_trait]
-impl ZoneTransportService for WitnessServiceImpl {
-    /// Handle a raw raft-rs message forwarded from another node.
-    ///
-    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
-    /// Auto-joins unknown zones (dynamic federation support).
-    async fn step_message(
+impl WitnessServiceImpl {
+    async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
+        protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(request.extensions())?;
+        }
         let message = match parse_raft_message(&request.get_ref().message) {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(&request, &message)?;
+        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
         let req = request.into_inner();
 
         // Route by zone_id — auto-join if zone not found (dynamic federation)
@@ -2901,7 +3120,50 @@ impl ZoneTransportService for WitnessServiceImpl {
         self.registry
             .learn_peer_address(&req.zone_id, peer, &req.sender_address);
 
-        step_raft_message(&node, message, &req.zone_id, "[Witness]").await
+        step_raft_message(&node, message, &req.zone_id, "[Witness]", protocol).await
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneTransportService for WitnessServiceImpl {
+    async fn prepare_replica_control_reader_v1(
+        &self,
+        request: Request<PrepareReplicaControlReaderRequest>,
+    ) -> std::result::Result<Response<PrepareReplicaControlReaderResponse>, Status> {
+        super::node_authority::require_authenticated_control_node(request.extensions())?;
+        let node = self
+            .registry
+            .get_node(&request.get_ref().zone_id)
+            .ok_or_else(|| Status::not_found("zone is not hosted on this witness"))?;
+        prepare_replica_control_reader(node).await
+    }
+
+    /// Handle a raw raft-rs message forwarded from another node.
+    ///
+    /// Routes to the correct zone's ZoneConsensus by `req.zone_id`.
+    /// Auto-joins unknown zones (dynamic federation support).
+    async fn step_message(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
+
+    async fn step_storage_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::Legacy)
+            .await
+    }
+
+    async fn step_replica_control_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::ReplicaControlV1)
+            .await
     }
 
     /// Witness nodes do not participate in EC replication.
@@ -2935,7 +3197,6 @@ mod tests {
             config.bind_address,
             "0.0.0.0:2026".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.max_message_size, 64 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -2981,8 +3242,10 @@ mod tests {
         assert!(registry.list_zones().is_empty());
     }
 
+    /// A witness opening a zone it does not hold — even with seeds known —
+    /// never founds it: no bootstrap entry, no ConfState of its own.
     #[test]
-    fn test_witness_auto_join_bootstraps_known_peer_roster() {
+    fn a_witness_opening_a_fresh_zone_never_founds_it() {
         use tempfile::TempDir;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -2997,25 +3260,13 @@ mod tests {
 
         let node = registry
             .auto_join_zone("corp-eng", runtime.handle())
-            .expect("witness auto-join");
+            .expect("witness opens the zone");
 
-        assert!(
-            !node.config().skip_bootstrap,
-            "known witness rosters must bootstrap ConfState so the witness can vote"
-        );
-        let mut peers = node.config().peers.clone();
-        peers.sort_unstable();
-        let mut expected = vec![
-            NodeAddress::parse("nexus-1:2126", false).unwrap().id,
-            NodeAddress::parse("nexus-2:2126", false).unwrap().id,
-        ];
-        expected.sort_unstable();
-        assert_eq!(
-            peers, expected,
-            "witness RaftConfig.peers must include full voters and exclude self"
-        );
+        assert!(node.config().skip_bootstrap);
+        assert!(node.voters().is_empty(), "no ConfState of its own");
+        assert_eq!(node.last_index(), 0, "no bootstrap entry");
 
-        registry.shutdown_all();
+        runtime.block_on(registry.shutdown().released());
     }
 
     // ---------------------------------------------------------------

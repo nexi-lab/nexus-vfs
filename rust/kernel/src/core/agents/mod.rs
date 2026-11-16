@@ -13,4 +13,5 @@
 //! Kernel owns the data; services owns the views (preserves the
 //! one-way `services -> kernel` dependency).
 
+pub mod host_cleanup;
 pub mod registry;

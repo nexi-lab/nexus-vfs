@@ -120,7 +120,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let node = registry
-            .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+            .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
             .unwrap();
         node.campaign().await.unwrap();
         ready(&node).await;
@@ -153,15 +153,12 @@ mod tests {
         assert_eq!(store.create(&winner), Err(PolicyError::Revoked));
         store.revoke(SPACE).unwrap();
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
         drop(registry);
-        // Like the existing native restart fixtures: driver/transport cleanup
-        // is asynchronous. This is not a production handoff/lease guarantee.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let node = registry
-            .open_persisted_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+            .open_persisted_zone(contracts::CONTROL_ZONE_ID, &runtime)
             .unwrap();
         node.campaign().await.unwrap();
         ready(&node).await;
@@ -169,6 +166,6 @@ mod tests {
         assert_eq!(store.current(SPACE), Err(PolicyError::Revoked));
         assert_eq!(store.create(&winner), Err(PolicyError::Revoked));
         drop(store);
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
 }

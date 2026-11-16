@@ -14,4 +14,6 @@ runs:
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}
-        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        # PR merge refs retain their own dependency cache for subsequent runs.
+        save-if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        cache-on-failure: true

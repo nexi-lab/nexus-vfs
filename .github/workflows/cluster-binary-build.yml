@@ -21,10 +21,11 @@ jobs:
       # pin, `stable` resolved differently per runner inside a single run, so
       # these numbers decided merges by coin flip.
       #
-      # These measurements include the confined user runtime on 1.99.0, after
-      # separating local routes from the remote gateway client. Same-toolchain
-      # before/after measurements and source revisions live in
-      # rust/profiles/README.md; unused gateway code is excluded before budgeting.
+      # Measurements include the runtime observation contract and the managed-agent
+      # cleanup latch and bootstrap on 1.99.0.
+      # Same-toolchain protected-main/feature measurements and source revisions
+      # live in rust/profiles/README.md. Caps restore ~3% measured headroom;
+      # source CI still measures every native artifact against its fixed cap.
       #
       # Headroom is ~3% deliberately. The linux cap previously passed with 0.22%
       # slack, which is how a compiler change could flip a green PR into a red
@@ -38,45 +39,44 @@ jobs:
           - os: ubuntu-22.04
             artifact_name: nexusd-cluster-linux-x86_64
             package: nexus-cluster
+            features: ''
             bin: nexusd-cluster
             binary: nexusd-cluster
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-linux-x86_64-operator-agent-enrollment
-            max_size_bytes: 20764672  # 19.8 MiB. Measured 20,202,880 on the
-                                      # rebased #364 (main's 1.99.0 baseline 19,515,016
-                                      # plus the typed ZoneRuntime plane and the declared
-                                      # mount subtree); ~2.8% headroom.
+            max_size_bytes: 22347776  # 21.3125 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: macos-15
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
+            features: ''
             bin: nexusd-cluster
             binary: nexusd-cluster
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-macos-arm64-operator-agent-enrollment
-            max_size_bytes: 18087936  # 17.25 MiB. Measured 17,419,600 on the
-                                      # rebased #364 (main's 1.99.0 baseline 16,804,432
-                                      # plus the #364/#361 stack); ~3.8% headroom.
+            max_size_bytes: 19267584  # 18.375 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: macos-15
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
+            features: ''
             bin: nexusd-cluster
             binary: nexusd-cluster
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-macos-x86_64-operator-agent-enrollment
             target: x86_64-apple-darwin
-            max_size_bytes: 19148800  # 18.25 MiB. Measured 18,580,176 on the
-                                      # rebased #364 (main's 1.99.0 baseline 17,947,120
-                                      # plus the #364/#361 stack); ~3.1% headroom.
+            max_size_bytes: 20578304  # 19.625 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
+            features: ''
             bin: nexusd-cluster
             binary: nexusd-cluster.exe
             operator_binary: nexus-agent-enroll.exe
             operator_artifact_name: nexus-agent-enroll-windows-x86_64-operator-agent-enrollment
-            max_size_bytes: 19922944  # 19 MiB. Measured 19,324,416 on the
-                                      # rebased #364 (main's 1.99.0 baseline 18,572,288
-                                      # plus the #364/#361 stack); ~3.1% headroom.
+            max_size_bytes: 21561344  # 20.5625 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
 
 
     steps:
@@ -105,17 +105,21 @@ jobs:
       # remember.
       - name: Feature-carrying builds must say so in their name
         shell: bash
+        env:
+          BUILD_FEATURES: ${{ matrix.features }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          OPERATOR_ARTIFACT_NAME: ${{ matrix.operator_artifact_name }}
         run: |
           set -euo pipefail
-          for f in $(echo "${{ matrix.features }}" | tr ',' ' '); do
-            if [[ "${{ matrix.artifact_name }}" != *"$f"* ]]; then
-              echo "::error::artifact_name '${{ matrix.artifact_name }}' does not name the feature '$f' it is built with."
+          for f in $(echo "$BUILD_FEATURES" | tr ',' ' '); do
+            if [[ "$ARTIFACT_NAME" != *"$f"* ]]; then
+              echo "::error::artifact_name '$ARTIFACT_NAME' does not name the feature '$f' it is built with."
               echo "A feature build is a different binary. Name it so, e.g. nexusd-cluster-<platform>-$f."
               exit 1
             fi
           done
-          echo "artifact name carries its features: ${{ matrix.features }}"
-          if [[ "${{ matrix.operator_artifact_name }}" != *"-operator-agent-enrollment" ]]; then
+          echo "artifact name carries its features: $BUILD_FEATURES"
+          if [[ "$OPERATOR_ARTIFACT_NAME" != *"-operator-agent-enrollment" ]]; then
             echo "::error::operator client artifact must name its operator-agent-enrollment feature"
             exit 1
           fi
@@ -125,7 +129,7 @@ jobs:
         run: python3 scripts/e2e/cluster_binary_enrollment.py prepare --output "$RUNNER_TEMP/release-enrollment"
 
       - name: Build release binary
-        run: cargo build --release -p ${{ matrix.package }} --bin ${{ matrix.bin }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: python scripts/ci/build_release_with_map.py --package ${{ matrix.package }} --bin ${{ matrix.bin }} --artifact ${{ matrix.artifact_name }} --output "${{ runner.temp }}/cluster-link-maps" ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Qualify the optimized binary before publication
         if: matrix.artifact_name == 'nexusd-cluster-linux-x86_64'
@@ -140,7 +144,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build the separate operator client
-        run: cargo build --release -p nexus-cluster --bin nexus-agent-enroll --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: python scripts/ci/build_release_with_map.py --package nexus-cluster --bin nexus-agent-enroll --artifact ${{ matrix.operator_artifact_name }} --output "${{ runner.temp }}/cluster-link-maps" --features operator-agent-enrollment ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Check daemon and operator client sizes
         shell: bash
@@ -167,6 +171,15 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Retain linker size evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-link-maps
+          path: ${{ runner.temp }}/cluster-link-maps
+          if-no-files-found: warn
+          retention-days: ${{ inputs.upload_retention_days }}
 
       - name: Sanity-check --help
         if: ${{ !matrix.target }}

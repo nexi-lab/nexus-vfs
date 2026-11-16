@@ -77,6 +77,15 @@ impl KernelBlobFetcher {
 
 #[tonic::async_trait]
 impl BlobFetcher for KernelBlobFetcher {
+    async fn read_in_zone(&self, zone_id: &str, content_id: &str) -> Result<Vec<u8>, String> {
+        let kernel = Arc::clone(&self.kernel);
+        let zone = zone_id.to_owned();
+        let content = content_id.to_owned();
+        tokio::task::spawn_blocking(move || kernel.read_local_zone_content(&zone, &content))
+            .await
+            .map_err(|error| format!("zone content worker: {error}"))?
+    }
+
     /// Resolve ``content_id`` against the local data plane.
     ///
     /// Absolute paths request logical files; other addresses request objects.

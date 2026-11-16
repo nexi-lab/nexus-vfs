@@ -35,12 +35,13 @@ use kernel::kernel::vfs_proto::{
     DeleteResponse, GetXattrBulkItem, GetXattrBulkRequest, GetXattrBulkResponse, GetXattrRequest,
     GetXattrResponse, InspectTargetRequest, InspectTargetResponse, IpcAck, IpcEmpty,
     IpcHasResponse, IpcPathRequest, LockRequest, LockResponse, MkdirRequest, MkdirResponse,
-    PingRequest, PingResponse, ReadRequest, ReadResponse, ReadVersionedRequest,
+    PingRequest, PingResponse, ReadGuardedRequest, ReadRequest, ReadResponse, ReadVersionedRequest,
     ReadVersionedResponse, ReaddirEntry, ReaddirRequest, ReaddirResponse, RenameRequest,
     RenameResponse, SetXattrRequest, SetXattrResponse, SetattrRequest, SetattrResponse,
     StatRequest, StatResponse, StreamCollectAllResponse, StreamReadAtRequest, StreamReadAtResponse,
     StreamWriteRequest, StreamWriteResponse, UnlockRequest, UnlockResponse, WatchRequest,
-    WatchResponse, WriteIfVersionRequest, WriteIfVersionResponse, WriteRequest, WriteResponse,
+    WatchResponse, WriteGuardedRequest, WriteIfVersionRequest, WriteIfVersionResponse,
+    WriteRequest, WriteResponse,
 };
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::Permission;
@@ -247,6 +248,7 @@ impl_authed_request!(
     MkdirRequest,
     PingRequest,
     ReadRequest,
+    ReadGuardedRequest,
     ReadVersionedRequest,
     ReaddirRequest,
     RenameRequest,
@@ -259,6 +261,7 @@ impl_authed_request!(
     UnlockRequest,
     WatchRequest,
     WriteRequest,
+    WriteGuardedRequest,
     WriteIfVersionRequest,
 );
 
@@ -297,11 +300,9 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
     runtime_scope: Option<&Arc<RuntimeScope>>,
     req: &Request<T>,
 ) -> Result<OperationContext, Status> {
-    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
-        return Err(Status::unavailable(
-            "nexusd is still booting: the VFS data plane is not wired yet \
-             (no distributed coordinator) — retry",
-        ));
+    wait_for_data_plane(ready).await?;
+    if let Some(ctx) = req.extensions().get::<AuthenticatedRequestContext>() {
+        return Ok(ctx.0.clone());
     }
     resolve_request_identity(
         auth,
@@ -313,10 +314,20 @@ pub(crate) async fn resolve_request_context<T: AuthedRequest>(
     )
 }
 
+pub(crate) async fn wait_for_data_plane(ready: &DataPlaneReady) -> Result<(), Status> {
+    if !ready.wait(DATA_PLANE_READY_BUDGET).await {
+        return Err(Status::unavailable(
+            "nexusd is still booting: the VFS data plane is not wired yet \
+             (no distributed coordinator) — retry",
+        ));
+    }
+    Ok(())
+}
+
 // Identity depends on the envelope, independently of the protobuf message type.
 // Keep one compiled resolver for every VFS and ZoneRuntime request shape.
 #[inline(never)]
-fn resolve_request_identity(
+pub(crate) fn resolve_request_identity(
     auth: &Arc<dyn AuthProvider>,
     foreign_ca_verifier: &ForeignCaVerifierSlot,
     runtime_scope: Option<&Arc<RuntimeScope>>,
@@ -324,9 +335,6 @@ fn resolve_request_identity(
     extensions: &tonic::Extensions,
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<OperationContext, Status> {
-    if let Some(ctx) = extensions.get::<AuthenticatedRequestContext>() {
-        return Ok(ctx.0.clone());
-    }
     // Reclassify against CURRENT roots even when the foreign set is empty.
     // A connection established before its last foreign anchor was removed
     // still carries that leaf; parsing it as local would revive its identity.
@@ -408,27 +416,7 @@ impl VfsServiceImpl {
     /// can no longer arrive as a Debug dump — which is the part a client could not
     /// parse and an operator could not read.
     pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
-        let code = match &err {
-            KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
-            KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
-            KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
-            // A backend's own refusal wording is the only signal available for
-            // whether a storage failure was really an authorization one.
-            KernelError::BackendError(m) => {
-                let lower = m.to_ascii_lowercase();
-                if lower.contains("permission")
-                    || lower.contains("denied")
-                    || lower.contains("read-only")
-                {
-                    RpcErrorCode::PermissionError
-                } else {
-                    RpcErrorCode::InternalError
-                }
-            }
-            KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
-            _ => RpcErrorCode::InternalError,
-        };
-        (code, err.to_string())
+        (kernel_err_code(&err), err.to_string())
     }
 
     /// Construct the requested backend through the registered provider, then
@@ -679,6 +667,20 @@ where
 
 #[tonic::async_trait]
 impl NexusVfsService for VfsServiceImpl {
+    async fn read_guarded(
+        &self,
+        req: Request<ReadGuardedRequest>,
+    ) -> Result<Response<ReadVersionedResponse>, Status> {
+        self.read_guarded_content(req).await
+    }
+
+    async fn write_guarded(
+        &self,
+        req: Request<WriteGuardedRequest>,
+    ) -> Result<Response<WriteIfVersionResponse>, Status> {
+        self.write_guarded_content(req).await
+    }
+
     async fn read_versioned(
         &self,
         req: Request<ReadVersionedRequest>,
@@ -2020,7 +2022,42 @@ pub enum RpcErrorCode {
     /// requested offset was trimmed. Distinct from `InternalError` so a reader
     /// can catch it and reset to the stream's `earliest_offset`.
     OffsetOutOfRange = -32019,
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed. A client that must not duplicate it reads the state back
+    /// instead of retrying.
+    OutcomeUnknown = -32020,
+    /// A replicated append was refused: nothing was appended, so a retry is
+    /// safe. Distinct from `OutcomeUnknown` so a client can tell the two apart
+    /// without parsing the message.
+    NotCommitted = -32021,
     InternalError = -32603,
+}
+
+/// The wire code for a kernel error. The text always comes from the error's
+/// own `Display`; this picks only how specific a code the client gets.
+fn kernel_err_code(err: &KernelError) -> RpcErrorCode {
+    match err {
+        KernelError::FileNotFound(_) => RpcErrorCode::FileNotFound,
+        KernelError::PermissionDenied(_) => RpcErrorCode::PermissionError,
+        KernelError::InvalidPath(_) => RpcErrorCode::InvalidPath,
+        // A backend's own refusal wording is the only signal available for
+        // whether a storage failure was really an authorization one.
+        KernelError::BackendError(m) => {
+            let lower = m.to_ascii_lowercase();
+            if lower.contains("permission")
+                || lower.contains("denied")
+                || lower.contains("read-only")
+            {
+                RpcErrorCode::PermissionError
+            } else {
+                RpcErrorCode::InternalError
+            }
+        }
+        KernelError::StreamTruncated(..) => RpcErrorCode::OffsetOutOfRange,
+        KernelError::OutcomeUnknown(_) => RpcErrorCode::OutcomeUnknown,
+        KernelError::NotCommitted(_) => RpcErrorCode::NotCommitted,
+        _ => RpcErrorCode::InternalError,
+    }
 }
 
 pub(crate) fn encode_rpc_error(code: RpcErrorCode, message: &str) -> Vec<u8> {
@@ -2264,6 +2301,20 @@ fn status_to_code(s: &Status) -> RpcErrorCode {
 pub(crate) mod tests {
     use super::*;
 
+    /// A client decides between a read-back and a retry from the code alone,
+    /// so an unanswered append and a refused one must not share a code.
+    #[test]
+    fn append_failures_carry_whether_the_entry_may_have_committed() {
+        let unknown = KernelError::OutcomeUnknown("timeout".into());
+        let refused = KernelError::NotCommitted("not leader".into());
+        assert_eq!(kernel_err_code(&unknown) as i64, -32020);
+        assert_eq!(kernel_err_code(&refused) as i64, -32021);
+        assert_eq!(
+            kernel_err_code(&KernelError::IOError("disk".into())) as i64,
+            RpcErrorCode::InternalError as i64
+        );
+    }
+
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -2383,6 +2434,18 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl NexusVfsService for HubStub {
+        async fn read_guarded(
+            &self,
+            _: Request<ReadGuardedRequest>,
+        ) -> Result<Response<ReadVersionedResponse>, Status> {
+            Err(Status::unimplemented("guarded content is unsupported"))
+        }
+        async fn write_guarded(
+            &self,
+            _: Request<WriteGuardedRequest>,
+        ) -> Result<Response<WriteIfVersionResponse>, Status> {
+            Err(Status::unimplemented("guarded content is unsupported"))
+        }
         async fn read_versioned(
             &self,
             _: Request<ReadVersionedRequest>,

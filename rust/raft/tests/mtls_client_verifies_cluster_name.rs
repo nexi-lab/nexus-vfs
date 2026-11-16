@@ -116,6 +116,11 @@ async fn spawn_mtls_server(
         }),
         ..Default::default()
     };
+    registry
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            config.tls.clone().unwrap(),
+        ));
     let server = RaftGrpcServer::new(registry, config);
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {

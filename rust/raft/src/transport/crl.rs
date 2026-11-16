@@ -17,6 +17,11 @@
 
 use std::path::{Path, PathBuf};
 
+mod issuer;
+pub(super) use issuer::CrlIssuer;
+mod lock;
+use lock::RevocationGuard;
+
 /// Validity window stamped into a CRL's `next_update`. Cosmetic to our own
 /// verification (which trusts the CA signature, not the clock) but honest to
 /// any standard CRL reader; nodes refresh far more often than this regardless.
@@ -47,11 +52,26 @@ pub fn generate_crl(
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
 ) -> Result<Vec<u8>, String> {
+    generate_crl_at(
+        revoked_serials,
+        &crl_number.to_be_bytes(),
+        ca_cert_pem,
+        ca_key_pem,
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
+fn generate_crl_at(
+    revoked_serials: &[Vec<u8>],
+    crl_number: &[u8],
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
+    now: time::OffsetDateTime,
+) -> Result<Vec<u8>, String> {
     use rcgen::{
         CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
     };
     let ca_issuer = super::certgen::ca_issuer_from_pem(ca_cert_pem, ca_key_pem)?;
-    let now = time::OffsetDateTime::now_utc();
     let revoked_certs = revoked_serials
         .iter()
         .map(|s| RevokedCertParams {
@@ -64,7 +84,7 @@ pub fn generate_crl(
     let params = CertificateRevocationListParams {
         this_update: now,
         next_update: now + time::Duration::days(CRL_VALIDITY_DAYS),
-        crl_number: SerialNumber::from(crl_number),
+        crl_number: SerialNumber::from_slice(crl_number),
         issuing_distribution_point: None,
         revoked_certs,
         key_identifier_method: rcgen::KeyIdMethod::Sha256,
@@ -155,11 +175,18 @@ fn parse_revoked_entry(line: &str) -> Result<RevokedEntry, String> {
 /// Authoritative revocation read for issuance: unreadable or malformed state
 /// refuses renewal. A missing file means no revocations have been recorded.
 pub fn read_revoked_serials_checked(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    Ok(read_revoked_entries_checked(path)?
+        .into_iter()
+        .map(|entry| entry.serial)
+        .collect())
+}
+
+fn read_revoked_entries_checked(path: &Path) -> Result<Vec<RevokedEntry>, String> {
     revoked_file_contents(path)?
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| parse_revoked_entry(line).map(|entry| entry.serial))
+        .map(parse_revoked_entry)
         .collect()
 }
 
@@ -170,16 +197,36 @@ pub fn with_unrevoked_serial<T>(
     serial: &[u8],
     issue: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = SERIALS_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    with_unrevoked_serials(path, &[serial], issue)
+}
+
+/// Check every signing principal in one current revocation snapshot and hold
+/// the existing writer lock through issuance. Controller and predecessor
+/// checks therefore share the same boundary as revocation and pruning.
+pub fn with_unrevoked_serials<T>(
+    path: &Path,
+    serials: &[&[u8]],
+    issue: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = unrevoked_serials_guard(path, serials)?;
+    issue()
+}
+
+// Keep the file read and serial validation shared across callback types. The
+// caller retains this same writer guard until its issuance callback returns.
+#[inline(never)]
+fn unrevoked_serials_guard(path: &Path, serials: &[&[u8]]) -> Result<RevocationGuard, String> {
+    if serials.is_empty() || serials.iter().any(|serial| serial.is_empty()) {
+        return Err("issuance requires nonempty certificate serials".into());
+    }
+    let guard = RevocationGuard::acquire(path)?;
     if read_revoked_serials_checked(path)?
         .iter()
-        .any(|entry| entry == serial)
+        .any(|entry| serials.contains(&entry.as_slice()))
     {
         return Err("session renewal refused for a revoked certificate".into());
     }
-    issue()
+    Ok(guard)
 }
 
 /// The revoked serials (raw bytes) — what the CRL is built from. Thin view over
@@ -191,21 +238,6 @@ pub fn read_revoked_serials(path: &Path) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Serialises the read-modify-write cycles on the revoked-serial file.
-///
-/// Both writers — recording a revocation and pruning expired entries — read the
-/// whole file, change it, and write it back. Interleave two of those and one
-/// disappears: a prune that read before a revocation landed will write the set
-/// it read, and the revocation is gone. A lost revocation is not a lost write,
-/// it is a certificate that stays valid after someone revoked it.
-///
-/// In-process is the whole surface. The other writer is the offline `auth
-/// revoke` CLI, which cannot run while the daemon is up: it opens the data
-/// dir's redb, the daemon holds that exclusively, and `auth_offline_lock.rs`
-/// pins that it fails loud rather than proceeding. So the concurrent writers
-/// are the revoke RPC and the prune timer, both here.
-static SERIALS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Serialise entries and replace the file atomically.
 ///
 /// Write-temp-then-rename, because the previous `fs::write` truncated the live
@@ -214,6 +246,7 @@ static SERIALS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// on it. A rename either happens or does not.
 fn write_revoked_entries(path: &Path, entries: &[RevokedEntry]) -> Result<(), String> {
     use base64::Engine;
+    use std::io::Write;
     let body = entries
         .iter()
         .map(|e| {
@@ -229,9 +262,25 @@ fn write_revoked_entries(path: &Path, entries: &[RevokedEntry]) -> Result<(), St
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{body}\n"))
+    let mut staged =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    staged
+        .write_all(format!("{body}\n").as_bytes())
         .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+    staged
+        .sync_all()
+        .map_err(|e| format!("synchronize {}: {e}", tmp.display()))?;
+    drop(staged);
+    lib::file_durability::replace_file(&tmp, path)
+        .map_err(|e| format!("replace {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    lib::file_durability::sync_directory(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+    .map_err(|e| format!("synchronize revocation directory: {e}"))?;
+    Ok(())
 }
 
 /// Record one revoked serial, with the certificate's `notAfter` when the caller
@@ -246,12 +295,8 @@ pub fn add_revoked_serial_with_expiry(
     serial: &[u8],
     not_after_unix: Option<i64>,
 ) -> Result<(), String> {
-    // Held across the read AND the write: see `SERIALS_WRITE_LOCK`. A poisoned
-    // lock still guards — the data is a file, not the mutex's payload — so take
-    // the guard either way rather than failing a revocation on someone else's
-    // panic.
-    let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut entries = read_revoked_entries(path);
+    let _guard = RevocationGuard::acquire(path)?;
+    let mut entries = read_revoked_entries_checked(path)?;
     if let Some(existing) = entries.iter_mut().find(|e| e.serial == serial) {
         // Re-revoking is a no-op except that a caller who knows the expiry
         // teaches it to an entry that did not have one.
@@ -298,8 +343,8 @@ pub fn prune_expired_serials(
     now_unix: i64,
     skew_margin_secs: i64,
 ) -> Result<usize, String> {
-    let _guard = SERIALS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let entries = read_revoked_entries(path);
+    let _guard = RevocationGuard::acquire(path)?;
+    let entries = read_revoked_entries_checked(path)?;
     let before = entries.len();
     let kept: Vec<RevokedEntry> = entries
         .into_iter()
@@ -314,6 +359,9 @@ pub fn prune_expired_serials(
     }
     Ok(dropped)
 }
+
+#[cfg(test)]
+mod issuance_tests;
 
 #[cfg(test)]
 mod tests {

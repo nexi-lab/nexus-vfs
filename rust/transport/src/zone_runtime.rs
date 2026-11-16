@@ -1,31 +1,10 @@
-//! Typed Zone runtime gRPC surface (R7–R13) — `ZoneRuntimeService`.
+//! Typed zone operations use the shared authenticated request path.
 //!
-//! The same door as the VFS face (`authenticate_with`: boot-gate wait →
-//! peer identity → `AuthProvider::resolve`), then zone-level authz, then
-//! a late-bound [`ZoneRuntimeOps`] backend (the raft `ZoneRuntimeBackend`,
-//! filled by boot after the `ZoneManager` exists — the `ForeignCaVerifierSlot`
-//! pattern: routes are built before the thing they serve).
-//!
-//! Authz (deliberately NOT `kernel.check_permission` for the admin gate —
-//! the TLS-on cluster profile installs a containment provider that admits
-//! every domestic caller, so it can never be the authorization basis
-//! here. The mount-path check below is likewise NOT a live second layer
-//! under today's armable providers: every caller that reaches it has
-//! already passed `require_admin`, and the providers this profile can
-//! arm (rebac, foreign containment) short-circuit admin/system to allow
-//! — so the check passes unconditionally in practice. It is kept as the
-//! pre-built gate for a future mount surface opened to non-admin
-//! principals, where it becomes the load-bearing layer):
-//!
-//! - every mutation (create/join/mount/unmount/remove-replica/deprovision)
-//!   requires `is_admin || is_system` — the `setattr_mount` gRPC-layer
-//!   admin-gate precedent, now uniform across the zone lifecycle;
-//! - mount/unmount additionally pass
-//!   `kernel.check_permission(canonical_mount_path, Write, ctx)` — see
-//!   above for its current (pass-through) and intended (future non-admin
-//!   mount face) semantics;
-//! - status / GetZoneOperation / GetRuntimeCapabilities are reads: any
-//!   authenticated caller.
+//! The operator surface controls cluster lifecycle. The owner surface uses a
+//! private-root backend for admitted learner joins, local mounts and removal.
+//! Its original caller and receiver installation are checked around execution.
+
+mod authorization;
 
 use std::sync::Arc;
 
@@ -42,11 +21,17 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::AuthProvider;
 use crate::grpc::{authenticate_with, AuthedRequest, DataPlaneReady, ForeignCaVerifierSlot};
+use crate::runtime_scope::RuntimeScope;
+use authorization::OwnerRequest;
 
 /// The backend seam. Implemented by the raft-side `ZoneRuntimeBackend`
 /// (below — a local-trait-for-foreign-type impl: this crate owns the
 /// trait, raft owns the struct, keeping transport free of raft internals).
 pub trait ZoneRuntimeOps: Send + Sync {
+    /// Confined routes accept only a backend whose private-root scope is enforced.
+    fn is_local_root(&self) -> bool {
+        false
+    }
     fn zone_create(&self, req: &ZoneCreateRequest) -> Result<ZoneReceipt, ZoneRuntimeError>;
     fn zone_join(&self, req: &ZoneJoinRequest) -> Result<ZoneReceipt, ZoneRuntimeError>;
     fn zone_status(&self, req: &ZoneStatusRequest) -> Result<ZoneStatusResponse, ZoneRuntimeError>;
@@ -67,6 +52,9 @@ pub trait ZoneRuntimeOps: Send + Sync {
 }
 
 impl ZoneRuntimeOps for ZoneRuntimeBackend {
+    fn is_local_root(&self) -> bool {
+        ZoneRuntimeBackend::is_local_root(self)
+    }
     fn zone_create(&self, req: &ZoneCreateRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
         ZoneRuntimeBackend::zone_create(self, req)
     }
@@ -122,6 +110,7 @@ pub struct ZoneRuntimeCapabilities {
 pub type ZoneRuntimeCapabilitiesSlot = Arc<std::sync::OnceLock<Arc<ZoneRuntimeCapabilities>>>;
 
 pub(crate) struct ZoneRuntimeServiceImpl {
+    owner_scope: Option<Arc<RuntimeScope>>,
     auth: Arc<dyn AuthProvider>,
     ops: ZoneRuntimeOpsSlot,
     ready: Arc<DataPlaneReady>,
@@ -176,27 +165,93 @@ impl AuthedRequest for GetRuntimeCapabilitiesRequest {
     }
 }
 
+struct ZoneRequest {
+    context: OperationContext,
+    owner: Option<Arc<OwnerRequest>>,
+}
+
+// Zone control operations share one blocking worker per response type. Erase
+// the small operation closure before spawning so each RPC does not instantiate
+// its own copy of Tokio's worker, cancellation and result machinery.
+type ZoneOperation<T> =
+    Box<dyn FnOnce(&dyn ZoneRuntimeOps, &OperationContext) -> Result<T, Status> + Send>;
+
+impl ZoneRequest {
+    fn check(&self) -> Result<OperationContext, Status> {
+        self.owner
+            .as_ref()
+            .map_or_else(|| Ok(self.context.clone()), |owner| owner.check())
+    }
+
+    fn finish<T>(&self, result: Result<T, Status>, mutation: bool) -> Result<T, Status> {
+        let checked = self.check().map(|_| ());
+        let result = match (checked, &self.owner) {
+            (Ok(()), Some(owner)) => owner.publish(result),
+            (Ok(()), None) => Ok(result),
+            (Err(error), _) => Err(error),
+        };
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) if mutation => Err(Status::unknown(
+                "zone operation may have executed; query its original operation ID",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl ZoneRuntimeServiceImpl {
     async fn authenticate<T: AuthedRequest>(
         &self,
         req: Request<T>,
-    ) -> Result<(OperationContext, T), Status> {
-        // No runtime delegation on the zone plane: a gateway-forwarded
-        // credential must be refused here rather than silently fall back to
-        // the gateway's own identity (fail closed, as `resolve_request_context`
-        // does for every door without a wired scope).
-        authenticate_with(
+    ) -> Result<(Arc<ZoneRequest>, T), Status> {
+        if let Some(scope) = &self.owner_scope {
+            crate::grpc::wait_for_data_plane(&self.ready).await?;
+            let owner = Arc::new(OwnerRequest::capture(
+                Arc::clone(&self.auth),
+                Arc::clone(&self.foreign_ca_verifier),
+                Arc::clone(scope),
+                req.get_ref().auth_token(),
+                req.extensions(),
+                req.metadata(),
+            )?);
+            let context = owner.context().clone();
+            return Ok((
+                Arc::new(ZoneRequest {
+                    context,
+                    owner: Some(owner),
+                }),
+                req.into_inner(),
+            ));
+        }
+        let (context, inner) = authenticate_with(
             &self.auth,
             &self.ready,
             &self.foreign_ca_verifier,
             None,
             req,
         )
-        .await
+        .await?;
+        Ok((
+            Arc::new(ZoneRequest {
+                context,
+                owner: None,
+            }),
+            inner,
+        ))
     }
 
-    fn require_admin(ctx: &OperationContext, mutation: &str) -> Result<(), Status> {
-        if ctx.is_admin || ctx.is_system {
+    fn require_mutation(&self, request: &ZoneRequest, mutation: &str) -> Result<(), Status> {
+        if self.owner_scope.is_some() {
+            return if matches!(mutation, "create" | "deprovision") {
+                Err(Status::permission_denied(
+                    "global zone lifecycle requires the control plane",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if request.context.is_admin || request.context.is_system {
             return Ok(());
         }
         Err(Status::permission_denied(format!(
@@ -204,35 +259,48 @@ impl ZoneRuntimeServiceImpl {
         )))
     }
 
-    /// Zone-level mount-path gate: the canonical path key for the mount
-    /// point must be writable for this caller under whatever permission
-    /// provider this deployment armed. Under the providers armable today
-    /// this is a pass-through (see the module doc: callers here are all
-    /// admin/system, and both providers short-circuit them); it becomes
-    /// load-bearing when the mount face opens to non-admin principals.
-    /// With no provider armed (NoAuth loopback) the gate is a no-op — the
-    /// admin gate above is the authorization basis.
-    ///
-    /// The key is built with the SAME canonicalization the route table
-    /// itself uses (`canonicalize_mount_path`), never a raw `format!`:
-    /// a raw `/{parent}{mount_path}` concatenation mis-shapes non-absolute
-    /// inputs (`"foo"` → `/rootfoo`) and root mounts (`"/"` → `/root/`),
-    /// so the gate would be asking about a path nobody writes. The raft
-    /// layer's `validate_zone_wire_path` admission (which runs after this gate
-    /// in the RPC chain) rejects those inputs outright before any journal
-    /// claim or execution.
-    fn check_mount_path(
+    async fn execute<T: Send + 'static>(
         &self,
+        request: Arc<ZoneRequest>,
+        mutation: bool,
+        mount: Option<(String, String)>,
+        operation: ZoneOperation<T>,
+    ) -> Result<T, Status> {
+        let ops = self.ops()?;
+        let worker = Arc::clone(&request);
+        let kernel = Arc::clone(&self.kernel);
+        // A queued worker revalidates before it can reach the journal. Once
+        // started, cancellation retains the worker and its original receipt.
+        let result = tokio::task::spawn_blocking(move || {
+            let mut context = worker.check()?;
+            if let Some((parent, path)) = mount {
+                Self::check_mount_path(&kernel, &context, &parent, &path)?;
+                context = worker.check()?;
+            }
+            Ok::<_, Status>(operation(ops.as_ref(), &context))
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "zone runtime worker failed");
+            if mutation && request.owner.is_some() {
+                Status::unknown("zone worker ended; query the original operation ID")
+            } else {
+                Status::internal("zone runtime worker failed")
+            }
+        })??;
+        request.finish(result, mutation)
+    }
+
+    /// Recheck the canonical mount path using the current caller in the worker.
+    fn check_mount_path(
+        kernel: &Kernel,
         ctx: &OperationContext,
         parent_zone_id: &str,
         mount_path: &str,
     ) -> Result<(), Status> {
         let canonical =
             kernel::core::vfs_router::canonicalize_mount_path(mount_path, parent_zone_id);
-        if let Err(e) = self
-            .kernel
-            .check_permission(&canonical, kernel::Permission::Write, ctx)
-        {
+        if let Err(e) = kernel.check_permission(&canonical, kernel::Permission::Write, ctx) {
             return Err(Status::permission_denied(format!(
                 "mount path '{canonical}' not writable for this caller: {e:?}"
             )));
@@ -241,10 +309,15 @@ impl ZoneRuntimeServiceImpl {
     }
 
     fn ops(&self) -> Result<Arc<dyn ZoneRuntimeOps>, Status> {
-        self.ops
-            .get()
-            .cloned()
-            .ok_or_else(|| Status::unavailable("zone runtime backend is not wired on this process"))
+        let ops = self.ops.get().cloned().ok_or_else(|| {
+            Status::unavailable("zone runtime backend is not wired on this process")
+        })?;
+        if self.owner_scope.is_some() && !ops.is_local_root() {
+            return Err(Status::unavailable(
+                "owner zone service requires a private-root backend",
+            ));
+        }
+        Ok(ops)
     }
 }
 
@@ -256,6 +329,7 @@ fn status_from(e: ZoneRuntimeError) -> Status {
         ZoneRuntimeError::Invalid(m) => Status::invalid_argument(m),
         ZoneRuntimeError::Conflict(m) => Status::failed_precondition(m),
         ZoneRuntimeError::NotFound(m) => Status::not_found(m),
+        ZoneRuntimeError::Unavailable(m) => Status::unavailable(m),
         ZoneRuntimeError::Internal(m) => {
             // Same discipline as `map_kernel_err` on the VFS face: the
             // detail (store errors, RaftError Debug text) is for the
@@ -274,13 +348,16 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneCreateRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "create")?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_create(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "create")?;
+        let out = self
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_create(&inner).map_err(status_from)),
+            )
+            .await?;
         Ok(Response::new(out))
     }
 
@@ -288,33 +365,16 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneJoinRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "join")?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_join(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
-        Ok(Response::new(out))
-    }
-
-    async fn zone_status(
-        &self,
-        req: Request<ZoneStatusRequest>,
-    ) -> Result<Response<ZoneStatusResponse>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        let ops = self.ops()?;
-        let mut out = tokio::task::spawn_blocking(move || ops.zone_status(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
-        // Reads are open to any authenticated caller, but the raft topology
-        // (term / commit index / leader / voter & witness counts) is
-        // operator intelligence — strip it for anyone the mutation face's
-        // gate would refuse. The presence ladder stays: it is the answer.
-        if !(ctx.is_admin || ctx.is_system) {
-            out.cluster = None;
-        }
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "join")?;
+        let out = self
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_join(&inner).map_err(status_from)),
+            )
+            .await?;
         Ok(Response::new(out))
     }
 
@@ -322,14 +382,17 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneMountRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "mount")?;
-        self.check_mount_path(&ctx, &inner.parent_zone_id, &inner.mount_path)?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_mount(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "mount")?;
+        let mount = Some((inner.parent_zone_id.clone(), inner.mount_path.clone()));
+        let out = self
+            .execute(
+                request,
+                true,
+                mount,
+                Box::new(move |ops, _context| ops.zone_mount(&inner).map_err(status_from)),
+            )
+            .await?;
         Ok(Response::new(out))
     }
 
@@ -337,14 +400,17 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneUnmountRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "unmount")?;
-        self.check_mount_path(&ctx, &inner.parent_zone_id, &inner.mount_path)?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_unmount(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "unmount")?;
+        let mount = Some((inner.parent_zone_id.clone(), inner.mount_path.clone()));
+        let out = self
+            .execute(
+                request,
+                true,
+                mount,
+                Box::new(move |ops, _context| ops.zone_unmount(&inner).map_err(status_from)),
+            )
+            .await?;
         Ok(Response::new(out))
     }
 
@@ -352,13 +418,16 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneRemoveReplicaRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "remove_replica")?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_remove_replica(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "remove_replica")?;
+        let out = self
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_remove_replica(&inner).map_err(status_from)),
+            )
+            .await?;
         Ok(Response::new(out))
     }
 
@@ -366,13 +435,36 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<ZoneDeprovisionRequest>,
     ) -> Result<Response<ZoneReceipt>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        Self::require_admin(&ctx, "deprovision")?;
-        let ops = self.ops()?;
-        let out = tokio::task::spawn_blocking(move || ops.zone_deprovision(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
+        let (request, inner) = self.authenticate(req).await?;
+        self.require_mutation(&request, "deprovision")?;
+        let out = self
+            .execute(
+                request,
+                true,
+                None,
+                Box::new(move |ops, _context| ops.zone_deprovision(&inner).map_err(status_from)),
+            )
+            .await?;
+        Ok(Response::new(out))
+    }
+
+    async fn zone_status(
+        &self,
+        req: Request<ZoneStatusRequest>,
+    ) -> Result<Response<ZoneStatusResponse>, Status> {
+        let (request, inner) = self.authenticate(req).await?;
+        let operator = request.context.is_admin || request.context.is_system;
+        let mut out = self
+            .execute(
+                request,
+                false,
+                None,
+                Box::new(move |ops, _| ops.zone_status(&inner).map_err(status_from)),
+            )
+            .await?;
+        if !operator {
+            out.cluster = None;
+        }
         Ok(Response::new(out))
     }
 
@@ -380,27 +472,23 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<GetZoneOperationRequest>,
     ) -> Result<Response<ZoneOperationRecord>, Status> {
-        let (ctx, inner) = self.authenticate(req).await?;
-        let ops = self.ops()?;
-        let mut out = tokio::task::spawn_blocking(move || ops.get_zone_operation(&inner))
-            .await
-            .map_err(|e| Status::internal(format!("zone runtime worker panicked: {e}")))?
-            .map_err(status_from)?;
-        // Same reader-facing filter as zone_status: the receipt's cluster
-        // facts and the raw refusal text (which can carry peer addresses
-        // via membership-conflict errors) stay operator-only; the status
-        // ladder and receipt identity are the caller's answer.
-        if !(ctx.is_admin || ctx.is_system) {
+        let (request, inner) = self.authenticate(req).await?;
+        let operator = request.context.is_admin || request.context.is_system;
+        let mut out = self
+            .execute(
+                request,
+                false,
+                None,
+                Box::new(move |ops, _| ops.get_zone_operation(&inner).map_err(status_from)),
+            )
+            .await?;
+        if !operator {
             if let Some(receipt) = out.receipt.as_mut() {
                 receipt.cluster = None;
             }
             if !out.error.is_empty() {
-                tracing::warn!(
-                    operation_id = %out.operation_id,
-                    "zone operation error redacted for a non-admin caller: {}",
-                    out.error
-                );
-                out.error = "operation was rejected".to_string();
+                tracing::warn!(operation_id = %out.operation_id, "zone operation error redacted: {}", out.error);
+                out.error = "operation was rejected".to_owned();
             }
         }
         Ok(Response::new(out))
@@ -410,22 +498,24 @@ impl kernel::kernel::vfs_proto::zone_runtime_service_server::ZoneRuntimeService
         &self,
         req: Request<GetRuntimeCapabilitiesRequest>,
     ) -> Result<Response<GetRuntimeCapabilitiesResponse>, Status> {
-        // The ready gate in `authenticate` IS the readiness semantics: a
-        // caller that gets this far is answered, one that doesn't gets
-        // `Unavailable` (retryable — the probe convention).
-        let _ = self.authenticate(req).await?;
+        let (request, _) = self.authenticate(req).await?;
+        if self.owner_scope.is_some() {
+            self.ops()?;
+        }
         let caps = self.capabilities.get().ok_or_else(|| {
             Status::unavailable("zone runtime capabilities are not wired on this process")
         })?;
-        Ok(Response::new(GetRuntimeCapabilitiesResponse {
-            node_id: caps.node_id.clone(),
-            // `authenticate` waited out the boot window: true here.
-            data_plane_ready: true,
-            auth: Some(caps.auth_proto()),
-            permission: Some(caps.permission_proto()),
-            zone_runtime: Some(caps.zone_runtime_proto()),
-            capabilities: caps.capabilities.clone(),
-        }))
+        request.finish(
+            Ok(Response::new(GetRuntimeCapabilitiesResponse {
+                node_id: caps.node_id.clone(),
+                data_plane_ready: true,
+                auth: Some(caps.auth_proto()),
+                permission: Some(caps.permission_proto()),
+                zone_runtime: Some(caps.zone_runtime_proto()),
+                capabilities: caps.capabilities.clone(),
+            })),
+            false,
+        )
     }
 }
 
@@ -470,6 +560,7 @@ pub fn build_zone_runtime_routes(
     max_message_bytes: usize,
 ) -> axum::Router {
     let svc = ZoneRuntimeServiceImpl {
+        owner_scope: None,
         auth,
         ops,
         ready,
@@ -477,6 +568,36 @@ pub fn build_zone_runtime_routes(
         capabilities,
         foreign_ca_verifier,
     };
+    routes(svc, max_message_bytes)
+}
+
+/// The owner surface shares the VFS scope and requires a confined backend.
+#[allow(clippy::too_many_arguments)]
+pub fn build_user_zone_runtime_routes(
+    auth: Arc<dyn AuthProvider>,
+    ops: ZoneRuntimeOpsSlot,
+    ready: Arc<DataPlaneReady>,
+    kernel: Arc<Kernel>,
+    capabilities: ZoneRuntimeCapabilitiesSlot,
+    foreign_ca_verifier: ForeignCaVerifierSlot,
+    scope: RuntimeScope,
+    max_message_bytes: usize,
+) -> axum::Router {
+    routes(
+        ZoneRuntimeServiceImpl {
+            owner_scope: Some(Arc::new(scope)),
+            auth,
+            ops,
+            ready,
+            kernel,
+            capabilities,
+            foreign_ca_verifier,
+        },
+        max_message_bytes,
+    )
+}
+
+fn routes(svc: ZoneRuntimeServiceImpl, max_message_bytes: usize) -> axum::Router {
     let server = ZoneRuntimeServiceServer::new(svc)
         .max_decoding_message_size(max_message_bytes)
         .max_encoding_message_size(max_message_bytes);

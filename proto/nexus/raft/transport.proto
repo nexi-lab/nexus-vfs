@@ -22,6 +22,29 @@ service ZoneTransportService {
   // routing all raft-rs internal message types (~15 types) through a single RPC.
   rpc StepMessage(StepMessageRequest) returns (StepMessageResponse);
 
+  // Versioned reader boundary for the storage command dialect through
+  // replica-issuance-v1. Every required exchange uses this RPC, including
+  // after reconnect. An unavailable method is a refusal; clients retain the
+  // original request and never fall back to StepMessage. Zone membership and
+  // committed protocol activation are checked independently by the receiver.
+  rpc StepStorageV1(StepMessageRequest) returns (StepMessageResponse);
+
+  // Replica-control transport carries every Raft exchange after local reader
+  // preparation. Both endpoints authenticate exact cluster Node identities.
+  // The owning driver persists its reader floor before accepting the message;
+  // subsequent legacy exchanges are refused at that same serialized boundary.
+  // This method acknowledges admission, not Raft commit or zone activation.
+  rpc StepReplicaControlV1(StepMessageRequest) returns (StepMessageResponse);
+
+  // Persist the local Raft reader floor for replica-control preparation on an
+  // already hosted Managed zone. Only an authenticated cluster Node may call
+  // this method. Success follows the owning driver's durable transaction on
+  // full nodes, learners and witnesses. Retrying this request is idempotent;
+  // an uncertain response preserves the original zone and destination.
+  // Replicated activation and membership qualification are separate operations.
+  rpc PrepareReplicaControlReaderV1(PrepareReplicaControlReaderRequest)
+      returns (PrepareReplicaControlReaderResponse);
+
   // ReplicateEntries sends EC (eventually consistent) entries to a peer.
   // This is NOT Raft consensus — EC writes bypass Raft and use async replication.
   // Used by the background replication loop (Phase C) for peer data sync.
@@ -115,6 +138,10 @@ service ZoneApiService {
   // metadata has been replicated ahead of content.
   rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
 
+  // Read one immutable object or logical file from a named data zone.
+  // The server authorizes the zone and uses its physical content namespace.
+  rpc ReadZoneBlob(ReadZoneBlobRequest) returns (ReadBlobResponse);
+
   // MintAgent signs an agent identity cert (`nexus://agent/{subject_id}`) on the
   // CA holder (founder) for a caller on any cluster node — so an agent on a
   // joiner is provisioned without hand-carrying a private key. mTLS-gated to a
@@ -123,6 +150,22 @@ service ZoneApiService {
   // local `auth mint`, run against the founder's live CA + auth store.
   rpc MintAgent(MintAgentRequest) returns (MintAgentResponse);
 
+  // RenewNodeCertificate re-issues the CALLING Node's certificate for a key it
+  // generated, before the current one expires. The only renewal path that needs
+  // no join token: the caller's current leaf (local CA, unexpired, unrevoked) is
+  // the admission, and it alone decides the Node ID and zone; the CSR
+  // contributes only the proven public key. Node-only like MintAgent; served by
+  // the CA holder — any other node answers that it does not hold the cluster CA,
+  // so a renewing node asks the same candidates MintAgent's caller does.
+  rpc RenewNodeCertificate(RenewNodeCertificateRequest) returns (RenewNodeCertificateResponse);
+
+  // RenewLocalNodeCertificate asks the receiving daemon to renew its OWN Node
+  // certificate now, through the same renewal its schedule runs, and to serve
+  // the result without a restart. The operator's trigger (`renew-certificate`):
+  // the daemon stays the only writer of its identity files and its key never
+  // leaves it. Callable only by that same Node (its operator CLI).
+  rpc RenewLocalNodeCertificate(RenewLocalNodeCertificateRequest) returns (RenewLocalNodeCertificateResponse);
+
   // Versioned, Node-only caller-owned key issuance. These methods use the same
   // CA-holder slot and immutable I/F records, never MintAgent's generated key
   // or allow_existing path. Query is read-only; NotObserved cannot prove a
@@ -130,6 +173,12 @@ service ZoneApiService {
   rpc GetAgentCsrCapabilities(AgentCsrCapabilitiesRequest) returns (AgentCsrCapabilitiesResponse);
   rpc IssueAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
   rpc QueryAgentCsrV1(AgentCsrRequest) returns (AgentCsrResponse);
+
+  // Current local Node controllers supply an original allocation-bound intent.
+  // Both operations use the CA-holder slot on this strict-mTLS listener.
+  rpc IssueReplicaCsrV1(ReplicaCsrRequest) returns (ReplicaCsrResponse);
+  rpc QueryReplicaCsrV1(ReplicaCsrRequest) returns (ReplicaCsrResponse);
+  rpc ControlReplicaV1(ReplicaControlRequest) returns (ReplicaControlResponse);
 
   // MintSessionAgent signs a SESSION credential: an agent identity bound to an
   // owner, with a fresh per-call subject and a short validity. Unlike MintAgent
@@ -225,6 +274,75 @@ service ZoneApiService {
   rpc ListForeignCas(ListForeignCasRequest) returns (ListForeignCasResponse);
 }
 
+message PrepareReplicaControlReaderRequest {
+  string zone_id = 1;
+}
+message PrepareReplicaControlReaderResponse {
+  // True only after the owning driver durably prepares and enforces
+  // StepReplicaControlV1 for both inbound and outbound traffic. Earlier
+  // readers return an empty reply, which decodes to false. Member-set
+  // validation and replicated activation remain separate.
+  bool replica_control_transport_v1 = 1;
+}
+
+// The oneof names the existing native contract encoded as UTF-8 JSON. Preserve
+// exact uint64 values and the original command bytes across uncertain replies.
+message ReplicaControlRequest {
+  oneof operation {
+    bytes apply_binding_json = 1;      // ReplicaBindingRequest
+    bytes current_binding_json = 2;    // ReplicaAllocation
+    bytes reconcile_binding_json = 3;  // original ReplicaBindingRequest
+    bytes apply_issuer_json = 4;        // ReplicaIssuanceRequest: Authority or Revoke
+    ReplicaIssuerQuery current_issuer = 5;
+    bytes reconcile_issuer_json = 6;    // original Authority or Revoke request
+  }
+}
+message ReplicaIssuerQuery {}
+enum ReplicaControlState {
+  REPLICA_CONTROL_STATE_UNSPECIFIED = 0;
+  // result_json is the original typed outcome or current durable fact.
+  REPLICA_CONTROL_STATE_RESULT = 1;
+  // Absence is an observation; an earlier proposal may still commit.
+  REPLICA_CONTROL_STATE_NOT_OBSERVED = 2;
+  REPLICA_CONTROL_STATE_REFUSED = 3;
+  REPLICA_CONTROL_STATE_UNKNOWN = 4;
+}
+message ReplicaControlResponse {
+  ReplicaControlState state = 1;
+  optional string error = 2;
+  bytes result_json = 3;
+}
+
+// UTF-8 JSON is the existing contracts::ReplicaIssuanceRequest encoding.
+// Callers retain its original Prepare variant as opaque bytes; uint64 fields
+// must retain their exact integer representation across client languages.
+message ReplicaCsrRequest {
+  bytes preparation_json = 1;
+  string publication_operation_id = 2;
+  bytes csr_pem = 3;
+  optional ReplicaCsrRenewalProof renewal = 4;
+}
+message ReplicaCsrRenewalProof {
+  uint64 issued_at_unix_ms = 1;
+  bytes signature = 2;
+}
+enum ReplicaCsrState {
+  REPLICA_CSR_STATE_UNSPECIFIED = 0;
+  REPLICA_CSR_STATE_PUBLISHED = 1;
+  REPLICA_CSR_STATE_PREPARED = 2;
+  REPLICA_CSR_STATE_NOT_OBSERVED = 3; // unresolved: an original proposal may still commit
+  REPLICA_CSR_STATE_REFUSED = 4; // current invocation refused; preserve original operation
+  REPLICA_CSR_STATE_UNKNOWN = 5; // reconcile the original operation before another mutation
+}
+message ReplicaCsrResponse {
+  ReplicaCsrState state = 1;
+  optional string error = 2;
+  string operation_id = 3;
+  bytes preparation_json = 4;
+  bytes certificate_der = 5;
+  bytes ca_pem = 6;
+}
+
 message AgentCsrCapabilitiesRequest {}
 message AgentCsrCapabilitiesResponse {
   uint32 version = 1; // 0 = unsupported/unarmed, 1 = immutable ordinary-Agent I/F
@@ -266,9 +384,10 @@ message AgentCsrResponse {
 // on this listener. GetCrl serves only a public CA-signed artifact.
 service NodeEnrollmentService {
   // JoinCluster provisions a new node with cluster TLS certificates. The caller
-  // authenticates with the join token password (k3s/kubeadm "join" model); the
-  // server verifies it, signs a node cert, and returns it with the CA cert. The
-  // CA key never leaves the signing node.
+  // authenticates with the join token password (k3s/kubeadm "join" model) and
+  // sends a CSR for a key it generated; the server verifies the token, certifies
+  // that key for the requested Node ID, and returns the cert with the CA cert.
+  // No private key crosses this plaintext channel.
   rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
 
   // GetCrl returns the cluster's current CA-signed agent-cert revocation list.
@@ -317,7 +436,12 @@ message ProposeResponse {
   optional string error = 2;
   optional string leader_address = 3;
   optional RaftResponse result = 4;
-  uint64 applied_index = 5;
+  // On success: the index the answering node had applied when the command
+  // resolved, which covers the command's own entry. A forwarding follower
+  // waits for its replica to apply through it before reporting the write
+  // visible. Absent means unknown (a refusal, or a node that predates the
+  // field) — never index 0.
+  optional uint64 applied_index = 5;
 }
 
 // QueryRequest reads from the local state machine.
@@ -555,6 +679,27 @@ message MintAgentResponse {
   bytes ca_pem = 5;
 }
 
+message RenewNodeCertificateRequest {
+  // PKCS#10 request for the caller's new P-256 key.
+  bytes csr_pem = 1;
+}
+
+message RenewNodeCertificateResponse {
+  bool success = 1;
+  optional string error = 2;
+  // The re-issued Node certificate (PEM) for the request's key.
+  bytes node_cert_pem = 3;
+}
+
+message RenewLocalNodeCertificateRequest {}
+
+message RenewLocalNodeCertificateResponse {
+  bool success = 1;
+  optional string error = 2;
+  // notAfter of the certificate the daemon now serves, Unix seconds.
+  int64 not_after_unix_s = 3;
+}
+
 // MintKeyRequest asks the daemon to mint an `sk-` user/service credential.
 message MintKeyRequest {
   // "user" or "service" — the sk- token plane (agents use MintAgent instead).
@@ -694,6 +839,9 @@ message JoinClusterRequest {
   // Reserved: was peers_bootstrap (removed — only token-based auth supported).
   reserved 5;
   reserved "peers_bootstrap";
+  // PKCS#10 request for the joiner's own P-256 key. Only the proven public key
+  // is certified; the identity is the token-authorized `node_id`.
+  bytes csr_pem = 6;
 }
 
 // JoinClusterResponse returns cluster TLS material on success.
@@ -706,10 +854,10 @@ message JoinClusterResponse {
   // Reserved: was ca_key_pem — removed for security (CA key stays on node-1).
   reserved 4;
   reserved "ca_key_pem";
-  // Server-signed node certificate (PEM-encoded).
+  // Server-signed node certificate (PEM-encoded) for the request's CSR key.
   bytes node_cert_pem = 5;
-  // Node private key (PEM-encoded). Generated server-side for the joiner.
-  bytes node_key_pem = 6;
+  reserved 6;
+  reserved "node_key_pem";
   // Cluster API-key HMAC secret (the `sk-` token signing key), served so a
   // joiner inherits it over the SAME token-gated channel as the CA. It must be
   // byte-identical cluster-wide for a minted key to resolve on any node
@@ -863,6 +1011,11 @@ message ReadBlobRequest {
   // ``content_id`` in its own way (CAS=hash, PAS=backend_path, etc.).
   // The caller's kernel never inspects this field.
   string content_id = 3;
+}
+
+message ReadZoneBlobRequest {
+  string zone_id = 1;
+  string content_id = 2;
 }
 
 // ReadBlobResponse returns either the blob bytes or a non-empty `error`.

@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use a2a::session::{SessionEndpoint, SessionPayload, SessionSide, MAX_SESSION_FRAME_BYTES};
 use a2a::session_io::SessionMailbox;
-use dashmap::DashMap;
 use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
 use subprocess::local_host::PreparedLocalHost;
@@ -18,11 +17,15 @@ use subprocess::{HostedSubprocess, ProcessExit};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{PreparedRawSpawn, ProcessLaunch, RawSpawn, SpawnHandle, StateObserver};
+use super::durable_session::DurableSession;
+use super::{
+    store_host_handle, HostedSessions, PreparedRawSpawn, ProcessLaunch, RawSpawn, SpawnHandle,
+    StateObserver,
+};
 
 struct SubprocessHandle {
     endpoint: SessionEndpoint,
-    durable: Arc<parking_lot::Mutex<Option<String>>>,
+    durable: Arc<SessionBinding>,
     cancel: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -36,7 +39,7 @@ impl SpawnHandle for SubprocessHandle {
         Some(&self.endpoint)
     }
     fn durable_session_id(&self) -> Option<String> {
-        self.durable.lock().clone()
+        self.durable.id()
     }
 }
 
@@ -44,14 +47,14 @@ impl SpawnHandle for SubprocessHandle {
 pub(crate) struct KernelRawSpawn {
     kernel: Arc<Kernel>,
     agent_registry: Arc<AgentRegistry>,
-    spawn_handles: Arc<DashMap<String, Box<dyn SpawnHandle>>>,
+    spawn_handles: HostedSessions,
 }
 
 impl KernelRawSpawn {
     pub(crate) fn new(
         kernel: Arc<Kernel>,
         agent_registry: Arc<AgentRegistry>,
-        spawn_handles: Arc<DashMap<String, Box<dyn SpawnHandle>>>,
+        spawn_handles: HostedSessions,
     ) -> Self {
         Self {
             kernel,
@@ -62,16 +65,25 @@ impl KernelRawSpawn {
 }
 
 impl RawSpawn for KernelRawSpawn {
-    fn prepare(&self, spec: ProcessLaunch) -> Result<Box<dyn PreparedRawSpawn>, String> {
+    fn prepare(
+        &self,
+        spec: ProcessLaunch,
+        resume_session_id: Option<String>,
+    ) -> Result<Box<dyn PreparedRawSpawn>, String> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "subprocess hosting requires an active tokio runtime")?;
         // One executor entry for either placement. Keep resource preparation
         // inside the same future rather than instantiating block_on per backend.
+        let durable = Arc::new(match &spec {
+            ProcessLaunch::Daemon(_) => SessionBinding::Acp(DurableSession::new(resume_session_id)),
+            ProcessLaunch::Local(_) => SessionBinding::Native(parking_lot::Mutex::new(None)),
+        });
         let execution = runtime.block_on(PreparedExecution::prepare(spec))?;
         Ok(Box::new(PreparedSubprocess {
             spawner: self.clone(),
             execution,
             runtime,
+            durable,
         }))
     }
 }
@@ -115,6 +127,7 @@ struct PreparedSubprocess {
     spawner: KernelRawSpawn,
     execution: PreparedExecution,
     runtime: tokio::runtime::Handle,
+    durable: Arc<SessionBinding>,
 }
 
 impl PreparedRawSpawn for PreparedSubprocess {
@@ -135,9 +148,19 @@ impl PreparedRawSpawn for PreparedSubprocess {
             spawner,
             execution,
             runtime,
-            ..
+            durable,
         } = *self;
-        spawner.attach(desc, instance, endpoint, execution, runtime, observer)
+        spawner.attach(
+            desc,
+            instance,
+            endpoint,
+            Attachment {
+                execution,
+                runtime,
+                durable,
+                observer,
+            },
+        )
     }
 }
 
@@ -152,11 +175,89 @@ struct ProcessIo {
     host_closed: Option<oneshot::Sender<()>>,
 }
 
-struct LocalControl {
-    local: bool,
-    durable: Arc<parking_lot::Mutex<Option<String>>>,
+// A raw ACP child establishes its one transcript by a correlated response.
+// A native host has already opened its engine and reports later /new switches.
+// These have different establishment rules but share one hosted handle and fence.
+enum SessionBinding {
+    Acp(DurableSession),
+    Native(parking_lot::Mutex<Option<String>>),
+}
+
+impl SessionBinding {
+    fn id(&self) -> Option<String> {
+        match self {
+            Self::Acp(binding) => binding.id().map(str::to_owned),
+            Self::Native(id) => id.lock().clone(),
+        }
+    }
+
+    fn before_request(&self, message: &serde_json::Value) -> Result<(), String> {
+        match self {
+            Self::Acp(binding) => binding.before_request(message),
+            // The existing native engine owns session selection and checks
+            // incoming ACP session IDs; the service does not open another one.
+            Self::Native(_) => Ok(()),
+        }
+    }
+
+    fn observe_response(&self, message: &serde_json::Value) -> Result<bool, String> {
+        match self {
+            Self::Acp(binding) => binding.observe_response(message),
+            Self::Native(_) => Ok(false),
+        }
+    }
+
+    fn native_session(&self, ready: bool, id: &str) -> Result<(), String> {
+        let Self::Native(current) = self else {
+            return Err("unexpected terminal session identity receipt".into());
+        };
+        let mut current = current.lock();
+        if ready == current.is_some() {
+            return Err("unexpected terminal session identity receipt".into());
+        }
+        *current = Some(id.to_owned());
+        Ok(())
+    }
+
+    fn native_ready(&self) -> bool {
+        matches!(self, Self::Native(id) if id.lock().is_some())
+    }
+}
+
+struct Attachment {
+    execution: PreparedExecution,
+    runtime: tokio::runtime::Handle,
+    durable: Arc<SessionBinding>,
     observer: StateObserver,
-    native_ready: bool,
+}
+
+struct HostControl {
+    durable: Arc<SessionBinding>,
+    observer: StateObserver,
+    registry: Arc<AgentRegistry>,
+    instance: AgentInstance,
+}
+
+impl HostControl {
+    fn check_current(&self) -> Result<(), String> {
+        if !self.registry.is_current_instance(&self.instance) {
+            return Err("session incarnation retired before response".into());
+        }
+        Ok(())
+    }
+
+    fn bind_ready(&self) -> Result<(), String> {
+        if !self.registry.bind_managed_host(&self.instance) {
+            return Err("session incarnation retired before durable binding".into());
+        }
+        match self
+            .registry
+            .update_instance_state(&self.instance, AgentState::Ready, None)
+        {
+            Ok(true) => Ok(()),
+            _ => Err("session incarnation retired before ready".into()),
+        }
+    }
 }
 
 /// An owned Child can attest its exit. A terminal-owned process can only
@@ -197,10 +298,14 @@ impl KernelRawSpawn {
         desc: &AgentDescriptor,
         instance: AgentInstance,
         endpoint: SessionEndpoint,
-        execution: PreparedExecution,
-        runtime: tokio::runtime::Handle,
-        observer: StateObserver,
+        attachment: Attachment,
     ) -> Result<(), String> {
+        let Attachment {
+            execution,
+            runtime,
+            durable,
+            observer,
+        } = attachment;
         let ctx = OperationContext::new(
             &desc.owner_id,
             &desc.zone_id,
@@ -259,29 +364,31 @@ impl KernelRawSpawn {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
         let stopped = Arc::new(AtomicBool::new(false));
-        let durable = Arc::new(parking_lot::Mutex::new(None));
-        let control = LocalControl {
+        let is_local = host_closed.is_some();
+        let control = HostControl {
             durable: Arc::clone(&durable),
-            local: host_closed.is_some(),
-            observer: Arc::clone(&observer),
-            native_ready: false,
+            observer,
+            registry: Arc::clone(&self.agent_registry),
+            instance: instance.clone(),
         };
-        let is_local = control.local;
-        self.spawn_handles.insert(
+        store_host_handle(
+            &self.agent_registry,
+            &self.spawn_handles,
             desc.pid.clone(),
+            instance.clone(),
             Box::new(SubprocessHandle {
                 endpoint,
-                durable,
+                durable: Arc::clone(&durable),
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
             }),
-        );
-        if !is_local {
-            observer(AgentState::Ready, None);
-        }
+            None,
+        )?;
 
         let input_mailbox = Arc::clone(&mailbox);
         let input_stopped = Arc::clone(&stopped);
         let input_failed = failed_tx.clone();
+        let input_registry = Arc::clone(&self.agent_registry);
+        let input_instance = instance.clone();
         let input = spawn_session_task(
             &runtime,
             Box::pin(async move {
@@ -290,6 +397,17 @@ impl KernelRawSpawn {
                     let message = tokio::task::spawn_blocking(move || reader.receive(200)).await;
                     match message {
                         Ok(Ok(Some(SessionPayload::Rpc { message }))) => {
+                            // Receiving can block. Recheck the original host before
+                            // delivering a controller command to its private transport.
+                            if !input_registry.is_current_instance(&input_instance) {
+                                let _ = input_failed
+                                    .send("session incarnation retired before request".into());
+                                break;
+                            }
+                            if let Err(error) = durable.before_request(&message) {
+                                let _ = input_failed.send(error);
+                                break;
+                            }
                             let mut bytes = serde_json::to_vec(&message).expect("JSON value");
                             bytes.push(b'\n');
                             if let Err(error) = stdin.write_all(&bytes).await {
@@ -428,7 +546,7 @@ fn spawn_session_task(
 async fn pump_output<R: AsyncRead + Unpin>(
     mut reader: R,
     mailbox: Arc<SessionMailbox<Kernel>>,
-    mut control: LocalControl,
+    control: HostControl,
 ) -> Result<(), String> {
     let mut buffer = [0; 8192];
     let mut line = Vec::new();
@@ -439,14 +557,14 @@ async fn pump_output<R: AsyncRead + Unpin>(
             .map_err(|e| format!("session stdout failed: {e}"))?;
         if count == 0 {
             if !line.is_empty() {
-                forward_line(&line, &mailbox, &mut control).await?;
+                forward_line(&line, &mailbox, &control).await?;
             }
             return Ok(());
         }
         for byte in &buffer[..count] {
             if *byte == b'\n' {
                 if !line.iter().all(u8::is_ascii_whitespace) {
-                    forward_line(&line, &mailbox, &mut control).await?;
+                    forward_line(&line, &mailbox, &control).await?;
                 }
                 line.clear();
             } else {
@@ -462,28 +580,25 @@ async fn pump_output<R: AsyncRead + Unpin>(
 async fn forward_line(
     line: &[u8],
     mailbox: &Arc<SessionMailbox<Kernel>>,
-    control: &mut LocalControl,
+    control: &HostControl,
 ) -> Result<(), String> {
     let message: serde_json::Value =
         serde_json::from_slice(line).map_err(|e| format!("invalid subprocess ACP message: {e}"))?;
+    control.check_current()?;
     let ready = message["method"] == contracts::local_host::HOST_READY_METHOD;
     if ready || message["method"] == contracts::local_host::HOST_SESSION_METHOD {
-        if !control.local || ready == control.native_ready {
-            return Err("unexpected terminal session identity receipt".into());
-        }
         let id = message["params"]["session_id"]
             .as_str()
-            .filter(|id| super::valid_durable_session_id(id))
+            .filter(|id| super::valid_durable_id(id))
             .ok_or("terminal runtime did not report a valid durable session ID")?;
-        *control.durable.lock() = Some(id.to_string());
+        control.durable.native_session(ready, id)?;
         if ready {
-            (control.observer)(AgentState::Ready, None);
-            control.native_ready = true;
+            control.bind_ready()?;
         }
         return Ok(());
     }
     if message["method"] == contracts::local_host::HOST_STATE_METHOD {
-        if !control.native_ready || !control.local {
+        if !control.durable.native_ready() {
             return Err("terminal state requires a running native runtime".into());
         }
         let params = &message["params"];
@@ -505,7 +620,13 @@ async fn forward_line(
         (control.observer)(state, reason);
         return Ok(());
     }
-    send_payload(mailbox, SessionPayload::Rpc { message }).await
+    if control.durable.observe_response(&message)? {
+        control.bind_ready()?;
+    }
+    send_payload(mailbox, SessionPayload::Rpc { message }).await?;
+    // A retirement during I/O closes the original connection. It does not
+    // authorize a replacement host or undo a completed durable append.
+    control.check_current()
 }
 
 /// All subprocess output uses the same blocking mailbox write boundary.

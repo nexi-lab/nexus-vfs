@@ -113,8 +113,18 @@ pub struct FileMetadata {
 pub enum MetaStoreError {
     /// Key not found.
     NotFound(String),
-    /// Underlying I/O or storage error.
+    /// Underlying I/O or storage error. For a replicated write it is an outcome
+    /// that is known, and the message states which: refused or never sent, so
+    /// nothing was applied, or committed but not yet applied on this replica. A
+    /// write that may have committed unseen is never this; it is
+    /// [`Self::OutcomeUnknown`]. Only where an operation's contract says so
+    /// (today [`MetaStore::append_stream_entry`]) does it mean nothing was
+    /// applied.
     IOError(String),
+    /// A replicated write was sent and no answer came back: it may have
+    /// committed, so a retry may apply it twice. A caller that must not
+    /// duplicate the write reads the state back before retrying.
+    OutcomeUnknown(String),
 }
 
 /// An error that carries its own message.
@@ -129,6 +139,12 @@ impl std::fmt::Display for MetaStoreError {
         match self {
             Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
             Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),
+            Self::OutcomeUnknown(msg) => {
+                write!(
+                    f,
+                    "metastore write outcome unknown, it may have committed: {msg}"
+                )
+            }
         }
     }
 }
@@ -183,6 +199,13 @@ pub struct PaginatedList {
 /// federation-layer concerns never leak up. Returned ``FileMetadata.path``
 /// values are likewise full paths.
 pub trait MetaStore: Send + Sync {
+    /// Qualified owner admission, record mutation and permanent retirement.
+    fn as_guarded_records(
+        &self,
+    ) -> Option<&dyn crate::extensions::guarded_records::GuardedRecords> {
+        None
+    }
+
     /// Storage-owned conversion to a conditional-only write policy.
     fn as_record_protection(
         &self,
@@ -422,6 +445,12 @@ pub trait MetaStore: Send + Sync {
     /// collide). The offset is assigned by the backend at its serialization
     /// point (``ZoneMetaStore`` → the raft apply), NOT by the caller — so a
     /// total order holds across concurrent writers and no two writers collide.
+    ///
+    /// Failure contract: `OutcomeUnknown` when the entry may have been
+    /// appended (the proposal was sent and not answered, or it committed and
+    /// the answer is unusable); `IOError` only when nothing was proposed — a
+    /// refusal, or a forward that never connected — so nothing was appended and
+    /// a retry is safe.
     fn append_stream_entry(&self, stream_prefix: &str, data: &[u8]) -> Result<u64, MetaStoreError> {
         let _ = (stream_prefix, data);
         Err(MetaStoreError::IOError(

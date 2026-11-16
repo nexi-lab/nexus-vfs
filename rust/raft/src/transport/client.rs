@@ -11,17 +11,20 @@ use super::proto::nexus::raft::{
     DiscoverZonesRequest, EcReplicationEntry, ExtendLock, GetClusterInfoRequest, GetCrlRequest,
     GetLockInfo, GetMetadata, JoinClusterRequest, JoinZoneRequest, ListForeignCasRequest,
     ListKeysRequest, ListMetadata, ListSessionMintersRequest, MintAgentRequest, MintKeyRequest,
-    MintSessionAgentRequest, ProposeRequest, PutMetadata, QueryRequest, RaftCommand, RaftQuery,
-    RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest, RenewSessionAgentRequest,
+    MintSessionAgentRequest, PrepareReplicaControlReaderRequest,
+    PrepareReplicaControlReaderResponse, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
+    RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest,
+    RenewLocalNodeCertificateRequest, RenewNodeCertificateRequest, RenewSessionAgentRequest,
     ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
-    StepMessageRequest, UnregisterForeignCaRequest,
+    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
+use lib::transport_primitives::{SharedTlsConfig, TlsSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 /// Default TTL for cached gRPC clients. Connections older than this are
 /// evicted on next access and a fresh connection is established.
@@ -85,9 +88,8 @@ pub struct ClientConfig {
     pub keep_alive_interval: Duration,
     /// Keep-alive timeout.
     pub keep_alive_timeout: Duration,
-    /// Shared TLS configuration — reads from registry's Arc<RwLock<>> so
-    /// transport loops pick up TLS upgrades without restart.
-    pub tls: Arc<std::sync::RwLock<Option<super::TlsConfig>>>,
+    /// The credential installation shared with the registry and listener.
+    pub tls: SharedTlsConfig,
 }
 
 impl Default for ClientConfig {
@@ -127,7 +129,7 @@ impl Default for ClientConfig {
             request_timeout: Duration::from_secs(10),
             keep_alive_interval: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(10),
-            tls: Arc::new(std::sync::RwLock::new(None)),
+            tls: SharedTlsConfig::default(),
         }
     }
 }
@@ -161,6 +163,12 @@ struct CachedClient {
     created_at: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerRole {
+    Replication,
+    Node,
+}
+
 /// A pool of gRPC clients for connecting to Raft peers.
 ///
 /// Provides lazy TTL-based eviction: on each `get()`, if the cached client
@@ -169,7 +177,7 @@ struct CachedClient {
 #[derive(Clone)]
 pub struct RaftClientPool {
     config: ClientConfig,
-    clients: Arc<RwLock<HashMap<u64, CachedClient>>>,
+    clients: Arc<RwLock<HashMap<(u64, PeerRole), CachedClient>>>,
     client_ttl: Duration,
 }
 
@@ -206,23 +214,87 @@ impl RaftClientPool {
     ///
     /// Cached clients older than the TTL are evicted and reconnected.
     pub async fn get(&self, addr: &NodeAddress) -> Result<RaftClient> {
+        self.get_for_role(addr, PeerRole::Replication).await
+    }
+
+    /// Connect to the exact cluster Node for control operations. Role is part
+    /// of the cache key and of every TLS handshake on the retained channel.
+    pub async fn get_node(&self, addr: &NodeAddress) -> Result<RaftClient> {
+        self.get_for_role(addr, PeerRole::Node).await
+    }
+
+    async fn get_for_role(&self, addr: &NodeAddress, role: PeerRole) -> Result<RaftClient> {
+        let key = (addr.id, role);
         // Reuse a still-fresh cached client. Otherwise record whether we are
         // refreshing a stale entry (routine, TTL-driven) or connecting with no
         // prior entry, so the lifecycle event below logs at the right level
         // instead of an ambiguous reconnect line.
-        let stale_age_secs: Option<u64> = {
+        let (stale_age_secs, tls_snapshot, cached) = {
             let clients = self.clients.read().await;
-            match clients.get(&addr.id) {
-                Some(cached) if cached.created_at.elapsed() < self.client_ttl => {
-                    return Ok(cached.client.clone());
-                }
-                Some(cached) => Some(cached.created_at.elapsed().as_secs()),
-                None => None,
-            }
+            self.config.tls.read(|tls| -> Result<_> {
+                tls.config()
+                    .map_err(|e| TransportError::Connection(e.into()))?;
+                let age = match clients.get(&key) {
+                    Some(cached)
+                        if cached.created_at.elapsed() < self.client_ttl
+                            && cached.client.endpoint() == addr.endpoint
+                            && cached.client.tls_snapshot.same_installation(tls) =>
+                    {
+                        return Ok((None, tls.clone(), Some(cached.client.clone())));
+                    }
+                    Some(cached) if cached.created_at.elapsed() >= self.client_ttl => {
+                        Some(cached.created_at.elapsed().as_secs())
+                    }
+                    _ => None,
+                };
+                Ok((age, tls.clone(), None))
+            })?
         };
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
 
         // Create new client (may replace a stale one).
-        let client = RaftClient::connect(&addr.endpoint, self.config.clone()).await?;
+        let expected = if tls_snapshot.uses_tls() || role == PeerRole::Node {
+            Some((
+                std::num::NonZeroU64::new(addr.id).ok_or_else(|| {
+                    TransportError::Connection(
+                        "authenticated peer requires a nonzero Node ID".into(),
+                    )
+                })?,
+                role,
+            ))
+        } else {
+            None
+        };
+        let client = RaftClient::connect_with_identity(
+            &addr.endpoint,
+            self.config.clone(),
+            tls_snapshot.clone(),
+            expected,
+        )
+        .await?;
+
+        // Store in pool with current timestamp.
+        {
+            let mut clients = self.clients.write().await;
+            self.config
+                .tls
+                .with_current(&tls_snapshot, || {
+                    clients.insert(
+                        key,
+                        CachedClient {
+                            client: client.clone(),
+                            created_at: Instant::now(),
+                        },
+                    );
+                })
+                .ok_or_else(|| {
+                    TransportError::Connection(
+                        "Raft TLS configuration changed while connecting".into(),
+                    )
+                })?;
+        }
 
         match stale_age_secs {
             Some(age_secs) => ClientPoolEvent::Refreshed {
@@ -237,25 +309,15 @@ impl RaftClientPool {
             .emit(),
         }
 
-        // Store in pool with current timestamp.
-        {
-            let mut clients = self.clients.write().await;
-            clients.insert(
-                addr.id,
-                CachedClient {
-                    client: client.clone(),
-                    created_at: Instant::now(),
-                },
-            );
-        }
-
         Ok(client)
     }
 
     /// Remove a client from the pool (e.g., after connection failure).
     pub async fn remove(&self, node_id: u64) {
         let mut clients = self.clients.write().await;
-        clients.remove(&node_id);
+        for role in [PeerRole::Replication, PeerRole::Node] {
+            clients.remove(&(node_id, role));
+        }
     }
 
     /// Get the number of active connections.
@@ -274,35 +336,89 @@ impl Default for RaftClientPool {
 #[derive(Clone)]
 pub struct RaftClient {
     endpoint: String,
-    #[allow(dead_code)]
     config: ClientConfig,
+    tls_snapshot: TlsSnapshot,
     inner: ZoneTransportServiceClient<Channel>,
+    is_node_channel: bool,
+}
+
+fn require_current_credentials(config: &ClientConfig, snapshot: &TlsSnapshot) -> Result<()> {
+    if config.tls.is_current(snapshot) {
+        Ok(())
+    } else {
+        Err(TransportError::Connection(
+            "Raft connection credential installation is no longer current".into(),
+        ))
+    }
+}
+
+fn decode_step_response(response: StepMessageResponse) -> Result<()> {
+    if !response.success {
+        return Err(TransportError::Rpc(
+            response
+                .error
+                .unwrap_or_else(|| "step_message failed".to_string()),
+        ));
+    }
+    Ok(())
 }
 
 impl RaftClient {
+    fn inner_mut(&mut self) -> Result<&mut ZoneTransportServiceClient<Channel>> {
+        require_current_credentials(&self.config, &self.tls_snapshot)?;
+        Ok(&mut self.inner)
+    }
+
     /// Connect to a Raft node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
-        let tls_snapshot = config.tls.read().unwrap().clone();
+        let tls_snapshot = config.tls.snapshot();
+        Self::connect_with_identity(endpoint, config, tls_snapshot, None).await
+    }
+
+    async fn connect_with_identity(
+        endpoint: &str,
+        config: ClientConfig,
+        tls_snapshot: TlsSnapshot,
+        expected: Option<(std::num::NonZeroU64, PeerRole)>,
+    ) -> Result<Self> {
         // Pre-dial diagnostic only (surfaces a hang inside `create_channel`);
         // the operator-facing lifecycle signal is emitted by the caller
         // (`RaftClientPool::get`) via `ClientPoolEvent` once the dial succeeds.
         tracing::debug!(
             endpoint = endpoint,
-            tls = tls_snapshot.is_some(),
+            tls = tls_snapshot.uses_tls(),
             "dialing raft node",
         );
 
-        let channel = lib::transport_primitives::create_channel(
-            endpoint,
-            &channel_config(&config, tls_snapshot),
-        )
-        .await?;
-        let inner = ZoneTransportServiceClient::new(channel);
+        let tls = tls_snapshot
+            .config()
+            .map_err(|e| TransportError::Connection(e.into()))?
+            .cloned();
+        let channel_config = channel_config(&config, tls);
+        let channel = match expected {
+            Some((expected, PeerRole::Replication)) => {
+                lib::transport_primitives::create_peer_channel(endpoint, &channel_config, expected)
+                    .await?
+            }
+            Some((expected, PeerRole::Node)) => {
+                lib::transport_primitives::create_node_channel(endpoint, &channel_config, expected)
+                    .await?
+            }
+            None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
+        };
+        let inner = bounded!(ZoneTransportServiceClient::new(channel));
+        if !config.tls.is_current(&tls_snapshot) {
+            return Err(TransportError::Connection(
+                "Raft TLS configuration changed while connecting".into(),
+            ));
+        }
 
         Ok(Self {
             endpoint: endpoint.to_string(),
             config,
+            tls_snapshot,
             inner,
+            is_node_channel: matches!(expected, Some((_, PeerRole::Node))),
         })
     }
 
@@ -311,17 +427,57 @@ impl RaftClient {
         &self.endpoint
     }
 
+    /// Prepare the original remote reader through its owning Raft driver.
+    /// A successful reply acknowledges local durability, not protocol activation.
+    /// Errors retain the original request; this method has no legacy fallback.
+    pub async fn prepare_replica_control_reader(&mut self, zone_id: &str) -> Result<()> {
+        self.prepare_reader(zone_id).await.map(|_| ())
+    }
+
+    /// Prepare the original remote reader and require its current transport
+    /// capability. An earlier empty acknowledgement cannot qualify a member.
+    /// The caller retains the original configuration view across this await.
+    pub async fn prepare_replica_control_transport(&mut self, zone_id: &str) -> Result<()> {
+        if !self
+            .prepare_reader(zone_id)
+            .await?
+            .replica_control_transport_v1
+        {
+            return Err(TransportError::Rpc(
+                "peer did not acknowledge replica-control transport v1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn prepare_reader(
+        &mut self,
+        zone_id: &str,
+    ) -> Result<PrepareReplicaControlReaderResponse> {
+        if !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "storage reader preparation requires an exact cluster Node channel".into(),
+            ));
+        }
+        Ok(self
+            .inner_mut()?
+            .prepare_replica_control_reader_v1(PrepareReplicaControlReaderRequest {
+                zone_id: zone_id.to_owned(),
+            })
+            .await?
+            .into_inner())
+    }
+
     /// Send a raw raft-rs message to this node.
     ///
     /// This is the primary transport method used by the transport loop.
     /// The message bytes are an opaque serialized `eraftpb::Message` (protobuf v2).
     ///
     /// `sender_address` is this node's own advertise address; the
-    /// receiver records `(message.from -> sender_address)` in its
-    /// transport peer map so the network is the SSOT for routing.
-    /// Pass `""` from contexts that don't have an advertise address
-    /// (the receiver falls back to whatever peer-map entry already
-    /// exists from prior ConfChange or env seed).
+    /// receiver records `(message.from -> sender_address)` in its peer
+    /// map's observed layer. Pass `""` from contexts that don't have an
+    /// advertise address (the receiver keeps routing by the sender's
+    /// member-address record).
     pub async fn step_message(
         &mut self,
         message_bytes: Vec<u8>,
@@ -334,17 +490,50 @@ impl RaftClient {
             sender_address,
         });
 
-        let response = self.inner.step_message(request).await?;
-        let resp = response.into_inner();
+        let response = self.inner_mut()?.step_message(request).await?;
+        decode_step_response(response.into_inner())
+    }
 
-        if !resp.success {
-            return Err(TransportError::Rpc(
-                resp.error
-                    .unwrap_or_else(|| "step_message failed".to_string()),
+    /// Send through the storage-v1 reader boundary on every exchange.
+    /// An unsupported peer or reconnect failure is returned without retrying
+    /// the legacy method. This method grants neither zone nor storage authority.
+    pub async fn step_storage_v1(
+        &mut self,
+        message_bytes: Vec<u8>,
+        zone_id: String,
+        sender_address: String,
+    ) -> Result<()> {
+        let request = tonic::Request::new(StepMessageRequest {
+            message: message_bytes,
+            zone_id,
+            sender_address,
+        });
+        let response = self.inner_mut()?.step_storage_v1(request).await?;
+        decode_step_response(response.into_inner())
+    }
+
+    /// Send a required replica-control exchange on the exact Node channel.
+    /// Every reconnect uses the same RPC; an older method table refuses it.
+    pub async fn step_replica_control_v1(
+        &mut self,
+        message_bytes: Vec<u8>,
+        zone_id: String,
+        sender_address: String,
+    ) -> Result<()> {
+        if !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "replica-control transport requires an exact cluster Node channel".into(),
             ));
         }
-
-        Ok(())
+        let response = self
+            .inner_mut()?
+            .step_replica_control_v1(StepMessageRequest {
+                message: message_bytes,
+                zone_id,
+                sender_address,
+            })
+            .await?;
+        decode_step_response(response.into_inner())
     }
 
     /// Send a batch of EC replication entries to this peer.
@@ -363,7 +552,7 @@ impl RaftClient {
             sender_node_id,
         });
 
-        let response = self.inner.replicate_entries(request).await?;
+        let response = self.inner_mut()?.replicate_entries(request).await?;
         let resp = response.into_inner();
 
         if !resp.success {
@@ -395,7 +584,7 @@ impl RaftClient {
             sender_node_id,
         });
 
-        let response = self.inner.snapshot_ec_state(request).await?;
+        let response = self.inner_mut()?.snapshot_ec_state(request).await?;
         let resp = response.into_inner();
 
         if !resp.success {
@@ -421,8 +610,8 @@ impl RaftClient {
 #[derive(Clone)]
 pub struct RaftApiClient {
     endpoint: String,
-    #[allow(dead_code)]
     config: ClientConfig,
+    tls_snapshot: TlsSnapshot,
     inner: ZoneApiServiceClient<Channel>,
     /// Zone ID for multi-zone routing (included in all requests).
     zone_id: String,
@@ -431,25 +620,33 @@ pub struct RaftApiClient {
 impl RaftApiClient {
     /// Connect to a Raft cluster node.
     pub async fn connect(endpoint: &str, config: ClientConfig) -> Result<Self> {
-        let tls_snapshot = config.tls.read().unwrap().clone();
+        let tls_snapshot = config.tls.snapshot();
         tracing::info!(
             "Connecting to Raft API at {} (tls={})",
             endpoint,
-            tls_snapshot.is_some()
+            tls_snapshot.uses_tls()
         );
 
-        let channel = lib::transport_primitives::create_channel(
-            endpoint,
-            &channel_config(&config, tls_snapshot),
-        )
-        .await?;
-        let inner = ZoneApiServiceClient::new(channel);
+        let tls = tls_snapshot
+            .config()
+            .map_err(|e| TransportError::Connection(e.into()))?
+            .cloned();
+        let channel =
+            lib::transport_primitives::create_channel(endpoint, &channel_config(&config, tls))
+                .await?;
+        if !config.tls.is_current(&tls_snapshot) {
+            return Err(TransportError::Connection(
+                "Raft API TLS configuration changed while connecting".into(),
+            ));
+        }
+        let inner = zone_api_client(channel);
 
         tracing::info!("Connected to Raft API at {}", endpoint);
 
         Ok(Self {
             endpoint: endpoint.to_string(),
             config,
+            tls_snapshot,
             inner,
             zone_id: String::new(),
         })
@@ -466,9 +663,15 @@ impl RaftApiClient {
         &self.endpoint
     }
 
+    /// A cached proposal channel belongs to its original credential source and snapshot.
+    pub(crate) fn uses_current_credentials(&self, config: &ClientConfig) -> bool {
+        config.tls.is_current(&self.tls_snapshot)
+    }
+
     /// Get mutable access to the inner gRPC client (for raw requests).
-    pub(crate) fn inner_mut(&mut self) -> &mut ZoneApiServiceClient<Channel> {
-        &mut self.inner
+    pub(crate) fn inner_mut(&mut self) -> Result<&mut ZoneApiServiceClient<Channel>> {
+        require_current_credentials(&self.config, &self.tls_snapshot)?;
+        Ok(&mut self.inner)
     }
 
     // === Propose Methods (Writes) ===
@@ -566,7 +769,7 @@ impl RaftApiClient {
             forwarded: false,
         });
 
-        let response = self.inner.propose(request).await?;
+        let response = self.inner_mut()?.propose(request).await?;
         let resp = response.into_inner();
 
         Ok(ProposeResult {
@@ -640,7 +843,7 @@ impl RaftApiClient {
             zone_id: self.zone_id.clone(),
         });
 
-        let response = self.inner.query(request).await?;
+        let response = self.inner_mut()?.query(request).await?;
         let resp = response.into_inner();
 
         Ok(QueryResult {
@@ -659,7 +862,7 @@ impl RaftApiClient {
             zone_id: self.zone_id.clone(),
         });
 
-        let response = self.inner.get_cluster_info(request).await?;
+        let response = self.inner_mut()?.get_cluster_info(request).await?;
         let resp = response.into_inner();
 
         Ok(ClusterInfoResult {
@@ -682,8 +885,9 @@ pub struct ProposeResult {
     pub error: Option<String>,
     /// Leader address if this node is not the leader.
     pub leader_address: Option<String>,
-    /// Log index where the command was applied.
-    pub applied_index: u64,
+    /// On success, the index the answering node had applied when the command
+    /// resolved; `None` when it did not say (a refusal, or an older node).
+    pub applied_index: Option<u64>,
 }
 
 /// Result of a Query operation.
@@ -721,11 +925,10 @@ pub struct ClusterInfoResult {
 // JoinCluster client — shared by cluster nodes and witness binary
 // =============================================================================
 
-/// Result of a successful JoinCluster call.
+/// Result of a successful JoinCluster call: the certificate for the CSR's key.
 pub struct JoinClusterResult {
     pub ca_pem: Vec<u8>,
     pub node_cert_pem: Vec<u8>,
-    pub node_key_pem: Vec<u8>,
     /// Cluster API-key HMAC secret the founder served (over the same
     /// token-gated channel as the CA). `None` when the founder is auth-off.
     /// The caller persists it to `tls/api-key-secret` (the single SSOT) so the
@@ -733,28 +936,14 @@ pub struct JoinClusterResult {
     pub api_key_secret: Option<String>,
 }
 
-/// Dial a one-shot `ZoneApiService` client, honoring mTLS when `tls` is set.
-///
-/// Routes through the shared [`lib::transport_primitives::create_channel`]
-/// primitive — the same Endpoint builder the pooled raft channels use — so
-/// the join / discover / remove / delete RPCs present the node's client
-/// identity + CA under mTLS. The pre-refactor helpers each hand-rolled a
-/// plaintext `Endpoint::from_shared(..).connect()`, which cannot complete a
-/// handshake against an mTLS leader (an `https://` endpoint with no
-/// `ClientTlsConfig` is rejected at connect): the federation dynamic-join
-/// path silently broke the moment TLS was turned on.
-///
-/// `what` labels the RPC in the connect error so a handshake failure names
-/// the operation. SNI note: `apply_tls` sets no `domain_name`, so the
-/// server cert must carry the endpoint host in a SAN — node certs already
-/// include `localhost` / `127.0.0.1` / `::1`, and cross-host reachability
-/// SANs come from `generate_node_cert`'s `extra_hostnames`.
-async fn connect_zone_api(
+/// Dial a one-shot RPC through the shared channel builder and timeout policy.
+/// The supplied credentials select mTLS; `what` identifies connection errors.
+async fn connect_rpc_channel(
     peer_addr: &str,
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
     what: &str,
-) -> Result<ZoneApiServiceClient<Channel>> {
+) -> Result<Channel> {
     let config = lib::transport_primitives::ClientConfig {
         connect_timeout: Duration::from_secs(timeout_secs),
         request_timeout: Duration::from_secs(timeout_secs),
@@ -763,18 +952,60 @@ async fn connect_zone_api(
         http2_keepalive_timeout: None,
         tls,
     };
-    let channel = lib::transport_primitives::create_channel(peer_addr, &config)
+    lib::transport_primitives::create_channel(peer_addr, &config)
         .await
         .map_err(|e| {
             TransportError::Connection(format!("{what} connect to {peer_addr} failed: {e}"))
-        })?;
-    Ok(ZoneApiServiceClient::new(channel))
+        })
 }
 
-/// Call JoinCluster on a leader to get a signed node certificate.
+/// Dial a one-shot `ZoneApiService` client using the supplied credentials.
+async fn connect_zone_api(
+    peer_addr: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+    what: &str,
+) -> Result<ZoneApiServiceClient<Channel>> {
+    connect_rpc_channel(peer_addr, tls, timeout_secs, what)
+        .await
+        .map(zone_api_client)
+}
+
+/// A `ZoneApiService` client over `channel`, within the raft message bound.
+pub fn zone_api_client(channel: Channel) -> ZoneApiServiceClient<Channel> {
+    bounded!(ZoneApiServiceClient::new(channel))
+}
+
+/// A zone's presence and raft facts (`ZoneStatus`) from the daemon at
+/// `peer_addr`, asked as this node: its certificate under mTLS, no bearer
+/// token — the identity under which the facts are not redacted.
+pub async fn call_zone_status_rpc(
+    peer_addr: &str,
+    zone_id: &str,
+    tls: Option<super::TlsConfig>,
+    timeout_secs: u64,
+) -> Result<kernel::kernel::vfs_proto::ZoneStatusResponse> {
+    let channel = connect_rpc_channel(peer_addr, tls, timeout_secs, "ZoneStatus").await?;
+    bounded!(
+        kernel::kernel::vfs_proto::zone_runtime_service_client::ZoneRuntimeServiceClient::new(
+            channel
+        )
+    )
+    .zone_status(kernel::kernel::vfs_proto::ZoneStatusRequest {
+        auth_token: String::new(),
+        zone_id: zone_id.to_string(),
+    })
+    .await
+    .map(tonic::Response::into_inner)
+    .map_err(|e| TransportError::Rpc(format!("ZoneStatus RPC failed: {e}")))
+}
+
+/// Call JoinCluster on a leader to certify this node's key (`csr_pem`, from
+/// [`super::generate_node_key_request`]).
 ///
 /// K3s-style: authenticates with join token password. The leader signs
-/// the cert server-side — CA key never leaves node-1.
+/// the cert server-side — the CA key never leaves it, and the joiner's key
+/// never leaves the joiner.
 ///
 /// Intentionally plaintext: this is the pre-identity bootstrap RPC a
 /// certless joiner uses to *obtain* its node cert, so it cannot present a
@@ -786,24 +1017,18 @@ pub async fn call_join_cluster(
     node_address: &str,
     zone_id: &str,
     password: &str,
+    csr_pem: &[u8],
     timeout_secs: u64,
 ) -> Result<JoinClusterResult> {
-    let ep = Endpoint::from_shared(leader_addr.to_string())
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
+    let channel = connect_rpc_channel(leader_addr, None, timeout_secs, "JoinCluster").await?;
 
-    let channel = ep
-        .connect()
-        .await
-        .map_err(|e| TransportError::Connection(format!("JoinCluster connect failed: {}", e)))?;
-
-    let mut client = NodeEnrollmentServiceClient::new(channel);
+    let mut client = bounded!(NodeEnrollmentServiceClient::new(channel));
     let request = JoinClusterRequest {
         password: password.to_string(),
         node_id,
         node_address: node_address.to_string(),
         zone_id: zone_id.to_string(),
+        csr_pem: csr_pem.to_vec(),
     };
 
     let response = client
@@ -822,7 +1047,6 @@ pub async fn call_join_cluster(
     Ok(JoinClusterResult {
         ca_pem: response.ca_pem,
         node_cert_pem: response.node_cert_pem,
-        node_key_pem: response.node_key_pem,
         api_key_secret: response.api_key_secret,
     })
 }
@@ -841,17 +1065,9 @@ pub async fn call_get_crl(enroll_addr: &str, timeout_secs: u64) -> Result<Vec<u8
     } else {
         format!("http://{enroll_addr}")
     };
-    let ep = Endpoint::from_shared(uri)
-        .map_err(|e| TransportError::InvalidAddress(e.to_string()))?
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .timeout(Duration::from_secs(timeout_secs));
+    let channel = connect_rpc_channel(&uri, None, timeout_secs, "GetCrl").await?;
 
-    let channel = ep
-        .connect()
-        .await
-        .map_err(|e| TransportError::Connection(format!("GetCrl connect failed: {e}")))?;
-
-    let response = NodeEnrollmentServiceClient::new(channel)
+    let response = bounded!(NodeEnrollmentServiceClient::new(channel))
         .get_crl(GetCrlRequest {})
         .await
         .map_err(|e| TransportError::Rpc(format!("GetCrl RPC failed: {e}")))?
@@ -929,6 +1145,95 @@ pub async fn call_join_zone_rpc(
         commit_index: response.commit_index,
         applied_index: response.applied_index,
     })
+}
+
+/// What one [`join_zone_round`] came to.
+#[derive(Debug, Clone)]
+pub enum JoinRound {
+    /// The leader at `endpoint` admitted this node: its membership change
+    /// committed there.
+    Admitted { endpoint: String },
+    /// No endpoint admitted this node. `catching_up` is the
+    /// `(commit_index, applied_index)` a leader reported while still
+    /// replicating to it as a learner.
+    Refused {
+        last_error: String,
+        catching_up: Option<(u64, u64)>,
+    },
+}
+
+/// One JoinZone round: ask each of `endpoints` in turn, following a
+/// follower's redirect to its leader once, until a leader admits
+/// `node_id` (advertising `node_address`). The one round data nodes and
+/// witnesses run; the replica they host and the retry policy around the
+/// round are theirs. Each endpoint and redirect reads the current credentials.
+pub async fn join_zone_round(
+    endpoints: impl IntoIterator<Item = String>,
+    zone_id: &str,
+    node_id: u64,
+    node_address: &str,
+    as_learner: bool,
+    credentials: &lib::transport_primitives::SharedTlsConfig,
+    timeout_secs: u64,
+) -> JoinRound {
+    let mut last_error = String::from("no endpoint to request membership from");
+    let mut catching_up = None;
+    for seed in endpoints {
+        let mut endpoint = seed;
+        let mut redirected = false;
+        loop {
+            let snapshot = credentials.snapshot();
+            let tls = match snapshot.config() {
+                Ok(tls) => tls.cloned(),
+                Err(error) => {
+                    return JoinRound::Refused {
+                        last_error: error.to_owned(),
+                        catching_up,
+                    };
+                }
+            };
+            match call_join_zone_rpc(
+                &endpoint,
+                zone_id,
+                node_id,
+                node_address,
+                as_learner,
+                tls,
+                timeout_secs,
+            )
+            .await
+            {
+                Ok(result) if result.success => return JoinRound::Admitted { endpoint },
+                Ok(result) => {
+                    if let Some(leader) = result
+                        .leader_address
+                        .filter(|leader| !redirected && !leader.is_empty() && *leader != endpoint)
+                    {
+                        tracing::info!(
+                            from = %endpoint,
+                            to = %leader,
+                            zone = %zone_id,
+                            "JoinZone redirect to leader",
+                        );
+                        endpoint = leader;
+                        redirected = true;
+                        continue;
+                    }
+                    if result.catching_up {
+                        catching_up = Some((result.commit_index, result.applied_index));
+                    }
+                    last_error = format!("{endpoint}: {}", result.error.unwrap_or_default());
+                }
+                Err(error) => last_error = format!("{endpoint}: {error}"),
+            }
+            tracing::debug!(zone = %zone_id, error = %last_error, "JoinZone not admitted; next endpoint");
+            break;
+        }
+    }
+    JoinRound::Refused {
+        last_error,
+        catching_up,
+    }
 }
 
 /// One federation zone reported by [`call_discover_zones_rpc`] —
@@ -1097,7 +1402,7 @@ pub struct MintAgentResult {
 /// uniqueness + audit live there) and returns the bundle. A peer that does not
 /// hold the CA returns `success=false` with "does not hold the cluster CA", so
 /// the caller tries the next peer. mTLS-only — the caller presents its NODE
-/// cert, which the founder's `AgentMinter` gate requires (an agent cert is a
+/// cert, which the founder's `CaIssuer` gate requires (an agent cert is a
 /// pure identity and must not be able to mint further agents).
 /// Permit `agent_id` to mint session credentials, against a live daemon.
 ///
@@ -1216,7 +1521,7 @@ pub async fn call_mint_session_agent_rpc(
 /// Renew the same actor using a session-key proof bound to the minter's TLS leaf.
 pub async fn call_renew_session_agent_rpc(
     peer_addr: &str,
-    renewal: crate::agent_minter::SessionRenewal<'_>,
+    renewal: crate::ca_issuer::SessionRenewal<'_>,
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<MintSessionAgentResult> {
@@ -1269,22 +1574,107 @@ pub async fn call_mint_agent_rpc(
     tls: Option<super::TlsConfig>,
     timeout_secs: u64,
 ) -> Result<MintAgentResult> {
-    let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "MintAgent").await?;
+    MintAgentChannel::connect(peer_addr, tls, timeout_secs)
+        .await?
+        .mint(subject_id, display_name, allow_existing)
+        .await
+}
+
+/// An established channel for exactly one MintAgent request. Connecting sends
+/// no request, so a [`Self::connect`] failure proves the issuer received
+/// nothing; once [`Self::mint`] starts, the request may have been delivered.
+pub struct MintAgentChannel(ZoneApiServiceClient<Channel>);
+
+impl MintAgentChannel {
+    pub async fn connect(
+        peer_addr: &str,
+        tls: Option<super::TlsConfig>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        connect_zone_api(peer_addr, tls, timeout_secs, "MintAgent")
+            .await
+            .map(Self)
+    }
+
+    pub async fn mint(
+        mut self,
+        subject_id: &str,
+        display_name: &str,
+        allow_existing: bool,
+    ) -> Result<MintAgentResult> {
+        let response = self
+            .0
+            .mint_agent(MintAgentRequest {
+                subject_id: subject_id.to_string(),
+                display_name: display_name.to_string(),
+                allow_existing,
+            })
+            .await
+            .map_err(|e| TransportError::Rpc(format!("MintAgent RPC failed: {e}")))?
+            .into_inner();
+        Ok(MintAgentResult {
+            success: response.success,
+            error: response.error,
+            agent_cert_pem: response.agent_cert_pem,
+            agent_key_pem: response.agent_key_pem,
+            ca_pem: response.ca_pem,
+        })
+    }
+}
+
+/// Ask `peer_addr` to re-issue this Node's certificate for the key in
+/// `csr_pem`, authenticating with the current Node identity in `tls`. A
+/// refusal (`Ok(Err(..))`) carries the server's reason — a node that is not the
+/// CA holder says so, and the caller asks the next candidate.
+pub async fn call_renew_node_certificate_rpc(
+    peer_addr: &str,
+    csr_pem: &[u8],
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    let mut client =
+        connect_zone_api(peer_addr, Some(tls), timeout_secs, "RenewNodeCertificate").await?;
     let response = client
-        .mint_agent(MintAgentRequest {
-            subject_id: subject_id.to_string(),
-            display_name: display_name.to_string(),
-            allow_existing,
+        .renew_node_certificate(RenewNodeCertificateRequest {
+            csr_pem: csr_pem.to_vec(),
         })
         .await
-        .map_err(|e| TransportError::Rpc(format!("MintAgent RPC failed: {e}")))?
+        .map_err(|e| TransportError::Rpc(format!("RenewNodeCertificate RPC failed: {e}")))?
         .into_inner();
-    Ok(MintAgentResult {
-        success: response.success,
-        error: response.error,
-        agent_cert_pem: response.agent_cert_pem,
-        agent_key_pem: response.agent_key_pem,
-        ca_pem: response.ca_pem,
+    Ok(if response.success {
+        Ok(response.node_cert_pem)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
+    })
+}
+
+/// Ask this Node's own daemon at `peer_addr` to renew its certificate now.
+/// Returns the notAfter (Unix seconds) of the certificate it then serves.
+pub async fn call_renew_local_node_certificate_rpc(
+    peer_addr: &str,
+    tls: super::TlsConfig,
+    timeout_secs: u64,
+) -> Result<std::result::Result<i64, String>> {
+    let mut client = connect_zone_api(
+        peer_addr,
+        Some(tls),
+        timeout_secs,
+        "RenewLocalNodeCertificate",
+    )
+    .await?;
+    let response = client
+        .renew_local_node_certificate(RenewLocalNodeCertificateRequest {})
+        .await
+        .map_err(|e| TransportError::Rpc(format!("RenewLocalNodeCertificate RPC failed: {e}")))?
+        .into_inner();
+    Ok(if response.success {
+        Ok(response.not_after_unix_s)
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "renewal refused".to_string()))
     })
 }
 
@@ -1495,7 +1885,7 @@ mod tests {
         {
             let mut clients = pool.clients.write().await;
             clients.insert(
-                42,
+                (42, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     created_at: Instant::now(),
@@ -1505,7 +1895,7 @@ mod tests {
 
         // The cached entry should still be present (within TTL)
         let clients = pool.clients.read().await;
-        let cached = clients.get(&42).unwrap();
+        let cached = clients.get(&(42, PeerRole::Replication)).unwrap();
         assert!(cached.created_at.elapsed() < pool.client_ttl);
     }
 
@@ -1520,7 +1910,7 @@ mod tests {
         {
             let mut clients = pool.clients.write().await;
             clients.insert(
-                99,
+                (99, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     created_at: Instant::now() - Duration::from_secs(10),
@@ -1530,7 +1920,7 @@ mod tests {
 
         // Verify the entry is stale
         let clients = pool.clients.read().await;
-        let cached = clients.get(&99).unwrap();
+        let cached = clients.get(&(99, PeerRole::Replication)).unwrap();
         assert!(cached.created_at.elapsed() >= pool.client_ttl);
     }
 
@@ -1544,7 +1934,7 @@ mod tests {
             let mut clients = pool.clients.write().await;
             // Fresh client (10s old)
             clients.insert(
-                1,
+                (1, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     created_at: now - Duration::from_secs(10),
@@ -1552,7 +1942,7 @@ mod tests {
             );
             // Stale client (120s old, past 60s TTL)
             clients.insert(
-                2,
+                (2, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     created_at: now - Duration::from_secs(120),
@@ -1560,7 +1950,7 @@ mod tests {
             );
             // Fresh client (59s old, just under TTL)
             clients.insert(
-                3,
+                (3, PeerRole::Replication),
                 CachedClient {
                     client: create_dummy_client(),
                     created_at: now - Duration::from_secs(59),
@@ -1571,11 +1961,32 @@ mod tests {
         let clients = pool.clients.read().await;
 
         // Client 1: fresh (10s < 60s TTL)
-        assert!(clients.get(&1).unwrap().created_at.elapsed() < ttl);
+        assert!(
+            clients
+                .get(&(1, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                < ttl
+        );
         // Client 2: stale (120s > 60s TTL)
-        assert!(clients.get(&2).unwrap().created_at.elapsed() >= ttl);
+        assert!(
+            clients
+                .get(&(2, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                >= ttl
+        );
         // Client 3: fresh (59s < 60s TTL)
-        assert!(clients.get(&3).unwrap().created_at.elapsed() < ttl);
+        assert!(
+            clients
+                .get(&(3, PeerRole::Replication))
+                .unwrap()
+                .created_at
+                .elapsed()
+                < ttl
+        );
     }
 
     /// Create a dummy RaftClient for testing pool management.
@@ -1583,10 +1994,13 @@ mod tests {
     fn create_dummy_client() -> RaftClient {
         // Create a channel pointing to a non-existent endpoint
         let channel = Channel::from_static("http://[::1]:1").connect_lazy();
+        let config = ClientConfig::default();
         RaftClient {
             endpoint: "http://[::1]:1".to_string(),
-            config: ClientConfig::default(),
-            inner: ZoneTransportServiceClient::new(channel),
+            tls_snapshot: config.tls.snapshot(),
+            config,
+            inner: bounded!(ZoneTransportServiceClient::new(channel)),
+            is_node_channel: false,
         }
     }
 }

@@ -79,12 +79,12 @@ pub mod blob_fetcher;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod search_capabilities;
 
-/// AgentMinter trait — lets the raft gRPC server serve `MintAgent` (remote
-/// agent-cert signing on the CA holder) without depending on `auth` or
-/// `peer_identity`. The cluster profile installs the impl on the founder at
-/// bootstrap. See [`agent_minter`] module.
+/// CaIssuer trait — lets the raft gRPC server serve the CA holder's issuance
+/// (agent certificates and Node certificate renewal) without depending on
+/// `auth` or `peer_identity`. The cluster profile installs the impl on the
+/// founder at bootstrap. See [`ca_issuer`] module.
 #[cfg(all(feature = "grpc", has_protos))]
-pub mod agent_minter;
+pub mod ca_issuer;
 
 /// Caller-owned CSR persistence and verified credential publication. This has
 /// no issuer, transport retry, owner resolution or runtime activation policy.
@@ -180,6 +180,8 @@ pub mod control_state_store;
 pub mod distributed_coordinator;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod foreign_ca_store;
+#[cfg(all(feature = "grpc", has_protos))]
+pub mod replica_binding_store;
 pub mod session_mint_admin;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod session_mint_allow_store;
@@ -196,12 +198,12 @@ pub mod stream_wakeup;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod stream_retention_gc;
 
-/// Node-bound peer address book persistence — `identity.json` at a
-/// platform-native user-data location.  Survives `<NEXUS_DATA_DIR>`
-/// wipes so cold-boot does not need operator re-specifying `--peers`.
-/// Deliberately narrow: peer list only, no `node_id` (raft's
-/// per-Progress heartbeat invariant requires wipe = id-rotation; see
-/// `docs/federation-architecture.md` § 6.3.1).
+/// Node-bound operator intent — `identity.json` at a platform-native
+/// user-data location: seed addresses and per-zone role intent.  Survives
+/// `<NEXUS_DATA_DIR>` wipes so cold-boot does not need operator
+/// re-specifying `--peers`.  Deliberately narrow: no replicated state and
+/// no `node_id` (raft's per-Progress heartbeat invariant requires wipe =
+/// id-rotation; see `docs/federation-architecture.md` § 6.3.1).
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod identity;
 

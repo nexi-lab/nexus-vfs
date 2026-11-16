@@ -61,6 +61,7 @@ pub mod grpc_plugin_access;
 pub mod grpc_plugin_proxy;
 pub mod grpc_search_access;
 pub mod peer_blob;
+mod peer_channels;
 /// Recover the caller's identity from the mTLS client certificate that
 /// rustls has already verified against the cluster CA. Feeds
 /// `AuthCredentials::peer`.
@@ -69,6 +70,8 @@ pub mod peer_identity;
 pub mod runtime_gateway;
 /// User-runtime confinement and original-agent delegation over a verified gateway.
 pub mod runtime_scope;
+#[cfg(test)]
+mod test_peer;
 /// Post-transport substrate observability.  Dual of
 /// [`peer_blob`]: peer_blob does cross-node blob fetches,
 /// transport_observer classifies which substrate path each fetch
@@ -88,6 +91,6 @@ pub mod vfs {
 // namespace so existing call sites keep working.
 pub use lib::transport_primitives::{
     create_channel, hostname_to_node_id, ClientConfig, ConnectionPool, NodeAddress, PeerAddress,
-    ServerConfig, TlsConfig, TransportError,
+    TlsConfig, TransportError,
 };
 pub type Result<T> = lib::transport_primitives::Result<T>;

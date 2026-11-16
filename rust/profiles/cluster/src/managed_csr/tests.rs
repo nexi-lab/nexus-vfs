@@ -128,7 +128,7 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let registry = Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1));
     let runtime = tokio::runtime::Handle::current();
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -145,32 +145,40 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     let verifier = lib::transport_primitives::FederatedClientCertVerifier::new(&ca).unwrap();
     let peer_slot = Arc::new(std::sync::OnceLock::new());
     peer_slot.set(verifier.clone()).unwrap();
-    let minter = Arc::new(FounderAgentMinter {
+    let minter = Arc::new(FounderCaIssuer {
         store: store.clone(),
         tls_dir: tls.clone(),
         data_dir: private.path().to_path_buf(),
         session_allow: nexus_raft::session_mint_allow_store::new_session_mint_allow_slot(),
+        replica_store: crate::replica_rpc::new_store_slot(),
         peer_verifier: peer_slot,
     });
-    let slot = nexus_raft::agent_minter::new_agent_minter_slot();
+    let slot = nexus_raft::ca_issuer::new_ca_issuer_slot();
     *slot.write() = Some(minter);
     let (server_cert, server_key) = generate_node_cert(1, "root", &ca, &ca_key, &[], None).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = port.local_addr().unwrap().to_string();
     drop(port);
+    let server_tls = TlsConfig {
+        ca_pem: ca.clone(),
+        cert_pem: server_cert,
+        key_pem: server_key,
+    };
+    registry
+        .clone()
+        .shared_tls()
+        .replace(lib::transport_primitives::TlsPolicy::Configured(
+            server_tls.clone(),
+        ));
     let server = RaftGrpcServer::new(
         registry.clone(),
         ServerConfig {
             bind_address: address.parse().unwrap(),
-            tls: Some(TlsConfig {
-                ca_pem: ca.clone(),
-                cert_pem: server_cert,
-                key_pem: server_key,
-            }),
+            tls: Some(server_tls),
             ..Default::default()
         },
     )
-    .with_agent_minter_slot(slot)
+    .with_ca_issuer_slot(slot)
     .with_foreign_ca_verifier(Some(verifier.clone()));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let running = tokio::spawn(async move {
@@ -418,7 +426,6 @@ async fn real_mtls_issuance_preserves_original_key_and_reconciles_both_lost_repl
     drop(another_operator);
     drop(store);
     drop(node);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }

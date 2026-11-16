@@ -29,13 +29,9 @@ async fn follower_put_and_revoke_return_after_local_apply() {
     };
     let founder = make_node(1, founder_dir.path(), &founder_addr);
     let follower = make_node(2, follower_dir.path(), &follower_addr);
-    let leader_zone = founder
-        .create_zone("sharedzone", vec![format!("1@{founder_addr}")])
-        .unwrap();
+    let leader_zone = founder.create_zone("sharedzone").unwrap();
     leader_zone.consensus_node().campaign().await.unwrap();
-    let follower_zone = follower
-        .join_zone("sharedzone", vec![format!("1@{founder_addr}")], true)
-        .unwrap();
+    let follower_zone = follower.join_zone("sharedzone", true).unwrap();
     let joined = call_join_zone_rpc(
         &format!("http://{founder_addr}"),
         "sharedzone",
@@ -105,9 +101,7 @@ async fn cas_loss_reads_back_the_winners_value() {
         None,
     )
     .unwrap();
-    let zone = zm
-        .create_zone("sharedzone", vec![format!("1@{addr}")])
-        .unwrap();
+    let zone = zm.create_zone("sharedzone").unwrap();
     for _ in 0..100 {
         if zone.is_leader() {
             break;
@@ -171,13 +165,9 @@ async fn forwarded_cas_loss_reports_the_loss() {
     };
     let founder = make_node(1, founder_dir.path(), &founder_addr);
     let follower = make_node(2, follower_dir.path(), &follower_addr);
-    let leader_zone = founder
-        .create_zone("sharedzone", vec![format!("1@{founder_addr}")])
-        .unwrap();
+    let leader_zone = founder.create_zone("sharedzone").unwrap();
     leader_zone.consensus_node().campaign().await.unwrap();
-    let follower_zone = follower
-        .join_zone("sharedzone", vec![format!("1@{founder_addr}")], true)
-        .unwrap();
+    let follower_zone = follower.join_zone("sharedzone", true).unwrap();
     let joined = call_join_zone_rpc(
         &format!("http://{founder_addr}"),
         "sharedzone",

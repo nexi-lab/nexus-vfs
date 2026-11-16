@@ -7,7 +7,7 @@ use std::time::Duration;
 /// All fields are PEM-encoded bytes (read from files by the caller).
 /// Rust core holds bytes, not paths — file I/O happens at the boundary
 /// (CLI reads files). This makes the core testable with in-memory certs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     /// Server/client certificate (PEM).
     pub cert_pem: Vec<u8>,
@@ -57,30 +57,6 @@ impl Default for ClientConfig {
             tcp_keepalive: Some(Duration::from_secs(30)),
             http2_keepalive_interval: Some(Duration::from_secs(20)),
             http2_keepalive_timeout: Some(Duration::from_secs(10)),
-            tls: None,
-        }
-    }
-}
-
-/// Server-side configuration.
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    /// Bind address (e.g. "0.0.0.0:2126").
-    pub bind_address: String,
-    /// Maximum concurrent connections.
-    pub max_connections: Option<usize>,
-    /// Maximum message size in bytes (default 64MB).
-    pub max_message_size: usize,
-    /// TLS config (None = plaintext).
-    pub tls: Option<TlsConfig>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "0.0.0.0:2126".to_string(),
-            max_connections: None,
-            max_message_size: 64 * 1024 * 1024, // 64MB
             tls: None,
         }
     }

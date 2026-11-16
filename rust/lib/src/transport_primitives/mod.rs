@@ -11,21 +11,31 @@ mod agent_credential;
 pub mod authorship;
 mod channel;
 mod config;
+mod credential_channel;
 mod crl;
 mod error;
 mod federated_tls;
 mod foreign_ca;
+mod node_credential;
 mod peer;
 mod peer_blob_client;
+mod peer_verifier;
 mod pool;
+mod replica_credential;
 mod runtime_credential;
 mod secret_file;
 mod server_limits;
+mod shared_tls;
+mod shared_tls_server;
+mod tls_incoming;
 mod tofu;
 
 pub use agent_credential::{AgentCredential, LoadedCredential, CREDENTIAL_MANIFEST};
-pub use channel::{create_channel, ensure_crypto_provider};
-pub use config::{ClientConfig, ServerConfig, TlsConfig};
+pub use channel::{
+    create_channel, create_node_channel, create_peer_channel, ensure_crypto_provider,
+};
+pub use config::{ClientConfig, TlsConfig};
+pub use credential_channel::CredentialChannel;
 pub use crl::{
     ca_spki_sha256, canonical_certificate_serial, verify_signed_crl, VerifiedCrl,
     CRL_MAXIMUM_AGE_SECS,
@@ -36,12 +46,16 @@ pub use federated_tls::{
     FederatedClientCertVerifier, ReloadableServerIdentity,
 };
 pub use foreign_ca::{first_certificate_der, CaFingerprint, ForeignCaAnchor, ForeignCaScope};
+pub use node_credential::{node_identity_from_x509, node_identity_uri, parse_node_identity_uri};
 pub use peer::{hostname_to_node_id, NodeAddress, PeerAddress};
 pub use peer_blob_client::{NoopPeerBlobClient, PeerBlobClient, PeerBlobResult};
 pub use pool::ConnectionPool;
+pub use replica_credential::{replica_identity_uri, replica_node_id_from_x509};
 pub use runtime_credential::{
     user_runtime_name_from_x509, user_runtime_server_name, USER_RUNTIME_MAX_VALIDITY_SECS,
 };
 pub use secret_file::{create_secret, protect_secret, write_secret};
 pub use server_limits::apply_server_limits;
+pub use shared_tls::{SharedTlsConfig, TlsPolicy, TlsSnapshot};
+pub use shared_tls_server::{shared_mtls_incoming, shared_tls_incoming, SharedTlsListener};
 pub use tofu::{cert_fingerprint, TofuError, TofuResult, TofuTrustStore, TrustedZone};

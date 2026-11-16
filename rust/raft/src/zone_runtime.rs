@@ -28,9 +28,16 @@ use crate::zone_deletion_registry::ZoneDeletionRegistry;
 use crate::zone_manager::{decode_file_metadata, ZoneManager, ZonePresence, DT_MOUNT};
 use crate::zone_op_journal::{BeginOutcome, JournalError, JournalRecord, ZoneOpJournal};
 
+#[cfg(test)]
+#[path = "zone_runtime/local_root_tests.rs"]
+mod local_root_tests;
+
 /// prost flattens the nested `ZoneStatusResponse.Presence` enum into a
 /// sibling module — re-exported here so the ladder reads as one type.
 use kernel::kernel::vfs_proto::zone_status_response::Presence;
+use kernel::kernel::vfs_proto::{
+    peer_replication::State as PeerState, PeerReplication as PeerReplicationFact,
+};
 
 /// Refusal taxonomy for the typed surface. The transport layer maps each
 /// variant onto a tonic `Status` code; the journal stores the message.
@@ -46,6 +53,9 @@ pub enum ZoneRuntimeError {
     Conflict(String),
     /// Journal lookup miss.
     NotFound(String),
+    /// The cluster could not be reached to carry the mutation out (no leader
+    /// admitted a join). Retryable: the intent stays PENDING.
+    Unavailable(String),
     /// Execution failure underneath (raft, IO).
     Internal(String),
 }
@@ -57,6 +67,7 @@ impl std::fmt::Display for ZoneRuntimeError {
             | ZoneRuntimeError::Invalid(m)
             | ZoneRuntimeError::Conflict(m)
             | ZoneRuntimeError::NotFound(m)
+            | ZoneRuntimeError::Unavailable(m)
             | ZoneRuntimeError::Internal(m) => f.write_str(m),
         }
     }
@@ -93,17 +104,15 @@ const CATCHUP_BUDGET: Duration = Duration::from_secs(10);
 /// (`ZoneOpJournal::refresh`) so its own execution window is protected.
 const PENDING_TAKEOVER_GRACE_MS: i64 = 120_000;
 
-/// Resource-hygiene bound on `ZoneCreateRequest.peers`: the set is sorted,
-/// joined and hashed in a blocking context, and a 64 MiB message could
-/// otherwise carry an unbounded membership spec into that work.
-const MAX_CREATE_PEERS: usize = 32;
-/// One peer is a `host:port` string (host ≤ 253 + separator + port ≤ 5).
-const MAX_CREATE_PEER_LEN: usize = 256;
-
 pub struct ZoneRuntimeBackend {
     zm: Arc<ZoneManager>,
     journal: ZoneOpJournal,
-    deletions: Arc<ZoneDeletionRegistry>,
+    deletions: Option<Arc<ZoneDeletionRegistry>>,
+    /// Operations whose execution on this node stopped without a terminal
+    /// outcome, with when it stopped. Memory only: it records that no
+    /// executor on this node runs them, so a same-operation retry drives one
+    /// again at once instead of waiting out the takeover grace.
+    stopped: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl ZoneRuntimeBackend {
@@ -115,8 +124,65 @@ impl ZoneRuntimeBackend {
         Self {
             zm,
             journal,
-            deletions,
+            deletions: Some(deletions),
+            stopped: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Bind owner-local operations to the existing private root journal.
+    /// Remote Node authority still controls initial data-zone admission.
+    pub fn for_local_root(zm: Arc<ZoneManager>) -> Result<Self, ZoneRuntimeError> {
+        if !zm.registry().owns_local_root() {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local operations require a private local root".into(),
+            ));
+        }
+        let root = zm.get_zone(contracts::ROOT_ZONE_ID).ok_or_else(|| {
+            ZoneRuntimeError::Unavailable("local root journal is not open".into())
+        })?;
+        Ok(Self {
+            journal: ZoneOpJournal::new(root.consensus_node(), root.runtime_handle()),
+            zm,
+            deletions: None,
+            stopped: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Whether operations are confined to this process's private root.
+    pub fn is_local_root(&self) -> bool {
+        self.deletions.is_none()
+    }
+
+    fn deletion_authority(&self) -> Result<&ZoneDeletionRegistry, ZoneRuntimeError> {
+        self.deletions.as_deref().ok_or_else(|| {
+            ZoneRuntimeError::PermissionDenied(
+                "global zone lifecycle requires the control plane".into(),
+            )
+        })
+    }
+
+    fn local_execution(&self) -> Result<Option<parking_lot::MutexGuard<'_, ()>>, ZoneRuntimeError> {
+        if self.deletions.is_some() {
+            return Ok(None);
+        }
+        // Share ownership across backend instances for this local root,
+        // including old PENDING retries. A slow worker retains ownership
+        // until its actual execution returns.
+        self.zm.try_local_zone_operation().map(Some).ok_or_else(|| {
+            ZoneRuntimeError::Unavailable(
+                "another local zone operation is executing; retain the original operation ID"
+                    .into(),
+            )
+        })
+    }
+
+    fn check_mount_parent(&self, parent: &str) -> Result<(), ZoneRuntimeError> {
+        if self.deletions.is_none() && parent != contracts::ROOT_ZONE_ID {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local mounts belong to the private root".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// R12: a deprovisioned zone stays gone — a create for a recorded-
@@ -126,7 +192,7 @@ impl ZoneRuntimeBackend {
         // Checked variant — store errors propagate, not degrade to "not
         // deleted": by the time an RPC is answered the control zone is
         // resident, so a store fault is a real failure the caller must see.
-        match self.deletions.deletion_epoch_checked(zone_id) {
+        match self.deletion_authority()?.deletion_epoch_checked(zone_id) {
             Ok(Some(epoch)) => Err(ZoneRuntimeError::Conflict(format!(
                 "zone '{zone_id}' was deprovisioned (deletion epoch {epoch}); re-creating it \
                  requires an operator-supervised recovery (founder boot with --force / \
@@ -141,29 +207,15 @@ impl ZoneRuntimeBackend {
 
     /// Create a zone — tenant-create admission (full 3–63/charset/edge/
     /// reserved rules), single executor per operation id, physical
-    /// read-back. `ZoneManager::create_zone` is itself idempotent per
-    /// address book, so an operation retried under a NEW operation id
-    /// after a crash mid-flight yields ALREADY_PRESENT, not a second zone.
+    /// read-back. `ZoneManager::create_zone` is itself idempotent, so an
+    /// operation retried under a NEW operation id after a crash mid-flight
+    /// yields ALREADY_PRESENT, not a second zone.
     pub fn zone_create(&self, req: &ZoneCreateRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        self.deletion_authority()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::TenantCreate, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
-        // Resource hygiene: bound the peer set BEFORE the sort+join+hash —
-        // an unbounded membership inside the 64 MiB message budget would
-        // otherwise land that work in this blocking context.
-        if req.peers.len() > MAX_CREATE_PEERS {
-            return Err(ZoneRuntimeError::Invalid(format!(
-                "peers: at most {MAX_CREATE_PEERS} allowed, got {}",
-                req.peers.len()
-            )));
-        }
-        if let Some(peer) = req.peers.iter().find(|p| p.len() > MAX_CREATE_PEER_LEN) {
-            return Err(ZoneRuntimeError::Invalid(format!(
-                "peers: an entry exceeds {MAX_CREATE_PEER_LEN} bytes (got {})",
-                peer.len()
-            )));
-        }
-        let hash = request_hash(b"create", &[&req.zone_id, &join_sorted(&req.peers)]);
+        let hash = request_hash(b"create", &[&req.zone_id]);
 
         if let Some(replay) =
             self.begin_or_replay(&header.operation_id, hash, "create", &req.zone_id)?
@@ -187,7 +239,7 @@ impl ZoneRuntimeBackend {
         // CREATED/ALREADY_PRESENT wording may differ from what a peer would
         // report — the cluster-facts read-back below is the physical truth.
         let existed = self.zm.get_zone(&req.zone_id).is_some();
-        if let Err(e) = self.zm.create_zone(&req.zone_id, req.peers.clone()) {
+        if let Err(e) = self.zm.create_zone(&req.zone_id) {
             return self.fail(
                 &header.operation_id,
                 map_raft_err(e),
@@ -216,10 +268,21 @@ impl ZoneRuntimeBackend {
         self.complete(&header.operation_id, &req.zone_id, receipt)
     }
 
-    /// Join an existing zone (R9/D2) — `ZoneManager::join_zone` only; there
-    /// is NO founder fallback on this path. A join that cannot reach peers
-    /// fails loudly; it can never degrade into a create.
+    /// Join an existing zone (R9/D2): host its replica and request membership
+    /// through JoinZone against the operator seeds — the same join loop as
+    /// boot and the offline `join` CLI
+    /// ([`crate::distributed_coordinator::join_zone_via_peers`]). JOINED means
+    /// this node's applied ConfState names it as the requested learner or
+    /// voter. There is NO founder fallback: a join no leader admits is
+    /// UNAVAILABLE, leaves no replica no leader reached, stays PENDING, and a
+    /// retry of the same operation id drives it again.
     pub fn zone_join(&self, req: &ZoneJoinRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        if self.deletions.is_none() && !req.learner {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner replicas join as learners".into(),
+            ));
+        }
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::RemoteLearned, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -233,14 +296,7 @@ impl ZoneRuntimeBackend {
                 req.zone_id
             )));
         }
-        let hash = request_hash(
-            b"join",
-            &[
-                &req.zone_id,
-                &join_sorted(&req.peers),
-                &req.learner.to_string(),
-            ],
-        );
+        let hash = request_hash(b"join", &[&req.zone_id, &req.learner.to_string()]);
 
         if let Some(replay) =
             self.begin_or_replay(&header.operation_id, hash, "join", &req.zone_id)?
@@ -248,19 +304,54 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
-        if let Err(e) = self
-            .zm
-            .join_zone(&req.zone_id, req.peers.clone(), req.learner)
-        {
-            return self.fail(&header.operation_id, map_raft_err(e), "join", &req.zone_id);
+        let advertise = self.zm.registry().self_address();
+        if advertise.is_empty() {
+            let refusal = ZoneRuntimeError::Conflict(
+                "this node advertises no address, so a leader could not reach it as a member"
+                    .to_string(),
+            );
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
+        }
+        let seeds =
+            crate::distributed_coordinator::peers_excluding_self(&self.zm.seed_peers(), &advertise);
+        if seeds.is_empty() {
+            let refusal = ZoneRuntimeError::Conflict(format!(
+                "no seed address to request membership of '{}' through; a join never founds \
+                 the zone",
+                req.zone_id
+            ));
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
+        }
+        let node_id = self.zm.node_id();
+        if let Err(e) = crate::distributed_coordinator::join_zone_via_peers(
+            &self.zm,
+            &req.zone_id,
+            node_id,
+            &advertise,
+            &seeds,
+            Some(crate::distributed_coordinator::BOUNDED_JOIN_ATTEMPTS),
+            req.learner,
+        ) {
+            let refusal = match e {
+                crate::distributed_coordinator::JoinZoneError::Local(e) => map_raft_err(e),
+                crate::distributed_coordinator::JoinZoneError::NotAdmitted(reason) => {
+                    ZoneRuntimeError::Unavailable(reason)
+                }
+            };
+            return self.fail(&header.operation_id, refusal, "join", &req.zone_id);
         }
         let mut facts = self.cluster_facts_caught_up(&req.zone_id);
         facts.has_store = facts.has_store && self.zm.hosts_zone(&req.zone_id);
+        let role = match self.zm.get_zone(&req.zone_id) {
+            Some(zone) if zone.consensus_node().voters().contains(&node_id) => "voter",
+            _ => "learner",
+        };
         let mut receipt = base_receipt(&header.operation_id, &req.zone_id, "join", OUTCOME_JOINED);
         receipt.cluster = Some(facts);
         receipt.evidence = vec![
             format!(
-                "join path only — no founder bootstrap fallback (learner={})",
+                "admitted through JoinZone; the applied ConfState names node {node_id} as a \
+                 {role} (requested learner={})",
                 req.learner
             ),
             format!(
@@ -293,8 +384,11 @@ impl ZoneRuntimeBackend {
         // time an RPC is answered).
         if let Some(info) = self
             .deletions
-            .deletion_info_checked(&req.zone_id)
+            .as_ref()
+            .map(|deletions| deletions.deletion_info_checked(&req.zone_id))
+            .transpose()
             .map_err(ZoneRuntimeError::Internal)?
+            .flatten()
         {
             resp.presence = Presence::Deleted.into();
             resp.deletion = Some(DeletionInfo {
@@ -323,6 +417,15 @@ impl ZoneRuntimeBackend {
     /// Mount target under parent (R11 zone-level layer) + DT_MOUNT
     /// read-back into MountFacts.
     pub fn zone_mount(&self, req: &ZoneMountRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        self.check_mount_parent(&req.parent_zone_id)?;
+        if self.deletions.is_none()
+            && contracts::RESERVED_ZONE_IDS.contains(&req.target_zone_id.as_str())
+        {
+            return Err(ZoneRuntimeError::PermissionDenied(
+                "owner-local mounts require a data zone".into(),
+            ));
+        }
         let header = require_header(req.mutation.as_ref())?;
         for (label, id) in [
             ("parent_zone_id", &req.parent_zone_id),
@@ -383,52 +486,41 @@ impl ZoneRuntimeBackend {
             );
         }
         // Physical read-back: the parent's state machine must now hold a
-        // DT_MOUNT at mount_path pointing at the target, and the target's
-        // i_links must have moved. A FOLLOWER's propose returns once the
-        // leader commits — the local apply lags by a raft tick (node.rs
-        // documents this), so POLL for the value to become visible instead
-        // of snapshotting once: a one-shot read on a follower observes
-        // stale state and would journal a permanent REJECTED for a mount
-        // that actually committed.
+        // DT_MOUNT at mount_path pointing at the target. `zm.mount` returned
+        // only after THIS replica applied both of its writes (the parent's
+        // DT_MOUNT and the target's i_links counter), so one read observes
+        // them; a write still lagging here failed the mount above instead.
         let parent = self
             .zm
             .get_zone(&req.parent_zone_id)
             .ok_or_else(|| ZoneRuntimeError::Internal("parent zone vanished after mount".into()))?;
-        let mounted_entry = poll_until_visible(CATCHUP_BUDGET, || {
-            parent
-                .get_metadata(&req.mount_path)
-                .ok()
-                .flatten()
-                .and_then(|bytes| decode_file_metadata(&bytes).ok())
-                .filter(|meta| {
-                    // The subtree is part of the mount's identity: this RPC
-                    // mounts the WHOLE zone (mount_subtree with VFS_ROOT),
-                    // so a same-target subtree mount left by join/CLI must
-                    // not satisfy the read-back as if it were this one.
-                    meta.entry_type == DT_MOUNT
-                        && meta.target_zone_id == req.target_zone_id
-                        && meta.target_subtree == contracts::VFS_ROOT
-                })
-        });
+        let mounted_entry = parent
+            .get_metadata(&req.mount_path)
+            .ok()
+            .flatten()
+            .and_then(|bytes| decode_file_metadata(&bytes).ok())
+            .filter(|meta| {
+                // The subtree is part of the mount's identity: this RPC
+                // mounts the WHOLE zone (mount_subtree with VFS_ROOT), so a
+                // same-target subtree mount left by join/CLI must not
+                // satisfy the read-back as if it were this one.
+                meta.entry_type == DT_MOUNT
+                    && meta.target_zone_id == req.target_zone_id
+                    && meta.target_subtree == contracts::VFS_ROOT
+            });
         if mounted_entry.is_none() {
-            // The mount may still have committed cluster-wide (a follower's
-            // local apply can lag past the budget): the outcome is UNKNOWN,
-            // so do NOT journal REJECTED — the record stays PENDING and the
-            // caller is told to query or retry under a fresh operation id
-            // (mount is idempotent).
+            // A concurrent unmount may have replaced the entry after this
+            // mount committed: the outcome is not a refusal, so do NOT journal
+            // REJECTED — the record stays PENDING and the caller is told to
+            // query or retry under a fresh operation id (mount is idempotent).
             let e = ZoneRuntimeError::Internal(format!(
-                "mount read-back: no DT_MOUNT → {} at '{}' in '{}' within {:?} — the \
-                 mount may have committed; query GetZoneOperation or retry with a new \
-                 operation_id",
-                req.target_zone_id, req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
+                "mount read-back: no DT_MOUNT → {} at '{}' in '{}' after the mount \
+                 committed; query GetZoneOperation or retry with a new operation_id",
+                req.target_zone_id, req.mount_path, req.parent_zone_id
             ));
             tracing::error!(zone = %req.target_zone_id, "zone runtime mount read-back: {e}");
             return Err(e);
         }
-        // Best-effort snapshot: `zm.mount` writes the parent's DT_MOUNT and
-        // the target's i_links counter on TWO independent raft groups — on
-        // a follower their local applies lag independently, so this count
-        // can read one behind right after the mount becomes visible.
         let links = self.zm.get_links_count(&req.target_zone_id).unwrap_or(None);
         let mut receipt = base_receipt(
             &header.operation_id,
@@ -451,6 +543,8 @@ impl ZoneRuntimeBackend {
     /// Unmount, restoring DT_DIR; MountFacts carries the post-unmount
     /// link count of the former target.
     pub fn zone_unmount(&self, req: &ZoneUnmountRequest) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
+        self.check_mount_parent(&req.parent_zone_id)?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.parent_zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("parent_zone_id: {e}")))?;
@@ -476,34 +570,27 @@ impl ZoneRuntimeBackend {
                 )
             }
         };
-        // Physical read-back (same follower-lag reasoning as `zone_mount`):
-        // poll until the mount point is no longer a DT_MOUNT in the parent.
-        // i_links is a counter with no predictable expected value, so it is
-        // read once the physical fact is visible — best-effort, same
-        // snapshot semantics as the mount receipt.
+        // Physical read-back (see `zone_mount`): the mount point is no longer
+        // a DT_MOUNT in the parent, and the target's i_links has moved —
+        // both applied here before `zm.unmount` returned.
         if former_target.is_some() {
             let parent = self.zm.get_zone(&req.parent_zone_id);
             let gone = parent.is_some_and(|parent| {
-                poll_until_visible(CATCHUP_BUDGET, || {
-                    let still_mount = parent
-                        .get_metadata(&req.mount_path)
-                        .ok()
-                        .flatten()
-                        .and_then(|bytes| decode_file_metadata(&bytes).ok())
-                        .is_some_and(|meta| meta.entry_type == DT_MOUNT);
-                    (!still_mount).then_some(())
-                })
-                .is_some()
+                !parent
+                    .get_metadata(&req.mount_path)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| decode_file_metadata(&bytes).ok())
+                    .is_some_and(|meta| meta.entry_type == DT_MOUNT)
             });
             if !gone {
-                // The unmount may still have committed cluster-wide: the
-                // outcome is UNKNOWN — no REJECTED, the record stays
-                // PENDING (mirrors the mount read-back semantics).
+                // A concurrent mount may have replaced the entry after this
+                // unmount committed: not a refusal — no REJECTED, the record
+                // stays PENDING (mirrors the mount read-back semantics).
                 let e = ZoneRuntimeError::Internal(format!(
-                    "unmount read-back: '{}' in '{}' still a DT_MOUNT within {:?} — the \
-                     unmount may have committed; query GetZoneOperation or retry with a \
-                     new operation_id",
-                    req.mount_path, req.parent_zone_id, CATCHUP_BUDGET
+                    "unmount read-back: '{}' in '{}' is a DT_MOUNT again after the unmount \
+                     committed; query GetZoneOperation or retry with a new operation_id",
+                    req.mount_path, req.parent_zone_id
                 ));
                 tracing::error!(zone = %req.parent_zone_id, "zone runtime unmount read-back: {e}");
                 return Err(e);
@@ -532,14 +619,13 @@ impl ZoneRuntimeBackend {
         self.complete(&header.operation_id, &req.parent_zone_id, receipt)
     }
 
-    /// Destroy this node's replica only — `ZoneManager::remove_zone`
-    /// semantics (peer fan-out of the local-destroy DeleteZone RPC, POSIX
-    /// i_links guard unless forced). No global Deleted state; that is
-    /// [`Self::zone_deprovision`].
+    /// Destroy this node's replica, preserving other members and the shared
+    /// deletion state. References require an explicit forced removal.
     pub fn zone_remove_replica(
         &self,
         req: &ZoneRemoveReplicaRequest,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let _execution = self.local_execution()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -554,7 +640,7 @@ impl ZoneRuntimeBackend {
             return Ok(replay);
         }
 
-        if let Err(e) = self.zm.remove_zone(&req.zone_id, req.force) {
+        if let Err(e) = self.zm.remove_local_replica(&req.zone_id, req.force) {
             return self.fail(
                 &header.operation_id,
                 map_raft_err(e),
@@ -584,6 +670,7 @@ impl ZoneRuntimeBackend {
         &self,
         req: &ZoneDeprovisionRequest,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
+        let deletions = self.deletion_authority()?;
         let header = require_header(req.mutation.as_ref())?;
         validate_zone_id_for(ZoneIdUse::ExistingRef, &req.zone_id)
             .map_err(|e| ZoneRuntimeError::Invalid(format!("zone_id: {e}")))?;
@@ -677,7 +764,7 @@ impl ZoneRuntimeBackend {
         // Record the deletion FIRST: the epoch must exist in the replicated
         // registry before any replica tears down, so a crash mid-fan-out
         // still leaves the anti-resurrection authority in place.
-        let epoch = match self.deletions.mark_deleted(&req.zone_id) {
+        let epoch = match deletions.mark_deleted(&req.zone_id) {
             Ok(epoch) => epoch,
             Err(e) => {
                 return self.fail(
@@ -792,7 +879,20 @@ impl ZoneRuntimeBackend {
                 // in flight.
                 crate::zone_op_journal::STATUS_PENDING if rec.request_hash == hash => {
                     let now = wall_now_ms();
-                    if !pending_takeover_allowed(&rec, now) {
+                    if self.take_stopped(&rec) {
+                        tracing::info!(
+                            operation_id,
+                            zone_id,
+                            "driving a PENDING operation again: its execution on this node stopped \
+                             without an outcome and no executor has claimed it since",
+                        );
+                    } else if pending_takeover_allowed(&rec, now) {
+                        tracing::warn!(
+                            operation_id,
+                            zone_id,
+                            "taking over an orphaned PENDING journal record (crash between begin and complete)"
+                        );
+                    } else {
                         return Err(ZoneRuntimeError::Conflict(format!(
                             "operation_id '{operation_id}' is still in flight (PENDING for \
                              {} ms); retry after {PENDING_TAKEOVER_GRACE_MS} ms, query \
@@ -800,12 +900,8 @@ impl ZoneRuntimeBackend {
                             now - rec.updated_at_ms
                         )));
                     }
-                    tracing::warn!(
-                        operation_id,
-                        zone_id,
-                        "taking over an orphaned PENDING journal record (crash between begin and complete)"
-                    );
-                    // Restart the grace window from the takeover point.
+                    // Restart the grace window: this execution is protected
+                    // like any other.
                     if let Err(e) = self.journal.refresh(operation_id) {
                         return Err(ZoneRuntimeError::Internal(format!(
                             "journal refresh for takeover: {e}"
@@ -844,7 +940,22 @@ impl ZoneRuntimeBackend {
         Ok(receipt)
     }
 
-    /// Persist definitive refusals; unknown outcomes remain recoverable.
+    /// Claim a PENDING operation whose execution on this node stopped without
+    /// an outcome, when no executor has re-stamped its record since. The
+    /// removal is the claim: of two concurrent retries, one drives it.
+    fn take_stopped(&self, rec: &JournalRecord) -> bool {
+        let mut stopped = self.stopped.lock();
+        match stopped.get(&rec.operation_id) {
+            Some(&stopped_at) if rec.updated_at_ms <= stopped_at => {
+                stopped.remove(&rec.operation_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Persist definitive refusals; unknown outcomes remain recoverable and,
+    /// on this node, drivable again by a retry at once.
     fn fail(
         &self,
         operation_id: &str,
@@ -852,11 +963,17 @@ impl ZoneRuntimeBackend {
         kind: &str,
         zone_id: &str,
     ) -> Result<ZoneReceipt, ZoneRuntimeError> {
-        if matches!(err, ZoneRuntimeError::Internal(_)) {
-            // Storage and consensus failures do not establish a business
-            // refusal. Keep the original intent PENDING so polling and a
-            // same-operation takeover can recover it after the grace period.
+        if matches!(
+            err,
+            ZoneRuntimeError::Internal(_) | ZoneRuntimeError::Unavailable(_)
+        ) {
+            // Storage, consensus and reachability failures do not establish a
+            // business refusal. Keep the original intent PENDING so polling and
+            // a same-operation takeover can recover it after the grace period.
             tracing::error!(zone = %zone_id, kind = %kind, "zone runtime mutation outcome unknown: {err}");
+            self.stopped
+                .lock()
+                .insert(operation_id.to_string(), wall_now_ms());
             return Err(err);
         }
         if let Err(journal_err) = self.journal.reject(operation_id, &err.to_string()) {
@@ -883,6 +1000,7 @@ impl ZoneRuntimeBackend {
             wait_until_caught_up(&node, zone_id, CATCHUP_BUDGET);
         }
         let status = self.zm.cluster_status(zone_id);
+        let replication = status.replication;
         ClusterFacts {
             has_store: status.has_store,
             term: status.term,
@@ -891,6 +1009,17 @@ impl ZoneRuntimeBackend {
             leader_id: status.leader_id,
             voter_count: status.voter_count as u32,
             witness_count: status.witness_count as u32,
+            leader_contact_age_ms: status.leader_contact_age_ms,
+            peers: replication
+                .peers
+                .iter()
+                .map(peer_replication_fact)
+                .collect(),
+            leader_commit_index: replication.leader_commit.map(|commit| commit.index),
+            leader_commit_age_ms: replication
+                .leader_commit
+                .map(|commit| millis(commit.observed_ago)),
+            stalled_ms: millis(replication.stalled_for),
         }
     }
 }
@@ -910,23 +1039,28 @@ fn require_header(
     Ok(header)
 }
 
-/// Poll `probe` until it yields a value or `budget` expires — the
-/// value-visibility pattern `ControlStateStore::wait_visible` established.
-/// A proposal returns once the LEADER commits, but on a follower the local
-/// apply lags by a raft tick (node.rs documents this), so a one-shot
-/// snapshot right after a successful propose can observe stale state. A
-/// transient read error counts as "not visible yet" — only the budget
-/// running out gives up.
-fn poll_until_visible<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if let Some(value) = probe() {
-            return Some(value);
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn peer_replication_fact(peer: &crate::raft::PeerReplication) -> PeerReplicationFact {
+    use crate::raft::ReplicationState;
+    PeerReplicationFact {
+        node_id: peer.node_id,
+        learner: peer.learner,
+        state: match peer.state {
+            ReplicationState::Probe => PeerState::Probe,
+            ReplicationState::Replicate => PeerState::Replicate,
+            ReplicationState::Snapshot => PeerState::Snapshot,
         }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        .into(),
+        matched: peer.matched,
+        next_index: peer.next_index,
+        state_age_ms: millis(peer.in_state_for),
+        stalled_ms: millis(peer.stalled_for),
+        send_failures: peer.send_failures,
+        send_failing_ms: millis(peer.send_failing_for),
+        last_send_error: peer.last_send_error.clone().unwrap_or_default(),
     }
 }
 
@@ -994,11 +1128,6 @@ fn record_from_journal(rec: JournalRecord) -> ZoneOperationRecord {
 
 fn map_raft_err(e: RaftError) -> ZoneRuntimeError {
     match e {
-        RaftError::ZoneAlreadyExistsWithDifferentMembership { actual, requested } => {
-            ZoneRuntimeError::Conflict(format!(
-                "zone already exists with different membership: have {actual:?}, requested {requested:?}"
-            ))
-        }
         RaftError::InvalidState(m) => ZoneRuntimeError::Conflict(m),
         other => ZoneRuntimeError::Internal(format!("{other:?}")),
     }
@@ -1020,12 +1149,6 @@ fn request_hash(kind: &[u8], fields: &[&str]) -> u64 {
             .try_into()
             .expect("8 bytes"),
     )
-}
-
-fn join_sorted(peers: &[String]) -> String {
-    let mut sorted = peers.to_vec();
-    sorted.sort();
-    sorted.join("\u{1}")
 }
 
 fn wall_now_ms() -> i64 {
@@ -1105,7 +1228,7 @@ mod tests {
         )
         .expect("ZoneManager");
         let zone = zm
-            .create_zone(contracts::CONTROL_ZONE_ID, vec![])
+            .create_zone(contracts::CONTROL_ZONE_ID)
             .expect("control zone");
         let node = zone.consensus_node();
         let handle = zone.runtime_handle();

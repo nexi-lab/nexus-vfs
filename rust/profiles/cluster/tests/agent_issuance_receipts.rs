@@ -106,7 +106,7 @@ async fn unsigned_winner_selected_der_and_all_crash_boundaries_survive_real_raft
     let runtime = tokio::runtime::Handle::current();
     let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
     let node = registry
-        .create_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .create_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     let kernel = Arc::new(Kernel::new());
@@ -264,13 +264,12 @@ async fn unsigned_winner_selected_der_and_all_crash_boundaries_survive_real_raft
     assert_eq!(before.len(), 6);
     drop(store);
     drop(kernel);
-    registry.shutdown_all();
+    registry.shutdown().released().await;
     drop(registry);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let restarted = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
     let node = restarted
-        .open_persisted_zone(contracts::CONTROL_ZONE_ID, vec![], &runtime)
+        .open_persisted_zone(contracts::CONTROL_ZONE_ID, &runtime)
         .unwrap();
     node.campaign().await.unwrap();
     // campaign replies before Ready applies the leader entry; Raft 0.7
@@ -332,5 +331,5 @@ async fn unsigned_winner_selected_der_and_all_crash_boundaries_survive_real_raft
         query_agent_issuance(&store, &CurrentAuthority, &after_sign.binding).unwrap(),
         AgentIssuanceState::Finalized { .. }
     ));
-    restarted.shutdown_all();
+    restarted.shutdown().released().await;
 }
