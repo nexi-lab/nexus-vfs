@@ -22,6 +22,7 @@ pub const CRL_MAXIMUM_AGE_SECS: u32 = 300;
 #[derive(Debug)]
 pub struct VerifiedCrl {
     authority: [u8; 32],
+    signed_der_sha256: [u8; 32],
     this_update: i64,
     next_update: i64,
     issuer_not_before: i64,
@@ -34,6 +35,10 @@ impl VerifiedCrl {
     pub fn authority(&self) -> &[u8; 32] {
         &self.authority
     }
+    /// Identity of the complete signed object, independent of PEM formatting.
+    pub fn signed_der_sha256(&self) -> &[u8; 32] {
+        &self.signed_der_sha256
+    }
     pub fn this_update(&self) -> i64 {
         self.this_update
     }
@@ -45,6 +50,33 @@ impl VerifiedCrl {
     }
     pub fn revoked_serials(&self) -> &[Vec<u8>] {
         &self.revoked
+    }
+
+    /// Validate a replacement against the last durably accepted signed CRL.
+    /// Identical signed bytes can be reconciled; a number belongs to exactly
+    /// one signed object. The store must call this against its current value
+    /// inside the same transaction that installs the successor and retains
+    /// revoked serials. Current issuer admission and freshness are separate.
+    pub fn check_successor(&self, previous: &Self) -> Result<(), String> {
+        if self.authority != previous.authority {
+            return Err("CRL successor belongs to another signing authority".into());
+        }
+        let number = unsigned(&self.number);
+        let previous_number = unsigned(&previous.number);
+        match number
+            .len()
+            .cmp(&previous_number.len())
+            .then_with(|| number.cmp(previous_number))
+        {
+            std::cmp::Ordering::Less => Err("CRL number moved backwards".into()),
+            std::cmp::Ordering::Equal if self.signed_der_sha256 != previous.signed_der_sha256 => {
+                Err("CRL number already identifies another signed snapshot".into())
+            }
+            _ if self.this_update < previous.this_update => {
+                Err("CRL issuance time moved backwards".into())
+            }
+            _ => Ok(()),
+        }
     }
     pub fn is_revoked(&self, serial: &[u8]) -> bool {
         self.revoked
@@ -194,6 +226,7 @@ pub fn verify_signed_crl(crl_pem: &[u8], ca_pem: &[u8]) -> Result<VerifiedCrl, S
     }
     Ok(VerifiedCrl {
         authority: Sha256::digest(ca.public_key().raw).into(),
+        signed_der_sha256: Sha256::digest(blocks[0].contents()).into(),
         this_update,
         next_update,
         number,
