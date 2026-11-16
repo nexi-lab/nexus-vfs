@@ -33,9 +33,14 @@ fn issuance_holds_the_existing_revocation_lock_through_the_callback() {
     let path = revoked_serials_path(dir.path());
     let principals = [b"caller".as_slice(), b"holder".as_slice()];
     let result: Result<(), String> = with_unrevoked_serials(&path, &principals, || {
+        let probe = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
         assert!(matches!(
-            SERIALS_WRITE_LOCK.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
         ));
         Err("original signing failure".into())
     });

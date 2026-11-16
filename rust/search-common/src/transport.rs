@@ -37,7 +37,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+pub use lib::transport_primitives::CredentialChannel;
+use lib::transport_primitives::{SharedTlsConfig, TlsConfig, TlsSnapshot};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// Runtime knobs a caller passes when building a
 /// [`PeerChannelCache`].  Every field has a documented default in
@@ -85,6 +87,11 @@ impl Default for PeerChannelConfig {
 /// of which variant fires.
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
+    #[error("local credentials for peer {target} are unavailable: {reason}")]
+    CredentialsUnavailable {
+        target: String,
+        reason: &'static str,
+    },
     #[error("TLS is required for peer {target}; use an https endpoint")]
     TlsRequired { target: String },
     #[error("connection handshake with peer {target} timed out")]
@@ -139,41 +146,37 @@ pub enum DialError {
 /// hashing to the same shard.  Same trade documented on the caller
 /// this abstraction replaces (`peer_fanout::PeerFanoutDispatcher`).
 pub struct PeerChannelCache {
-    channels: DashMap<Arc<str>, Channel>,
+    channels: DashMap<Arc<str>, CachedChannel>,
     config: PeerChannelConfig,
-    /// The client identity and its generation; a dial that began under an
-    /// older generation is used once but never cached.
-    tls: std::sync::RwLock<(u64, Option<ClientTlsConfig>)>,
+    credentials: SharedTlsConfig,
+}
+
+struct CachedChannel {
+    snapshot: TlsSnapshot,
+    channel: CredentialChannel,
 }
 
 impl PeerChannelCache {
     /// Build an empty cache under `config`.  No I/O runs here; the
     /// dial happens lazily on first [`Self::get_or_dial`].
     pub fn new(config: PeerChannelConfig) -> Self {
-        Self {
-            channels: DashMap::new(),
-            config,
-            tls: std::sync::RwLock::new((0, None)),
-        }
+        Self::with_credentials(config, SharedTlsConfig::default())
     }
 
     /// Share the daemon's verified cluster CA and node identity with outgoing
     /// RPCs. Requiring TLS prevents credentials from reaching plaintext peers.
-    pub fn with_tls(mut config: PeerChannelConfig, tls: ClientTlsConfig) -> Self {
+    pub fn with_tls(mut config: PeerChannelConfig, credentials: SharedTlsConfig) -> Self {
         config.require_tls = true;
+        Self::with_credentials(config, credentials)
+    }
+
+    /// Consume the daemon's credential source, including its withdrawal state.
+    pub fn with_credentials(config: PeerChannelConfig, credentials: SharedTlsConfig) -> Self {
         Self {
             channels: DashMap::new(),
             config,
-            tls: std::sync::RwLock::new((0, Some(tls))),
+            credentials,
         }
-    }
-
-    /// Present a renewed client identity from now on: cached channels are
-    /// dropped, so the next RPC to each target dials with `tls`.
-    pub fn install_tls(&self, tls: ClientTlsConfig) {
-        let mut current = self.tls.write().unwrap_or_else(|e| e.into_inner());
-        *current = (current.0.wrapping_add(1), Some(tls));
-        self.channels.clear();
     }
 
     /// The config this cache was built under.  Useful for a caller
@@ -188,23 +191,59 @@ impl PeerChannelCache {
     /// accepts — no scheme rewriting happens here (the caller
     /// controls TLS by choosing the URL scheme AND by setting
     /// [`PeerChannelConfig::require_tls`]).
-    pub async fn get_or_dial(&self, target: &str) -> Result<Channel, DialError> {
-        // Fast-path: shared read of the shard, clone the Arc-y
-        // Channel handle, done.  Held for the length of a hash +
-        // clone — no `.await` inside the shard lock.
+    pub async fn get_or_dial(&self, target: &str) -> Result<CredentialChannel, DialError> {
         let key: Arc<str> = Arc::from(target);
-        if let Some(c) = self.channels.get(&key) {
-            return Ok(c.clone());
-        }
-        // Slow-path: dial, then publish.  See the struct docstring's
-        // race posture note.
-        let (generation, tls) = self.tls.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let channel = self.dial(target, tls).await?;
-        let current = self.tls.read().unwrap_or_else(|e| e.into_inner());
-        if current.0 != generation {
+        let (snapshot, cached) = self.credentials.read(|snapshot| {
+            snapshot
+                .config()
+                .map_err(|reason| DialError::CredentialsUnavailable {
+                    target: target.into(),
+                    reason,
+                })?;
+            let cached = self.channels.get(&key).and_then(|entry| {
+                entry
+                    .snapshot
+                    .same_installation(snapshot)
+                    .then(|| entry.channel.clone())
+            });
+            Ok::<_, DialError>((snapshot.clone(), cached))
+        })?;
+        if let Some(channel) = cached {
             return Ok(channel);
         }
-        Ok(self.channels.entry(key).or_insert(channel).clone())
+        let tls = snapshot
+            .config()
+            .map_err(|reason| DialError::CredentialsUnavailable {
+                target: target.into(),
+                reason,
+            })?;
+        let channel = self.dial(target, tls).await?;
+        self.publish(key, snapshot, channel)
+    }
+
+    fn publish(
+        &self,
+        key: Arc<str>,
+        snapshot: TlsSnapshot,
+        channel: Channel,
+    ) -> Result<CredentialChannel, DialError> {
+        self.credentials
+            .with_current(&snapshot, || {
+                let channel =
+                    CredentialChannel::new(channel, self.credentials.clone(), snapshot.clone());
+                self.channels.insert(
+                    Arc::clone(&key),
+                    CachedChannel {
+                        snapshot: snapshot.clone(),
+                        channel: channel.clone(),
+                    },
+                );
+                channel
+            })
+            .ok_or_else(|| DialError::CredentialsUnavailable {
+                target: key.to_string(),
+                reason: "credential installation changed while connecting",
+            })
     }
 
     /// Build a Channel to `target` under the config's TLS +
@@ -213,8 +252,9 @@ impl PeerChannelCache {
     /// invalidation surface on this abstraction on purpose — tonic
     /// handles reconnection internally, so a cached dead Channel
     /// heals without a caller-visible signal).
-    async fn dial(&self, target: &str, tls: Option<ClientTlsConfig>) -> Result<Channel, DialError> {
-        if self.config.require_tls && !target.starts_with("https://") {
+    async fn dial(&self, target: &str, tls: Option<&TlsConfig>) -> Result<Channel, DialError> {
+        let require_tls = self.config.require_tls || tls.is_some();
+        if require_tls && !target.starts_with("https://") {
             return Err(DialError::TlsRequired {
                 target: target.into(),
             });
@@ -224,8 +264,7 @@ impl PeerChannelCache {
         // uses conservative host-extraction — a DNS name that
         // happens to resolve to a loopback address is NOT treated
         // as loopback, because we do no resolution here.
-        if !self.config.require_tls && !is_loopback_url(target) && !self.config.allow_insecure_peer
-        {
+        if !require_tls && !is_loopback_url(target) && !self.config.allow_insecure_peer {
             return Err(DialError::PlaintextOffLoopback {
                 target: target.to_string(),
             });
@@ -238,12 +277,20 @@ impl PeerChannelCache {
         endpoint = endpoint
             .connect_timeout(self.config.connect_timeout)
             .tcp_keepalive(Some(Duration::from_secs(30)));
-        if self.config.require_tls {
+        if require_tls {
             // `with_enabled_roots` opts into the platform trust
             // roots enabled at build time (webpki-roots on
             // tls-ring) — matches the outbound-client posture the
             // wider tonic 0.14 tree uses.
-            let tls_config = tls.unwrap_or_else(|| ClientTlsConfig::new().with_enabled_roots());
+            let tls_config = tls.map_or_else(
+                || ClientTlsConfig::new().with_enabled_roots(),
+                |tls| {
+                    ClientTlsConfig::new()
+                        .domain_name(TlsConfig::CLUSTER_SERVER_NAME)
+                        .ca_certificate(Certificate::from_pem(&tls.ca_pem))
+                        .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem))
+                },
+            );
             endpoint = endpoint
                 .tls_config(tls_config)
                 .map_err(|e| DialError::BadEndpoint {
@@ -299,9 +346,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn publication_and_cache_reuse_require_the_same_live_installation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use lib::transport_primitives::TlsPolicy;
+            let credentials = SharedTlsConfig::default();
+            let cache = PeerChannelCache::with_credentials(
+                PeerChannelConfig::default(),
+                credentials.clone(),
+            );
+            let target = "http://127.0.0.1:1";
+            let key: Arc<str> = Arc::from(target);
+            let original = credentials.snapshot();
+            let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+            cache
+                .publish(key.clone(), original.clone(), channel.clone())
+                .unwrap();
+            assert!(cache.get_or_dial(target).await.is_ok());
+            credentials.replace(TlsPolicy::Plaintext);
+            assert!(matches!(
+                cache.publish(key.clone(), original, channel.clone()),
+                Err(DialError::CredentialsUnavailable { .. })
+            ));
+            assert!(matches!(
+                cache.get_or_dial(target).await,
+                Err(DialError::ConnectFailed { .. })
+            ));
+            cache.publish(key, credentials.snapshot(), channel).unwrap();
+            assert!(cache.get_or_dial(target).await.is_ok());
+            credentials.replace(TlsPolicy::Rejected("revoked"));
+            assert!(matches!(
+                cache.get_or_dial(target).await,
+                Err(DialError::CredentialsUnavailable {
+                    reason: "revoked",
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
     fn tls_identity_refuses_plaintext_even_on_loopback() {
         let cache =
-            PeerChannelCache::with_tls(PeerChannelConfig::default(), ClientTlsConfig::new());
+            PeerChannelCache::with_tls(PeerChannelConfig::default(), SharedTlsConfig::default());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -326,7 +416,7 @@ mod tests {
                     connect_timeout: Duration::from_millis(100),
                     ..PeerChannelConfig::default()
                 },
-                ClientTlsConfig::new().domain_name("localhost"),
+                SharedTlsConfig::default(),
             );
             let target = format!("https://{}", listener.local_addr().unwrap());
             let error = tokio::time::timeout(Duration::from_secs(3), cache.get_or_dial(&target))

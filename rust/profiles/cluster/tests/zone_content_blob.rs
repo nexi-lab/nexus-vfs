@@ -279,6 +279,35 @@ async fn scoped_blob_rpc_cannot_use_a_known_hash_or_forged_pointer_to_read_other
         base: 0,
     }
     .key("conversation-alice-bob");
+    let bound_locator = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .read_key("agent-alice", &segment_hash)
+    .unwrap();
+    assert!(namespaces[0].read_blob(&bound_locator).is_err());
+    let bound = client
+        .read_zone_blob(request("agent-alice", &bound_locator))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(bound.error.is_empty());
+    assert_eq!(bound.content, segment_bytes);
+    let wrong_identity = ColdSegmentAddress {
+        stream_path: sealed_path,
+        base: 0,
+    }
+    .read_key("agent-alice", &private_hash)
+    .unwrap();
+    let refused = client
+        .read_zone_blob(request("agent-alice", &wrong_identity))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !refused.error.is_empty() && refused.content.is_empty(),
+        "specialized cold reads must retain the original committed object ID"
+    );
     assert_replica_membership_controls_content(
         &manager,
         &address,

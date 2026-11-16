@@ -7,6 +7,7 @@ use nexus_raft::{
     raft::ZoneRaftRegistry,
     transport::{
         generate_agent_cert, generate_node_cert, generate_session_agent_cert, generate_zone_ca,
+        TlsConfig,
     },
 };
 use std::time::Duration;
@@ -137,6 +138,8 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
         cert_pem: node_cert.clone(),
         key_pem: node_key.clone(),
     };
+    let native_tls = tls.clone();
+    let credentials = SharedTlsConfig::new(Some(tls.clone()));
     let runtime = tokio::runtime::Handle::current();
     let zones = Arc::new(ZoneRaftRegistry::new(private.path().join("raft"), 1));
     let node = zones
@@ -173,7 +176,14 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
             service_decl(
                 tls_dir.clone(),
                 true,
-                Some(NativeIssuer::from_tls(slot.clone(), &tls, runtime.clone()).unwrap()),
+                Some(
+                    NativeIssuer::from_shared_tls(
+                        slot.clone(),
+                        credentials.clone(),
+                        runtime.clone(),
+                    )
+                    .unwrap(),
+                ),
             )
             .unwrap(),
         ])
@@ -385,6 +395,15 @@ async fn actual_mtls_owner_uses_existing_issuer_and_recovers_applied_i_and_f_wit
             .count(),
         2
     );
+    live_tls::LiveTlsFixture {
+        slot: &slot,
+        credentials: &credentials,
+        tls: &native_tls,
+        tls_dir: &tls_dir,
+        store: &store,
+    }
+    .exercise_withdrawn_reply(&mut owner, &pid, op)
+    .await;
     drop((owner, other, admin, issued_agent));
     stop.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), serving)
@@ -405,8 +424,18 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
         cert_pem: agent,
         key_pem: key,
     };
-    assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
-    assert!(NativeIssuer::for_host(slot.clone(), &tls, runtime.handle().clone()).is_none());
+    assert!(NativeIssuer::from_shared_tls(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls.clone())),
+        runtime.handle().clone()
+    )
+    .is_err());
+    assert!(NativeIssuer::for_host(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls)),
+        runtime.handle().clone()
+    )
+    .is_none());
     let (foreign, foreign_key) = generate_zone_ca("foreign").unwrap();
     let (node, key) = generate_node_cert(9, "root", &foreign, &foreign_key, &[], None).unwrap();
     let tls = TlsConfig {
@@ -414,8 +443,18 @@ fn native_issuer_rejects_non_node_and_foreign_tls_selection_without_request_auth
         cert_pem: node,
         key_pem: key,
     };
-    assert!(NativeIssuer::from_tls(slot.clone(), &tls, runtime.handle().clone()).is_err());
-    assert!(NativeIssuer::for_host(slot, &tls, runtime.handle().clone()).is_none());
+    assert!(NativeIssuer::from_shared_tls(
+        slot.clone(),
+        SharedTlsConfig::new(Some(tls.clone())),
+        runtime.handle().clone()
+    )
+    .is_err());
+    assert!(NativeIssuer::for_host(
+        slot,
+        SharedTlsConfig::new(Some(tls)),
+        runtime.handle().clone()
+    )
+    .is_none());
 }
 
 #[test]
@@ -439,7 +478,7 @@ fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_fai
     };
     let native = NativeIssuer::for_host(
         nexus_raft::ca_issuer::new_ca_issuer_slot(),
-        &tls,
+        SharedTlsConfig::new(Some(tls)),
         runtime.handle().clone(),
     );
     assert!(
@@ -485,3 +524,5 @@ fn confined_runtime_keeps_preparation_without_node_issuing_authority_or_boot_fai
         json!(Sha256::digest(first_certificate_der(&issuer, "original issuer").unwrap()).to_vec())
     );
 }
+
+mod live_tls;
