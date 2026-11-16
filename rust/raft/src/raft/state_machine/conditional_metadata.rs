@@ -23,9 +23,11 @@ impl Command {
             return is_managed_key(key);
         }
         match self {
-            Self::PutControlState { namespace, .. }
-            | Self::DeleteControlState { namespace, .. } => {
-                namespace == NAMESPACE || namespace == super::crl_control::NAMESPACE
+            Self::PutControlState { namespace, key, .. }
+            | Self::DeleteControlState { namespace, key } => {
+                namespace == NAMESPACE
+                    || namespace == super::crl_control::NAMESPACE
+                    || crate::crl_records::is_crl_record(namespace, key)
             }
             _ => false,
         }

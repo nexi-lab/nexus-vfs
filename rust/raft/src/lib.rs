@@ -176,6 +176,7 @@ pub mod collaboration_store;
 /// Shared DRY layer under `auth_key_store` and the cross-org foreign-CA registry.
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod control_state_store;
+mod crl_records;
 #[cfg(all(feature = "grpc", has_protos))]
 pub mod distributed_coordinator;
 #[cfg(all(feature = "grpc", has_protos))]

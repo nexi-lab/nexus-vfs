@@ -22,7 +22,7 @@ use lib::transport_primitives::{
 };
 use sha2::{Digest, Sha256};
 
-const REVOKED: &[u8] = b"collaboration-certificate-revoked-v1";
+use crate::crl_records::{snapshot_key, REVOKED};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CrlStateError {
@@ -47,10 +47,6 @@ pub struct RaftCollaborationCrlStore {
     maximum_age_secs: u32,
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn now() -> Result<i64, String> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -60,15 +56,10 @@ fn now() -> Result<i64, String> {
         .map_err(|_| "clock overflow".into())
 }
 
-fn snapshot_key(authority: &[u8; 32]) -> String {
-    format!("crl-v1:{}", hex(authority))
-}
-
 fn revoked_key(authority: &[u8; 32], serial: &[u8]) -> Result<String, String> {
-    Ok(format!(
-        "certificate-revoked-v1:{}:{}",
-        hex(authority),
-        hex(canonical_certificate_serial(serial)?)
+    Ok(crate::crl_records::revoked_key(
+        authority,
+        canonical_certificate_serial(serial)?,
     ))
 }
 
