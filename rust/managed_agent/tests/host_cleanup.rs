@@ -41,8 +41,8 @@ impl SpawnHandle for Handle {
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
         self.endpoint.as_ref()
     }
-    fn durable_session_id(&self) -> Option<&str> {
-        Some("session-original-transcript")
+    fn durable_session_id(&self) -> Option<String> {
+        Some("session-original-transcript".to_owned())
     }
 }
 struct Provider(Arc<Body>);

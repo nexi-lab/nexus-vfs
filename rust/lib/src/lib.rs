@@ -30,9 +30,6 @@ pub mod types;
 #[cfg(feature = "file-storage")]
 pub mod file_durability;
 
-#[cfg(feature = "file-storage")]
-pub mod file_publication;
-
 #[cfg(feature = "redb-storage")]
 pub mod redb_storage;
 

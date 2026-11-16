@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use a2a::session::{SessionCodec, SessionEndpoint, SessionPayload, SessionSide};
 use kernel::kernel::syscall::KernelSyscall;
-use kernel::kernel::OperationContext;
+use kernel::kernel::{Kernel, OperationContext};
 use serde_json::json;
 
 #[path = "common/session_control.rs"]
