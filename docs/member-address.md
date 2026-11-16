@@ -123,9 +123,14 @@ traffic. It has two layers:
 | Registered | The state machine's member-address records; empty on a witness | Rebuilt at driver start, after a snapshot install, and after an applied batch that contains a member-address command or a ConfChange |
 | Observed | `sender_address` of authenticated inbound Raft messages, and the address of an admitted original registration | Memory only; an entry for an id is cleared when that id's registered record changes |
 
-`route(id)` returns the observed address, else the registered address. The
-local node is never a peer. Ordinary applied batches do not touch the map, and
-the send path reads it under one shared lock per batch of outgoing messages.
+`route(id)` returns the observed address, else the registered address, only for
+members in the driver's existing applied membership view. The same filter
+applies when enumerating routes. A delayed inbound message cannot restore a
+removed member's route. Both halves of a joint configuration, learners and
+witnesses remain eligible. An unconfigured joiner can reply before it receives
+its first ConfState; retained address hints become usable when membership
+admits their node. The local node is never a peer. The address cache does not
+hold a second membership list.
 
 ## Raft contract
 
