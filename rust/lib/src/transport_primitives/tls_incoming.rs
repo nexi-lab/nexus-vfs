@@ -56,6 +56,12 @@ impl<I: Send + 'static> Stream for Incoming<I> {
                 Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
                 Poll::Pending => return Poll::Pending,
             };
+            // `serve_with_incoming` ignores the builder's `tcp_nodelay`. Without
+            // it, each reply's later HTTP/2 frames wait for the peer's delayed
+            // ACK: about 40 ms on every call that answers in more than one write.
+            if let Err(error) = tcp.set_nodelay(true) {
+                tracing::warn!(%error, "accepted TLS connection keeps Nagle's algorithm");
+            }
             let Some((config, installation)) = (this.config)() else {
                 drop(tcp);
                 continue;
