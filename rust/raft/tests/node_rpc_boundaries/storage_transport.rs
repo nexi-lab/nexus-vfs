@@ -29,6 +29,7 @@ async fn versioned_step_retains_sender_identity_and_storage_activation_gates() {
         key_pem: server_key,
     })
     .await;
+    admit_root_learners_without_routes(&server.registry, &[2, 9]).await;
     let (cert, client_key) = generate_node_cert(2, "root", &ca, &key, &[], None).unwrap();
     let pool = RaftClientPool::with_config(ClientConfig {
         tls: lib::transport_primitives::SharedTlsConfig::new(Some(TlsConfig {
@@ -245,6 +246,7 @@ async fn versioned_client_never_falls_back_on_legacy_peer_or_reconnect() {
         .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
+    admit_root_learners_without_routes(&registry, &[2]).await;
     let server = RaftGrpcServer::new(
         registry.clone(),
         ServerConfig {

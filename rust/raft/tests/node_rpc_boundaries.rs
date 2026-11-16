@@ -69,6 +69,20 @@ async fn listener_ready(address: &str) {
     .expect("isolated listener must bind");
 }
 
+async fn admit_root_learners_without_routes(registry: &ZoneRaftRegistry, node_ids: &[u64]) {
+    let node = registry.get_node("root").unwrap();
+    for &node_id in node_ids {
+        node.propose_conf_change(
+            raft::eraftpb::ConfChangeType::AddLearnerNode,
+            node_id,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!registry.get_peers("root").unwrap().contains_key(&node_id));
+    }
+}
+
 struct PeerServer {
     _directory: tempfile::TempDir,
     registry: Arc<ZoneRaftRegistry>,
@@ -863,6 +877,9 @@ async fn agents_and_foreign_nodes_cannot_propose_or_step_but_local_nodes_can() {
         .create_zone("root", &tokio::runtime::Handle::current())
         .unwrap();
     node.campaign().await.unwrap();
+    // Include the forged sender and relayed origin so membership filtering
+    // cannot hide an incorrect identity check or address attribution.
+    admit_root_learners_without_routes(&registry, &[2, 3, 7]).await;
     let address = common::node_bind_addr();
     let server_tls = TlsConfig {
         ca_pem: ca.clone(),
