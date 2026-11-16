@@ -62,6 +62,11 @@ fn contents(path: &Path) -> Vec<(String, Vec<u8>)> {
     let state = FullStateMachine::new(&store).unwrap();
     let mut rows = state.list_control_state(NAMESPACE).unwrap();
     rows.extend(state.list_control_state("content-version-v1").unwrap());
+    rows.extend(
+        state
+            .list_control_state(contracts::constants::CONTROL_NS_COLLABORATION)
+            .unwrap(),
+    );
     rows.sort();
     rows
 }
@@ -111,20 +116,19 @@ fn populate(path: &Path, withdraw: bool) {
         ));
     }
     let node = runtime.0.get_zone("root").unwrap().consensus_node().clone();
-    let authority: String = ca_spki_sha256(&ca)
-        .unwrap()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let authority = ca_spki_sha256(&ca).unwrap();
     runtime
         .0
         .runtime_handle()
         .block_on(node.read_linearizable(move |state| {
             assert_eq!(
                 state
-                    .get_control_state(NAMESPACE, &format!("revoked:{authority}:8001"))
+                    .get_control_state(
+                        contracts::constants::CONTROL_NS_COLLABORATION,
+                        &crate::crl_records::revoked_key(&authority, &[0x80, 1])
+                    )
                     .unwrap(),
-                Some(b"revoked-v1".to_vec())
+                Some(crate::crl_records::REVOKED.to_vec())
             );
             assert_eq!(
                 state

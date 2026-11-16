@@ -18,6 +18,8 @@ fn durable_contents(path: &Path) -> (u64, Vec<(String, Vec<u8>)>) {
     let mut records = state.list_control_state("replica-binding").unwrap();
     records.extend(state.list_control_state("content-version-v1").unwrap());
     records.extend(state.list_control_state("signed-crl-v1").unwrap());
+    // The old reader inspects opaque records; it must not mutate current CRL bytes.
+    records.extend(state.list_control_state("collaboration").unwrap());
     records.sort();
     (state.last_applied_index(), records)
 }
