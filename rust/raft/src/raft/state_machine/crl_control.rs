@@ -60,6 +60,31 @@ impl FullStateMachine {
             .transpose()
     }
 
+    /// Once typed CRL storage is admitted, delayed generic commands cannot
+    /// replace its existing snapshot or erase any irreversible revoke marker.
+    pub(super) fn crl_owns_control_key_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        namespace: &str,
+        record: &str,
+    ) -> Result<bool> {
+        if !crate::crl_records::is_crl_record(namespace, record) {
+            return Ok(false);
+        }
+        let table = txn
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                self.control_state.name(),
+            ))
+            .map_err(storage_error)?;
+        let required = table
+            .get(super::storage_admission::requirement_key().as_slice())
+            .map_err(storage_error)?;
+        Ok(
+            StorageFormat::decode(required.as_ref().map(|value| value.value()))?
+                .is_some_and(|format| format >= StorageFormat::SignedCrl),
+        )
+    }
+
     pub(super) fn apply_crl_control(
         &self,
         txn: &redb::WriteTransaction,
@@ -227,8 +252,13 @@ fn transition(
             if let Err(error) = verified.check_freshness(*observed_unix_s, *maximum_age_secs) {
                 return refused(&error);
             }
-            let authority = hex(verified.authority());
-            let snapshot_key = key("snapshot", &authority);
+            // Keep the deployed collaboration namespace and record encoding.
+            // Earlier irreversible markers remain authoritative without copying
+            // them into a second writable store or enumerating a whole domain.
+            let snapshot_key = control_key(
+                contracts::constants::CONTROL_NS_COLLABORATION,
+                &crate::crl_records::snapshot_key(verified.authority()),
+            );
             if let Some(previous) = read(&snapshot_key)? {
                 let previous = verify_signed_crl(&previous, &ca_pem).map_err(storage_error)?;
                 if let Err(error) = verified.check_successor(&previous) {
@@ -238,13 +268,16 @@ fn transition(
             let mut writes = vec![(snapshot_key, crl_pem.clone())];
             for serial in verified.revoked_serials() {
                 let serial = canonical_certificate_serial(serial).map_err(storage_error)?;
-                let revoked_key = key("revoked", &format!("{authority}:{}", hex(serial)));
+                let revoked_key = control_key(
+                    contracts::constants::CONTROL_NS_COLLABORATION,
+                    &crate::crl_records::revoked_key(verified.authority(), serial),
+                );
                 match read(&revoked_key)? {
-                    Some(value) if value != b"revoked-v1" => {
+                    Some(value) if value != crate::crl_records::REVOKED => {
                         return Err(storage_error("invalid revocation marker"))
                     }
                     Some(_) => {}
-                    None => writes.push((revoked_key, b"revoked-v1".to_vec())),
+                    None => writes.push((revoked_key, crate::crl_records::REVOKED.to_vec())),
                 }
             }
             Ok((
@@ -257,11 +290,6 @@ fn transition(
             ))
         }
     }
-}
-
-#[cfg(all(feature = "grpc", has_protos))]
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(all(test, feature = "grpc", has_protos))]

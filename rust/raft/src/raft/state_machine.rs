@@ -2367,7 +2367,9 @@ impl FullStateMachine {
                 if_absent,
             } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if owned_control_namespace(namespace) {
+                if owned_control_namespace(namespace)
+                    || self.crl_owns_control_key_in_txn(txn, namespace, key)?
+                {
                     return Ok(CommandResult::Error(
                         "control state is owned by its typed apply primitive".into(),
                     ));
@@ -2399,7 +2401,9 @@ impl FullStateMachine {
 
             Command::DeleteControlState { namespace, key } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if owned_control_namespace(namespace) {
+                if owned_control_namespace(namespace)
+                    || self.crl_owns_control_key_in_txn(txn, namespace, key)?
+                {
                     return Ok(CommandResult::Error(
                         "control state is owned by its typed apply primitive".into(),
                     ));

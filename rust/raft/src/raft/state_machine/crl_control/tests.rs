@@ -7,6 +7,24 @@ use crate::{
 };
 use lib::transport_primitives::{ca_spki_sha256, verify_signed_crl, ForeignCaAnchor};
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn snapshot_key(authority: &str) -> Vec<u8> {
+    control_key(
+        contracts::constants::CONTROL_NS_COLLABORATION,
+        &format!("crl-v1:{authority}"),
+    )
+}
+
+fn revoked_key(authority: &str, serial: &str) -> Vec<u8> {
+    control_key(
+        contracts::constants::CONTROL_NS_COLLABORATION,
+        &format!("certificate-revoked-v1:{authority}:{serial}"),
+    )
+}
+
 fn request(operation: &str, change: CrlControlChange) -> CrlControlRequest {
     CrlControlRequest {
         operation_id: operation.into(),
@@ -140,18 +158,15 @@ fn abort_leaves_no_snapshot_revocations_receipt_floor_or_applied_index() {
     ));
     let authority = hex(&ca_spki_sha256(&ca).unwrap());
     assert_eq!(
-        state
-            .control_state
-            .get(&key("snapshot", &authority))
-            .unwrap(),
+        state.control_state.get(&snapshot_key(&authority)).unwrap(),
         Some(crl)
     );
     assert_eq!(
         state
             .control_state
-            .get(&key("revoked", &format!("{authority}:8001")))
+            .get(&revoked_key(&authority, "8001"))
             .unwrap(),
-        Some(b"revoked-v1".to_vec())
+        Some(crate::crl_records::REVOKED.to_vec())
     );
     assert!(state
         .control_state
@@ -188,15 +203,12 @@ fn late_lower_and_conflicting_equal_numbers_cannot_replace_committed_snapshot() 
     );
     let authority = hex(&ca_spki_sha256(&ca).unwrap());
     assert_eq!(
-        state
-            .control_state
-            .get(&key("snapshot", &authority))
-            .unwrap(),
+        state.control_state.get(&snapshot_key(&authority)).unwrap(),
         Some(current.clone())
     );
     assert!(state
         .control_state
-        .get(&key("revoked", &format!("{authority}:09")))
+        .get(&revoked_key(&authority, "09"))
         .unwrap()
         .is_none());
     assert_eq!(apply(&mut state, &winner), original_outcome);
@@ -252,7 +264,7 @@ fn pruning_restart_and_snapshot_keep_revocations_and_order_floor() {
     let authority = hex(&ca_spki_sha256(&ca).unwrap());
     assert!(state
         .control_state
-        .get(&key("revoked", &format!("{authority}:8001")))
+        .get(&revoked_key(&authority, "8001"))
         .unwrap()
         .is_some());
     refused(
@@ -380,5 +392,198 @@ fn untyped_and_eventual_writers_cannot_modify_signed_crl_state() {
     assert_eq!(
         state.control_state.get(&key("issuer", "local")).unwrap(),
         original_bytes
+    );
+}
+
+#[test]
+fn typed_adoption_preserves_existing_records_and_fences_delayed_writers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adopted.redb");
+    let db = RedbStore::open(&path).unwrap();
+    let mut state = FullStateMachine::new(&db).unwrap();
+    let (ca, signer) = generate_zone_ca("existing").unwrap();
+    let authority = hex(&ca_spki_sha256(&ca).unwrap());
+    let old_crl = generate_crl(&[], 4, &ca, &signer).unwrap();
+    let snapshot_name = format!("crl-v1:{authority}");
+    let marker_name = format!("certificate-revoked-v1:{authority}:8001");
+    let put = |record: &str, bytes: &[u8], if_absent| Command::PutControlState {
+        namespace: contracts::constants::CONTROL_NS_COLLABORATION.into(),
+        key: record.into(),
+        value: bytes.into(),
+        if_absent,
+    };
+    // Stage actual previously deployed records, including a revoke already
+    // pruned from the signed snapshot. No typed command exists yet.
+    for command in [
+        put(&snapshot_name, &old_crl, false),
+        put(&marker_name, crate::crl_records::REVOKED, true),
+    ] {
+        assert!(matches!(
+            state
+                .apply(state.last_applied_index() + 1, &command)
+                .unwrap(),
+            CommandResult::Success
+        ));
+    }
+    let original_records = state
+        .list_control_state(contracts::constants::CONTROL_NS_COLLABORATION)
+        .unwrap();
+    // An aborted admission must neither move records nor fence the old store.
+    let txn = state.control_state.raw_db().begin_write().unwrap();
+    state
+        .apply_crl_control(&txn, &local("abort", None, Some(&ca)))
+        .unwrap();
+    txn.abort().unwrap();
+    assert!(matches!(
+        state
+            .apply(
+                state.last_applied_index() + 1,
+                &put("ordinary", b"before", false)
+            )
+            .unwrap(),
+        CommandResult::Success
+    ));
+    assert!(matches!(
+        state
+            .apply(
+                state.last_applied_index() + 1,
+                &put(&snapshot_name, &old_crl, false)
+            )
+            .unwrap(),
+        CommandResult::Success
+    ));
+    enrolled(&mut state, &ca);
+    // The first typed publication respects the EXISTING sequence and marker.
+    let lower = generate_crl(&[], 3, &ca, &signer).unwrap();
+    refused(
+        apply(&mut state, &install("lower-existing", 1, &lower, &ca)),
+        "number",
+    );
+    let next = generate_crl(&[], 5, &ca, &signer).unwrap();
+    assert!(matches!(
+        apply(&mut state, &install("next", 1, &next, &ca)),
+        CrlControlOutcome::Installed { .. }
+    ));
+    for command in [
+        put(&snapshot_name, &old_crl, false),
+        put(&marker_name, b"cleared", false),
+        put(
+            &format!("certificate-revoked-v1:{authority}:02"),
+            b"forged",
+            true,
+        ),
+        Command::DeleteControlState {
+            namespace: contracts::constants::CONTROL_NS_COLLABORATION.into(),
+            key: marker_name.clone(),
+        },
+        Command::DeleteControlState {
+            namespace: contracts::constants::CONTROL_NS_COLLABORATION.into(),
+            key: snapshot_name.clone(),
+        },
+    ] {
+        let before = state.snapshot().unwrap();
+        assert!(state.apply_local(&command).is_err());
+        assert_snapshots_equal(&state.snapshot().unwrap(), &before);
+        assert!(
+            matches!(
+                state
+                    .apply(state.last_applied_index() + 1, &command)
+                    .unwrap(),
+                CommandResult::Error(_)
+            ),
+            "delayed generic CRL writer must refuse"
+        );
+        let after: super::super::Snapshot =
+            bincode::deserialize(&state.snapshot().unwrap()).unwrap();
+        let before: super::super::Snapshot = bincode::deserialize(&before).unwrap();
+        assert_eq!(after.control_state, before.control_state);
+    }
+    assert!(matches!(
+        state
+            .apply(
+                state.last_applied_index() + 1,
+                &put("ordinary", b"after", false)
+            )
+            .unwrap(),
+        CommandResult::Success
+    ));
+    assert!(matches!(
+        state
+            .apply(
+                state.last_applied_index() + 1,
+                &Command::DeleteControlState {
+                    namespace: contracts::constants::CONTROL_NS_COLLABORATION.into(),
+                    key: "ordinary".into()
+                }
+            )
+            .unwrap(),
+        CommandResult::Success
+    ));
+    let expected = state.snapshot().unwrap();
+    assert_eq!(
+        state
+            .get_control_state(contracts::constants::CONTROL_NS_COLLABORATION, &marker_name)
+            .unwrap(),
+        Some(crate::crl_records::REVOKED.to_vec())
+    );
+    assert_eq!(
+        state
+            .get_control_state(
+                contracts::constants::CONTROL_NS_COLLABORATION,
+                &snapshot_name
+            )
+            .unwrap(),
+        Some(next.clone())
+    );
+    assert_eq!(
+        state
+            .list_control_state(contracts::constants::CONTROL_NS_COLLABORATION)
+            .unwrap()
+            .len(),
+        original_records.len()
+    );
+    assert!(
+        state
+            .list_control_state(NAMESPACE)
+            .unwrap()
+            .iter()
+            .all(|(key, _)| !key.starts_with("snapshot:") && !key.starts_with("revoked:")),
+        "one canonical snapshot and revoke namespace"
+    );
+    drop(state);
+    drop(db);
+    let db = RedbStore::open(&path).unwrap();
+    let mut reopened = FullStateMachine::new(&db).unwrap();
+    assert_snapshots_equal(&reopened.snapshot().unwrap(), &expected);
+    assert!(matches!(
+        reopened
+            .apply(
+                reopened.last_applied_index() + 1,
+                &put(&snapshot_name, &old_crl, false)
+            )
+            .unwrap(),
+        CommandResult::Error(_)
+    ));
+    let copy_db = RedbStore::open_temporary().unwrap();
+    let mut restored = FullStateMachine::new(&copy_db).unwrap();
+    restored.restore_snapshot(&expected).unwrap();
+    assert_snapshots_equal(&restored.snapshot().unwrap(), &expected);
+    assert!(matches!(
+        restored
+            .apply(
+                restored.last_applied_index() + 1,
+                &Command::DeleteControlState {
+                    namespace: contracts::constants::CONTROL_NS_COLLABORATION.into(),
+                    key: marker_name.clone()
+                }
+            )
+            .unwrap(),
+        CommandResult::Error(_)
+    ));
+    assert_eq!(
+        restored
+            .get_control_state(contracts::constants::CONTROL_NS_COLLABORATION, &marker_name)
+            .unwrap(),
+        Some(crate::crl_records::REVOKED.to_vec())
     );
 }
