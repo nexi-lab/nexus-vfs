@@ -11,13 +11,44 @@ use kernel::{Permission, PermissionProvider};
 use std::sync::Arc;
 use transport::grpc::DataPlaneReady;
 
+/// Mandatory relationship enforcement supplied only by authenticated cluster
+/// composition. This checks the original caller, not the service's privileges.
+/// It does not establish a durable Session/storage association.
+#[cfg(feature = "rebac")]
+pub struct CurrentResourceGrants {
+    relationships: Arc<nexus_rebac::RebacPermissionProvider>,
+}
+
+#[cfg(feature = "rebac")]
+impl CurrentResourceGrants {
+    /// Run off the async executor: the tuple store awaits an actual ReadIndex.
+    /// Retain the same captured route/storage through the operation. A successful
+    /// check must not be cached as authority for a later action or another route.
+    pub fn check(
+        &self,
+        path: &str,
+        route: &RouteResult,
+        permission: Permission,
+        ctx: &OperationContext,
+    ) -> Result<(), KernelError> {
+        a2a::foreign_containment::ForeignAgentMailboxOnly.check(
+            path,
+            Some(route),
+            permission,
+            ctx,
+        )?;
+        self.relationships
+            .check_current_grants(path, route, permission, ctx)
+    }
+}
+
 /// The cluster's single permission slot enforces both policies, in order.
 /// Foreign containment bounds trust-domain authority even when relationships grant access.
 struct ClusterPermissionProvider {
     #[cfg(feature = "rebac")]
     router: Arc<VFSRouter>,
     #[cfg(feature = "rebac")]
-    relationships: Option<nexus_rebac::RebacPermissionProvider>,
+    relationships: Option<Arc<nexus_rebac::RebacPermissionProvider>>,
 }
 
 impl PermissionProvider for ClusterPermissionProvider {
@@ -72,7 +103,7 @@ pub(super) fn validate(common: &CommonArgs) -> Result<()> {
 
 pub(super) fn service_decls(
     common: &CommonArgs,
-    _ctx: &ServiceBootCtx,
+    _ctx: &mut ServiceBootCtx,
     _zm: &nexus_raft::ZoneManager,
     _ready: Arc<DataPlaneReady>,
 ) -> Result<Vec<ServiceDecl>> {
@@ -90,10 +121,22 @@ pub(super) fn service_decls(
     };
     #[cfg(feature = "rebac")]
     let relationships = store.as_ref().map(|store| {
-        nexus_rebac::RebacPermissionProvider::new(Arc::new(nexus_rebac::ReBACGraphCache::new(
-            Arc::clone(store),
+        Arc::new(nexus_rebac::RebacPermissionProvider::new(Arc::new(
+            nexus_rebac::ReBACGraphCache::new(Arc::clone(store)),
         )))
     });
+    #[cfg(feature = "rebac")]
+    {
+        _ctx.current_resource_grants = if _ctx.auth_armed {
+            relationships.as_ref().map(|relationships| {
+                Arc::new(CurrentResourceGrants {
+                    relationships: Arc::clone(relationships),
+                })
+            })
+        } else {
+            None
+        };
+    }
     let services = vec![ServiceDecl {
         name: "authorization".into(),
         install: Box::new(move |kernel| {
@@ -171,6 +214,42 @@ pub(super) fn service_decls(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(feature = "rebac")]
+    #[test]
+    fn boot_without_relationship_enforcement_exposes_no_current_grant_provider() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let zm = {
+            let _entered = runtime.enter();
+            nexus_raft::ZoneManager::new(
+                "authorization-test",
+                data.path().to_str().unwrap(),
+                Vec::new(),
+                "127.0.0.1:0",
+                None,
+            )
+            .unwrap()
+        };
+        let mut common = crate::Args::try_parse_from(["nexusd-cluster"])
+            .unwrap()
+            .common;
+        common.enable_rebac = false;
+        common.http_addr = None;
+        for auth_armed in [false, true] {
+            let mut ctx = ServiceBootCtx {
+                auth_armed,
+                auth: Arc::new(transport::auth::NoAuth),
+                runtime: runtime.handle().clone(),
+                credential_plane: None,
+                current_resource_grants: None,
+            };
+            let declarations =
+                service_decls(&common, &mut ctx, &zm, DataPlaneReady::pending()).unwrap();
+            assert_eq!(declarations.len(), 1);
+            assert!(ctx.current_resource_grants.is_none());
+        }
+    }
 
     #[test]
     fn open_posture_bypasses_collaboration_namespace_reservation() {

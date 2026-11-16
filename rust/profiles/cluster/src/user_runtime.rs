@@ -367,6 +367,8 @@ pub(super) async fn serve(
         auth: Arc::clone(&auth),
         runtime: tokio::runtime::Handle::current(),
         credential_plane: None,
+        #[cfg(feature = "rebac")]
+        current_resource_grants: None,
     };
     kernel
         .bring_up_services(build_decls(&ctx))
