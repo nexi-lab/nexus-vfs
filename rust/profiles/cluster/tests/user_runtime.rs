@@ -543,6 +543,17 @@ async fn required_durable_backend_obeys_build_and_platform_at_startup() {
 #[cfg(feature = "driver-ai")]
 #[tokio::test]
 async fn local_backend_configuration_serves_model_requests_without_granting_mount_authority() {
+    model_backend_survives_restart(false).await;
+}
+
+#[cfg(feature = "driver-ai")]
+#[tokio::test]
+async fn replica_backend_configuration_serves_model_requests_without_granting_mount_authority() {
+    model_backend_survives_restart(true).await;
+}
+
+#[cfg(feature = "driver-ai")]
+async fn model_backend_survives_restart(is_replica: bool) {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -590,8 +601,19 @@ async fn local_backend_configuration_serves_model_requests_without_granting_moun
     });
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
-    let (server_cert, server_key) =
-        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let (server_cert, server_key) = if is_replica {
+        nexus_raft::transport::generate_user_replica_cert(
+            "runtime-alice",
+            "alice",
+            31,
+            300,
+            &ca,
+            &ca_key,
+        )
+        .unwrap()
+    } else {
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap()
+    };
     let credential = root.path().join("credential");
     bundle(
         &credential,
@@ -618,23 +640,23 @@ async fn local_backend_configuration_serves_model_requests_without_granting_moun
         "backend_params": {"base_url": provider_url, "blob_root": data.join("model-blobs"), "api_key": key}
     }]})).unwrap()).unwrap();
     let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let seed = format!("127.0.0.1:{}", free_port());
+    let mut arguments = vec!["--data-dir", data.to_str().unwrap(), "--bind-addr", &bind];
+    if is_replica {
+        arguments.extend(["--advertise-addr", &bind, "--peers", &seed]);
+    }
+    arguments.extend([
+        "serve-user",
+        "--owner",
+        "alice",
+        "--credential",
+        credential.to_str().unwrap(),
+        "--backend-config",
+        config.to_str().unwrap(),
+    ]);
     for (index, reply) in ["MODEL-FIRST", "MODEL-AFTER-RESTART"].iter().enumerate() {
-        let mut daemon = Daemon::spawn(
-            &[
-                "--data-dir",
-                data.to_str().unwrap(),
-                "--bind-addr",
-                &format!("127.0.0.1:{port}"),
-                "serve-user",
-                "--owner",
-                "alice",
-                "--credential",
-                credential.to_str().unwrap(),
-                "--backend-config",
-                config.to_str().unwrap(),
-            ],
-            &[("RUST_LOG", LOG_FILTER)],
-        );
+        let mut daemon = Daemon::spawn(&arguments, &[("RUST_LOG", LOG_FILTER)]);
         daemon
             .wait_for_log("confined user runtime ready", BUDGET)
             .await
