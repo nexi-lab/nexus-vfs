@@ -1065,8 +1065,22 @@ async fn failed_replica_removal_preserves_the_existing_route_map() {
     let manager = node(41, directory.path(), &address).unwrap();
     found(&manager, AGENT_ZONE).await;
     let registry = manager.registry();
+    registry
+        .get_node(AGENT_ZONE)
+        .unwrap()
+        .propose_conf_change(
+            raft::eraftpb::ConfChangeType::AddLearnerNode,
+            42,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
     let endpoint = "http://127.0.0.1:2526";
     assert!(registry.learn_peer_address(AGENT_ZONE, 42, endpoint));
+    assert_eq!(
+        registry.get_peers(AGENT_ZONE).unwrap()[&42].endpoint,
+        endpoint
+    );
     let blocker = directory.path().join(AGENT_ZONE).join(".removed");
     std::fs::create_dir(&blocker).unwrap();
     let removal = registry.remove_zone(AGENT_ZONE).await;

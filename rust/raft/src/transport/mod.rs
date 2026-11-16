@@ -602,11 +602,15 @@ pub(crate) fn observe_sender(
 ///
 /// [`Self::route`] prefers the observation, then the record. Self is never a
 /// peer: this type owns `self_id` and both writers drop a self-entry.
+/// A bound driver supplies its existing applied membership view. Observations
+/// remain routing hints and cannot make a removed member routable again.
 #[derive(Debug)]
 pub struct PeerMap {
     self_id: u64,
     registered: std::collections::HashMap<u64, NodeAddress>,
     observed: std::collections::HashMap<u64, NodeAddress>,
+    #[cfg(all(feature = "grpc", has_protos))]
+    membership: Option<std::sync::Arc<parking_lot::RwLock<crate::raft::MembershipSnapshot>>>,
 }
 
 impl PeerMap {
@@ -616,18 +620,33 @@ impl PeerMap {
             self_id,
             registered: std::collections::HashMap::new(),
             observed: std::collections::HashMap::new(),
+            #[cfg(all(feature = "grpc", has_protos))]
+            membership: None,
         }
     }
 
     /// The dial address for `id`: its observation, else its record.
     #[inline]
     pub fn route(&self, id: u64) -> Option<&NodeAddress> {
+        #[cfg(all(feature = "grpc", has_protos))]
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|view| !view.read().permits_route(id))
+        {
+            return None;
+        }
+        self.cached_route(id)
+    }
+
+    fn cached_route(&self, id: u64) -> Option<&NodeAddress> {
         self.observed.get(&id).or_else(|| self.registered.get(&id))
     }
 
     /// Every routed peer once, as `(id, route)`.
     pub fn routes(&self) -> impl Iterator<Item = (u64, &NodeAddress)> {
-        self.observed
+        let routes = self
+            .observed
             .iter()
             .map(|(id, address)| (*id, address))
             .chain(
@@ -635,12 +654,22 @@ impl PeerMap {
                     .iter()
                     .filter(|(id, _)| !self.observed.contains_key(id))
                     .map(|(id, address)| (*id, address)),
-            )
+            );
+        #[cfg(all(feature = "grpc", has_protos))]
+        let routes = {
+            let membership = self.membership.as_ref().map(|view| view.read());
+            routes.filter(move |(id, _)| {
+                membership
+                    .as_ref()
+                    .is_none_or(|view| view.permits_route(*id))
+            })
+        };
+        routes
     }
 
     /// Whether no peer is routed.
     pub fn is_empty(&self) -> bool {
-        self.observed.is_empty() && self.registered.is_empty()
+        self.routes().next().is_none()
     }
 
     /// Number of routed peers.
@@ -653,6 +682,15 @@ impl PeerMap {
         self.routes()
             .map(|(id, address)| (id, address.clone()))
             .collect()
+    }
+
+    /// Bind the driver's existing read view; do not copy membership into routes.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn set_membership_view(
+        &mut self,
+        membership: std::sync::Arc<parking_lot::RwLock<crate::raft::MembershipSnapshot>>,
+    ) {
+        self.membership = Some(membership);
     }
 
     /// Replace the registered layer with `records` — the zone driver's only
@@ -683,7 +721,7 @@ impl PeerMap {
     pub fn observe(&mut self, id: u64, address: NodeAddress) -> bool {
         if id == self.self_id
             || self
-                .route(id)
+                .cached_route(id)
                 .is_some_and(|route| route.endpoint == address.endpoint)
         {
             return false;

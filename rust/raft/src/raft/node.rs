@@ -307,11 +307,22 @@ impl LeaderContact {
 }
 
 /// Ephemeral read view published by the Raft driver from its ProgressTracker.
-#[derive(Default)]
-struct MembershipSnapshot {
+#[derive(Debug, Default)]
+pub(crate) struct MembershipSnapshot {
     voters: Vec<u64>,
     #[cfg(all(feature = "grpc", has_protos))]
     members: Vec<u64>,
+    #[cfg(all(feature = "grpc", has_protos))]
+    initialized: bool,
+}
+
+impl MembershipSnapshot {
+    /// An unconfigured joiner must reply before receiving its first ConfState.
+    /// Once configured, an address observation cannot confer membership.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn permits_route(&self, id: u64) -> bool {
+        !self.initialized || self.members.binary_search(&id).is_ok()
+    }
 }
 
 impl Membership {
@@ -2166,6 +2177,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// the transport loop starts.
     #[cfg(all(feature = "grpc", has_protos))]
     pub fn set_peer_map(&mut self, peer_map: SharedPeerMap, dial_uses_tls: bool) {
+        peer_map
+            .write()
+            .unwrap()
+            .set_membership_view(self.cached_membership.clone());
         self.peer_map = Some(peer_map);
         self.dial_uses_tls = dial_uses_tls;
     }
@@ -3299,6 +3314,8 @@ fn refresh_cached_status_from_raw_node(
     *membership.write() = MembershipSnapshot {
         voters: voter_ids_from_raw_node(raw_node),
         #[cfg(all(feature = "grpc", has_protos))]
+        initialized: !members.is_empty() || raw_node.raft.raft_log.applied > 0,
+        #[cfg(all(feature = "grpc", has_protos))]
         members,
     };
 }
@@ -3455,6 +3472,9 @@ impl ZoneConsensus<super::state_machine::FullStateMachine> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "grpc", has_protos))]
+    mod peer_routes;
+
     use super::*;
     use crate::raft::state_machine::{FullStateMachine, WitnessStateMachine};
     use crate::storage::RedbStore;

@@ -74,7 +74,11 @@ jobs:
       - name: Confined owner zone operations
         run: cargo test --locked -p transport --test user_zone_runtime -- --test-threads=1
       - name: Owner zone routes on the real daemon across restart
-        run: cargo test --locked -p nexus-cluster --test user_runtime owner_zone_runtime_preserves_scope_and_original_journal_across_restart -- --exact
+        run: cargo test --locked -p nexus-cluster --features driver-ai --test user_runtime
+      - name: Applied membership routes and delayed sender observations
+        run: |
+          cargo test --locked -p raft@0.1.0 --lib raft::node::tests::peer_routes
+          cargo test --locked -p raft@0.1.0 --test test_member_address_ssot
       - name: Durable replica allocation authority
         run: |
           cargo test --locked -p raft@0.1.0 --lib raft::node::storage_submission_tests

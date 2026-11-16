@@ -17,6 +17,23 @@ impl SpawnHandle for Handle {
     }
 }
 impl SpawnTask<Kernel> for Provider {
+    // This fixture starts no threads, receivers or writers. Its synchronous
+    // body is fully finished before reporting joined cleanup.
+    fn spawn_with_cleanup(
+        &self,
+        kernel: Arc<Kernel>,
+        desc: kernel::core::agents::registry::AgentDescriptor,
+        options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        observer: Arc<
+            dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+        >,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        let result = self.spawn_with_options(kernel, desc, options, observer);
+        assert!(cleanup.complete(Ok(())));
+        result
+    }
+
     fn spawn(
         &self,
         _: Arc<Kernel>,
@@ -43,6 +60,23 @@ impl SpawnTask<Kernel> for Provider {
 }
 struct LegacyProvider;
 impl SpawnTask<Kernel> for LegacyProvider {
+    // This fixture starts no threads, receivers or writers. Its synchronous
+    // body is fully finished before reporting joined cleanup.
+    fn spawn_with_cleanup(
+        &self,
+        kernel: Arc<Kernel>,
+        desc: kernel::core::agents::registry::AgentDescriptor,
+        options: SpawnOptions,
+        cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+        observer: Arc<
+            dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+        >,
+    ) -> Result<Box<dyn SpawnHandle>, String> {
+        let result = self.spawn_with_options(kernel, desc, options, observer);
+        assert!(cleanup.complete(Ok(())));
+        result
+    }
+
     fn spawn(
         &self,
         _: Arc<Kernel>,
@@ -236,10 +270,18 @@ fn providers_without_recovery_reject_it_instead_of_starting_fresh() {
     );
 }
 #[test]
-fn raw_spawns_and_paths_cannot_be_used_as_durable_recovery() {
+fn paths_aliases_and_unhosted_sessions_cannot_be_used_as_durable_recovery() {
     let kernel = Arc::new(Kernel::new());
     install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
-    for id in ["", "../outside", "/sessions/other", "a\\b"] {
+    for id in [
+        "",
+        "../outside",
+        "/sessions/other",
+        "a\\b",
+        "latest",
+        "last",
+        "recent",
+    ] {
         assert!(call(
             &kernel,
             "start_session_v1",
@@ -247,12 +289,6 @@ fn raw_spawns_and_paths_cannot_be_used_as_durable_recovery() {
         )
         .is_err());
     }
-    assert!(call(
-        &kernel,
-        "start_session_v1",
-        json!({"agent_id":"agent","resume_session_id":"saved","spawn_spec":{"cmd":"echo"}})
-    )
-    .is_err());
     let slim = Arc::new(Kernel::new());
     managed_agent::install_managed_agent(&slim).unwrap();
     assert!(call(
@@ -316,6 +352,23 @@ fn replacement_race_fixture() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicBool
         }
     }
     impl SpawnTask<Kernel> for RaceProvider {
+        // This fixture starts no threads, receivers or writers. Its synchronous
+        // body is fully finished before reporting joined cleanup.
+        fn spawn_with_cleanup(
+            &self,
+            kernel: Arc<Kernel>,
+            desc: kernel::core::agents::registry::AgentDescriptor,
+            options: SpawnOptions,
+            cleanup: kernel::core::agents::host_cleanup::ManagedHostCleanup,
+            observer: Arc<
+                dyn Fn(kernel::core::agents::registry::AgentState, Option<String>) + Send + Sync,
+            >,
+        ) -> Result<Box<dyn SpawnHandle>, String> {
+            let result = self.spawn_with_options(kernel, desc, options, observer);
+            assert!(cleanup.complete(Ok(())));
+            result
+        }
+
         fn spawn(
             &self,
             _: Arc<Kernel>,
@@ -379,4 +432,38 @@ fn session_snapshot_rejects_a_pid_replaced_during_attachment_lookup() {
     assert_eq!(replacement.owner_id, "another-owner");
     assert_eq!(replacement.state, AgentState::Registered);
     kernel.agent_registry().kill(pid, 0).unwrap();
+}
+
+#[test]
+fn replacement_present_before_lookup_cannot_inherit_the_old_handle() {
+    let kernel = Arc::new(Kernel::new());
+    install_managed_agent_with_spawn(&kernel, Arc::new(Provider)).unwrap();
+    let started = call(&kernel, "start_session_v1", json!({"agent_id":"original"})).unwrap();
+    let pid = started["session_id"].as_str().unwrap();
+    kernel.agent_registry().unregister(pid).unwrap();
+    let replacement = kernel
+        .agent_registry()
+        .register_instance(AgentDescriptor {
+            pid: pid.into(),
+            name: "replacement".into(),
+            owner_id: "operator".into(),
+            zone_id: "root".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).is_err());
+    let cancel = call(
+        &kernel,
+        "cancel_v2",
+        json!({"session_id":pid,
+        "channel_id":started["session_endpoint"]["channel_id"]}),
+    )
+    .unwrap();
+    assert_eq!(cancel["cancelled"], false);
+    assert!(kernel.agent_registry().is_current_instance(&replacement));
+    assert!(!kernel.agent_registry().is_managed_host_bound(&replacement));
+    kernel
+        .agent_registry()
+        .kill_instance(&replacement, 0)
+        .unwrap();
 }

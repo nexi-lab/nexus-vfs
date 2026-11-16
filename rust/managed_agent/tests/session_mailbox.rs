@@ -139,8 +139,14 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
         let initialized = receive(&kernel, &endpoint, &mut codec, &mut offset);
         assert_eq!(initialized["id"], 0, "initialize response: {initialized}");
         assert_eq!(initialized["result"]["_meta"]["nativePid"], native, "PID must be the actual Python process, not the broker");
+        let unbound = call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap();
+        assert!(unbound.get("durable_session_id").is_none());
+        assert_eq!(unbound["state"], "warming_up");
         send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":"/"}}));
         assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["result"]["sessionId"], "durable-fixture-session");
+        assert_eq!(call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap()["durable_session_id"], "durable-fixture-session");
+        let (instance, _) = kernel.agent_registry().get_instance(pid).unwrap();
+        assert!(kernel.agent_registry().is_managed_host_bound(&instance));
         for (turn, cancelled) in [("first", true), ("second", false)] {
             let prompt = send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":turn,"method":"session/prompt","params":{"sessionId":"durable-fixture-session","prompt":[{"type":"text","text":"edit"}]}}));
             // An uncertain append may be retried with identical bytes. It must
@@ -173,6 +179,111 @@ async fn subprocess_streams_approvals_and_accepts_cancel_without_public_fd_strea
             assert!(Instant::now() < deadline, "stdout EOF must close and reap a still-running child");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }).await.unwrap();
+}
+
+fn wait_for_close(
+    kernel: &Kernel,
+    endpoint: &SessionEndpoint,
+    codec: &mut SessionCodec,
+    offset: &mut usize,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some((bytes, next)) = kernel
+            .stream_read_at(&endpoint.transcript, *offset)
+            .unwrap()
+        {
+            *offset = next;
+            if let Some(SessionPayload::Closed { reason }) = codec.decode(&bytes).unwrap() {
+                return reason;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected original connection closure"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_raw_resume_binds_only_after_the_original_load_response() {
+    let kernel = session_kernel("resume-worker");
+    tokio::task::spawn_blocking(move || {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session_agent.py");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let environment: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let started = call(&kernel, "start_session_v1", json!({
+            "agent_id":"resume-worker", "resume_session_id":"durable-fixture-session",
+            "spawn_spec":{"cmd":python,"args":["-u",fixture],"env":environment}
+        })).unwrap();
+        let pid = started["session_id"].as_str().unwrap();
+        assert!(started.get("durable_session_id").is_none());
+        let endpoint: SessionEndpoint = serde_json::from_value(started["session_endpoint"].clone()).unwrap();
+        let (instance, _) = kernel.agent_registry().get_instance(pid).unwrap();
+        assert!(!kernel.agent_registry().is_managed_host_bound(&instance));
+        let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
+        let mut offset = 0;
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}));
+        receive(&kernel, &endpoint, &mut codec, &mut offset);
+        assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap().get("durable_session_id").is_none());
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"durable-fixture-session","cwd":"/"}}));
+        assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset), json!({"jsonrpc":"2.0","id":2,"result":{}}));
+        assert_eq!(call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap()["durable_session_id"], "durable-fixture-session");
+        assert!(kernel.agent_registry().is_managed_host_bound(&instance));
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":3,"method":"test/counts"}));
+        assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["result"], json!({"new":0,"load":1}));
+        call(&kernel, "cancel_v2", json!({"session_id":pid,"channel_id":endpoint.channel_id})).unwrap();
+        wait_for_close(&kernel, &endpoint, &mut codec, &mut offset);
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_raw_load_preserves_error_and_refuses_fresh_fallback() {
+    let kernel = session_kernel("missing-worker");
+    tokio::task::spawn_blocking(move || {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session_agent.py");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let environment: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let started = call(&kernel, "start_session_v1", json!({
+            "agent_id":"missing-worker", "resume_session_id":"missing",
+            "spawn_spec":{"cmd":python,"args":["-u",fixture],"env":environment}
+        })).unwrap();
+        let pid = started["session_id"].as_str().unwrap();
+        let endpoint: SessionEndpoint = serde_json::from_value(started["session_endpoint"].clone()).unwrap();
+        let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
+        let mut offset = 0;
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"missing"}}));
+        let response = receive(&kernel, &endpoint, &mut codec, &mut offset);
+        assert_eq!(response["error"], json!({"code":-32002,"message":"not found","data":{"sessionId":"missing"}}));
+        assert!(call(&kernel, "get_session_v1", json!({"session_id":pid})).unwrap().get("durable_session_id").is_none());
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":2,"method":"test/counts"}));
+        assert_eq!(receive(&kernel, &endpoint, &mut codec, &mut offset)["result"], json!({"new":0,"load":1}));
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/"}}));
+        assert!(wait_for_close(&kernel, &endpoint, &mut codec, &mut offset).contains("one durable session establishment"));
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_raw_load_success_cannot_publish_a_durable_binding() {
+    let kernel = session_kernel("mismatch-worker");
+    tokio::task::spawn_blocking(move || {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session_agent.py");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let environment: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let started = call(&kernel, "start_session_v1", json!({
+            "agent_id":"mismatch-worker", "resume_session_id":"wrong-load-result",
+            "spawn_spec":{"cmd":python,"args":["-u",fixture],"env":environment}
+        })).unwrap();
+        let pid = started["session_id"].as_str().unwrap();
+        let (instance, _) = kernel.agent_registry().get_instance(pid).unwrap();
+        let endpoint: SessionEndpoint = serde_json::from_value(started["session_endpoint"].clone()).unwrap();
+        let mut codec = SessionCodec::new(endpoint.clone(), SessionSide::Controller).unwrap();
+        let mut offset = 0;
+        send(&kernel, &endpoint, &mut codec, json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"wrong-load-result"}}));
+        assert!(wait_for_close(&kernel, &endpoint, &mut codec, &mut offset).contains("another durable session ID"));
+        assert!(!kernel.agent_registry().is_managed_host_bound(&instance));
     }).await.unwrap();
 }
 

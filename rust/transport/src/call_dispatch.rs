@@ -192,7 +192,9 @@ fn agent_err_to_payload(err: AgentError) -> Vec<u8> {
             RpcErrorCode::Conflict
         }
         AgentError::InvalidKind(_) | AgentError::Protocol(_) => RpcErrorCode::ValidationError,
-        AgentError::PidExhausted => RpcErrorCode::InternalError,
+        AgentError::PidExhausted | AgentError::CleanupUnconfirmed { .. } => {
+            RpcErrorCode::InternalError
+        }
     };
     encode_rpc_error(code, &err.to_string())
 }
