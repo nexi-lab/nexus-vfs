@@ -173,7 +173,7 @@ async fn local_admission_observes_withdrawal_replacement_and_restart() {
         .unwrap();
     node.campaign().await.unwrap();
     ready(&node).await;
-    let store = RaftCollaborationCrlStore::new(node.clone(), runtime.clone(), 60).unwrap();
+    let store = RaftCollaborationCrlStore::new(node, runtime.clone(), 60).unwrap();
     let (ca, key) = generate_zone_ca("local-admission-original").unwrap();
     let authority = ca_spki_sha256(&ca).unwrap();
     let fingerprint = ForeignCaAnchor::from_pem("local", &ca)
