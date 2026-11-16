@@ -12,7 +12,7 @@ use kernel::kernel::{
 };
 use lib::transport_primitives::{federated_tls_incoming, server_config, verify_signed_crl};
 use nexus_raft::{
-    collaboration_crl::RaftCollaborationCrlStore, raft::ZoneRaftRegistry, transport::generate_crl,
+    collaboration_crl::RaftCollaborationCrlStore, transport::generate_crl, ZoneManager,
 };
 use std::sync::{Arc, Mutex, OnceLock};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server};
@@ -42,8 +42,9 @@ async fn connect(
     client_key: &[u8],
 ) -> LiveAdmission {
     let verifier = FederatedClientCertVerifier::new(ca).unwrap();
-    let current =
-        crate::collaboration_authority::RaftCurrentAgentAuthority::new(ca.to_vec(), store).unwrap();
+    let current = Arc::new(
+        crate::collaboration_authority::RaftCurrentAgentAuthority::new(ca.to_vec(), store).unwrap(),
+    );
     let slot = Arc::new(OnceLock::new());
     slot.set(verifier.clone()).unwrap();
     // This fixture exercises the existing request identity entry over Ping.
@@ -84,7 +85,7 @@ async fn connect(
     let service = NexusVfsServiceServer::with_interceptor(service, move |request: Request<()>| {
         let (metadata, extensions, ()) = request.into_parts();
         let request = Request::from_parts(metadata, extensions, PingRequest::default());
-        let principal = authenticate_request(&request, &gate_verifier, &current)
+        let principal = authenticate_request(&request, &gate_verifier, current.as_ref())
             .map_err(|error| tonic::Status::permission_denied(format!("{error:?}")))?;
         gate_admitted
             .lock()
@@ -208,10 +209,11 @@ async fn refused(client: &mut NexusVfsServiceClient<Channel>, reason: &str) {
 async fn established_local_mtls_observes_withdrawal_and_same_key_replacement() {
     use rcgen::{DistinguishedName, DnType, KeyUsagePurpose};
     let directory = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Handle::current();
     // The current typed protocol supports FixedLocal. This genuine native
     // consumer fixture does not claim Managed control-zone activation.
-    let registry = ZoneRaftRegistry::isolated_root(directory.path().into(), 1);
+    let manager = ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
+    let registry = manager.registry();
+    let runtime = manager.runtime_handle();
     let node = registry
         .create_zone(contracts::ROOT_ZONE_ID, &runtime)
         .unwrap();
@@ -327,4 +329,5 @@ async fn established_local_mtls_observes_withdrawal_and_same_key_replacement() {
     live.close().await;
     drop(crls);
     registry.shutdown().released().await;
+    manager.shutdown();
 }
