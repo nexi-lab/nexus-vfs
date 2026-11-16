@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 
 use crate::crl_records::{snapshot_key, REVOKED};
 
+mod control;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CrlStateError {
     /// Validation failed before this operation attempted any control write.

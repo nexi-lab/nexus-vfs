@@ -142,6 +142,10 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
         handle.commit_record_storage(Command::Noop).await,
         Err(RaftError::InvalidState(_))
     ));
+    assert!(matches!(
+        handle.commit_crl_control(Command::Noop).await,
+        Err(RaftError::InvalidState(_))
+    ));
     assert!(driver.msg_rx.is_empty());
     assert_eq!(
         handle.state_machine.read().await.snapshot().unwrap(),
@@ -191,12 +195,9 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
     finish(&mut driver, handle.commit_replica_control(replica()))
         .await
         .unwrap();
-    let outcome = finish(
-        &mut driver,
-        handle.submit_storage_command(signed_crl(), StorageProtocol::SignedCrl),
-    )
-    .await
-    .unwrap();
+    let outcome = finish(&mut driver, handle.commit_crl_control(signed_crl()))
+        .await
+        .unwrap();
     let CommandResult::Value(bytes) = outcome else {
         panic!("typed CRL result");
     };
