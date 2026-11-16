@@ -62,6 +62,7 @@ pub(crate) mod raw_spawn;
 #[cfg(feature = "subprocess-host")]
 mod durable_session;
 
+pub mod bootstrap;
 pub mod credential_binding;
 pub(crate) mod proc_entry;
 mod runtime_discovery;

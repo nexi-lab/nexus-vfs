@@ -14,6 +14,7 @@
 use super::host_cleanup::{HostCleanupOutcome, ManagedHostCleanup};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +27,8 @@ pub use runtime_observation::{RuntimeDirectoryLookup, RuntimeRegistryHost, Runti
 // ── ExternalProcessInfo ────────────────────────────────────────────────
 
 /// Connection metadata for external (gRPC/MCP) processes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalProcessInfo {
     pub connection_id: String,
     pub remote_addr: Option<String>,
@@ -40,7 +42,8 @@ pub struct ExternalProcessInfo {
 /// Drives the per-alias DT_LINK rows stamped under
 /// `/proc/{pid}/workspace/{alias}` at start_session time
 /// (services::managed_agent::proc_entry::register_proc_entry).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoMount {
     pub alias: String,
     pub mount_path: String,
@@ -49,7 +52,8 @@ pub struct RepoMount {
 // ── AgentDescriptor ────────────────────────────────────────────────────
 
 /// Agent process descriptor — analogous to Linux task_struct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDescriptor {
     // Identity
     pub pid: String,
@@ -124,7 +128,8 @@ impl Default for AgentDescriptor {
 }
 
 /// Agent process kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentKind {
     Worker,
     Daemon,
@@ -159,7 +164,8 @@ pub enum AgentKind {
 /// overlaying any activity), which broke the single-axis model. If cooperative
 /// pause/resume is ever needed, model it as an orthogonal `paused` flag — not a
 /// lifecycle state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentState {
     Registered,
     WarmingUp,
