@@ -9,18 +9,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use contracts::runtime_status::RuntimeStatusSource;
-use contracts::runtime_status::{RuntimeDirectory, RuntimeInstanceId, RuntimeObservationHost};
+use contracts::runtime_status::{
+    online_agent_names, OnlineAgents, RuntimeInstanceId, RuntimeObservationHost,
+};
 
-/// Installed at the concrete host boundary, never a raw-registry syscall escape.
-pub type RuntimeDirectoryLookup =
-    Arc<dyn Fn(&str, &str) -> Result<RuntimeDirectory, String> + Send + Sync>;
+/// The zone's online Agents for a caller `(owner, zone)`. Installed at the
+/// concrete host boundary, never a raw-registry syscall escape.
+pub type OnlineAgentsLookup = Arc<dyn Fn(&str, &str) -> Result<OnlineAgents, String> + Send + Sync>;
 
 pub struct RuntimeRegistryHost {
     registry: Arc<AgentRegistry>,
     instance: AgentInstance,
     owner: String,
     zone: String,
-    lookup: Option<RuntimeDirectoryLookup>,
+    lookup: Option<OnlineAgentsLookup>,
 }
 
 impl std::fmt::Debug for RuntimeRegistryHost {
@@ -36,7 +38,7 @@ impl RuntimeRegistryHost {
     pub fn new(
         registry: Arc<AgentRegistry>,
         instance: AgentInstance,
-        lookup: Option<RuntimeDirectoryLookup>,
+        lookup: Option<OnlineAgentsLookup>,
     ) -> Option<Self> {
         let descriptor = registry.get_instance_descriptor(&instance)?;
         Some(Self {
@@ -79,16 +81,14 @@ impl RuntimeObservationHost for RuntimeRegistryHost {
         self.registry.runtime_instance_id(&self.instance)
     }
 
-    fn discover(&self) -> Result<RuntimeDirectory, String> {
+    fn online_agents(&self) -> Result<OnlineAgents, String> {
         self.instance().ok_or("runtime host retired")?;
         match &self.lookup {
             Some(lookup) => lookup(&self.owner, &self.zone),
-            None => Ok(RuntimeDirectory {
+            None => Ok(OnlineAgents {
                 version: 1,
-                inventories: vec![self
-                    .registry
-                    .runtime_inventory(Some(&self.owner), &self.zone)],
-                unavailable: Vec::new(),
+                zone_id: self.zone.clone(),
+                online: online_agent_names([&self.registry.runtime_inventory(None, &self.zone)]),
             }),
         }
     }

@@ -132,11 +132,15 @@ impl Node {
     }
 
     async fn register(&mut self, connection: &str) -> RuntimeInstanceId {
+        self.register_as("agent-a", connection).await
+    }
+
+    async fn register_as(&mut self, agent: &str, connection: &str) -> RuntimeInstanceId {
         self.result(
             "alice-agent-a",
             "agent_runtime_register_v1",
             json!(RegisterRuntimeRequest {
-                name: "agent-a".into(),
+                name: agent.into(),
                 connection_id: connection.into(),
                 registration_id: uuid::Uuid::new_v4().to_string(),
                 owner_id: None,
@@ -509,7 +513,7 @@ async fn live_source_binding_cleanup_cannot_remove_a_replacement() {
         .unregister_instance(&instance)
         .expect("retire first host");
     assert!(host.instance().is_none());
-    assert!(host.discover().is_err());
+    assert!(host.online_agents().is_err());
     let new_instance = registry
         .register_instance(AgentDescriptor {
             pid: id.pid.clone(),
