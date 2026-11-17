@@ -3,7 +3,7 @@
 use super::*;
 use auth::ApiKeyAuthProvider;
 use contracts::lock_state::Locks;
-use contracts::runtime_status::RuntimeDirectory;
+use contracts::runtime_status::OnlineAgents;
 use kernel::abc::meta_store::MetaStore;
 use kernel::hal::distributed_coordinator::*;
 use nexus_raft::transport::{
@@ -68,7 +68,7 @@ struct TlsNode {
 }
 
 impl TlsNode {
-    async fn start(ca: &[u8], key: &[u8], node_id: u64, owner: &str) -> Self {
+    async fn start(ca: &[u8], key: &[u8], node_id: u64, owner: &str, agent: &str) -> Self {
         lib::transport_primitives::ensure_crypto_provider();
         let (cert, private) =
             generate_node_cert(node_id, "root", ca, key, &[], None).expect("node cert");
@@ -105,7 +105,7 @@ impl TlsNode {
                 .expect("serve");
         });
         let (client_cert, client_key) =
-            generate_session_agent_cert("agent-a", owner, 60, ca, key).expect("owner cert");
+            generate_session_agent_cert(agent, owner, 60, ca, key).expect("owner cert");
         let channel = Endpoint::from_shared(endpoint.clone())
             .expect("endpoint")
             .connect_timeout(Duration::from_secs(2))
@@ -146,10 +146,10 @@ impl TlsNode {
         }
     }
 
-    async fn directory(&mut self, payload: Value) -> RuntimeDirectory {
+    async fn presence(&mut self, payload: Value) -> OnlineAgents {
         let response = self
             .node
-            .call("", "runtime_directory.list_v1", payload)
+            .call("", "runtime_directory.presence_v1", payload)
             .await;
         assert!(
             !response.is_error,
@@ -161,98 +161,65 @@ impl TlsNode {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_directory_preserves_owner_scope_and_partial_coverage() {
+async fn zone_presence_names_every_owners_online_agents_only() {
     let (ca, key) = generate_zone_ca("root").expect("CA");
-    let mut first = TlsNode::start(&ca, &key, 1, "alice").await;
-    let mut second = TlsNode::start(&ca, &key, 2, "alice").await;
-    let mut foreign = TlsNode::start(&ca, &key, 3, "mallory").await;
-    // On each node the same Agent/SID has its own current instance.
-    let one = first.node.register(&uuid::Uuid::new_v4().to_string()).await;
+    let mut first = TlsNode::start(&ca, &key, 1, "alice", "agent-a").await;
+    let mut second = TlsNode::start(&ca, &key, 2, "bob", "agent-b").await;
+    let mut third = TlsNode::start(&ca, &key, 3, "mallory", "agent-c").await;
+    let one = first
+        .node
+        .register_as("agent-a", &uuid::Uuid::new_v4().to_string())
+        .await;
     let two = second
         .node
-        .register(&uuid::Uuid::new_v4().to_string())
+        .register_as("agent-b", &uuid::Uuid::new_v4().to_string())
         .await;
-    let hidden = foreign
+    let gone = third
         .node
-        .register(&uuid::Uuid::new_v4().to_string())
+        .register_as("agent-c", &uuid::Uuid::new_v4().to_string())
         .await;
-    first
-        .node
-        .publish(&one, &update(1, ForegroundState::Running))
-        .await;
-    second
-        .node
-        .publish(
-            &two,
-            &update(1, ForegroundState::AwaitingInput(InputReason::Question)),
-        )
-        .await;
-    foreign
-        .node
-        .publish(&hidden, &update(1, ForegroundState::Running))
-        .await;
+    assert!(
+        !third
+            .node
+            .call("", "agent_runtime_unregister_v1", json!({"instance": gone}))
+            .await
+            .is_error
+    );
     first
         .node
         .kernel
         .set_distributed_coordinator(Arc::new(Membership(vec![
             second.endpoint.clone(),
-            foreign.endpoint.clone(),
+            third.endpoint.clone(),
         ])));
-    let view = first.directory(json!({})).await;
-    assert_eq!(view.inventories.len(), 3);
-    assert!(view.unavailable.is_empty());
-    assert!(view
-        .inventories
-        .iter()
-        .all(
-            |inventory| inventory.scope.owner_id.as_deref() == Some("alice")
-                && inventory.scope.zone_id == "root"
-        ));
-    let observations: Vec<_> = view
-        .inventories
-        .iter()
-        .flat_map(|scope| &scope.instances)
-        .collect();
+    // Every member of the zone sees every owner's online Agents, by name only.
     assert_eq!(
-        observations.len(),
-        2,
-        "other owner's node contributes an empty authorized scope"
+        first.presence(json!({})).await,
+        OnlineAgents {
+            version: 1,
+            zone_id: "root".into(),
+            online: vec!["agent-a".into(), "agent-b".into()],
+        }
     );
-    assert!(observations.iter().any(|item| item.instance == one));
-    assert!(observations.iter().any(|item| item.instance == two));
-    assert!(!observations.iter().any(|item| item.instance == hidden));
-    assert!(
-        first
-            .node
-            .call(
-                "",
-                "runtime_directory.list_v1",
-                json!({"owner_id":"mallory"})
-            )
-            .await
-            .is_error
-    );
-    assert!(
-        first
-            .node
-            .call("", "runtime_directory.list_v1", json!({"zone_id":"other"}))
-            .await
-            .is_error
-    );
-    // Authenticated entry points reject arbitrary user-supplied fan-out addresses.
-    assert!(
-        first
-            .node
-            .call(
-                "",
-                "runtime_directory.list_v1",
-                json!({"peers":[foreign.endpoint]})
-            )
-            .await
-            .is_error
-    );
-    // A bound socket that never serves HTTP/2 deterministically exercises the
-    // whole connection deadline, including with a cached healthy peer channel.
+    for refused in [
+        ("runtime_directory.presence_v1", json!({"zone_id": "other"})),
+        (
+            "runtime_directory.presence_v1",
+            json!({"peers": [third.endpoint]}),
+        ),
+        ("runtime_directory.list_v1", json!({})),
+    ] {
+        assert!(
+            first
+                .node
+                .call("", refused.0, refused.1.clone())
+                .await
+                .is_error,
+            "{refused:?}"
+        );
+    }
+    // A bound socket that never serves HTTP/2 holds the whole connection
+    // deadline; its Agents are simply not seen online.
     let silent_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("silent peer");
@@ -264,27 +231,30 @@ async fn authenticated_directory_preserves_owner_scope_and_partial_coverage() {
         .node
         .kernel
         .set_distributed_coordinator(Arc::new(Membership(vec![
-            silent_endpoint.clone(),
-            foreign.endpoint.clone(),
+            silent_endpoint,
+            second.endpoint.clone(),
         ])));
+    for (node, instance) in [(&mut first, &one), (&mut second, &two)] {
+        assert!(
+            !node
+                .node
+                .call(
+                    "",
+                    "agent_runtime_heartbeat_v1",
+                    json!({"instance": instance})
+                )
+                .await
+                .is_error
+        );
+    }
     let started = std::time::Instant::now();
-    let partial = first.directory(json!({})).await;
+    let partial = first.presence(json!({})).await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "one bounded deadline includes connection and queue time"
     );
-    assert_eq!(partial.unavailable.len(), 1);
-    assert_eq!(partial.unavailable[0].endpoint, silent_endpoint);
-    assert_eq!(partial.inventories.len(), 2);
-    assert_eq!(
-        partial
-            .inventories
-            .iter()
-            .flat_map(|scope| &scope.instances)
-            .count(),
-        1
-    );
-    // Even a shared pool without node identity must fail closed.
+    assert_eq!(partial.online, vec!["agent-a", "agent-b"]);
+    // A pool without node identity reads this node alone.
     let no_identity = Arc::new(FederationClient::new(
         first.node.kernel.runtime().handle().clone(),
         None,
@@ -292,10 +262,5 @@ async fn authenticated_directory_preserves_owner_scope_and_partial_coverage() {
     assert!(first.node.kernel.unregister_service("runtime_directory"));
     runtime_directory::install(&first.node.kernel, no_identity, PEER_NAMESPACE)
         .expect("replace service");
-    let unavailable = first.directory(json!({})).await;
-    assert_eq!(unavailable.unavailable.len(), 2);
-    assert!(unavailable
-        .unavailable
-        .iter()
-        .all(|scope| scope.reason == "peer_identity_unavailable"));
+    assert_eq!(first.presence(json!({})).await.online, vec!["agent-a"]);
 }

@@ -150,17 +150,18 @@ independent of fact availability (`fresh`, `stale`, `unsupported` or
 facts. An expired observation never implies idle work or a confirmed exit.
 Neither transcript contents nor silence are an activity source.
 
-`runtime_directory.list_v1` uses the existing authenticated Rust-service and
-federation client to query coordinator-known peers. The host supplies its
-canonical discovery namespace; the existing VFS mount table selects that
-namespace's peer-routing zone. This stays separate from the caller's
-owner/zone metadata filter, since each node's root is local while its mailbox
-namespace can route through a shared zone. Queries use node mTLS rather than
-forwarding caller credentials,
-and reports unavailable scopes separately from complete empty inventories.
-Each registry remains authoritative for its own instances; this directory
-does not replicate activity or grant process control. Its peer queries share
-one bounded deadline. Unsupported or disconnected nodes remain explicit.
+`runtime_directory.presence_v1` names the Agents of the caller's zone that
+have an online instance. Every member of the zone may read it, as it may list
+the zone's Agents; it carries names only, for every owner, and nothing about
+their work. It uses the existing authenticated Rust-service and federation
+client to query coordinator-known peers. The host supplies its canonical
+discovery namespace; the existing VFS mount table selects that namespace's
+peer-routing zone, since each node's root is local while its mailbox namespace
+can route through a shared zone. Queries use node mTLS rather than forwarding
+caller credentials and share one bounded deadline. A peer that does not answer
+contributes no names: an Agent absent from the list was not seen online. Each
+registry remains authoritative for its own instances; this directory does not
+replicate activity or grant process control.
 
 `managed_agent.start_session_v1` retains its existing `session_id` response:
 this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.

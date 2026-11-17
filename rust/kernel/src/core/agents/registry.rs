@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 #[path = "runtime_observation.rs"]
 mod runtime_observation;
-pub use runtime_observation::{RuntimeDirectoryLookup, RuntimeRegistryHost, RuntimeStatusSource};
+pub use runtime_observation::{OnlineAgentsLookup, RuntimeRegistryHost, RuntimeStatusSource};
 
 // ── ExternalProcessInfo ────────────────────────────────────────────────
 
