@@ -422,22 +422,44 @@ mod tests {
     /// is deliberately a test stand-in, not a foreign-CRL implementation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_mtls_connection_rechecks_policy_and_removed_anchor() {
-        exercise_mtls_admission(false, false).await;
+        exercise_mtls_admission(false, false, AdmissionFixture::Transcript).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_mtls_admission_does_not_authorize_the_legacy_vfs_door() {
-        exercise_mtls_admission(true, false).await;
+        exercise_mtls_admission(true, false, AdmissionFixture::Transcript).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_mtls_uses_current_registered_issuer_and_retained_crl_revocations() {
-        exercise_mtls_admission(true, true).await;
+        exercise_mtls_admission(true, true, AdmissionFixture::Transcript).await;
     }
 
-    async fn exercise_mtls_admission(scoped: bool, native_current: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pair_preparation_on_retained_mtls_rechecks_native_issuer_crl_and_space() {
+        exercise_mtls_admission(true, true, AdmissionFixture::PairProvision).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pair_discovery_on_retained_mtls_keeps_original_actor_and_refuses_revocation() {
+        exercise_mtls_admission(false, false, AdmissionFixture::PairDiscovery).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum AdmissionFixture {
+        Transcript,
+        PairProvision,
+        PairDiscovery,
+    }
+
+    async fn exercise_mtls_admission(
+        scoped: bool,
+        native_current: bool,
+        admission: AdmissionFixture,
+    ) {
         use crate::collaboration_access::SpaceAuthorizer;
         use a2a::{
+            collaboration_pair::{PairIntent, PairRequest},
             collaboration_policy::{CollaborationOperation, SpacePolicy, SpacePolicyStore},
             domain_address::ConversationAddress,
         };
@@ -486,6 +508,7 @@ mod tests {
         .unwrap();
         let serial = client_identity.certificate().serial().to_vec();
         let other = AgentAddress::new(host, "other-agent".into()).unwrap();
+        let pair_peer = other.clone();
         let space = "0123456789abcdef0123456789abcdef";
         let pair = ConversationAddress::new(
             space.into(),
@@ -599,23 +622,52 @@ mod tests {
                 let request = Request::from_parts(metadata, extensions, PingRequest::default());
                 // This is an admission fixture over Ping, not a transcript
                 // operation or proof of an installed collaboration mount.
-                let principal = SpaceAuthorizer::new(
+                let authorizer = SpaceAuthorizer::new(
                     &gate_verifier,
                     gate_current.as_ref(),
                     gate_store.as_ref(),
                     &host,
                     "collab-one",
-                )
-                .authorize(
-                    &request,
-                    &pair.transcript(),
-                    CollaborationOperation::ReadTranscript,
-                )
-                .map_err(|_| tonic::Status::permission_denied("collaboration admission refused"))?;
-                gate_admitted
-                    .lock()
-                    .unwrap()
-                    .push(principal.actor().clone());
+                );
+                let refusal =
+                    |_| tonic::Status::permission_denied("collaboration admission refused");
+                let actor = match admission {
+                    AdmissionFixture::Transcript => authorizer
+                        .authorize(
+                            &request,
+                            &pair.transcript(),
+                            CollaborationOperation::ReadTranscript,
+                        )
+                        .map_err(refusal)?
+                        .actor()
+                        .clone(),
+                    AdmissionFixture::PairProvision => {
+                        let pair_request = PairRequest::new(space.to_owned(), &pair_peer).unwrap();
+                        let admitted = authorizer
+                            .authorize_pair(&request, &pair_request, PairIntent::Provision)
+                            .map_err(refusal)?;
+                        assert_eq!(admitted.intent(), PairIntent::Provision);
+                        assert_eq!(admitted.description().conversation().unwrap(), pair);
+                        assert_eq!(
+                            admitted.description().own_reader().unwrap(),
+                            pair.reader(admitted.actor()).unwrap()
+                        );
+                        admitted.actor().clone()
+                    }
+                    AdmissionFixture::PairDiscovery => {
+                        let admitted = authorizer
+                            .discover_pairs(&request, space)
+                            .map_err(refusal)?;
+                        assert_eq!(admitted.descriptions().len(), 1);
+                        assert_eq!(admitted.descriptions()[0].conversation().unwrap(), pair);
+                        assert_eq!(
+                            admitted.descriptions()[0].own_reader().unwrap(),
+                            pair.reader(admitted.actor()).unwrap()
+                        );
+                        admitted.actor().clone()
+                    }
+                };
+                gate_admitted.lock().unwrap().push(actor);
                 let (metadata, extensions, _) = request.into_parts();
                 Ok(Request::from_parts(metadata, extensions, ()))
             });

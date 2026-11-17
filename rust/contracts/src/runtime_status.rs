@@ -187,38 +187,63 @@ pub fn resolve_runtime_scope(
     ctx: &OperationContext,
     request: &ListRuntimesRequest,
 ) -> Result<(Option<String>, String), AgentContextError> {
-    if ctx.trust_domain.is_some() && !ctx.is_admin && !ctx.is_system {
-        return Err(AgentContextError::PermissionDenied(
-            "foreign runtime scope is not authorized".into(),
-        ));
-    }
+    let zone = resolve_runtime_zone(ctx, request.zone_id.as_deref())?;
+    // Runtime work is owner-private metadata, not a filesystem or tenancy grant.
     let owner = if ctx.is_admin || ctx.is_system {
         request.owner_id.clone()
     } else {
         Some(resolve_agent_owner(ctx, request.owner_id.as_deref())?)
     };
-    // Attendance is owner-private metadata, not a filesystem or tenancy grant.
-    let zone = match request.zone_id.as_deref() {
-        Some(zone) if zone != ctx.zone_id => resolve_agent_zone(ctx, Some(zone))?,
-        _ => ctx.zone_id.clone(),
-    };
     Ok((owner, zone))
 }
 
-/// A missing peer is a coverage gap, never evidence that its agents are offline.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeUnavailableScope {
-    pub endpoint: String,
-    pub reason: String,
+/// The zone whose runtimes the caller may read: its own, or one it is granted.
+/// A foreign trust domain reads none.
+pub fn resolve_runtime_zone(
+    ctx: &OperationContext,
+    requested: Option<&str>,
+) -> Result<String, AgentContextError> {
+    if ctx.trust_domain.is_some() && !ctx.is_admin && !ctx.is_system {
+        return Err(AgentContextError::PermissionDenied(
+            "foreign runtime scope is not authorized".into(),
+        ));
+    }
+    match requested {
+        Some(zone) if zone != ctx.zone_id => resolve_agent_zone(ctx, Some(zone)),
+        _ => Ok(ctx.zone_id.clone()),
+    }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceRequest {
+    pub zone_id: Option<String>,
+}
+
+/// The Agents of a zone with at least one online instance. Every member of the
+/// zone may read it, as it may list the zone's Agents; it carries names only.
+/// An Agent absent from the list was not seen online.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeDirectory {
+pub struct OnlineAgents {
     pub version: u32,
-    pub inventories: Vec<RuntimeInventory>,
-    pub unavailable: Vec<RuntimeUnavailableScope>,
+    pub zone_id: String,
+    pub online: Vec<String>,
+}
+
+/// The Agents with an online instance in these inventories, sorted and unique.
+pub fn online_agent_names<'a>(
+    inventories: impl IntoIterator<Item = &'a RuntimeInventory>,
+) -> Vec<String> {
+    let mut names: Vec<String> = inventories
+        .into_iter()
+        .flat_map(|inventory| &inventory.instances)
+        .filter(|observation| observation.presence == RuntimePresence::Online)
+        .map(|observation| observation.agent_id.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// One non-owning engine reader. Neither transcript storage nor task output is retained.
@@ -229,5 +254,5 @@ pub type RuntimeStatusSource = std::sync::Arc<dyn Fn() -> Option<RuntimeFacts> +
 pub trait RuntimeObservationHost: Send + Sync + std::fmt::Debug {
     fn bind(&self, source: RuntimeStatusSource) -> Option<Box<dyn Send>>;
     fn instance(&self) -> Option<RuntimeInstanceId>;
-    fn discover(&self) -> Result<RuntimeDirectory, String>;
+    fn online_agents(&self) -> Result<OnlineAgents, String>;
 }
