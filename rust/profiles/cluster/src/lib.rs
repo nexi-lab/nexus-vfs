@@ -3568,12 +3568,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     };
     // Construct the same policy before custom service builders run. Its later
     // kernel installation cannot stand in for an explicit service dependency.
-    let authorization_decls = authorization::service_decls(
-        &common,
-        &mut svc_ctx,
-        &zm,
-        Arc::clone(&data_plane_ready),
-    )?;
+    let authorization_decls =
+        authorization::service_decls(&common, &mut svc_ctx, &zm, Arc::clone(&data_plane_ready))?;
     let mut service_decls = build_decls(&svc_ctx);
     #[cfg(feature = "experimental-managed-agent-csr")]
     let service_tls = zm.registry().tls_config().map_err(anyhow::Error::msg)?;
