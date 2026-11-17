@@ -126,7 +126,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let registry = ZoneRaftRegistry::new(tmp.path().to_path_buf(), 1);
         let runtime = tokio::runtime::Handle::current();
-        let node = registry.create_zone("root", vec![], &runtime).unwrap();
+        let node = registry.create_zone("root", &runtime).unwrap();
         node.campaign().await.unwrap();
         let store = RaftReBACTupleStore::new(node, runtime);
         let key = "root|file:/sessions/original|reader|user|alice";
@@ -137,7 +137,7 @@ mod tests {
         );
         assert!(store.delete(key).unwrap());
         assert!(store.list_linearizable().unwrap().is_empty());
-        registry.shutdown_all();
+        registry.shutdown().released().await;
     }
     /// Full lifecycle against a live 1-voter zone, exercised from
     /// inside a multi-thread tokio runtime — the shape every real
