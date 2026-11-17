@@ -260,6 +260,8 @@ class Journey:
         assert self.request("unknown-frontend", self.claim("a", "1", frontend="agent"))["outcome"] == "not_submitted"
         uppercase = self.claim("a", "1", frontend="claude") | {"actor": "claude-" + "A" * 32}
         assert self.request("uppercase-actor", uppercase)["outcome"] == "not_submitted"
+        bad_slug = self.claim("a", "1") | {"actor": "codex-Bad_slug-0123abcd"}
+        assert self.request("malformed-slug-actor", bad_slug)["outcome"] == "not_submitted"
         assert not state.exists(), "Local refusals must not reserve an operation"
 
         self.proof["stage"] = "mint and exact replay"
@@ -291,6 +293,13 @@ class Journey:
         assert claude_receipt["actor"] == claude["actor"], claude_receipt
         assert self.request("claude-replay", claude) == claude_receipt
         assert (Path(claude_receipt["credentialDirectory"]) / "agent.pem").is_file()
+
+        self.proof["stage"] = "readable workspace actor"
+        readable = self.claim("e", "5") | {"actor": "codex-workspace-0123abcd"}
+        readable_receipt = self.request("readable-mint", readable)
+        assert readable_receipt["actor"] == readable["actor"], readable_receipt
+        assert self.request("readable-replay", readable) == readable_receipt
+        assert (Path(readable_receipt["credentialDirectory"]) / "agent.pem").is_file()
 
         self.proof["stage"] = "named product Agents"
         self.named_agents()

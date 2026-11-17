@@ -103,6 +103,10 @@ impl RuntimeScope {
         self
     }
 
+    pub(crate) fn server_identity(&self) -> Option<&lib::transport_primitives::SharedTlsConfig> {
+        self.server_identity.as_ref()
+    }
+
     pub(crate) fn resolve(
         &self,
         auth: &dyn AuthProvider,

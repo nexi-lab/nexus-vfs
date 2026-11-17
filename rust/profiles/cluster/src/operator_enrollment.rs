@@ -234,6 +234,37 @@ fn uuid(value: &str) -> bool {
 /// The Node a TLS bundle names, through the same check boot applies. A grant
 /// binds this durable identity; the leaf naming it is renewed routinely.
 #[inline]
+/// Each native frontend (Codex thread, Claude Code session) mints its own
+/// random actor under its frontend's prefix; nothing else is issuable. The
+/// suffix is either 32 lowercase hex, or a readable workspace slug (at most 24
+/// of `[a-z0-9-]`, starting alphanumeric) followed by `-` and 8 lowercase hex.
+fn issuable_actor(actor: &str) -> bool {
+    let lower_hex = |value: &str| {
+        value
+            .bytes()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let Some(suffix) = ["codex-", "claude-"]
+        .iter()
+        .find_map(|prefix| actor.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    if suffix.len() == 32 && lower_hex(suffix) {
+        return true;
+    }
+    let Some((slug, random)) = suffix.rsplit_once('-') else {
+        return false;
+    };
+    random.len() == 8
+        && lower_hex(random)
+        && (1..=24).contains(&slug.len())
+        && slug.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && slug
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
 fn node_identity(tls: &TlsConfig) -> Result<String> {
     nexus_raft::transport::local_node_identity(&tls.cert_pem, &tls.ca_pem)
         .map(|node| node.identity_uri())
@@ -278,16 +309,9 @@ fn prepare(grant_file: &Path, claim: Claim) -> Result<(Grant, Attempt, TlsConfig
                 claim.version == 1 && claim.thread_id.as_deref().is_some_and(uuid),
                 "invalid operation/thread identity"
             );
-            let suffix = ["codex-", "claude-"]
-                .iter()
-                .find_map(|prefix| claim.actor.strip_prefix(prefix))
-                .unwrap_or_default();
             ensure!(
-                suffix.len() == 32
-                    && suffix
-                        .bytes()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "grant permits only codex-<32 lowercase hex> or claude-<32 lowercase hex> actors"
+                issuable_actor(&claim.actor),
+                "grant permits only codex-/claude- actors: <32 lowercase hex> or <workspace slug>-<8 lowercase hex>"
             );
             let mut authorized = false;
             for root in &grant.workspace_roots {
@@ -574,6 +598,37 @@ mod tests {
         certify(&grant.node_data_directory, 7, None, &foreign, &foreign_key);
         let error = validate_target(&grant).unwrap_err().to_string();
         assert_eq!(error, "operator cluster CA changed");
+    }
+
+    #[test]
+    fn issuable_actors_are_legacy_hex_or_a_readable_workspace_slug() {
+        for actor in [
+            format!("codex-{}", "a".repeat(32)),
+            format!("claude-{}", "0".repeat(32)),
+            "codex-sudocode-4-1a2b3c4d".to_string(),
+            "claude-x-00000000".to_string(),
+            format!("codex-{}-deadbeef", "s".repeat(24)),
+        ] {
+            assert!(issuable_actor(&actor), "{actor} must be issuable");
+        }
+        for actor in [
+            format!("agent-{}", "a".repeat(32)),
+            format!("codex-{}", "A".repeat(32)),
+            format!("codex-{}", "a".repeat(31)),
+            "codex-deadbeef".to_string(),
+            "codex--deadbeef".to_string(),
+            "codex--x-deadbeef".to_string(),
+            "codex-Sudo-deadbeef".to_string(),
+            "codex-sudo_code-deadbeef".to_string(),
+            "codex-sudo-DEADBEEF".to_string(),
+            "codex-sudo-deadbee".to_string(),
+            "codex-sudo-deadbeef0".to_string(),
+            format!("codex-{}-deadbeef", "s".repeat(25)),
+            "codex-../x-deadbeef".to_string(),
+            "nexus-mac-codex".to_string(),
+        ] {
+            assert!(!issuable_actor(&actor), "{actor} must be refused");
+        }
     }
 
     #[tokio::test]

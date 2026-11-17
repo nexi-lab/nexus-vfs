@@ -115,6 +115,13 @@ impl ControlStateStore {
         bridge_block_on(&self.runtime, fut).map_err(|e| format!("list({ns}): {e}"))
     }
 
+    /// Enumerate one namespace at a ReadIndex-backed state-machine snapshot.
+    /// This orders the read; it does not authorize a later cross-zone mutation.
+    pub fn list_linearizable(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let ns = self.namespace;
+        self.read_linearizable(move |sm| sm.list_control_state(ns).map_err(|e| e.to_string()))?
+    }
+
     /// Upsert (rotation-friendly): replaces any existing value at `key`.
     #[inline]
     pub fn put(&self, key: &str, value: &[u8]) -> Result<(), String> {

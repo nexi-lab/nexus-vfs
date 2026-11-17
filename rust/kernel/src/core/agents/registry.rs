@@ -11,8 +11,10 @@
 //! (see the `AgentState` docstring for the per-state semantics + the design
 //! note on why the former `Suspended` state was removed.)
 
+use super::host_cleanup::{HostCleanupOutcome, ManagedHostCleanup};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,12 +22,13 @@ use uuid::Uuid;
 
 #[path = "runtime_observation.rs"]
 mod runtime_observation;
-pub use runtime_observation::{RuntimeDirectoryLookup, RuntimeRegistryHost, RuntimeStatusSource};
+pub use runtime_observation::{OnlineAgentsLookup, RuntimeRegistryHost, RuntimeStatusSource};
 
 // ── ExternalProcessInfo ────────────────────────────────────────────────
 
 /// Connection metadata for external (gRPC/MCP) processes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalProcessInfo {
     pub connection_id: String,
     pub remote_addr: Option<String>,
@@ -39,7 +42,8 @@ pub struct ExternalProcessInfo {
 /// Drives the per-alias DT_LINK rows stamped under
 /// `/proc/{pid}/workspace/{alias}` at start_session time
 /// (services::managed_agent::proc_entry::register_proc_entry).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoMount {
     pub alias: String,
     pub mount_path: String,
@@ -48,7 +52,8 @@ pub struct RepoMount {
 // ── AgentDescriptor ────────────────────────────────────────────────────
 
 /// Agent process descriptor — analogous to Linux task_struct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDescriptor {
     // Identity
     pub pid: String,
@@ -123,7 +128,8 @@ impl Default for AgentDescriptor {
 }
 
 /// Agent process kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentKind {
     Worker,
     Daemon,
@@ -158,7 +164,8 @@ pub enum AgentKind {
 /// overlaying any activity), which broke the single-axis model. If cooperative
 /// pause/resume is ever needed, model it as an orthogonal `paused` flag — not a
 /// lifecycle state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentState {
     Registered,
     WarmingUp,
@@ -312,6 +319,11 @@ pub enum AgentError {
     PidExhausted,
     /// Generic protocol violation (e.g. external_info missing on heartbeat).
     Protocol(String),
+    /// Stop was requested, but the original host has not confirmed all joins.
+    CleanupUnconfirmed {
+        pid: String,
+        outcome: HostCleanupOutcome,
+    },
 }
 
 impl std::fmt::Display for AgentError {
@@ -328,6 +340,10 @@ impl std::fmt::Display for AgentError {
             AgentError::InvalidKind(msg) => write!(f, "invalid kind: {msg}"),
             AgentError::PidExhausted => write!(f, "failed to allocate a unique process id"),
             AgentError::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            AgentError::CleanupUnconfirmed { pid, outcome } => write!(
+                f,
+                "host cleanup unconfirmed for {pid}: {outcome:?}; original custody retained"
+            ),
         }
     }
 }
@@ -398,6 +414,7 @@ struct AgentRecord {
     runtime_last_seen: Option<std::time::Instant>,
     runtime_registration: Option<String>,
     runtime_revision: u64,
+    host_cleanup: Option<ManagedHostCleanup>,
 }
 
 impl std::ops::Deref for AgentRecord {
@@ -451,6 +468,13 @@ impl AgentRecord {
             pid: self.pid.clone(),
             identity: Arc::clone(&self.identity),
         }
+    }
+
+    fn pending_host_cleanup(&self) -> Option<ManagedHostCleanup> {
+        self.host_cleanup
+            .as_ref()
+            .filter(|c| !c.is_joined())
+            .cloned()
     }
 }
 
@@ -592,6 +616,7 @@ impl AgentRegistry {
                     runtime_last_seen: None,
                     runtime_registration,
                     runtime_revision: 0,
+                    host_cleanup: None,
                 };
                 let instance = record.instance();
                 v.insert(record);
@@ -758,6 +783,11 @@ impl AgentRegistry {
         {
             return None;
         }
+        if let Some(cleanup) = entry.pending_host_cleanup() {
+            drop(entry);
+            cleanup.request_stop();
+            return None;
+        }
         entry.removing = true;
         let instance = entry.instance();
         let desc = entry.descriptor.clone();
@@ -823,6 +853,34 @@ impl AgentRegistry {
             .is_some_and(|record| !record.removing && record.matches(instance))
     }
 
+    /// Install the native completion gate before starting an in-process host.
+    /// It cannot be replaced or obtained through descriptor/label RPCs.
+    pub fn arm_host_cleanup(&self, instance: &AgentInstance) -> Option<ManagedHostCleanup> {
+        let mut record = self.agents.get_mut(&instance.pid)?;
+        if record.removing
+            || !record.matches(instance)
+            || record.kind != AgentKind::Managed
+            || record.state.is_terminal()
+            || record.host_cleanup.is_some()
+        {
+            return None;
+        }
+        let cleanup = ManagedHostCleanup::new();
+        record.host_cleanup = Some(cleanup.clone());
+        Some(cleanup)
+    }
+
+    /// A retained instance is not necessarily available for new operations.
+    pub fn host_stop_requested(&self, instance: &AgentInstance) -> bool {
+        self.agents.get(&instance.pid).is_some_and(|record| {
+            record.matches(instance)
+                && record
+                    .host_cleanup
+                    .as_ref()
+                    .is_some_and(|c| c.stop_requested())
+        })
+    }
+
     /// Trusted native host seam, after validating its session handle. Generic
     /// registry RPCs only register descriptors and cannot set this private bit.
     pub fn bind_managed_host(&self, instance: &AgentInstance) -> bool {
@@ -833,6 +891,10 @@ impl AgentRegistry {
             || !record.matches(instance)
             || record.kind != AgentKind::Managed
             || record.state.is_terminal()
+            || record
+                .host_cleanup
+                .as_ref()
+                .is_some_and(|c| c.stop_requested())
         {
             return false;
         }
@@ -848,6 +910,10 @@ impl AgentRegistry {
                 && record.managed_host_bound
                 && record.kind == AgentKind::Managed
                 && !record.state.is_terminal()
+                && !record
+                    .host_cleanup
+                    .as_ref()
+                    .is_some_and(|c| c.stop_requested())
         })
     }
 
@@ -900,6 +966,22 @@ impl AgentRegistry {
         if entry.removing || expected.is_some_and(|instance| !entry.matches(instance)) {
             return Ok(false);
         }
+        if new_state == AgentState::Terminated {
+            if let Some(cleanup) = entry.pending_host_cleanup() {
+                drop(entry);
+                cleanup.request_stop();
+                return Err(AgentError::CleanupUnconfirmed {
+                    pid: pid.into(),
+                    outcome: cleanup.outcome(),
+                });
+            }
+        } else if entry
+            .host_cleanup
+            .as_ref()
+            .is_some_and(|c| c.stop_requested())
+        {
+            return Ok(false);
+        }
         if !entry.change_state(new_state, reason)? {
             return Ok(true);
         }
@@ -932,6 +1014,22 @@ impl AgentRegistry {
             None => return Ok(false),
         };
         if entry.removing {
+            return Ok(false);
+        }
+        if new_state == AgentState::Terminated {
+            if let Some(cleanup) = entry.pending_host_cleanup() {
+                drop(entry);
+                cleanup.request_stop();
+                return Err(AgentError::CleanupUnconfirmed {
+                    pid: pid.into(),
+                    outcome: cleanup.outcome(),
+                });
+            }
+        } else if entry
+            .host_cleanup
+            .as_ref()
+            .is_some_and(|c| c.stop_requested())
+        {
             return Ok(false);
         }
         let from = entry.state;
@@ -1233,6 +1331,14 @@ impl AgentRegistry {
         if entry.removing || expected.is_some_and(|instance| !entry.matches(instance)) {
             return Ok(None);
         }
+        if let Some(cleanup) = entry.pending_host_cleanup() {
+            drop(entry);
+            cleanup.request_stop();
+            return Err(AgentError::CleanupUnconfirmed {
+                pid: pid.into(),
+                outcome: cleanup.outcome(),
+            });
+        }
         let terminated = entry.state != AgentState::Terminated;
         if terminated {
             entry.state = AgentState::Terminated;
@@ -1380,6 +1486,131 @@ impl Default for AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gated_host() -> (AgentRegistry, AgentInstance, ManagedHostCleanup) {
+        let registry = AgentRegistry::new();
+        let instance = registry
+            .register_instance(AgentDescriptor {
+                pid: "original-host".into(),
+                state: AgentState::Ready,
+                ..Default::default()
+            })
+            .unwrap();
+        let cleanup = registry.arm_host_cleanup(&instance).unwrap();
+        assert!(registry.bind_managed_host(&instance));
+        (registry, instance, cleanup)
+    }
+
+    #[test]
+    fn every_retirement_path_retains_an_unjoined_host() {
+        for path in 0..8 {
+            let (registry, instance, cleanup) = gated_host();
+            match path {
+                0 => {
+                    assert!(matches!(
+                        registry.kill_instance(&instance, 0),
+                        Err(AgentError::CleanupUnconfirmed { .. })
+                    ));
+                }
+                1 => {
+                    assert!(registry
+                        .signal(&instance.pid, AgentSignal::Sigkill, None)
+                        .is_err());
+                }
+                2 => {
+                    assert!(registry
+                        .update_state(&instance.pid, AgentState::Terminated)
+                        .is_err());
+                }
+                3 => {
+                    assert!(registry
+                        .update_state_with_exit(&instance.pid, AgentState::Terminated, 0)
+                        .is_err());
+                }
+                4 => {
+                    assert!(!registry.reap(&instance.pid));
+                }
+                5 => {
+                    assert!(registry.unregister_instance(&instance).is_none());
+                }
+                6 => {
+                    registry.close_all();
+                }
+                7 => {
+                    assert!(registry
+                        .update_instance_state(&instance, AgentState::Terminated, None)
+                        .is_err());
+                }
+                _ => unreachable!(),
+            }
+            assert!(cleanup.stop_requested());
+            assert!(registry.is_current_instance(&instance));
+            assert!(!registry.is_managed_host_bound(&instance));
+            assert_eq!(
+                registry.get(&instance.pid).unwrap().state,
+                AgentState::Ready
+            );
+            assert!(!registry
+                .update_instance_state(&instance, AgentState::Busy, None)
+                .unwrap());
+            assert!(!registry.register(AgentDescriptor {
+                pid: instance.pid.clone(),
+                ..Default::default()
+            }));
+            assert!(cleanup.complete(Ok(())));
+            assert!(registry.kill_instance(&instance, 0).unwrap().is_some());
+            assert!(!registry.is_current_instance(&instance));
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_is_sticky_and_cannot_release_the_original_pid() {
+        let (registry, instance, cleanup) = gated_host();
+        assert!(!cleanup.complete(Err("receiver join unconfirmed".into())));
+        // No terminal observer is needed to withdraw current-host readiness.
+        assert!(registry.host_stop_requested(&instance));
+        assert!(!registry.is_managed_host_bound(&instance));
+        for _ in 0..2 {
+            assert!(!cleanup.complete(Ok(())));
+            assert!(registry.kill_instance(&instance, 0).is_err());
+            assert!(!registry.reap(&instance.pid));
+        }
+        assert!(registry.is_current_instance(&instance));
+        assert_eq!(
+            cleanup.outcome(),
+            HostCleanupOutcome::Unconfirmed("receiver join unconfirmed".into())
+        );
+    }
+
+    #[test]
+    fn stop_callback_can_reenter_registry_and_old_completion_cannot_release_replacement() {
+        let (registry, old, cleanup) = gated_host();
+        let registry = Arc::new(registry);
+        let r = Arc::clone(&registry);
+        let captured = old.clone();
+        let completion = cleanup.clone();
+        cleanup
+            .set_stop_handler(Arc::new(move || {
+                assert!(r.is_current_instance(&captured));
+                assert!(completion.complete(Ok(())));
+            }))
+            .unwrap();
+        // This request reports the unconfirmed observation; a subsequent
+        // original-instance operation can retire after the callback completed.
+        assert!(registry.kill_instance(&old, 0).is_err());
+        registry.kill_instance(&old, 0).unwrap();
+        let replacement = registry
+            .register_instance(AgentDescriptor {
+                pid: old.pid.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        let replacement_cleanup = registry.arm_host_cleanup(&replacement).unwrap();
+        assert!(cleanup.complete(Ok(())));
+        assert!(registry.kill_instance(&old, 0).unwrap().is_none());
+        assert_eq!(replacement_cleanup.outcome(), HostCleanupOutcome::Pending);
+        assert!(registry.is_current_instance(&replacement));
+    }
 
     fn make_desc(pid: &str, name: &str) -> AgentDescriptor {
         AgentDescriptor {

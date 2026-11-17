@@ -33,6 +33,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod auth_posture;
 mod authorization;
+#[cfg(feature = "rebac")]
+pub use authorization::CurrentResourceGrants;
 #[cfg(feature = "experimental-managed-agent-csr")]
 mod csr_cli;
 mod doctor;
@@ -1142,6 +1144,10 @@ pub struct ServiceBootCtx {
     pub runtime: tokio::runtime::Handle,
     /// The cluster credential authority, absent in a confined user runtime.
     pub credential_plane: Option<CredentialPlaneBootCtx>,
+    /// Explicit current resource policy, absent when authentication or ReBAC
+    /// enforcement is unavailable. This is not a Session/storage grant provider.
+    #[cfg(feature = "rebac")]
+    pub current_resource_grants: Option<Arc<CurrentResourceGrants>>,
 }
 
 /// Resources belonging to the cluster credential authority, never a user runtime.
@@ -3537,7 +3543,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         (cred_zone.consensus_node(), cred_zone.runtime_handle())
     };
 
-    let svc_ctx = ServiceBootCtx {
+    let mut svc_ctx = ServiceBootCtx {
         auth_armed: identity_armed,
         // `vfs_auth` is the trait-object the kernel gRPC interceptor
         // consumes — reuse it so every authenticated surface (kernel
@@ -3557,34 +3563,33 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
             runtime: credential_zone_runtime,
             api_key_secret,
         }),
+        #[cfg(feature = "rebac")]
+        current_resource_grants: None,
     };
+    // Construct the same policy before custom service builders run. Its later
+    // kernel installation cannot stand in for an explicit service dependency.
+    let authorization_decls =
+        authorization::service_decls(&common, &mut svc_ctx, &zm, Arc::clone(&data_plane_ready))?;
     let mut service_decls = build_decls(&svc_ctx);
     #[cfg(feature = "experimental-managed-agent-csr")]
     let service_tls = zm.registry().tls_config().map_err(anyhow::Error::msg)?;
     #[cfg(feature = "experimental-managed-agent-csr")]
     if identity_armed && !common.no_tls {
+        service_tls.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("managed credentials require the selected native TLS identity")
+        })?;
         let native_issuer = managed_csr_binding::NativeIssuer::for_host(
             zm.ca_issuer_slot(),
-            service_tls.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("managed credentials require the selected native TLS identity")
-            })?,
+            zm.registry().shared_tls(),
             svc_ctx.runtime.clone(),
         );
-        if let Some(issuer) = &native_issuer {
-            zm.on_node_identity(issuer.node_identity_holder());
-        }
         service_decls.push(managed_csr_binding::service_decl(
             common.data_dir.join("tls"),
             identity_armed,
             native_issuer,
         )?);
     }
-    service_decls.extend(authorization::service_decls(
-        &common,
-        &svc_ctx,
-        &zm,
-        Arc::clone(&data_plane_ready),
-    )?);
+    service_decls.extend(authorization_decls);
     kernel
         .bring_up_services(service_decls)
         .map_err(|e| anyhow::anyhow!("bring up services: {e}"))?;

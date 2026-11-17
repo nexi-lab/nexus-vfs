@@ -21,7 +21,8 @@ jobs:
       # pin, `stable` resolved differently per runner inside a single run, so
       # these numbers decided merges by coin flip.
       #
-      # Measurements include the runtime observation contract on 1.99.0.
+      # Measurements include the runtime observation contract and the managed-agent
+      # cleanup latch and bootstrap on 1.99.0.
       # Same-toolchain protected-main/feature measurements and source revisions
       # live in rust/profiles/README.md. Caps restore ~3% measured headroom;
       # source CI still measures every native artifact against its fixed cap.
@@ -43,8 +44,8 @@ jobs:
             binary: nexusd-cluster
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-linux-x86_64-operator-agent-enrollment
-            max_size_bytes: 21757952  # 20.75 MiB; ~3% over the measured
-                                      # runtime-observation candidate. See rust/profiles/README.md.
+            max_size_bytes: 22347776  # 21.3125 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: macos-15
             artifact_name: nexusd-cluster-macos-arm64
             package: nexus-cluster
@@ -53,8 +54,8 @@ jobs:
             binary: nexusd-cluster
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-macos-arm64-operator-agent-enrollment
-            max_size_bytes: 18743296  # 17.875 MiB; ~3% over the measured
-                                      # runtime-observation candidate. See rust/profiles/README.md.
+            max_size_bytes: 19267584  # 18.375 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: macos-15
             artifact_name: nexusd-cluster-macos-x86_64
             package: nexus-cluster
@@ -64,8 +65,8 @@ jobs:
             operator_binary: nexus-agent-enroll
             operator_artifact_name: nexus-agent-enroll-macos-x86_64-operator-agent-enrollment
             target: x86_64-apple-darwin
-            max_size_bytes: 20054016  # 19.125 MiB; ~3% over the measured
-                                      # runtime-observation candidate. See rust/profiles/README.md.
+            max_size_bytes: 20578304  # 19.625 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
           - os: windows-latest
             artifact_name: nexusd-cluster-windows-x86_64
             package: nexus-cluster
@@ -74,8 +75,8 @@ jobs:
             binary: nexusd-cluster.exe
             operator_binary: nexus-agent-enroll.exe
             operator_artifact_name: nexus-agent-enroll-windows-x86_64-operator-agent-enrollment
-            max_size_bytes: 20840448  # 19.875 MiB; ~3% over the measured
-                                      # runtime-observation candidate. See rust/profiles/README.md.
+            max_size_bytes: 21561344  # 20.5625 MiB; ~3% over the measured
+                                      # managed-agent cleanup candidate. See rust/profiles/README.md.
 
 
     steps:
