@@ -52,6 +52,8 @@
 
 #![allow(dead_code)]
 
+pub mod local_host;
+
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -297,7 +299,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// Terminal status of a hosted child (frozen-contract ③). Exactly one of
 /// `code` / `signal` is `Some` for a real exit; both `None` means the
 /// wait itself failed (status indeterminable).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessExit {
     pub code: Option<i32>,
     pub signal: Option<i32>,
@@ -332,22 +334,12 @@ fn spawn_child_piped(
     env: HashMap<String, String>,
     cwd: &Path,
 ) -> Result<(Child, ChildStdin, ChildStdout, ChildStderr), SubprocessError> {
-    if argv.is_empty() {
-        return Err(SubprocessError::Spawn("empty argv".into()));
-    }
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .env_clear()
-        .envs(env)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| SubprocessError::Spawn(e.to_string()))?;
+    let mut child = spawn_child(
+        argv,
+        env,
+        cwd,
+        [Stdio::piped(), Stdio::piped(), Stdio::piped()],
+    )?;
     let stdin = child
         .stdin
         .take()
@@ -361,6 +353,32 @@ fn spawn_child_piped(
         .take()
         .ok_or_else(|| SubprocessError::Io("subprocess stderr missing".into()))?;
     Ok((child, stdin, stdout, stderr))
+}
+
+/// Process policy is independent of presentation. Only the three inherited or
+/// piped handles differ; argv, environment, cwd and child ownership stay shared.
+fn spawn_child(
+    argv: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: &Path,
+    stdio: [Stdio; 3],
+) -> Result<Child, SubprocessError> {
+    if argv.is_empty() {
+        return Err(SubprocessError::Spawn("empty argv".into()));
+    }
+    let [stdin, stdout, stderr] = stdio;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .env_clear()
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .kill_on_drop(true);
+
+    cmd.spawn()
+        .map_err(|e| SubprocessError::Spawn(e.to_string()))
 }
 
 /// `dup(2)` the raw fd so the kernel-side StdioPipeBackend holds an

@@ -59,6 +59,7 @@ use kernel::service_registry::{RustCallError, RustService};
 // same SessionMailbox as an in-process host. Slim builds reject spawn_spec.
 #[cfg(feature = "subprocess-host")]
 pub(crate) mod raw_spawn;
+pub mod session_transport;
 
 #[cfg(feature = "subprocess-host")]
 mod durable_session;
@@ -175,10 +176,19 @@ pub(crate) struct StartSessionRequest {
     /// Launch policy (command, model and credentials) belongs to the embedder.
     #[serde(default)]
     pub spawn_spec: Option<SpawnSpec>,
+    /// A one-use local host capability. The authenticated controller admits
+    /// a session in the caller's existing process; it grants no OS PID authority.
+    /// Mutually exclusive with daemon-owned `spawn_spec`.
+    #[serde(default)]
+    pub local_host: Option<contracts::local_host::LocalHostOffer>,
     /// Durable transcript to restore in a supporting hosted runtime. This is NOT
     /// the pid-valued `session_id` accepted by get/cancel.
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Omitted clients retain the durable mailbox protocol. Live delivery is
+    /// negotiated explicitly, never a silent change to replay guarantees.
+    #[serde(default)]
+    pub session_protocol: Option<String>,
 }
 
 /// Subprocess specification supplied by the embedder. The kernel owns process
@@ -192,6 +202,13 @@ pub(crate) struct SpawnSpec {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub cwd: String,
+}
+
+/// Process placement is an adapter choice; registration and authorization stay
+/// in the same managed-session path. Neither variant carries terminal bytes.
+pub(crate) enum ProcessLaunch {
+    Daemon(SpawnSpec),
+    Local(contracts::local_host::LocalHostOffer),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,7 +346,7 @@ pub trait SpawnHandle: Send + Sync {
     }
 
     /// Durable transcript identity, independent of the registry pid.
-    fn durable_session_id(&self) -> Option<&str> {
+    fn durable_session_id(&self) -> Option<String> {
         None
     }
 }
@@ -340,6 +357,7 @@ pub(crate) struct HostedSession {
     instance: AgentInstance,
     handle: Arc<dyn SpawnHandle>,
     cleanup: Option<ManagedHostCleanup>,
+    transport: Option<session_transport::SessionTransport>,
 }
 
 type HostedSessions = Arc<dashmap::DashMap<String, HostedSession>>;
@@ -351,6 +369,7 @@ fn store_host_handle(
     instance: AgentInstance,
     handle: Box<dyn SpawnHandle>,
     cleanup: Option<&kernel::core::agents::host_cleanup::ManagedHostCleanup>,
+    transport: Option<session_transport::SessionTransport>,
 ) -> Result<Arc<dyn SpawnHandle>, String> {
     let handle: Arc<dyn SpawnHandle> = handle.into();
     // All host insertions use the same map guard before the incarnation check.
@@ -371,6 +390,7 @@ fn store_host_handle(
                     instance,
                     handle: Arc::clone(&handle),
                     cleanup: cleanup.cloned(),
+                    transport,
                 });
                 drop(hosted);
                 if let Some(cleanup) = cleanup {
@@ -399,7 +419,7 @@ fn store_host_handle(
 #[derive(Clone, Debug, Default)]
 pub struct SpawnOptions {
     pub resume_session_id: Option<String>,
-    pub session_endpoint: Option<a2a::session::SessionEndpoint>,
+    pub session_transport: Option<session_transport::SessionTransport>,
     /// Exact host-owned instance. Binding only exposes engine facts.
     pub runtime_observation: Option<Arc<dyn contracts::runtime_status::RuntimeObservationHost>>,
 }
@@ -477,8 +497,11 @@ pub trait SpawnTask<K: KernelSyscall>: Send + Sync + 'static {
         if options.resume_session_id.is_some() {
             return Err("this runtime does not support resume_session_id".into());
         }
-        if options.session_endpoint.is_some() {
-            return Err("this runtime does not support acp-mailbox/1".into());
+        if let Some(transport) = options.session_transport {
+            return Err(format!(
+                "this runtime does not support {}",
+                transport.endpoint().protocol
+            ));
         }
         self.spawn(kernel, desc, state_observer)
     }
@@ -499,7 +522,7 @@ pub(crate) trait RawSpawn: Send + Sync {
     /// OS PID. Dropping an unattached launch terminates the child.
     fn prepare(
         &self,
-        spec: SpawnSpec,
+        spec: ProcessLaunch,
         resume_session_id: Option<String>,
     ) -> Result<Box<dyn PreparedRawSpawn>, String>;
 }
@@ -514,13 +537,18 @@ fn valid_durable_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+type StateObserver = Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>;
+
 pub(crate) trait PreparedRawSpawn: Send {
-    fn os_pid(&self) -> u32;
+    /// Only the daemon's own Child handle attests an OS PID here. Delegated
+    /// launchers use a logical registry identity and never grant PID authority.
+    fn os_pid(&self) -> Option<u32>;
     fn attach(
         self: Box<Self>,
         desc: &AgentDescriptor,
         instance: AgentInstance,
-        endpoint: a2a::session::SessionEndpoint,
+        transport: session_transport::SessionTransport,
+        observer: StateObserver,
     ) -> Result<(), String>;
 }
 
@@ -551,6 +579,7 @@ pub(crate) struct ManagedAgentService<K: KernelSyscall> {
     /// [`raw_spawn::KernelRawSpawn`] (`subprocess-host`); `None`
     /// elsewhere, in which case a `spawn_spec` request is rejected.
     raw_spawn: Option<Arc<dyn RawSpawn>>,
+    retired_sessions: Arc<session_transport::RetiredSessions>,
 }
 
 impl<K: KernelSyscall> ManagedAgentService<K> {
@@ -569,6 +598,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             spawn_provider: None,
             spawn_handles: Arc::new(dashmap::DashMap::new()),
             raw_spawn: None,
+            retired_sessions: Arc::default(),
         }
     }
 
@@ -590,6 +620,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             spawn_provider: Some(spawn_provider),
             spawn_handles: Arc::new(dashmap::DashMap::new()),
             raw_spawn: None,
+            retired_sessions: Arc::default(),
         }
     }
 
@@ -613,6 +644,80 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         self.start_session_for(req, Some("test-controller"))
     }
 
+    fn state_observer(&self, desc: &AgentDescriptor, instance: AgentInstance) -> StateObserver {
+        // Construct the SSOT state observer. AgentRegistry is
+        // the single writer of AgentState in the runtime path
+        // (see kernel::core::agents::registry::update_state +
+        // can_transition_to FSM); the spawn body reports an
+        // AgentState on each transition (the running-state
+        // subset WarmingUp/Ready/Busy — Registered/Suspended/
+        // Terminated are service-set at plant/teardown) and this
+        // closure forwards it through update_state.
+        // InvalidTransition is logged rather than panicked so
+        // an FSM bug in the runtime body surfaces as a warning
+        // instead of taking down the worker thread.
+        let registry = Arc::clone(&self.agent_registry);
+        let pid_for_observer = desc.pid.clone();
+        let observer_instance = instance;
+        let kernel_for_observer = Arc::clone(&self.kernel);
+        let agent_name = desc.name.clone();
+        let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
+            Arc::new(move |state: AgentState, reason: Option<String>| {
+                // Note the pre-update AwaitingInput status so we publish
+                // only the attention enter/exit edges (bounded), not
+                // every Ready↔Busy flip.
+                let was_awaiting = registry
+                    .get(&pid_for_observer)
+                    .map(|d| d.state == AgentState::AwaitingInput)
+                    .unwrap_or(false);
+                match registry.update_instance_state(&observer_instance, state, reason.clone()) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(e) => {
+                        tracing::warn!(
+                            pid = %pid_for_observer,
+                            state = ?state,
+                            error = %e,
+                            "AgentRegistry.update_state rejected runtime-side transition",
+                        );
+                        return;
+                    }
+                }
+                // Publish the AwaitingInput enter/exit edge to the
+                // agent's replicated state stream — best-effort, so a
+                // non-stream / std deployment (no reader) never disturbs
+                // the agent.
+                let is_awaiting = state == AgentState::AwaitingInput;
+                if was_awaiting != is_awaiting {
+                    let event = serde_json::json!({
+                        "state": state.as_str(),
+                        "reason": reason,
+                    })
+                    .to_string();
+                    let ctx = kernel::kernel::OperationContext::new(
+                        "managed_agent",
+                        "root",
+                        true,
+                        None,
+                        true,
+                    );
+                    if let Err(e) = kernel_for_observer.sys_write(
+                        &a2a::agent_state_path(&agent_name),
+                        &ctx,
+                        event.as_bytes(),
+                        0,
+                    ) {
+                        tracing::warn!(
+                            agent = %agent_name,
+                            error = ?e,
+                            "publish agent attention state failed (best-effort)",
+                        );
+                    }
+                }
+            });
+        observer
+    }
+
     fn start_session_for(
         &self,
         mut req: StartSessionRequest,
@@ -623,13 +728,36 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 "'agent_id' is required".into(),
             ));
         }
+        let protocol = req
+            .session_protocol
+            .as_deref()
+            .unwrap_or(a2a::session::SESSION_PROTOCOL);
+        if protocol != a2a::session::SESSION_PROTOCOL
+            && protocol != a2a::session::LIVE_SESSION_PROTOCOL
+        {
+            return Err(ManagedAgentError::InvalidArgument(
+                "unsupported hosted ACP protocol".into(),
+            ));
+        }
+        if req.spawn_spec.is_some() && req.local_host.is_some() {
+            return Err(ManagedAgentError::InvalidArgument(
+                "spawn_spec and local_host are mutually exclusive".into(),
+            ));
+        }
+        if let Some(offer) = &req.local_host {
+            offer
+                .validate()
+                .map_err(|error| ManagedAgentError::InvalidArgument(error.into()))?;
+        }
         if let Some(id) = req.resume_session_id.as_deref() {
             if !valid_durable_id(id) {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id must be a durable ID, not a path".into(),
                 ));
             }
-            if req.spawn_spec.is_none() && self.spawn_provider.is_none() {
+            if req.local_host.is_some()
+                || (req.spawn_spec.is_none() && self.spawn_provider.is_none())
+            {
                 return Err(ManagedAgentError::InvalidArgument(
                     "resume_session_id requires a hosted runtime provider".into(),
                 ));
@@ -638,18 +766,26 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         // Take the raw spawn spec out early — it selects the spawn
         // strategy below (raw ACP subprocess vs. runtime body) and the
         // rest of the descriptor build doesn't touch it.
-        let spawn_spec = req.spawn_spec.take();
-        let session_endpoint = if spawn_spec.is_some() || self.spawn_provider.is_some() {
+        let process_launch = req
+            .spawn_spec
+            .take()
+            .map(ProcessLaunch::Daemon)
+            .or_else(|| req.local_host.take().map(ProcessLaunch::Local));
+        let session_endpoint = if process_launch.is_some() || self.spawn_provider.is_some() {
             let controller = controller.filter(|id| !id.is_empty()).ok_or_else(|| {
                 ManagedAgentError::InvalidArgument(
                     "hosted sessions require an authenticated controller agent".into(),
                 )
             })?;
-            let endpoint = a2a::session::SessionEndpoint::new(
+            let mut endpoint = a2a::session::SessionEndpoint::new(
                 req.agent_id.clone(),
                 controller.to_string(),
                 uuid::Uuid::new_v4().to_string(),
             );
+            if protocol == a2a::session::LIVE_SESSION_PROTOCOL {
+                endpoint.protocol = protocol.into();
+                endpoint.transcript.clear();
+            }
             endpoint
                 .validate()
                 .map_err(ManagedAgentError::InvalidArgument)?;
@@ -668,10 +804,10 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             req.zone_id.clone()
         };
 
-        let raw_session = if let Some(spec) = spawn_spec {
+        let raw_session = if let Some(spec) = process_launch {
             let spawner = self.raw_spawn.as_ref().ok_or_else(|| {
                 ManagedAgentError::InvalidArgument(
-                    "spawn_spec requires the subprocess-host feature".into(),
+                    "process launch requires the subprocess-host feature".into(),
                 )
             })?;
             Some(
@@ -682,7 +818,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         } else {
             None
         };
-        let os_pid = raw_session.as_ref().map(|child| child.os_pid());
+        let os_pid = raw_session.as_ref().and_then(|child| child.os_pid());
         let pid = if let Some(native) = os_pid {
             contracts::agent_pid::encode_agent_pid(i64::from(native), None)
         } else {
@@ -764,12 +900,17 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
             {
                 tracing::warn!(pid=%pid, error=%e, "ensure_agent_state_stream failed");
             }
+            let observer = self.state_observer(&desc, instance.clone());
+            let session_transport = session_endpoint
+                .clone()
+                .map(|endpoint| session_transport::SessionTransport::new(endpoint, &desc));
             if let Some(child) = raw_session {
                 child
                     .attach(
                         &desc,
                         instance.clone(),
-                        session_endpoint.clone().expect("hosted endpoint"),
+                        session_transport.expect("hosted transport"),
+                        observer,
                     )
                     .map_err(|error| {
                         let _ = self.agent_registry.kill_instance(&instance, 127);
@@ -785,80 +926,6 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                                 .into(),
                         )
                     })?;
-                // Construct the SSOT state observer. AgentRegistry is
-                // the single writer of AgentState in the runtime path
-                // (see kernel::core::agents::registry::update_state +
-                // can_transition_to FSM); the spawn body reports an
-                // AgentState on each transition (the running-state
-                // subset WarmingUp/Ready/Busy — Registered/Suspended/
-                // Terminated are service-set at plant/teardown) and this
-                // closure forwards it through update_state.
-                // InvalidTransition is logged rather than panicked so
-                // an FSM bug in the runtime body surfaces as a warning
-                // instead of taking down the worker thread.
-                let registry = Arc::clone(&self.agent_registry);
-                let pid_for_observer = pid.clone();
-                let observer_instance = instance.clone();
-                let kernel_for_observer = Arc::clone(&self.kernel);
-                let agent_name = desc.name.clone();
-                let observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync> =
-                    Arc::new(move |state: AgentState, reason: Option<String>| {
-                        // Note the pre-update AwaitingInput status so we publish
-                        // only the attention enter/exit edges (bounded), not
-                        // every Ready↔Busy flip.
-                        let was_awaiting = registry
-                            .get(&pid_for_observer)
-                            .map(|d| d.state == AgentState::AwaitingInput)
-                            .unwrap_or(false);
-                        match registry.update_instance_state(
-                            &observer_instance,
-                            state,
-                            reason.clone(),
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => return,
-                            Err(e) => {
-                                tracing::warn!(
-                                    pid = %pid_for_observer,
-                                    state = ?state,
-                                    error = %e,
-                                    "AgentRegistry.update_state rejected runtime-side transition",
-                                );
-                                return;
-                            }
-                        }
-                        // Publish the AwaitingInput enter/exit edge to the
-                        // agent's replicated state stream — best-effort, so a
-                        // non-stream / std deployment (no reader) never disturbs
-                        // the agent.
-                        let is_awaiting = state == AgentState::AwaitingInput;
-                        if was_awaiting != is_awaiting {
-                            let event = serde_json::json!({
-                                "state": state.as_str(),
-                                "reason": reason,
-                            })
-                            .to_string();
-                            let ctx = kernel::kernel::OperationContext::new(
-                                "managed_agent",
-                                "root",
-                                true,
-                                None,
-                                true,
-                            );
-                            if let Err(e) = kernel_for_observer.sys_write(
-                                &a2a::agent_state_path(&agent_name),
-                                &ctx,
-                                event.as_bytes(),
-                                0,
-                            ) {
-                                tracing::warn!(
-                                    agent = %agent_name,
-                                    error = ?e,
-                                    "publish agent attention state failed (best-effort)",
-                                );
-                            }
-                        }
-                    });
                 // A provider may refuse before creating anything or fail after
                 // partial startup. Only its native completion latch can authorize
                 // retirement; an error string alone cannot distinguish those cases.
@@ -868,7 +935,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                         desc,
                         SpawnOptions {
                             resume_session_id: req.resume_session_id.clone(),
-                            session_endpoint: session_endpoint.clone(),
+                            session_transport: session_transport.clone(),
                             runtime_observation:
                                 kernel::core::agents::registry::RuntimeRegistryHost::new(
                                     Arc::clone(&self.agent_registry),
@@ -905,20 +972,19 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                     instance.clone(),
                     handle,
                     Some(&cleanup),
+                    session_transport,
                 )
                 .map_err(ManagedAgentError::Internal)?;
-                if req
-                    .resume_session_id
-                    .as_deref()
-                    .is_some_and(|requested| handle.durable_session_id() != Some(requested))
-                {
+                if req.resume_session_id.as_deref().is_some_and(|requested| {
+                    handle.durable_session_id().as_deref() != Some(requested)
+                }) {
                     handle.abort();
                     let _ = self.agent_registry.kill_instance(&instance, 1);
                     return Err(ManagedAgentError::Internal(
                         "runtime did not restore the requested durable session".into(),
                     ));
                 }
-                durable_session_id = handle.durable_session_id().map(str::to_owned);
+                durable_session_id = handle.durable_session_id();
                 if handle.session_endpoint() != session_endpoint.as_ref() {
                     handle.abort();
                     let _ = self.agent_registry.kill_instance(&instance, 1);
@@ -1066,6 +1132,40 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
         (!ctx.is_admin && !ctx.is_system).then_some(ctx.user_id.as_str())
     }
 
+    fn live_session(
+        &self,
+        session_id: &str,
+        channel_id: &str,
+        ctx: &OperationContext,
+        writing: bool,
+    ) -> Result<Arc<session_transport::LiveSession>, RustCallError> {
+        let live = self
+            .spawn_handles
+            .get(session_id)
+            .and_then(|host| {
+                let transport = host.transport.as_ref()?;
+                if transport.endpoint().channel_id != channel_id
+                    || (writing && !self.agent_registry.is_current_instance(&host.instance))
+                {
+                    return None;
+                }
+                transport.live().cloned()
+            })
+            .or_else(|| {
+                (!writing)
+                    .then(|| self.retired_sessions.get(session_id, channel_id))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                RustCallError::InvalidArgument(
+                    "unknown or expired live ACP attachment; recover the current session state"
+                        .into(),
+                )
+            })?;
+        live.authorize(ctx)?;
+        Ok(live)
+    }
+
     /// Read-through liveness snapshot. Cheap by design; the live
     /// message flow uses `sys_watch` over `/proc/{pid}/transcript`,
     /// not this RPC.
@@ -1094,7 +1194,7 @@ impl<K: KernelSyscall> ManagedAgentService<K> {
                 }
                 Ok((
                     host.handle.session_endpoint().cloned(),
-                    host.handle.durable_session_id().map(str::to_owned),
+                    host.handle.durable_session_id(),
                     host.cleanup
                         .as_ref()
                         .and_then(ManagedHostCleanup::stop_outcome),
@@ -1311,6 +1411,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
             spawn_provider,
             spawn_handles,
             raw_spawn,
+            retired_sessions: Arc::default(),
         });
 
         // Tear down the per-pid procfs subtree on out-of-band
@@ -1334,6 +1435,7 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         let kernel_for_cb = Arc::clone(kernel);
         let registry_for_cb = Arc::clone(kernel.agent_registry());
         let spawn_handles_for_cb = Arc::clone(&svc.spawn_handles);
+        let retired_for_cb = Arc::clone(&svc.retired_sessions);
         kernel.agent_registry().register_on_terminate(
             Self::NAME,
             Arc::new(move |pid: &str| {
@@ -1341,6 +1443,9 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
                     if let Some((_, host)) = spawn_handles_for_cb.remove_if(pid, |_, host| {
                         host.instance.incarnation() == instance.incarnation()
                     }) {
+                        if let Some(transport) = &host.transport {
+                            retired_for_cb.retire(transport);
+                        }
                         host.handle.abort();
                     }
                     unregister_proc_entry(kernel_for_cb.as_ref(), &desc);
@@ -1492,6 +1597,26 @@ impl<K: KernelSyscall> RustService for ManagedAgentService<K> {
         payload: &[u8],
     ) -> Result<Vec<u8>, RustCallError> {
         match method {
+            "session_read_v1" => {
+                let req: a2a::session_live::ReadSessionRequest = serde_json::from_slice(payload)
+                    .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                let live = self.live_session(&req.session_id, &req.channel_id, ctx, false)?;
+                let response = live
+                    .read(req.after_sequence, req.timeout_ms)
+                    .map_err(RustCallError::InvalidArgument)?;
+                serde_json::to_vec(&response)
+                    .map_err(|error| RustCallError::Internal(error.to_string()))
+            }
+            "session_submit_v1" => {
+                let req: a2a::session_live::SubmitSessionRequest = serde_json::from_slice(payload)
+                    .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
+                let live = self.live_session(&req.session_id, &req.channel_id, ctx, true)?;
+                live.submit(req.sequence, req.payload)
+                    .map_err(RustCallError::InvalidArgument)?;
+                Ok(serde_json::json!({"accepted_sequence":req.sequence})
+                    .to_string()
+                    .into_bytes())
+            }
             "start_session_v1" => {
                 let mut req: StartSessionRequest = serde_json::from_slice(payload)
                     .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
@@ -1671,7 +1796,9 @@ mod tests {
             owner_id: "ethan".to_string(),
             zone_id: "root".to_string(),
             spawn_spec: None,
+            local_host: None,
             resume_session_id: None,
+            session_protocol: None,
         }
     }
 
@@ -1715,7 +1842,11 @@ mod tests {
             observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Result<Box<dyn SpawnHandle>, String> {
             self.spawn(kernel, desc, observer)?;
-            Ok(Box::new(NoopHandle(options.session_endpoint)))
+            Ok(Box::new(NoopHandle(
+                options
+                    .session_transport
+                    .map(|transport| transport.endpoint().clone()),
+            )))
         }
 
         fn spawn(
@@ -1762,7 +1893,11 @@ mod tests {
             observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Result<Box<dyn SpawnHandle>, String> {
             self.spawn(kernel, desc, observer)?;
-            Ok(Box::new(NoopHandle(options.session_endpoint)))
+            Ok(Box::new(NoopHandle(
+                options
+                    .session_transport
+                    .map(|transport| transport.endpoint().clone()),
+            )))
         }
 
         fn spawn(
@@ -1919,7 +2054,11 @@ mod tests {
             observer: Arc<dyn Fn(AgentState, Option<String>) + Send + Sync>,
         ) -> Result<Box<dyn SpawnHandle>, String> {
             self.spawn(kernel, desc, observer)?;
-            Ok(Box::new(NoopHandle(options.session_endpoint)))
+            Ok(Box::new(NoopHandle(
+                options
+                    .session_transport
+                    .map(|transport| transport.endpoint().clone()),
+            )))
         }
 
         fn spawn(

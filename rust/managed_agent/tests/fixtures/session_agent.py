@@ -32,6 +32,13 @@ for line in sys.stdin:
             emit({'id': message['id'], 'result': {'sessionId': 'different-transcript'}})
         else:
             emit({'id': message['id'], 'error': {'code': -32002, 'message': 'not found', 'data': {'sessionId': sid}}})
+    elif method == 'test/burst':
+        for index in range(message['params']['count']):
+            emit({'method': 'session/update', 'params': {'index': index, 'text': 'x' * 8192}})
+        emit({'id': message['id'], 'result': {'emitted': message['params']['count']}})
+    elif method == 'test/close_final':
+        emit({'id': message['id'], 'result': {'final': True}})
+        break
     elif method == 'test/counts':
         emit({'id': message['id'], 'result': {'new': new_count, 'load': load_count}})
     elif method == 'session/prompt':

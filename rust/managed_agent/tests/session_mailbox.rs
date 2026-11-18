@@ -6,112 +6,203 @@ use std::time::{Duration, Instant};
 use a2a::session::{SessionCodec, SessionEndpoint, SessionPayload, SessionSide};
 use kernel::kernel::syscall::KernelSyscall;
 use kernel::kernel::{Kernel, OperationContext};
-use serde_json::{json, Value};
+use serde_json::json;
 
-fn call(kernel: &Kernel, method: &str, payload: Value) -> Result<Value, String> {
-    let mut ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
-    // The fixture's operator holds an explicit root grant: under the
-    // caller-context rules an ordinary agent credential reaches the root
-    // default only through a grant, never by omitting the field.
-    ctx.zone_perms = vec![("root".to_string(), "rw".to_string())];
-    let response = kernel
-        .dispatch_rust_call(
-            "managed_agent",
-            method,
-            payload.to_string().as_bytes(),
-            &ctx,
-        )
-        .expect("installed service")
-        .map_err(|e| format!("{e:?}"))?;
-    serde_json::from_slice(&response).map_err(|e| e.to_string())
+#[path = "common/session_control.rs"]
+mod session_control;
+use session_control::{call, receive, send, session_kernel};
+
+struct LiveController {
+    kernel: Arc<Kernel>,
+    pid: String,
+    endpoint: SessionEndpoint,
+    sent: u64,
 }
 
-fn receive(
-    kernel: &Kernel,
-    endpoint: &SessionEndpoint,
-    codec: &mut SessionCodec,
-    offset: &mut usize,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if let Some((data, next)) = kernel
-            .stream_read_at(&endpoint.transcript, *offset)
-            .unwrap()
-        {
-            *offset = next;
-            match codec.decode(&data).unwrap() {
-                Some(SessionPayload::Rpc { message }) => return message,
-                Some(SessionPayload::Closed { reason }) => panic!("unexpected closure: {reason}"),
-                None => {}
+impl LiveController {
+    fn start(agent: &str) -> Self {
+        let kernel = session_kernel(agent);
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/session_agent.py");
+        let environment: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let started = call(
+            &kernel,
+            "start_session_v1",
+            json!({
+                "agent_id":agent, "session_protocol":"acp-live/1",
+                "spawn_spec":{"cmd":if cfg!(windows) { "python" } else { "python3" },
+                    "args":["-u",fixture],"env":environment}
+            }),
+        )
+        .unwrap();
+        let endpoint: SessionEndpoint =
+            serde_json::from_value(started["session_endpoint"].clone()).unwrap();
+        assert_eq!(endpoint.protocol, "acp-live/1");
+        assert!(endpoint.transcript.is_empty());
+        assert!(SessionCodec::new(endpoint.clone(), SessionSide::Controller).is_err());
+        Self {
+            kernel,
+            pid: started["session_id"].as_str().unwrap().into(),
+            endpoint,
+            sent: 0,
+        }
+    }
+
+    fn submit(
+        &self,
+        sequence: u64,
+        message: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        call(
+            &self.kernel,
+            "session_submit_v1",
+            json!({
+                "session_id":self.pid,"channel_id":self.endpoint.channel_id,
+                "sequence":sequence,"payload":{"type":"rpc","message":message}
+            }),
+        )
+    }
+
+    fn send(&mut self, message: serde_json::Value) {
+        let next = self.sent + 1;
+        assert_eq!(
+            self.submit(next, message).unwrap()["accepted_sequence"],
+            next
+        );
+        self.sent = next;
+    }
+
+    fn read(&self, after: u64) -> a2a::session_live::ReadSessionResponse {
+        serde_json::from_value(
+            call(
+                &self.kernel,
+                "session_read_v1",
+                json!({
+                    "session_id":self.pid,"channel_id":self.endpoint.channel_id,
+                    "after_sequence":after,"timeout_ms":200
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn wait_for(
+        &self,
+        after: u64,
+        predicate: impl Fn(&a2a::session_live::ReadSessionResponse) -> bool,
+    ) -> a2a::session_live::ReadSessionResponse {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = self.read(after);
+            if predicate(&response) {
+                return response;
             }
-        } else {
+            assert!(
+                Instant::now() < deadline,
+                "live ACP response timed out: {response:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    panic!("timed out waiting for a session message")
 }
 
-fn send(
-    kernel: &Kernel,
-    endpoint: &SessionEndpoint,
-    codec: &mut SessionCodec,
-    message: Value,
-) -> Vec<u8> {
-    let bytes = codec.encode(SessionPayload::Rpc { message }).unwrap();
-    let ctx = OperationContext::new("operator", "root", false, Some("operator"), false);
-    assert!(
-        KernelSyscall::sys_write(kernel, &endpoint.transcript, &ctx, &bytes, 0)
-            .unwrap()
-            .hit
-    );
-    bytes
+impl Drop for LiveController {
+    fn drop(&mut self) {
+        let _ = call(
+            &self.kernel,
+            "cancel_v2",
+            json!({
+                "session_id":self.pid,"channel_id":self.endpoint.channel_id
+            }),
+        );
+    }
 }
 
-fn session_kernel(agent: &str) -> Arc<Kernel> {
-    let kernel = Arc::new(Kernel::new());
-    kernel.vfs_router_arc().add_mount("/", "root", None, false);
-    a2a::install_a2a_stamp_hook(&kernel, true).unwrap();
-    managed_agent::install_managed_agent(&kernel).unwrap();
-    // This fixture has no raft WAL. Use the kernel's framed memory stream;
-    // production provisions the same record API over the replicated WAL.
-    let path = a2a::conversation_transcript_path(&a2a::conversation_id(agent, "operator"));
-    let parent = path.rsplit_once('/').unwrap().0;
-    // Fixture provisioning: the kernel-level ctx the typed sys_setattr
-    // requires; not the subject under test.
-    let ctx = contracts::OperationContext::new("system", "root", true, None, true);
-    kernel
-        .sys_setattr(
-            parent, &ctx, 1, "", None, None, None, "balanced", "root", false, 0, None, None, None,
-            None, None, None, None, None, None, None, None,
-        )
-        .unwrap();
-    kernel
-        .sys_setattr(
-            &path,
-            &ctx,
-            4,
-            "",
-            None,
-            None,
-            None,
-            "memory",
-            "root",
-            false,
-            1 << 20,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-    kernel
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_acp_replays_without_reexecuting_input_or_writing_the_peer_log() {
+    tokio::task::spawn_blocking(|| {
+        let mut controller = LiveController::start("live-replay");
+        controller.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}));
+        let initial = controller.wait_for(0, |response| !response.frames.is_empty());
+        assert_eq!(initial.frames[0].sequence, 1);
+        assert_eq!(initial.accepted_sequence, 1);
+        assert_eq!(controller.read(0).frames[0].payload, initial.frames[0].payload);
+        controller.send(json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}));
+        controller.wait_for(1, |response| !response.frames.is_empty());
+        let prompt = json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"durable-fixture-session"}});
+        controller.send(prompt.clone());
+        let permission = controller.wait_for(2, |response| response.frames.len() == 2);
+        assert!(controller.submit(controller.sent, prompt).unwrap_err().contains("input sequence"));
+        assert_eq!(controller.read(2).frames.len(), 2, "reconnect replays existing delivery");
+        assert_eq!(permission.accepted_sequence, controller.sent);
+        controller.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"durable-fixture-session"}}));
+        let terminal = controller.wait_for(4, |response| !response.frames.is_empty());
+        let SessionPayload::Rpc { message } = &terminal.frames[0].payload else { panic!("missing terminal response") };
+        assert_eq!(message["result"]["stopReason"], "cancelled");
+        let path = a2a::conversation_transcript_path(&a2a::conversation_id("live-replay", "operator"));
+        assert!(controller.kernel.stream_read_at(&path, 0).unwrap().is_none(), "live ACP must not enter the peer log");
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_acp_reports_retention_loss_and_batches_the_retained_tail() {
+    tokio::task::spawn_blocking(|| {
+        let mut controller = LiveController::start("live-retention");
+        controller
+            .send(json!({"jsonrpc":"2.0","id":1,"method":"test/burst","params":{"count":1200}}));
+        let gap = controller.wait_for(0, |response| response.latest_sequence == 1201);
+        assert!(gap.resync_required);
+        assert!(
+            gap.frames.is_empty(),
+            "a gap must not masquerade as complete replay"
+        );
+        assert!(gap.earliest_sequence > 1);
+        let batch = controller.read(gap.earliest_sequence - 1);
+        assert!(!batch.resync_required);
+        assert!(batch.frames.len() > 1 && batch.frames.len() <= 128);
+        let tail = controller.read(gap.latest_sequence - 1);
+        let SessionPayload::Rpc { message } = &tail.frames[0].payload else {
+            panic!("missing final burst response")
+        };
+        assert_eq!(message["result"]["emitted"], 1200);
+        assert_eq!(tail.accepted_sequence, 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_acp_final_response_survives_retirement_but_rejects_other_identities_and_old_inputs() {
+    tokio::task::spawn_blocking(|| {
+        let mut controller = LiveController::start("live-final");
+        for (owner, zone, actor) in [("operator", "root", "intruder"), ("intruder", "root", "operator"), ("operator", "other", "operator")] {
+            // Even an administrator cannot impersonate a private ACP controller.
+            let ctx = OperationContext::new(owner, zone, true, Some(actor), false);
+            let result = controller.kernel.dispatch_rust_call("managed_agent", "session_read_v1",
+                json!({"session_id":controller.pid,"channel_id":controller.endpoint.channel_id,"after_sequence":0}).to_string().as_bytes(), &ctx).unwrap();
+            assert!(matches!(result, Err(contracts::RustCallError::PermissionDenied(_))));
+        }
+        controller.send(json!({"jsonrpc":"2.0","id":"final","method":"test/close_final"}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.kernel.agent_registry().get(&controller.pid).is_some() {
+            assert!(Instant::now() < deadline, "actual subprocess must retire");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let final_delivery = controller.read(0);
+        assert!(final_delivery.closed && final_delivery.retired);
+        assert_eq!(final_delivery.frames.len(), 2);
+        let SessionPayload::Rpc { message } = &final_delivery.frames[0].payload else { panic!("lost final response") };
+        assert_eq!(message["result"]["final"], true);
+        assert!(matches!(final_delivery.frames[1].payload, SessionPayload::Closed { .. }));
+        assert!(controller.submit(2, json!({"jsonrpc":"2.0","id":2,"method":"initialize"})).is_err());
+        assert!(controller.kernel.agent_registry().register(kernel::core::agents::registry::AgentDescriptor {
+            pid: controller.pid.clone(), name: "replacement".into(), owner_id: "operator".into(), zone_id: "root".into(), ..Default::default()
+        }));
+        assert!(controller.submit(2, json!({"jsonrpc":"2.0","id":2,"method":"initialize"})).is_err());
+        assert_eq!(controller.read(0).frames.len(), 2);
+        controller.kernel.agent_registry().kill(&controller.pid, 0).unwrap();
+    }).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

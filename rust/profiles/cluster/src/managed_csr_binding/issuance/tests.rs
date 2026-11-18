@@ -24,8 +24,8 @@ impl SpawnHandle for Handle {
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
         Some(&self.0)
     }
-    fn durable_session_id(&self) -> Option<&str> {
-        Some("session-original-managed-runtime")
+    fn durable_session_id(&self) -> Option<String> {
+        Some("session-original-managed-runtime".into())
     }
 }
 impl SpawnTask<Kernel> for Host {
@@ -65,7 +65,11 @@ impl SpawnTask<Kernel> for Host {
     ) -> Result<Box<dyn SpawnHandle>, String> {
         observer(kernel::core::agents::registry::AgentState::Ready, None);
         Ok(Box::new(Handle(
-            options.session_endpoint.ok_or("missing native mailbox")?,
+            options
+                .session_transport
+                .ok_or("missing native transport")?
+                .endpoint()
+                .clone(),
         )))
     }
 }

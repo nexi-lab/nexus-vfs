@@ -72,9 +72,12 @@ jobs:
       - name: "Process instances: cargo test -p kernel --no-default-features core::agents --lib"
         if: runner.os != 'Linux'
         run: cargo --config .github/ci/functional-tests.toml test -p kernel --no-default-features core::agents --lib
-      - name: "Process instances: cargo test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume"
+      - name: "Process instances: cargo test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume --test local_terminal"
         if: runner.os != 'Linux'
-        run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume
+        run: cargo --config .github/ci/functional-tests.toml test -p managed-agent --all-features --lib --test host_cleanup --test session_mailbox --test session_resume --test local_terminal
+      - name: "Native terminal admission and OS ownership"
+        if: runner.os != 'Linux'
+        run: cargo --config .github/ci/functional-tests.toml test -p subprocess --test local_host
 
   durable-runtime-build:
     name: Durable runtime executables / Linux

@@ -41,8 +41,8 @@ impl SpawnHandle for Handle {
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
         self.endpoint.as_ref()
     }
-    fn durable_session_id(&self) -> Option<&str> {
-        Some("session-original-transcript")
+    fn durable_session_id(&self) -> Option<String> {
+        Some("session-original-transcript".to_owned())
     }
 }
 struct Provider(Arc<Body>);
@@ -86,7 +86,9 @@ impl SpawnTask<Kernel> for Provider {
             endpoint: if self.0.malformed {
                 None
             } else {
-                options.session_endpoint
+                options
+                    .session_transport
+                    .map(|transport| transport.endpoint().clone())
             },
             stopped: AtomicBool::new(false),
         }))

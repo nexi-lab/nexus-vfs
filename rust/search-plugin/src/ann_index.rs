@@ -980,9 +980,9 @@ mod tests {
         idx
     }
 
-    fn assert_sentinel_first(idx: &AnnIndex, query: &[f32]) {
+    fn assert_exact_sentinel_first(idx: &AnnIndex, query: &[f32]) {
         for k in [1, 5, 10] {
-            let hits = idx.search(query, k).expect("search");
+            let hits = idx.exact_search_under(query, "/", k).expect("search");
             assert_eq!(hits.len(), k, "k={k} must fill: {hits:?}");
             assert_eq!(hits[0].path, "/sentinel.md", "k={k}: {hits:?}");
             assert_eq!(
@@ -1004,6 +1004,13 @@ mod tests {
         let sentinel = vec_dir(16, 1.0);
         idx.add_vector("/sentinel.md", 0, &sentinel).unwrap();
         let nodes = idx.hnsw.get_nb_point();
+        // HNSW's random graph may reach fewer than k nodes. Reusing a node
+        // must preserve the same graph's results, rather than guarantee a
+        // recall count that approximate search does not promise.
+        let before: Vec<_> = [1, 5, 10]
+            .into_iter()
+            .map(|k| (k, idx.search(&sentinel, k).expect("initial search")))
+            .collect();
         for i in 0..300 {
             if i == 150 {
                 idx.commit().expect("commit mid-way");
@@ -1015,14 +1022,21 @@ mod tests {
         assert_eq!(idx.hnsw.get_nb_point(), nodes, "no duplicate nodes");
         assert!(idx.sidecar.read().shadowed.is_empty(), "no shadows");
         assert_eq!(idx.live_count(), 21);
-        assert_sentinel_first(&idx, &sentinel);
+        for (k, hits) in before {
+            assert_eq!(
+                idx.search(&sentinel, k).expect("search after reindex"),
+                hits,
+                "reindex must preserve approximate results for k={k}"
+            );
+        }
+        assert_exact_sentinel_first(&idx, &sentinel);
 
         // A real content change still replaces the vector.
         let edited = vec_dir(16, 1.3);
         idx.delete_all_chunks("/sentinel.md");
         idx.add_vector("/sentinel.md", 0, &edited).unwrap();
         assert_eq!(idx.sidecar.read().shadowed.len(), 1);
-        assert_sentinel_first(&idx, &edited);
+        assert_exact_sentinel_first(&idx, &edited);
     }
 
     #[test]

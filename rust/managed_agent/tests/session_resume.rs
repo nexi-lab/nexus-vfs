@@ -12,8 +12,8 @@ impl SpawnHandle for Handle {
     fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
         self.1.as_ref()
     }
-    fn durable_session_id(&self) -> Option<&str> {
-        Some(&self.0)
+    fn durable_session_id(&self) -> Option<String> {
+        Some(self.0.clone())
     }
 }
 impl SpawnTask<Kernel> for Provider {
@@ -54,7 +54,9 @@ impl SpawnTask<Kernel> for Provider {
             options
                 .resume_session_id
                 .unwrap_or_else(|| "durable-test-session".into()),
-            options.session_endpoint,
+            options
+                .session_transport
+                .map(|transport| transport.endpoint().clone()),
         )))
     }
 }
@@ -388,7 +390,7 @@ fn replacement_race_fixture() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicBool
                 armed: Arc::clone(&self.0),
                 registry: Arc::clone(kernel.agent_registry()),
                 descriptor,
-                endpoint: options.session_endpoint.unwrap(),
+                endpoint: options.session_transport.unwrap().endpoint().clone(),
             }))
         }
     }

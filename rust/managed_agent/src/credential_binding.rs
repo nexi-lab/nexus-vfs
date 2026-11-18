@@ -184,8 +184,8 @@ mod tests {
         fn session_endpoint(&self) -> Option<&a2a::session::SessionEndpoint> {
             self.endpoint.as_ref()
         }
-        fn durable_session_id(&self) -> Option<&str> {
-            self.durable.then_some("session-native-host")
+        fn durable_session_id(&self) -> Option<String> {
+            self.durable.then(|| "session-native-host".into())
         }
     }
     impl SpawnTask<Kernel> for Host {
@@ -224,7 +224,9 @@ mod tests {
             observer(AgentState::Ready, None);
             Ok(Box::new(Handle {
                 endpoint: if self.mailbox {
-                    options.session_endpoint
+                    options
+                        .session_transport
+                        .map(|transport| transport.endpoint().clone())
                 } else {
                     None
                 },
