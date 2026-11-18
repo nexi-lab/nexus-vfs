@@ -211,7 +211,11 @@ impl LiveSession {
                 state.input_bytes -= bytes;
                 return Ok(Some(payload));
             }
-            if self.input_ready.wait_until(&mut state, deadline).timed_out() {
+            if self
+                .input_ready
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
                 return Ok(None);
             }
         }
@@ -251,7 +255,11 @@ impl LiveSession {
             return Err("live ACP cursor is ahead of this attachment".into());
         }
         while state.sent == after && !state.closed {
-            if self.output_ready.wait_until(&mut state, deadline).timed_out() {
+            if self
+                .output_ready
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
                 break;
             }
         }
