@@ -17,6 +17,7 @@ pub(super) enum StorageFormat {
     NodeIdentity,
     ReplicaIssuance,
     ReplicaControlActive,
+    SignedCrl,
 }
 
 impl StorageFormat {
@@ -29,6 +30,7 @@ impl StorageFormat {
             Self::NodeIdentity => b"node-identity-v1",
             Self::ReplicaIssuance => b"replica-issuance-v1",
             Self::ReplicaControlActive => b"managed-replica-control-v2",
+            Self::SignedCrl => b"signed-crl-control-v1",
         }
     }
 
@@ -42,11 +44,17 @@ impl StorageFormat {
             Some(b"node-identity-v1") => Ok(Some(Self::NodeIdentity)),
             Some(b"replica-issuance-v1") => Ok(Some(Self::ReplicaIssuance)),
             Some(b"managed-replica-control-v2") => Ok(Some(Self::ReplicaControlActive)),
+            Some(b"signed-crl-control-v1") => Ok(Some(Self::SignedCrl)),
             Some(_) => Err(storage_error("unsupported control storage format")),
         }
     }
 
     fn validate_policy(self, policy: MembershipPolicy, replica_reader: bool) -> Result<()> {
+        if self == Self::SignedCrl && !cfg!(all(feature = "grpc", has_protos)) {
+            return Err(RaftError::Config(
+                "signed CRL storage requires its native verifier".into(),
+            ));
+        }
         if policy == MembershipPolicy::Managed
             && replica_reader
             && self == Self::ReplicaControlActive

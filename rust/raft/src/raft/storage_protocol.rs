@@ -9,6 +9,7 @@ pub(crate) enum StorageProtocol {
     ConditionalMetadata,
     RecordLifetime,
     ReplicaControl,
+    SignedCrl,
 }
 
 impl Command {
@@ -30,6 +31,7 @@ impl Command {
             | Self::ReserveNodeIdentity(_)
             | Self::ApplyReplicaIssuance(_)
             | Self::ActivateReplicaControl { .. } => Some(StorageProtocol::ReplicaControl),
+            Self::ApplyCrlControl(_) => Some(StorageProtocol::SignedCrl),
             _ => None,
         }
     }

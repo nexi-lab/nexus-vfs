@@ -1,9 +1,11 @@
-//! Owner-scoped, read-only fan-out over the existing authenticated peer pool.
+//! A zone's online Agents: a read-only fan-out over the existing authenticated
+//! peer pool. Every member of the zone may read it, as it may list the zone's
+//! Agents, and it carries names only.
 
 use super::FederationClient;
 use contracts::runtime_status::{
-    resolve_runtime_scope, ListRuntimesRequest, RuntimeDirectory, RuntimeInventory,
-    RuntimeUnavailableScope,
+    online_agent_names, resolve_runtime_zone, ListRuntimesRequest, OnlineAgents, PresenceRequest,
+    RuntimeInventory,
 };
 use contracts::{AgentContextError, OperationContext, RustCallError, RustService};
 use futures::{stream, StreamExt};
@@ -54,27 +56,20 @@ impl DirectoryService {
 }
 
 impl FederationClient {
-    async fn runtime_inventory(
-        &self,
-        endpoint: &str,
-        owner: Option<&str>,
-        zone: &str,
-    ) -> Result<RuntimeInventory, &'static str> {
-        // A trusted node already has peer-plane authority. Keep the original
-        // caller's resolved filter; never forward a client token or delegation.
+    /// One peer's inventory of `zone` for every owner, or nothing when the peer
+    /// cannot answer it.
+    async fn runtime_inventory(&self, endpoint: &str, zone: &str) -> Option<RuntimeInventory> {
+        // A trusted node already has peer-plane authority; never forward a
+        // client token or delegation.
         if !self.channels.uses_tls() {
-            return Err("peer_identity_unavailable");
+            return None;
         }
-        let channel = self
-            .channels
-            .channel_for(endpoint)
-            .await
-            .map_err(|_| "unavailable")?;
+        let channel = self.channels.channel_for(endpoint).await.ok()?;
         let payload = serde_json::to_vec(&ListRuntimesRequest {
-            owner_id: owner.map(str::to_owned),
+            owner_id: None,
             zone_id: Some(zone.into()),
         })
-        .map_err(|_| "invalid_request")?;
+        .ok()?;
         let response = NexusVfsServiceClient::new(channel)
             .call(tonic::Request::new(CallRequest {
                 method: "agent_runtime_list_v1".into(),
@@ -82,27 +77,23 @@ impl FederationClient {
                 auth_token: String::new(),
             }))
             .await
-            .map_err(|_| "unavailable")?
+            .ok()?
             .into_inner();
         if response.is_error {
-            return Err("unsupported_or_denied");
+            return None;
         }
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&response.payload).map_err(|_| "invalid_response")?;
+        let envelope: serde_json::Value = serde_json::from_slice(&response.payload).ok()?;
         let inventory: RuntimeInventory =
-            serde_json::from_value(envelope["result"].clone()).map_err(|_| "invalid_response")?;
-        if inventory.version != 1
-            || !inventory.scope.complete
-            || inventory.scope.owner_id.as_deref() != owner
-            || inventory.scope.zone_id != zone
-            || inventory
+            serde_json::from_value(envelope["result"].clone()).ok()?;
+        (inventory.version == 1
+            && inventory.scope.complete
+            && inventory.scope.owner_id.is_none()
+            && inventory.scope.zone_id == zone
+            && inventory
                 .instances
                 .iter()
-                .any(|item| item.instance.registry_id != inventory.scope.registry_id)
-        {
-            return Err("invalid_scope");
-        }
-        Ok(inventory)
+                .all(|item| item.instance.registry_id == inventory.scope.registry_id))
+        .then_some(inventory)
     }
 }
 
@@ -111,7 +102,7 @@ impl RustService for DirectoryService {
         NAME
     }
     fn exports(&self) -> Vec<String> {
-        vec!["list_v1".into()]
+        vec!["presence_v1".into()]
     }
 
     fn dispatch(
@@ -120,68 +111,53 @@ impl RustService for DirectoryService {
         payload: &[u8],
         ctx: &OperationContext,
     ) -> Result<Vec<u8>, RustCallError> {
-        if method != "list_v1" {
+        if method != "presence_v1" {
             return Err(RustCallError::NotFound);
         }
-        let request: ListRuntimesRequest = serde_json::from_slice(payload)
+        let request: PresenceRequest = serde_json::from_slice(payload)
             .map_err(|error| RustCallError::InvalidArgument(error.to_string()))?;
-        let (owner, zone) = resolve_runtime_scope(ctx, &request).map_err(|error| match error {
-            AgentContextError::InvalidArgument(message) => RustCallError::InvalidArgument(message),
-            AgentContextError::PermissionDenied(message) => {
-                RustCallError::PermissionDenied(message)
-            }
-        })?;
+        let zone =
+            resolve_runtime_zone(ctx, request.zone_id.as_deref()).map_err(|error| match error {
+                AgentContextError::InvalidArgument(message) => {
+                    RustCallError::InvalidArgument(message)
+                }
+                AgentContextError::PermissionDenied(message) => {
+                    RustCallError::PermissionDenied(message)
+                }
+            })?;
         let kernel = self
             .kernel
             .upgrade()
             .ok_or_else(|| RustCallError::Internal("runtime host retired".into()))?;
-        let local = kernel
-            .agent_registry()
-            .runtime_inventory(owner.as_deref(), &zone);
+        let mut inventories = vec![kernel.agent_registry().runtime_inventory(None, &zone)];
         let peers = self.peer_endpoints(&kernel, &zone)?;
-        let results = self.client.block_on_safely(async {
+        // Peers answer the node plane for every owner; only names leave this call.
+        // A peer that does not answer contributes no names: not seen online.
+        inventories.extend(self.client.block_on_safely(async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
             stream::iter(peers)
                 .map(|endpoint| {
-                    let owner = owner.as_deref();
                     let zone = &zone;
                     async move {
-                        let result = tokio::time::timeout_at(
+                        tokio::time::timeout_at(
                             deadline,
-                            self.client.runtime_inventory(&endpoint, owner, zone),
+                            self.client.runtime_inventory(&endpoint, zone),
                         )
                         .await
-                        .unwrap_or(Err("unavailable"));
-                        (endpoint, result)
+                        .ok()
+                        .flatten()
                     }
                 })
                 .buffer_unordered(4)
+                .filter_map(std::future::ready)
                 .collect::<Vec<_>>()
                 .await
-        });
-        let mut directory = RuntimeDirectory {
+        }));
+        let online = OnlineAgents {
             version: 1,
-            inventories: vec![local],
-            unavailable: Vec::new(),
+            online: online_agent_names(&inventories),
+            zone_id: zone,
         };
-        for (endpoint, result) in results {
-            match result {
-                Ok(inventory) => directory.inventories.push(inventory),
-                Err(reason) => directory.unavailable.push(RuntimeUnavailableScope {
-                    endpoint,
-                    reason: reason.into(),
-                }),
-            }
-        }
-        directory
-            .inventories
-            .sort_by(|left, right| left.scope.registry_id.cmp(&right.scope.registry_id));
-        directory
-            .inventories
-            .dedup_by(|left, right| left.scope.registry_id == right.scope.registry_id);
-        directory
-            .unavailable
-            .sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
-        serde_json::to_vec(&directory).map_err(|error| RustCallError::Internal(error.to_string()))
+        serde_json::to_vec(&online).map_err(|error| RustCallError::Internal(error.to_string()))
     }
 }

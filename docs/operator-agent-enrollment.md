@@ -59,8 +59,10 @@ The command accepts one JSON claim on stdin, bounded to 8 KiB:
 ```
 
 Invoke `nexus-agent-enroll --grant /absolute/private/node-grant.json`. Only
-`codex-` (a Codex thread) or `claude-` (a Claude Code session) followed by 32
-lowercase hex digits is permitted. The canonical workspace must lie beneath an
+`codex-` (a Codex thread) or `claude-` (a Claude Code session) followed by
+either 32 lowercase hex digits, or a readable workspace slug (at most 24 of
+`[a-z0-9-]`, starting with a letter or digit), `-` and 8 lowercase hex digits,
+is permitted; for example `codex-sudocode-4-1a2b3c4d`. The canonical workspace must lie beneath an
 explicitly granted canonical subtree. The local Node leaf must be current, chain
 to the pinned cluster CA and name the pinned Node. Endpoint, key paths and
 authority are never accepted from the claim. Changing an owner/CA or grant is an

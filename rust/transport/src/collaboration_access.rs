@@ -3,7 +3,10 @@
 //! management, content gates and canonical sender stamping remain required.
 
 use a2a::{
-    collaboration_policy::{CollaborationOperation, PolicyError, SpacePolicyStore},
+    collaboration_pair::{PairContext, PairDescription, PairIntent, PairRequest},
+    collaboration_policy::{
+        validated_space_key, CollaborationOperation, PolicyError, SpacePolicyStore,
+    },
     domain_address::{AgentAddress, ConversationPath},
 };
 use lib::transport_primitives::FederatedClientCertVerifier;
@@ -39,6 +42,54 @@ impl AdmittedOperation {
     pub fn path(&self) -> &ConversationPath {
         &self.path
     }
+}
+
+/// Actual current TLS/policy admission for pair preparation. Not a storage
+/// transaction, durable attachment, presence report or reusable grant. The
+/// adapter must inspect the intent and retain its operation/completion fences.
+#[derive(Debug)]
+pub struct AdmittedPair {
+    actor: AuthenticatedAgent,
+    description: PairDescription,
+    intent: PairIntent,
+}
+
+impl AdmittedPair {
+    pub fn actor(&self) -> &AgentAddress {
+        self.actor.address()
+    }
+    pub fn description(&self) -> &PairDescription {
+        &self.description
+    }
+    pub fn intent(&self) -> PairIntent {
+        self.intent
+    }
+}
+
+/// Candidate pair descriptions within ONE current granted space. No global
+/// listing, other party's reader write, active receiver or provision is implied.
+#[derive(Debug)]
+pub struct AdmittedPairDiscovery {
+    actor: AuthenticatedAgent,
+    descriptions: Vec<PairDescription>,
+}
+
+impl AdmittedPairDiscovery {
+    pub fn actor(&self) -> &AgentAddress {
+        self.actor.address()
+    }
+    pub fn descriptions(&self) -> &[PairDescription] {
+        &self.descriptions
+    }
+}
+
+fn now_ms() -> Result<u64, AdmissionError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AdmissionError::ClockUnavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AdmissionError::ClockUnavailable)
 }
 
 /// Composition-root binding to this serving authority and its ACTUAL routed
@@ -101,5 +152,63 @@ impl<'a> SpaceAuthorizer<'a> {
             )
             .map_err(AdmissionError::Policy)?;
         Ok(AdmittedOperation { actor, path })
+    }
+
+    /// A typed adapter supplies this operation, not a generic Write/mkdir RPC.
+    /// The peer is request data; the original caller always comes from TLS.
+    pub fn authorize_pair<T: AuthedRequest>(
+        &self,
+        request: &Request<T>,
+        pair: &PairRequest,
+        intent: PairIntent,
+    ) -> Result<AdmittedPair, AdmissionError> {
+        let actor = authenticate_request(request, self.verifier, self.current)
+            .map_err(AdmissionError::Identity)?;
+        let policy = self
+            .store
+            .current(pair.space())
+            .map_err(AdmissionError::Policy)?;
+        let description = PairDescription::prepare(
+            &policy,
+            pair,
+            intent,
+            &PairContext {
+                actor: actor.address(),
+                serving_authority: self.host,
+                routed_zone: self.routed_zone,
+                now_unix_ms: now_ms()?,
+            },
+        )
+        .map_err(AdmissionError::Policy)?;
+        Ok(AdmittedPair {
+            actor,
+            description,
+            intent,
+        })
+    }
+
+    pub fn discover_pairs<T: AuthedRequest>(
+        &self,
+        request: &Request<T>,
+        space: &str,
+    ) -> Result<AdmittedPairDiscovery, AdmissionError> {
+        let actor = authenticate_request(request, self.verifier, self.current)
+            .map_err(AdmissionError::Identity)?;
+        validated_space_key(space).map_err(AdmissionError::Policy)?;
+        let policy = self.store.current(space).map_err(AdmissionError::Policy)?;
+        let descriptions = PairDescription::discover(
+            &policy,
+            &PairContext {
+                actor: actor.address(),
+                serving_authority: self.host,
+                routed_zone: self.routed_zone,
+                now_unix_ms: now_ms()?,
+            },
+        )
+        .map_err(AdmissionError::Policy)?;
+        Ok(AdmittedPairDiscovery {
+            actor,
+            descriptions,
+        })
     }
 }

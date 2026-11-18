@@ -22,6 +22,7 @@ pub use contracts::lock_state::{HolderInfo, LockAcquireResult, LockEntry, LockIn
 use super::Result;
 
 mod conditional_metadata;
+mod crl_control;
 mod metadata_rename;
 mod node_identity;
 mod protected_metadata;
@@ -39,6 +40,7 @@ pub use replica_activation::ReplicaControlActivation;
 const OWNED_CONTROL_NAMESPACES: &[&str] = &[
     conditional_metadata::NAMESPACE,
     contracts::constants::CONTROL_NS_REPLICA,
+    crl_control::NAMESPACE,
 ];
 
 fn owned_control_namespace(namespace: &str) -> bool {
@@ -340,6 +342,9 @@ pub enum Command {
     ApplyReplicaIssuance(Box<contracts::replica_credential::ReplicaIssuanceRequest>),
     /// Commit the one-way reader-protocol activation and its original operation.
     ActivateReplicaControl { operation_id: String },
+    /// Native atomic signed-CRL transition. Existing command indices stay fixed.
+    /// This has a separate storage admission domain and durable reader floor.
+    ApplyCrlControl(Box<contracts::crl_control::CrlControlRequest>),
 }
 
 impl Command {
@@ -1997,7 +2002,7 @@ impl FullStateMachine {
                 "versioned metadata requires a Raft-committed transaction".into(),
             )),
             Command::ApplyReplicaBinding(_) | Command::ReserveNodeIdentity(_) | Command::ApplyReplicaIssuance(_)
-                | Command::ActivateReplicaControl { .. } => Err(super::RaftError::InvalidState(
+                | Command::ActivateReplicaControl { .. } | Command::ApplyCrlControl(_) => Err(super::RaftError::InvalidState(
                 "replica binding requires a Raft-committed transaction".into(),
             )),
             Command::PutControlState {
@@ -2362,7 +2367,9 @@ impl FullStateMachine {
                 if_absent,
             } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if owned_control_namespace(namespace) {
+                if owned_control_namespace(namespace)
+                    || self.crl_owns_control_key_in_txn(txn, namespace, key)?
+                {
                     return Ok(CommandResult::Error(
                         "control state is owned by its typed apply primitive".into(),
                     ));
@@ -2394,7 +2401,9 @@ impl FullStateMachine {
 
             Command::DeleteControlState { namespace, key } => {
                 let def = redb::TableDefinition::<&[u8], &[u8]>::new(self.control_state.name());
-                if owned_control_namespace(namespace) {
+                if owned_control_namespace(namespace)
+                    || self.crl_owns_control_key_in_txn(txn, namespace, key)?
+                {
                     return Ok(CommandResult::Error(
                         "control state is owned by its typed apply primitive".into(),
                     ));
@@ -2411,6 +2420,7 @@ impl FullStateMachine {
             Command::ApplyReplicaBinding(request) => self.apply_replica_binding(txn, request),
             Command::ReserveNodeIdentity(request) => self.reserve_node_identity(txn, request),
             Command::ApplyReplicaIssuance(request) => self.apply_replica_issuance(txn, request),
+            Command::ApplyCrlControl(request) => self.apply_crl_control(txn, request),
             Command::ActivateReplicaControl { operation_id } => {
                 self.activate_replica_control_in_txn(txn, operation_id)
             }

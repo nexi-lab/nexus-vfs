@@ -553,7 +553,7 @@ pub(crate) trait PreparedRawSpawn: Send {
 }
 
 pub(crate) struct ManagedAgentService<K: KernelSyscall> {
-    runtime_directory: Option<kernel::core::agents::registry::RuntimeDirectoryLookup>,
+    runtime_directory: Option<kernel::core::agents::registry::OnlineAgentsLookup>,
     /// Shared kernel handle for `start_session` to stamp the per-pid
     /// procfs subtree (`/proc/{pid}/`, `/proc/{pid}/workspace/`,
     /// workspace shortcut DT_LINK, per-repo alias DT_LINKs) and for
@@ -1391,15 +1391,15 @@ impl ManagedAgentService<kernel::kernel::Kernel> {
         let raw_spawn: Option<Arc<dyn RawSpawn>> = None;
 
         let weak_kernel = Arc::downgrade(kernel);
-        let runtime_directory: kernel::core::agents::registry::RuntimeDirectoryLookup =
+        let runtime_directory: kernel::core::agents::registry::OnlineAgentsLookup =
             Arc::new(move |owner, zone| {
                 let kernel = weak_kernel.upgrade().ok_or("runtime host retired")?;
                 let ctx = contracts::OperationContext::new(owner, zone, false, None, false);
                 let payload =
-                    serde_json::to_vec(&contracts::runtime_status::ListRuntimesRequest::default())
+                    serde_json::to_vec(&contracts::runtime_status::PresenceRequest::default())
                         .map_err(|error| error.to_string())?;
                 let result = kernel
-                    .dispatch_rust_call_ctx(&ctx, "runtime_directory", "list_v1", &payload)
+                    .dispatch_rust_call_ctx(&ctx, "runtime_directory", "presence_v1", &payload)
                     .ok_or("runtime directory is unavailable")?
                     .map_err(|error| error.to_string())?;
                 serde_json::from_slice(&result).map_err(|error| error.to_string())

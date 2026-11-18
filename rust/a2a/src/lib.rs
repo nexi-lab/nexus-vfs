@@ -33,6 +33,8 @@ pub mod addresses;
 #[cfg(feature = "experimental-domain-join")]
 pub mod collaboration_admin;
 #[cfg(feature = "experimental-domain-join")]
+pub mod collaboration_pair;
+#[cfg(feature = "experimental-domain-join")]
 pub mod collaboration_policy;
 #[cfg(feature = "experimental-domain-join")]
 pub mod domain_address;

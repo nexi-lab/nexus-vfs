@@ -115,6 +115,13 @@ impl ControlStateStore {
         bridge_block_on(&self.runtime, fut).map_err(|e| format!("list({ns}): {e}"))
     }
 
+    /// Enumerate one namespace at a ReadIndex-backed state-machine snapshot.
+    /// This orders the read; it does not authorize a later cross-zone mutation.
+    pub fn list_linearizable(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let ns = self.namespace;
+        self.read_linearizable(move |sm| sm.list_control_state(ns).map_err(|e| e.to_string()))?
+    }
+
     /// Upsert (rotation-friendly): replaces any existing value at `key`.
     #[inline]
     pub fn put(&self, key: &str, value: &[u8]) -> Result<(), String> {
@@ -146,6 +153,17 @@ impl ControlStateStore {
     pub(crate) fn commit_replica_control(&self, command: Command) -> Result<CommandResult, String> {
         bridge_block_on(&self.runtime, self.node.commit_replica_control(command))
             .map_err(|e| format!("replica binding proposal: {e}"))
+    }
+
+    #[cfg(feature = "experimental-domain-join")]
+    pub(crate) fn supports_signed_crl(&self) -> bool {
+        self.node.supports_signed_crl()
+    }
+
+    #[cfg(feature = "experimental-domain-join")]
+    pub(crate) fn commit_crl_control(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.commit_crl_control(command))
+            .map_err(|error| format!("signed CRL proposal: {error}"))
     }
 
     fn put_inner(&self, key: &str, value: &[u8], if_absent: bool) -> Result<bool, String> {

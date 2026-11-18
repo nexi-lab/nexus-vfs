@@ -17,6 +17,9 @@ fn durable_contents(path: &Path) -> (u64, Vec<(String, Vec<u8>)>) {
     let state = FullStateMachine::new(&store).unwrap();
     let mut records = state.list_control_state("replica-binding").unwrap();
     records.extend(state.list_control_state("content-version-v1").unwrap());
+    records.extend(state.list_control_state("signed-crl-v1").unwrap());
+    // The old reader inspects opaque records; it must not mutate current CRL bytes.
+    records.extend(state.list_control_state("collaboration").unwrap());
     records.sort();
     (state.last_applied_index(), records)
 }
@@ -36,6 +39,9 @@ fn previous_reader_refuses_applied_compacted_and_snapshot_replica_formats() {
         "issuer-applied",
         "issuer-compacted",
         "issuer-snapshot",
+        "crl-applied",
+        "crl-compacted",
+        "crl-snapshot",
     ] {
         let path = fixtures.join(fixture);
         let id = {
