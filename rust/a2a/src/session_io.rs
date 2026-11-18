@@ -33,6 +33,9 @@ impl<K: KernelSyscall> SessionMailbox<K> {
         side: SessionSide,
     ) -> Result<Self, String> {
         endpoint.validate()?;
+        if endpoint.protocol != crate::session::SESSION_PROTOCOL {
+            return Err("session mailbox requires acp-mailbox/1".into());
+        }
         let actor = match side {
             SessionSide::Agent => &endpoint.agent,
             SessionSide::Controller => &endpoint.controller,

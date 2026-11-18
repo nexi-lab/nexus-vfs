@@ -164,9 +164,34 @@ one bounded deadline. Unsupported or disconnected nodes remain explicit.
 
 `managed_agent.start_session_v1` retains its existing `session_id` response:
 this is the registry pid used by `get_session_v1`, `cancel_v1`, and `/proc`.
-An in-process runtime can additionally return `durable_session_id`, the key of
-its persistent transcript. `get_session_v1` exposes the same optional field.
-Raw subprocesses and providers without durable sessions omit it.
+A hosted runtime can additionally report `durable_session_id`, the key of its
+persistent transcript. `get_session_v1` exposes the same optional field. ACP
+subprocesses publish it only after a correlated session creation/load succeeds;
+providers without durable sessions omit it.
+
+| Placement | Start request | Process ownership |
+| --- | --- | --- |
+| In-process host | No `spawn_spec` or `local_host` | The installed provider owns the runtime. |
+| Independent ACP process | `spawn_spec` | The daemon owns the actual child and its kill/wait lifecycle. |
+| Native CLI in an existing terminal | One-use `local_host` offer | The shell owns the process; the service admits its shared control session. No terminal relay or fabricated OS exit receipt. |
+
+All placements share the managed session transport. Omitting `session_protocol`
+retains `acp-mailbox/1`. Explicit `acp-live/1` selects authenticated, bounded
+delivery on the admitting daemon and returns no transcript path. Controllers
+use `session_submit_v1` and `session_read_v1` with the managed `session_id` and
+`channel_id`; access requires the original controller identity, owner and zone.
+These frames do not enter the participants' ordinary conversation log.
+
+Live output retains at most 1,024 frames and 8 MiB of payload. Reads after the
+last received sequence return bounded ordered batches; a missing prefix returns
+`resync_required` instead of claiming complete replay. Input uses a monotonic
+sequence with explicit admission receipts, never automatic prompt retries.
+`accepted_sequence` proves transport admission, not execution. After a gap,
+the client must recover content and pending interactions through its agent's
+state API, separately from subsequent live events. This buffer is not replicated
+and does not survive daemon restart. Final responses remain readable after host
+retirement for up to 60 seconds, with an eight-channel bound; this is not proof
+of OS exit.
 
 Hosted controllers cancel a live attachment with `managed_agent.cancel_v2`,
 passing `session_id` and the returned `session_endpoint.channel_id`. A retired
@@ -175,14 +200,15 @@ even if a restart reused its PID. The existing channel generation is the
 attachment identity; it is never persisted as a transcript ID. This method
 retains the same delegated-owner authorization as the existing controls.
 
-To restore a stopped co-hosted session, start the same agent with
+To restore a stopped hosted session, start the same agent with
 `resume_session_id` set to the previous `durable_session_id`. The runtime owns
 loading, identity checks and protection against concurrent writers. A successful
 restore returns a new pid in `session_id` and the original durable ID.
 
 The ID is a single path component (ASCII letters, digits, `_` and `-`, at most
-128 bytes). Recovery is rejected for `spawn_spec`, a daemon without an
-in-process provider, or a provider that has not implemented recovery. It never
-silently falls back to a fresh session. Existing `SpawnTask` implementations
-remain source-compatible: `spawn_with_options` defaults to ordinary `spawn`
-when no recovery was requested, and rejects recovery otherwise.
+128 bytes). An ACP subprocess binds that durable ID only after the controller's
+correlated `session/load` succeeds. An in-process provider must implement
+recovery; a provider-less daemon or unsupported provider refuses it. Recovery
+never silently falls back to a fresh session. `SpawnTask::spawn_with_options`
+defaults to ordinary `spawn` when no recovery was requested and rejects
+unsupported recovery otherwise.

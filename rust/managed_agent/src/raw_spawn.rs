@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use a2a::session::{SessionEndpoint, SessionPayload, SessionSide, MAX_SESSION_FRAME_BYTES};
-use a2a::session_io::SessionMailbox;
+use super::session_transport::{HostSessionIo, SessionTransport};
+use a2a::session::{SessionEndpoint, SessionPayload, MAX_SESSION_FRAME_BYTES};
 use kernel::core::agents::registry::{AgentDescriptor, AgentInstance, AgentRegistry, AgentState};
 use kernel::kernel::{Kernel, OperationContext};
 use subprocess::local_host::PreparedLocalHost;
@@ -24,7 +24,7 @@ use super::{
 };
 
 struct SubprocessHandle {
-    endpoint: SessionEndpoint,
+    transport: SessionTransport,
     durable: Arc<SessionBinding>,
     cancel: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -36,7 +36,7 @@ impl SpawnHandle for SubprocessHandle {
         }
     }
     fn session_endpoint(&self) -> Option<&SessionEndpoint> {
-        Some(&self.endpoint)
+        Some(self.transport.endpoint())
     }
     fn durable_session_id(&self) -> Option<String> {
         self.durable.id()
@@ -141,7 +141,7 @@ impl PreparedRawSpawn for PreparedSubprocess {
         self: Box<Self>,
         desc: &AgentDescriptor,
         instance: AgentInstance,
-        endpoint: SessionEndpoint,
+        transport: SessionTransport,
         observer: StateObserver,
     ) -> Result<(), String> {
         let Self {
@@ -153,7 +153,7 @@ impl PreparedRawSpawn for PreparedSubprocess {
         spawner.attach(
             desc,
             instance,
-            endpoint,
+            transport,
             Attachment {
                 execution,
                 runtime,
@@ -297,7 +297,7 @@ impl KernelRawSpawn {
         &self,
         desc: &AgentDescriptor,
         instance: AgentInstance,
-        endpoint: SessionEndpoint,
+        transport: SessionTransport,
         attachment: Attachment,
     ) -> Result<(), String> {
         let Attachment {
@@ -313,12 +313,8 @@ impl KernelRawSpawn {
             Some(&desc.name),
             false,
         );
-        let mailbox = Arc::new(SessionMailbox::open(
-            Arc::clone(&self.kernel),
-            ctx,
-            endpoint.clone(),
-            SessionSide::Agent,
-        )?);
+        let mailbox = Arc::new(transport.open(Arc::clone(&self.kernel), ctx)?);
+        let endpoint = transport.endpoint();
         let ProcessIo {
             mut process,
             mut stdin,
@@ -377,11 +373,12 @@ impl KernelRawSpawn {
             desc.pid.clone(),
             instance.clone(),
             Box::new(SubprocessHandle {
-                endpoint,
+                transport: transport.clone(),
                 durable: Arc::clone(&durable),
                 cancel: parking_lot::Mutex::new(Some(cancel_tx)),
             }),
             None,
+            Some(transport),
         )?;
 
         let input_mailbox = Arc::clone(&mailbox);
@@ -545,7 +542,7 @@ fn spawn_session_task(
 /// ACP stdio uses newline-delimited JSON. Bound partial lines as well as complete frames.
 async fn pump_output<R: AsyncRead + Unpin>(
     mut reader: R,
-    mailbox: Arc<SessionMailbox<Kernel>>,
+    mailbox: Arc<HostSessionIo<Kernel>>,
     control: HostControl,
 ) -> Result<(), String> {
     let mut buffer = [0; 8192];
@@ -579,7 +576,7 @@ async fn pump_output<R: AsyncRead + Unpin>(
 
 async fn forward_line(
     line: &[u8],
-    mailbox: &Arc<SessionMailbox<Kernel>>,
+    mailbox: &Arc<HostSessionIo<Kernel>>,
     control: &HostControl,
 ) -> Result<(), String> {
     let message: serde_json::Value =
@@ -631,9 +628,12 @@ async fn forward_line(
 
 /// All subprocess output uses the same blocking mailbox write boundary.
 async fn send_payload(
-    mailbox: &Arc<SessionMailbox<Kernel>>,
+    mailbox: &Arc<HostSessionIo<Kernel>>,
     payload: SessionPayload,
 ) -> Result<(), String> {
+    if mailbox.is_live() {
+        return mailbox.send(payload);
+    }
     let mailbox = Arc::clone(mailbox);
     tokio::task::spawn_blocking(move || mailbox.send(payload))
         .await

@@ -65,7 +65,11 @@ impl SpawnTask<Kernel> for Host {
     ) -> Result<Box<dyn SpawnHandle>, String> {
         observer(kernel::core::agents::registry::AgentState::Ready, None);
         Ok(Box::new(Handle(
-            options.session_endpoint.ok_or("missing native mailbox")?,
+            options
+                .session_transport
+                .ok_or("missing native transport")?
+                .endpoint()
+                .clone(),
         )))
     }
 }

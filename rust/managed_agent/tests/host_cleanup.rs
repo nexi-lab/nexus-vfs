@@ -86,7 +86,9 @@ impl SpawnTask<Kernel> for Provider {
             endpoint: if self.0.malformed {
                 None
             } else {
-                options.session_endpoint
+                options
+                    .session_transport
+                    .map(|transport| transport.endpoint().clone())
             },
             stopped: AtomicBool::new(false),
         }))

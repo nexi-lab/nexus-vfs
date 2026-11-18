@@ -224,7 +224,9 @@ mod tests {
             observer(AgentState::Ready, None);
             Ok(Box::new(Handle {
                 endpoint: if self.mailbox {
-                    options.session_endpoint
+                    options
+                        .session_transport
+                        .map(|transport| transport.endpoint().clone())
                 } else {
                     None
                 },

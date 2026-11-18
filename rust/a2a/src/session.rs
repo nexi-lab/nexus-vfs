@@ -11,6 +11,8 @@ use serde_json::Value;
 use crate::{conversation_id, conversation_transcript_path};
 
 pub const SESSION_PROTOCOL: &str = "acp-mailbox/1";
+/// Authenticated managed-service RPC with bounded, non-durable replay.
+pub const LIVE_SESSION_PROTOCOL: &str = "acp-live/1";
 pub const SESSION_KIND: &str = "session";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const MAX_SESSION_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -39,7 +41,7 @@ impl SessionEndpoint {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.protocol != SESSION_PROTOCOL {
+        if self.protocol != SESSION_PROTOCOL && self.protocol != LIVE_SESSION_PROTOCOL {
             return Err(format!("unsupported session protocol: {}", self.protocol));
         }
         if self.agent.is_empty() || self.controller.is_empty() || self.agent == self.controller {
@@ -47,6 +49,13 @@ impl SessionEndpoint {
         }
         if self.channel_id.is_empty() {
             return Err("a session channel requires a generation identifier".into());
+        }
+        if self.protocol == LIVE_SESSION_PROTOCOL {
+            return if self.transcript.is_empty() {
+                Ok(())
+            } else {
+                Err("live session endpoints do not expose an A2A transcript".into())
+            };
         }
         let expected =
             conversation_transcript_path(&conversation_id(&self.agent, &self.controller));
@@ -110,6 +119,9 @@ pub struct SessionCodec {
 impl SessionCodec {
     pub fn new(endpoint: SessionEndpoint, side: SessionSide) -> Result<Self, String> {
         endpoint.validate()?;
+        if endpoint.protocol != SESSION_PROTOCOL {
+            return Err("mailbox codec requires acp-mailbox/1".into());
+        }
         let (sender, recipient) = match side {
             SessionSide::Agent => (endpoint.agent.clone(), endpoint.controller.clone()),
             SessionSide::Controller => (endpoint.controller.clone(), endpoint.agent.clone()),
@@ -199,7 +211,7 @@ impl SessionCodec {
     }
 }
 
-fn validate_payload(payload: &SessionPayload) -> Result<(), String> {
+pub fn validate_payload(payload: &SessionPayload) -> Result<(), String> {
     let SessionPayload::Rpc { message } = payload else {
         return Ok(());
     };

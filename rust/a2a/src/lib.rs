@@ -41,6 +41,7 @@ pub mod mailbox_stamping_hook;
 pub mod mailbox_stamping_policy;
 pub mod session;
 pub mod session_io;
+pub mod session_live;
 
 pub use foreign_containment::ForeignAgentMailboxOnly;
 pub use mailbox_stamping_hook::MailboxStampingHook;
