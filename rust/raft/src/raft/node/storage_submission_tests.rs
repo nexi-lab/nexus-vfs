@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use tempfile::TempDir;
 
 mod activation;
+mod crl_format;
 mod managed_activation;
 mod member_preparation;
 mod reader_preparation;
@@ -80,6 +81,17 @@ fn conditional() -> Command {
     }
 }
 
+fn signed_crl() -> Command {
+    let (ca, _) = crate::transport::generate_zone_ca("storage-protocol").unwrap();
+    Command::ApplyCrlControl(Box::new(contracts::crl_control::CrlControlRequest {
+        operation_id: "typed-crl-issuer".into(),
+        change: contracts::crl_control::CrlControlChange::LocalIssuer {
+            expected_revision: None,
+            ca_pem: Some(ca),
+        },
+    }))
+}
+
 #[tokio::test]
 async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
     let (handle, mut driver, _dir) = node(MembershipPolicy::FixedLocal);
@@ -98,11 +110,13 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
         (conditional(), StorageProtocol::ConditionalMetadata),
         (record(), StorageProtocol::RecordLifetime),
         (replica(), StorageProtocol::ReplicaControl),
+        (signed_crl(), StorageProtocol::SignedCrl),
     ] {
         for wrong in [
             StorageProtocol::ConditionalMetadata,
             StorageProtocol::RecordLifetime,
             StorageProtocol::ReplicaControl,
+            StorageProtocol::SignedCrl,
         ] {
             if wrong != owner {
                 assert!(matches!(
@@ -126,6 +140,10 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
     ));
     assert!(matches!(
         handle.commit_record_storage(Command::Noop).await,
+        Err(RaftError::InvalidState(_))
+    ));
+    assert!(matches!(
+        handle.commit_crl_control(Command::Noop).await,
         Err(RaftError::InvalidState(_))
     ));
     assert!(driver.msg_rx.is_empty());
@@ -177,6 +195,16 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
     finish(&mut driver, handle.commit_replica_control(replica()))
         .await
         .unwrap();
+    let outcome = finish(&mut driver, handle.commit_crl_control(signed_crl()))
+        .await
+        .unwrap();
+    let CommandResult::Value(bytes) = outcome else {
+        panic!("typed CRL result");
+    };
+    assert!(matches!(
+        bincode::deserialize::<contracts::crl_control::CrlControlOutcome>(&bytes).unwrap(),
+        contracts::crl_control::CrlControlOutcome::LocalIssuerChanged(_)
+    ));
     let state = handle.state_machine.read().await;
     assert_eq!(state.node_identity(42).unwrap().unwrap().node_id, 42);
     assert!(state
@@ -194,6 +222,7 @@ async fn managed_membership_does_not_implicitly_enable_any_storage_protocol() {
         (conditional(), StorageProtocol::ConditionalMetadata),
         (record(), StorageProtocol::RecordLifetime),
         (replica(), StorageProtocol::ReplicaControl),
+        (signed_crl(), StorageProtocol::SignedCrl),
     ] {
         assert!(matches!(
             handle.submit_storage_command(command, protocol).await,

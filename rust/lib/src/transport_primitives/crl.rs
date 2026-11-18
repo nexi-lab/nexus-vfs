@@ -13,9 +13,9 @@ use x509_parser::{
     revocation_list::CertificateRevocationList,
 };
 
-const MAX_CRL_BYTES: usize = 1024 * 1024;
+use contracts::crl_control::MAX_CRL_BYTES;
 const MAX_REVOKED: usize = 16_384;
-pub const CRL_MAXIMUM_AGE_SECS: u32 = 300;
+pub use contracts::crl_control::CRL_MAXIMUM_AGE_SECS;
 
 /// Verified public CRL data. Only `verify_signed_crl` constructs it; no decode
 /// path can turn caller-supplied fields into verified revocation evidence.

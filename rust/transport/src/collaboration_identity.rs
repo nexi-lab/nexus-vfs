@@ -847,4 +847,8 @@ mod tests {
         registry.shutdown().released().await;
         drop(registry);
     }
+
+    mod local_issuer {
+        include!("collaboration_identity/local_issuer_tests.rs");
+    }
 }

@@ -37,7 +37,7 @@ jobs:
       - run: cargo test --locked -p transport --features experimental-domain-join --lib collaboration_identity::tests
       - run: cargo test --locked -p transport --features experimental-domain-join --lib peer_identity::tests::collaboration_only_anchor
       - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_store::tests
-      - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_crl::tests
+      - run: 'cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib collaboration_crl::'
       - run: cargo clippy --locked -p raft@0.1.0 --features experimental-domain-join --all-targets -- -D warnings
       - run: cargo test --locked -p raft@0.1.0 --features experimental-domain-join --lib foreign_ca_store::tests
       - run: cargo clippy --locked -p transport --features experimental-domain-join --lib -- -D warnings

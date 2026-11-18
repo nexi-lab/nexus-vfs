@@ -1562,6 +1562,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 self.supports_conditional_metadata(),
                 "conditional metadata requires fixed local membership",
             ),
+            StorageProtocol::SignedCrl => (
+                self.supports_signed_crl(),
+                "signed CRL control requires fixed local membership",
+            ),
         };
         if !supported {
             return Err(RaftError::UnsupportedOperation(refusal));
@@ -1599,6 +1603,23 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     pub(crate) async fn commit_replica_control(&self, command: Command) -> Result<CommandResult> {
         self.submit_storage_command(command, StorageProtocol::ReplicaControl)
             .await
+    }
+
+    /// CRL authority and revocations commit in their own storage domain.
+    #[cfg(all(
+        feature = "grpc",
+        has_protos,
+        any(test, feature = "experimental-domain-join")
+    ))]
+    pub(crate) async fn commit_crl_control(&self, command: Command) -> Result<CommandResult> {
+        self.submit_storage_command(command, StorageProtocol::SignedCrl)
+            .await
+    }
+
+    /// Replica-control activation does not activate signed-CRL commands.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn supports_signed_crl(&self) -> bool {
+        self.supports_conditional_metadata()
     }
 
     #[cfg(all(feature = "grpc", has_protos))]

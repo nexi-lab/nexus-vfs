@@ -33,6 +33,7 @@ async fn activation_commits_replica_only_and_survives_original_store_reopen() {
     for (command, protocol) in [
         (conditional(), StorageProtocol::ConditionalMetadata),
         (record(), StorageProtocol::RecordLifetime),
+        (signed_crl(), StorageProtocol::SignedCrl),
     ] {
         assert!(matches!(
             handle.submit_storage_command(command, protocol).await,

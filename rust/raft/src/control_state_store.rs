@@ -155,6 +155,17 @@ impl ControlStateStore {
             .map_err(|e| format!("replica binding proposal: {e}"))
     }
 
+    #[cfg(feature = "experimental-domain-join")]
+    pub(crate) fn supports_signed_crl(&self) -> bool {
+        self.node.supports_signed_crl()
+    }
+
+    #[cfg(feature = "experimental-domain-join")]
+    pub(crate) fn commit_crl_control(&self, command: Command) -> Result<CommandResult, String> {
+        bridge_block_on(&self.runtime, self.node.commit_crl_control(command))
+            .map_err(|error| format!("signed CRL proposal: {error}"))
+    }
+
     fn put_inner(&self, key: &str, value: &[u8], if_absent: bool) -> Result<bool, String> {
         let ns = self.namespace;
         let result = self.propose(Command::PutControlState {
