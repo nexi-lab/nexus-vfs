@@ -18,9 +18,10 @@ import { CORE_METADATA_PROTO, RAFT_COMMANDS_PROTO, RAFT_TRANSPORT_PROTO } from '
 const endpoint = process.env.NEXUS_ZONE_API_ENDPOINT
 const tlsDir = process.env.NEXUS_ZONE_API_TLS_DIR
 const binary = process.env.NEXUS_USER_RUNTIME_BIN
+const enrollment = process.env.NEXUS_ENROLLMENT_ENDPOINT
 
 test('SDK bundles start serve-user and rotate its real TLS server atomically', {
-  skip: endpoint && tlsDir && binary ? false : 'set NEXUS_ZONE_API_ENDPOINT, NEXUS_ZONE_API_TLS_DIR and NEXUS_USER_RUNTIME_BIN',
+  skip: endpoint && tlsDir && binary && enrollment ? false : 'set NEXUS_ZONE_API_ENDPOINT, NEXUS_ZONE_API_TLS_DIR, NEXUS_USER_RUNTIME_BIN and NEXUS_ENROLLMENT_ENDPOINT',
   timeout: 60000,
 }, async () => {
   const root = new protobuf.Root()
@@ -61,7 +62,7 @@ test('SDK bundles start serve-user and rotate its real TLS server atomically', {
     const port = socket.address().port
     await new Promise(resolve => socket.close(resolve))
     child = spawn(binary, ['--data-dir', join(work, 'durable-data'), '--bind-addr', `127.0.0.1:${port}`,
-      'serve-user', '--owner', owner, '--credential', directory], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      'serve-user', '--owner', owner, '--credential', directory, '--crl-endpoint', enrollment], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let daemonLog = ''
     child.stdout.on('data', bytes => { daemonLog += bytes.toString() })
     child.stderr.on('data', bytes => { daemonLog += bytes.toString() })
