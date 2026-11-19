@@ -1055,6 +1055,19 @@ enum Cmd {
         /// Local startup backend configuration; credentials remain in process memory.
         #[arg(long)]
         backend_config: Option<PathBuf>,
+        /// Issuer enrollment endpoint (`host:port`) serving the CA-signed
+        /// revocation list. The runtime refuses every request while its list
+        /// is missing or older than five minutes.
+        #[arg(
+            long,
+            conflicts_with = "crl_file",
+            required_unless_present = "crl_file"
+        )]
+        crl_endpoint: Option<String>,
+        /// CA-signed revocation list file that another component keeps
+        /// current; the alternative to `--crl-endpoint`.
+        #[arg(long)]
+        crl_file: Option<PathBuf>,
     },
     /// Mint an EXTRA join token for THIS cluster (founder), and print it.
     ///
@@ -1317,9 +1330,25 @@ where
                     owner,
                     credential,
                     backend_config,
+                    crl_endpoint,
+                    crl_file,
                 }) => {
-                    user_runtime::serve(args.common, build_decls, owner, credential, backend_config)
-                        .await
+                    let crl = match (crl_endpoint, crl_file) {
+                        (Some(endpoint), None) => user_runtime::CrlSource::Endpoint(endpoint),
+                        (None, Some(file)) => user_runtime::CrlSource::File(file),
+                        _ => anyhow::bail!(
+                            "serve-user needs exactly one of --crl-endpoint or --crl-file"
+                        ),
+                    };
+                    user_runtime::serve(
+                        args.common,
+                        build_decls,
+                        owner,
+                        credential,
+                        backend_config,
+                        crl,
+                    )
+                    .await
                 }
                 Some(Cmd::ServeLocal { port }) => {
                     // Force the trusted-local-backend posture: loopback

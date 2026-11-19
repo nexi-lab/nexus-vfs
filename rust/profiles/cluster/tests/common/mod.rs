@@ -669,6 +669,26 @@ impl Vfs {
         .await
     }
 
+    /// Dial as an agent without waiting to be admitted, for a server expected
+    /// to refuse every request.
+    pub async fn dial_as_agent(port: u16, cred: &LoadedCredential) -> Self {
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&cred.ca_pem))
+            .identity(Identity::from_pem(&cred.cert_pem, &cred.key_pem))
+            .domain_name(&cred.server_name);
+        let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+            .expect("valid uri")
+            .tls_config(tls)
+            .expect("tls config")
+            .connect()
+            .await
+            .expect("TLS connection");
+        Vfs {
+            c: NexusVfsServiceClient::new(channel),
+        }
+    }
+
     /// Dial the mTLS plane presenting a client identity cert chaining to `ca_pem`,
     /// verifying the server as the cluster's fixed name. For a NODE cert or raw PEMs;
     /// an agent has a credential, so it uses [`Self::connect_as_agent`].

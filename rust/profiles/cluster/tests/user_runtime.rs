@@ -11,7 +11,8 @@ use kernel::kernel::vfs_proto::{
 };
 use lib::transport_primitives::{user_runtime_server_name, AgentCredential, LoadedCredential};
 use nexus_raft::transport::{
-    generate_session_agent_cert, generate_user_runtime_cert, generate_zone_ca,
+    add_revoked_serial, call_get_crl, generate_session_agent_cert, generate_user_runtime_cert,
+    generate_zone_ca, serial_from_cert_pem, serve_node_enrollment,
 };
 
 const BUDGET: Duration = Duration::from_secs(90);
@@ -53,6 +54,7 @@ async fn signed_search_keeps_the_owner_boundary_and_reopens_committed_indexes() 
     let root = tempfile::tempdir().unwrap();
     let plugins = common::search_plugin::signed_plugin(root.path());
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("server");
@@ -100,6 +102,8 @@ async fn signed_search_keeps_the_owner_boundary_and_reopens_committed_indexes() 
                 "alice",
                 "--credential",
                 credential.to_str().unwrap(),
+                "--crl-endpoint",
+                issuer.address(),
             ],
             &[
                 ("RUST_LOG", LOG_FILTER),
@@ -307,8 +311,8 @@ fn bundle(
     AgentCredential::load(dir).unwrap()
 }
 
-fn start(data: &Path, credential: &Path, owner: &str, port: u16) -> Daemon {
-    start_with_backends(data, credential, owner, port, None)
+fn start(data: &Path, credential: &Path, owner: &str, port: u16, crl: &str) -> Daemon {
+    start_with_backends(data, credential, owner, port, None, ["--crl-endpoint", crl])
 }
 
 fn start_with_backends(
@@ -317,6 +321,7 @@ fn start_with_backends(
     owner: &str,
     port: u16,
     config: Option<&Path>,
+    crl: [&str; 2],
 ) -> Daemon {
     let bind = format!("127.0.0.1:{port}");
     let mut arguments = vec![
@@ -330,10 +335,338 @@ fn start_with_backends(
         "--credential",
         credential.to_str().unwrap(),
     ];
+    arguments.extend(crl);
     if let Some(config) = config {
         arguments.extend(["--backend-config", config.to_str().unwrap()]);
     }
     Daemon::spawn(&arguments, &[("RUST_LOG", LOG_FILTER)])
+}
+
+/// One test CA's revocation service: the `GetCrl` enrollment endpoint a
+/// founder serves, over a revoked-serials file the test appends to.
+struct Issuer {
+    address: String,
+    revoked: std::path::PathBuf,
+    _stop: tokio::sync::oneshot::Sender<()>,
+    _directory: tempfile::TempDir,
+}
+
+impl Issuer {
+    async fn start(ca: &[u8], ca_key: &[u8]) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let revoked = directory.path().join("revoked-serials");
+        let address: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve_node_enrollment(
+            address,
+            ca.to_vec(),
+            ca_key.to_vec(),
+            directory.path().join("join-token-hashes"),
+            None,
+            Some(revoked.clone()),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let address = address.to_string();
+        let deadline = std::time::Instant::now() + BUDGET;
+        while call_get_crl(&address, 2).await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "issuer did not serve a revocation list"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Self {
+            address,
+            revoked,
+            _stop: stop,
+            _directory: directory,
+        }
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn revoke(&self, certificate: &[u8]) {
+        add_revoked_serial(&self.revoked, &serial_from_cert_pem(certificate).unwrap()).unwrap();
+    }
+}
+
+/// A revocation list signed by `ca`, numbered `number`, issued `age` ago.
+fn signed_crl(ca: &[u8], ca_key: &[u8], number: u64, revoked: &[&[u8]], age: Duration) -> Vec<u8> {
+    let issuer = rcgen::Issuer::from_ca_cert_pem(
+        std::str::from_utf8(ca).unwrap(),
+        rcgen::KeyPair::from_pem(std::str::from_utf8(ca_key).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let issued = time::OffsetDateTime::now_utc() - age;
+    rcgen::CertificateRevocationListParams {
+        this_update: issued,
+        next_update: issued + time::Duration::days(30),
+        crl_number: rcgen::SerialNumber::from_slice(&number.to_be_bytes()),
+        issuing_distribution_point: None,
+        revoked_certs: revoked
+            .iter()
+            .map(|serial| rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from_slice(serial),
+                revocation_time: issued,
+                reason_code: Some(rcgen::RevocationReason::Unspecified),
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer)
+    .unwrap()
+    .pem()
+    .unwrap()
+    .into_bytes()
+}
+
+/// A session agent whose serial's DER encoding carries a leading zero octet, so
+/// the list and the presented certificate must keep the same serial encoding.
+fn padded_serial_agent(ca: &[u8], ca_key: &[u8], name: &str) -> (Vec<u8>, Vec<u8>) {
+    loop {
+        let (cert, key) = generate_session_agent_cert(name, "alice", 300, ca, ca_key).unwrap();
+        if serial_from_cert_pem(&cert).unwrap().first() == Some(&0) {
+            return (cert, key);
+        }
+    }
+}
+
+const NOT_CURRENT: &str = "certificate revocation status is not current";
+/// One refresh interval plus slack for the list to be fetched and installed.
+const REFRESH_BUDGET: Duration = Duration::from_secs(30);
+
+/// Read until the connection is refused; panics if it is still served at the deadline.
+async fn refused_within(vfs: &mut Vfs, path: &str, budget: Duration) -> String {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Err(error) = vfs.read_file(path, "").await {
+            return error;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{path} is still served"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_session_agent_is_refused_within_one_refresh_while_others_continue() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let (revoked_cert, revoked_key) = padded_serial_agent(&ca, &ca_key, "session-revoked");
+    let revoked = bundle(
+        &root.path().join("revoked"),
+        "session-revoked",
+        "alice",
+        &ca,
+        &revoked_cert,
+        &revoked_key,
+    );
+    let (kept_cert, kept_key) =
+        generate_session_agent_cert("session-kept", "alice", 300, &ca, &ca_key).unwrap();
+    let kept = bundle(
+        &root.path().join("kept"),
+        "session-kept",
+        "alice",
+        &ca,
+        &kept_cert,
+        &kept_key,
+    );
+    let port = free_port();
+    let mut daemon = start(
+        &root.path().join("data"),
+        &credential,
+        "alice",
+        port,
+        issuer.address(),
+    );
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut revoked_vfs = Vfs::connect_as_agent(port, &revoked, BUDGET).await;
+    revoked_vfs
+        .write_file("/revoked.txt", b"before", "")
+        .await
+        .unwrap();
+    let mut kept_vfs = Vfs::connect_as_agent(port, &kept, BUDGET).await;
+    kept_vfs.write_file("/kept.txt", b"kept", "").await.unwrap();
+
+    issuer.revoke(&revoked_cert);
+    let error = refused_within(&mut revoked_vfs, "/revoked.txt", REFRESH_BUDGET).await;
+    assert!(error.contains("invalid credentials"), "{error}");
+    assert_eq!(kept_vfs.read_file("/kept.txt", "").await.unwrap(), b"kept");
+    let mut reconnected = Vfs::dial_as_agent(port, &revoked).await;
+    let error = reconnected.read_file("/revoked.txt", "").await.unwrap_err();
+    assert!(error.contains("invalid credentials"), "{error}");
+}
+
+#[tokio::test]
+async fn a_revocation_list_file_is_read_again_and_an_older_number_cannot_undo_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let (agent_cert, agent_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let agent = bundle(
+        &root.path().join("agent"),
+        "session-alice",
+        "alice",
+        &ca,
+        &agent_cert,
+        &agent_key,
+    );
+    let serial = serial_from_cert_pem(&agent_cert).unwrap();
+    let list = root.path().join("revocation.pem");
+    std::fs::write(&list, signed_crl(&ca, &ca_key, 2, &[], Duration::ZERO)).unwrap();
+    let port = free_port();
+    let mut daemon = start_with_backends(
+        &root.path().join("data"),
+        &credential,
+        "alice",
+        port,
+        None,
+        ["--crl-file", list.to_str().unwrap()],
+    );
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut vfs = Vfs::connect_as_agent(port, &agent, BUDGET).await;
+    vfs.write_file("/memory.txt", b"bytes", "").await.unwrap();
+
+    std::fs::write(
+        &list,
+        signed_crl(&ca, &ca_key, 3, &[&serial], Duration::ZERO),
+    )
+    .unwrap();
+    let error = refused_within(&mut vfs, "/memory.txt", REFRESH_BUDGET).await;
+    assert!(error.contains("invalid credentials"), "{error}");
+
+    std::fs::write(&list, signed_crl(&ca, &ca_key, 1, &[], Duration::ZERO)).unwrap();
+    // Long enough for the runtime to read the older list at least twice.
+    let deadline = std::time::Instant::now() + REFRESH_BUDGET;
+    while std::time::Instant::now() < deadline {
+        let error = vfs.read_file("/memory.txt", "").await.unwrap_err();
+        assert!(
+            error.contains("invalid credentials"),
+            "an older list undid a revocation: {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    daemon
+        .wait_for_log("revocation list refused", BUDGET)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_runtime_without_a_current_revocation_list_refuses_every_request() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let (agent_cert, agent_key) =
+        generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let agent = bundle(
+        &root.path().join("agent"),
+        "session-alice",
+        "alice",
+        &ca,
+        &agent_cert,
+        &agent_key,
+    );
+
+    // No issuer answers: the runtime serves, but admits nobody.
+    let unreachable = format!("127.0.0.1:{}", free_port());
+    let port = free_port();
+    let mut daemon = start(
+        &root.path().join("unreachable"),
+        &credential,
+        "alice",
+        port,
+        &unreachable,
+    );
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut vfs = Vfs::dial_as_agent(port, &agent).await;
+    let error = vfs.read_file("/memory.txt", "").await.unwrap_err();
+    assert!(error.contains(NOT_CURRENT), "{error}");
+    drop(vfs);
+    drop(daemon);
+
+    // A list that ages past the freshness budget stops admitting, including
+    // on a connection that was already open.
+    let list = root.path().join("ageing.pem");
+    std::fs::write(
+        &list,
+        signed_crl(&ca, &ca_key, 1, &[], Duration::from_secs(280)),
+    )
+    .unwrap();
+    let port = free_port();
+    let mut daemon = start_with_backends(
+        &root.path().join("ageing"),
+        &credential,
+        "alice",
+        port,
+        None,
+        ["--crl-file", list.to_str().unwrap()],
+    );
+    daemon
+        .wait_for_log("confined user runtime ready", BUDGET)
+        .await
+        .unwrap();
+    let mut vfs = Vfs::connect_as_agent(port, &agent, BUDGET).await;
+    vfs.write_file("/memory.txt", b"bytes", "").await.unwrap();
+    let error = refused_within(&mut vfs, "/memory.txt", Duration::from_secs(60)).await;
+    assert!(error.contains(NOT_CURRENT), "{error}");
+}
+
+#[tokio::test]
+async fn serve_user_without_a_revocation_source_does_not_start() {
+    let root = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let (cert, key) =
+        generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
+    let credential = root.path().join("credential");
+    bundle(&credential, "runtime-alice", "alice", &ca, &cert, &key);
+    let data = root.path().join("data");
+    let mut rejected = Daemon::spawn(
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "serve-user",
+            "--owner",
+            "alice",
+            "--credential",
+            credential.to_str().unwrap(),
+        ],
+        &[("RUST_LOG", LOG_FILTER)],
+    );
+    let log = rejected.wait_exit(BUDGET).await.unwrap();
+    assert!(log.contains("--crl-endpoint"), "{log}");
+    assert!(
+        !data.exists(),
+        "a runtime without a revocation source must not create storage"
+    );
 }
 
 #[cfg(all(feature = "driver-cas-local", target_os = "linux"))]
@@ -341,6 +674,7 @@ fn start_with_backends(
 async fn durable_cas_mount_reopens_immutable_content_with_the_owner_boundary() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (server_cert, server_key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("server");
@@ -376,7 +710,14 @@ async fn durable_cas_mount_reopens_immutable_content_with_the_owner_boundary() {
     let next = b"replacement durable runtime image";
     let port = free_port();
     for turn in 0..3 {
-        let mut daemon = start_with_backends(&data, &credential, "alice", port, Some(&config));
+        let mut daemon = start_with_backends(
+            &data,
+            &credential,
+            "alice",
+            port,
+            Some(&config),
+            ["--crl-endpoint", issuer.address()],
+        );
         daemon
             .wait_for_log("confined user runtime ready", BUDGET)
             .await
@@ -457,7 +798,14 @@ async fn durable_cas_mount_reopens_immutable_content_with_the_owner_boundary() {
     let object = backing.join(format!("cas/{}/{}/{hash}", &hash[..2], &hash[2..4]));
     let corrupted = b"a different durable runtime image";
     std::fs::write(&object, corrupted).unwrap();
-    let mut daemon = start_with_backends(&data, &credential, "alice", port, Some(&config));
+    let mut daemon = start_with_backends(
+        &data,
+        &credential,
+        "alice",
+        port,
+        Some(&config),
+        ["--crl-endpoint", issuer.address()],
+    );
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -500,6 +848,7 @@ async fn required_durable_backend_obeys_build_and_platform_at_startup() {
 
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("server");
@@ -516,6 +865,7 @@ async fn required_durable_backend_obeys_build_and_platform_at_startup() {
         "alice",
         free_port(),
         Some(&config),
+        ["--crl-endpoint", issuer.address()],
     );
     let is_available = DefaultObjectStoreProvider.can_build("cas-local-durable");
     if is_available && cfg!(target_os = "linux") {
@@ -601,6 +951,7 @@ async fn model_backend_survives_restart(is_replica: bool) {
     });
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (server_cert, server_key) = if is_replica {
         nexus_raft::transport::generate_user_replica_cert(
             "runtime-alice",
@@ -652,6 +1003,8 @@ async fn model_backend_survives_restart(is_replica: bool) {
         "alice",
         "--credential",
         credential.to_str().unwrap(),
+        "--crl-endpoint",
+        issuer.address(),
         "--backend-config",
         config.to_str().unwrap(),
     ]);
@@ -745,6 +1098,7 @@ async fn model_backend_survives_restart(is_replica: bool) {
 async fn malformed_startup_backends_fail_before_touching_owner_storage() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("credential");
@@ -771,6 +1125,8 @@ async fn malformed_startup_backends_fail_before_touching_owner_storage() {
                 "alice",
                 "--credential",
                 credential.to_str().unwrap(),
+                "--crl-endpoint",
+                issuer.address(),
                 "--backend-config",
                 config_path.to_str().unwrap(),
             ],
@@ -789,6 +1145,7 @@ async fn malformed_startup_backends_fail_before_touching_owner_storage() {
 async fn a_requested_unsigned_plugin_blocks_the_confined_server() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("credential");
@@ -812,6 +1169,8 @@ async fn a_requested_unsigned_plugin_blocks_the_confined_server() {
             "alice",
             "--credential",
             credential.to_str().unwrap(),
+            "--crl-endpoint",
+            issuer.address(),
         ],
         &[("RUST_LOG", LOG_FILTER)],
     );
@@ -829,6 +1188,7 @@ async fn signed_vault_uses_the_owned_data_root_and_keeps_the_owner_boundary() {
     let plugins = std::env::var("NEXUS_VAULT_PLUGIN_DIR").expect("signed Vault fixture directory");
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("server");
@@ -849,6 +1209,8 @@ async fn signed_vault_uses_the_owned_data_root_and_keeps_the_owner_boundary() {
             "alice",
             "--credential",
             credential.to_str().unwrap(),
+            "--crl-endpoint",
+            issuer.address(),
         ],
         &[
             ("RUST_LOG", LOG_FILTER),
@@ -989,6 +1351,7 @@ async fn signed_vault_on_the_control_plane_refuses_a_user_runtime_identity() {
 async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (server_cert, server_key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential_dir = root.path().join("server-credential");
@@ -1023,7 +1386,7 @@ async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart
     bob.server_name = alice.server_name.clone();
     let data = root.path().join("data");
     let port = free_port();
-    let mut daemon = start(&data, &credential_dir, "alice", port);
+    let mut daemon = start(&data, &credential_dir, "alice", port, issuer.address());
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1081,7 +1444,7 @@ async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart
     drop(owner);
     drop(daemon);
 
-    let mut daemon = start(&data, &credential_dir, "alice", port);
+    let mut daemon = start(&data, &credential_dir, "alice", port, issuer.address());
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1115,7 +1478,7 @@ async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart
         &bob_server,
         &bob_server_key,
     );
-    let mut mismatch = start(&data, &credential_dir, "bob", port);
+    let mut mismatch = start(&data, &credential_dir, "bob", port, issuer.address());
     let log = mismatch
         .wait_exit(BUDGET)
         .await
@@ -1130,6 +1493,7 @@ async fn owner_boundary_stream_history_and_memory_survive_a_real_process_restart
 async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creating_data() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 300, &ca, &ca_key).unwrap();
     let credential_dir = root.path().join("credential");
@@ -1153,6 +1517,8 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
             "alice",
             "--credential",
             credential_dir.to_str().unwrap(),
+            "--crl-endpoint",
+            issuer.address(),
         ];
         args.extend(flags);
         let env = if index == 4 {
@@ -1184,6 +1550,8 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
                 "alice",
                 "--credential",
                 credential_dir.to_str().unwrap(),
+                "--crl-endpoint",
+                issuer.address(),
             ],
             &[("RUST_LOG", LOG_FILTER)],
         );
@@ -1201,7 +1569,13 @@ async fn boot_refuses_cluster_authority_and_a_client_only_identity_before_creati
         generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
     bundle(&credential_dir, "session-alice", "alice", &ca, &cert, &key);
     let data = root.path().join("client-only");
-    let mut rejected = start(&data, &credential_dir, "alice", free_port());
+    let mut rejected = start(
+        &data,
+        &credential_dir,
+        "alice",
+        free_port(),
+        issuer.address(),
+    );
     let log = rejected.wait_exit(BUDGET).await.unwrap();
     assert!(
         log.contains("another owner or lacks server capability"),
@@ -1223,6 +1597,7 @@ async fn replica_restart_with_expired_identity_recovers_after_renewal() {
 async fn expired_runtime_restart(is_replica: bool) {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let runtime_certificate = |validity| {
         if is_replica {
             nexus_raft::transport::generate_user_replica_cert(
@@ -1253,7 +1628,7 @@ async fn expired_runtime_restart(is_replica: bool) {
     );
     let data = root.path().join("data");
     let port = free_port();
-    let mut daemon = start(&data, &credential_dir, "alice", port);
+    let mut daemon = start(&data, &credential_dir, "alice", port, issuer.address());
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1289,7 +1664,7 @@ async fn expired_runtime_restart(is_replica: bool) {
     {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut daemon = start(&data, &credential_dir, "alice", port);
+    let mut daemon = start(&data, &credential_dir, "alice", port, issuer.address());
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1326,6 +1701,7 @@ async fn expired_runtime_restart(is_replica: bool) {
 async fn rotation_keeps_existing_connections_and_expiry_refuses_them_until_a_valid_replacement() {
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_runtime_cert("runtime-alice", "alice", 30, &ca, &ca_key).unwrap();
     let credential_dir = root.path().join("server-credential");
@@ -1341,7 +1717,13 @@ async fn rotation_keeps_existing_connections_and_expiry_refuses_them_until_a_val
         &client_key,
     );
     let port = free_port();
-    let mut daemon = start(&root.path().join("data"), &credential_dir, "alice", port);
+    let mut daemon = start(
+        &root.path().join("data"),
+        &credential_dir,
+        "alice",
+        port,
+        issuer.address(),
+    );
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1438,6 +1820,7 @@ async fn rotation_preserves_the_signed_replica_identity() {
 
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key).unwrap();
     let credential_dir = root.path().join("server");
@@ -1464,7 +1847,13 @@ async fn rotation_preserves_the_signed_replica_identity() {
     };
     let port = free_port();
     let endpoint = format!("https://127.0.0.1:{port}");
-    let mut daemon = start(&root.path().join("data"), &credential_dir, "alice", port);
+    let mut daemon = start(
+        &root.path().join("data"),
+        &credential_dir,
+        "alice",
+        port,
+        issuer.address(),
+    );
     daemon
         .wait_for_log("confined user runtime ready", BUDGET)
         .await
@@ -1555,6 +1944,7 @@ async fn runtime_reserves_its_listener_before_creating_owner_storage() {
 
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (client_cert, client_key) =
         generate_session_agent_cert("session-alice", "alice", 300, &ca, &ca_key).unwrap();
     let client = bundle(
@@ -1578,7 +1968,7 @@ async fn runtime_reserves_its_listener_before_creating_owner_storage() {
         let data = root.path().join(format!("data-{profile}"));
         let port = free_port();
         let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
-        let mut rejected = start(&data, &credential, "alice", port);
+        let mut rejected = start(&data, &credential, "alice", port, issuer.address());
         let log = rejected
             .wait_exit(BUDGET)
             .await
@@ -1602,7 +1992,7 @@ async fn runtime_reserves_its_listener_before_creating_owner_storage() {
         drop(occupied);
 
         // The same identity, directory and port must work once the socket is free.
-        let mut daemon = start(&data, &credential, "alice", port);
+        let mut daemon = start(&data, &credential, "alice", port, issuer.address());
         daemon
             .wait_for_log("confined user runtime ready", BUDGET)
             .await
@@ -1635,6 +2025,7 @@ async fn replica_listener_keeps_the_owner_boundary_and_local_root_across_restart
 
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let (cert, key) =
         generate_user_replica_cert("runtime-alice", "alice", 31, 300, &ca, &ca_key).unwrap();
     let credential = root.path().join("server");
@@ -1695,6 +2086,8 @@ async fn replica_listener_keeps_the_owner_boundary_and_local_root_across_restart
                 "alice",
                 "--credential",
                 credential.to_str().unwrap(),
+                "--crl-endpoint",
+                issuer.address(),
             ],
             &[("RUST_LOG", LOG_FILTER)],
         );
@@ -1787,6 +2180,7 @@ async fn owner_zone_runtime_preserves_scope_and_original_journal_across_restart(
 
     let root = tempfile::tempdir().unwrap();
     let (ca, ca_key) = generate_zone_ca("root").unwrap();
+    let issuer = Issuer::start(&ca, &ca_key).await;
     let mut clients = Vec::new();
     for owner in ["alice", "bob"] {
         let actor = format!("session-{owner}");
@@ -1824,7 +2218,7 @@ async fn owner_zone_runtime_preserves_scope_and_original_journal_across_restart(
         let mut original_record = None;
         let mut original_node_id = None;
         for round in 0..2 {
-            let mut daemon = start(&data, &credential, "alice", port);
+            let mut daemon = start(&data, &credential, "alice", port, issuer.address());
             daemon
                 .wait_for_log("confined user runtime ready", BUDGET)
                 .await

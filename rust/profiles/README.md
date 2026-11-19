@@ -25,10 +25,12 @@ profiles/
 ## Confined user runtime
 
 `nexusd-cluster --data-dir <user-volume> --bind-addr <address> serve-user
---owner <owner-id> --credential <bundle-directory>` runs the same Kernel and
-service declarations under one fixed owner's delegated mTLS identity. The
-external issuer supplies the standard `AgentCredential` bundle. The certificate
-must have the owner's runtime server name and a lifetime of at most 300 seconds.
+--owner <owner-id> --credential <bundle-directory>
+(--crl-endpoint <issuer-enroll-address> | --crl-file <signed-crl.pem>)` runs the
+same Kernel and service declarations under one fixed owner's delegated mTLS
+identity. The external issuer supplies the standard `AgentCredential` bundle.
+The certificate must have the owner's runtime server name and a lifetime of at
+most 300 seconds.
 
 The runtime opens a local root Raft zone without a peer/control-plane listener.
 Namespace metadata, WAL transcripts, files and the owner/volume binding are
@@ -43,6 +45,16 @@ connections stop when the current credential expires; a later valid replacement
 restores service. This mode is also available to binaries composing
 `run_with_services`, including the in-process SudoCode adapter. Pod placement,
 credential delivery and renewal remain the control plane's responsibility.
+
+The runtime admits agents only against a current revocation list signed by the
+credential bundle's CA. It reads the list every 10 seconds, either from the
+issuer's enrollment endpoint (`GetCrl`, the founder's `--accept-enrollments`
+port) or from a file another component keeps current. It installs a list only
+if the signature verifies, the list is fresh, and its number does not go
+backwards. A revoked agent is refused within one refresh. Until the first list
+arrives, and whenever the one in force is older than 300 seconds, every request
+is refused as unavailable, including on established connections. One of the two
+sources is required; without one the runtime does not start.
 
 ### Startup backends
 
