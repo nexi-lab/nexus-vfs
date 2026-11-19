@@ -1,4 +1,4 @@
-//! A single-endpoint operator client for automatic Codex Agent enrollment.
+//! A single-endpoint operator client for explicitly granted Agent enrollment.
 //!
 //! This uses the existing Node-gated MintAgent RPC, TLS loader and credential
 //! writer. It never opens the auth store, signs offline, elects another subject
@@ -31,6 +31,15 @@ struct Args {
     endpoint: Option<String>,
     #[arg(long, requires = "initialize")]
     workspace_root: Vec<PathBuf>,
+    /// Authorize one named Agent at one exact workspace (repeat per Agent).
+    /// This creates a separate v2 grant; frontend wildcard grants stay unchanged.
+    #[arg(
+        long,
+        requires = "initialize",
+        conflicts_with = "workspace_root",
+        value_name = "NAME=WORKSPACE"
+    )]
+    agent: Vec<NamedAgent>,
 }
 
 /// Standalone client entry; never dispatches the daemon or opens its database.
@@ -46,6 +55,7 @@ pub fn main() -> Result<()> {
                 .as_deref()
                 .context("--initialize requires --endpoint")?,
             args.workspace_root,
+            args.agent,
         );
     }
     tokio::runtime::Builder::new_current_thread()
@@ -65,35 +75,99 @@ struct Grant {
     owner_node_identity: String,
     ca_certificate_sha256: String,
     workspace_roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<NamedAgent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NamedAgent {
+    name: String,
+    workspace: PathBuf,
+}
+
+impl std::str::FromStr for NamedAgent {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (name, workspace) = value.split_once('=').ok_or("Expected NAME=WORKSPACE")?;
+        Ok(Self {
+            name: name.into(),
+            workspace: workspace.into(),
+        })
+    }
+}
+
+impl NamedAgent {
+    fn canonical_workspace(&self) -> Result<PathBuf> {
+        // A portable single path component, including on case-insensitive hosts.
+        // The server still owns identity admission and the global name claim.
+        ensure!(
+            !self.name.is_empty() && self.name.len() <= 64
+                && self.name.as_bytes()[0].is_ascii_lowercase()
+                && self.name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+            "named Agent must use 1-64 lowercase letters, digits or hyphens and start with a letter"
+        );
+        ensure!(
+            !matches!(self.name.as_str(), "con" | "prn" | "aux" | "nul")
+                && !["com", "lpt"].iter().any(|prefix| {
+                    self.name.strip_prefix(prefix).is_some_and(|suffix| {
+                        suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+                    })
+                }),
+            "named Agent cannot use a reserved device name"
+        );
+        ensure!(
+            self.workspace.is_absolute(),
+            "named Agent workspace must be absolute"
+        );
+        let workspace = self.workspace.canonicalize()?;
+        ensure!(
+            workspace.is_dir(),
+            "named Agent workspace must be an existing directory"
+        );
+        Ok(workspace)
+    }
 }
 
 /// Prepare an explicit operator capability without issuing a credential or
 /// starting a service. Existing grants are never overwritten.
-pub(super) fn initialize(
+fn initialize(
     file: &Path,
     data_directory: &Path,
     endpoint: &str,
     workspace_roots: Vec<PathBuf>,
+    mut agents: Vec<NamedAgent>,
 ) -> Result<()> {
     ensure!(
         file.is_absolute() && data_directory.is_absolute(),
         "absolute grant/data paths are required"
     );
     ensure!(
-        !workspace_roots.is_empty(),
-        "at least one explicitly authorized workspace root is required"
+        workspace_roots.is_empty() != agents.is_empty(),
+        "select either frontend workspace roots or explicit named Agents"
     );
+    for agent in &mut agents {
+        agent.workspace = agent.canonical_workspace()?;
+    }
+    validate_named_agents(&agents)?;
     let tls = super::load_node_tls(data_directory)?;
     let parent = file.parent().context("grant requires a parent directory")?;
     let grant = Grant {
-        version: 1,
-        purpose: "codex-a2a".into(),
+        version: if agents.is_empty() { 1 } else { 2 },
+        purpose: if agents.is_empty() {
+            "codex-a2a"
+        } else {
+            "named-agent-a2a"
+        }
+        .into(),
         endpoint: endpoint.into(),
         node_data_directory: data_directory.canonicalize()?,
         state_directory: parent.join("node-enrollment-operations"),
         owner_node_identity: node_identity(&tls)?,
         ca_certificate_sha256: super::certificate_sha256_hex(&tls.ca_pem)?,
         workspace_roots,
+        agents,
     };
     // The same validator used at issuance checks URI/TLS/root inputs before a
     // grant can be published. Do not run an RPC merely to prepare local policy.
@@ -109,7 +183,7 @@ pub(super) fn initialize(
     println!(
         "{}",
         serde_json::json!({"prepared":true,"grantFile":file,"issued":false,
-        "endpoint":grant.endpoint,"workspaceRoots":grant.workspace_roots,
+        "endpoint":grant.endpoint,"workspaceRoots":grant.workspace_roots,"agents":grant.agents,
         "ownerNodeIdentity":grant.owner_node_identity})
     );
     Ok(())
@@ -121,7 +195,8 @@ struct Claim {
     version: u32,
     actor: String,
     operation_id: String,
-    thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
     workspace: PathBuf,
 }
 
@@ -217,30 +292,52 @@ fn prepare(grant_file: &Path, claim: Claim) -> Result<(Grant, Attempt, TlsConfig
         "an absolute operator grant is required"
     );
     let grant: Grant = read_json(grant_file)?;
-    ensure!(
-        grant.version == 1 && grant.purpose == "codex-a2a",
-        "unsupported operator grant"
-    );
-    ensure!(
-        claim.version == 1 && uuid(&claim.operation_id) && uuid(&claim.thread_id),
-        "invalid operation/thread identity"
-    );
-    ensure!(
-        issuable_actor(&claim.actor),
-        "grant permits only codex-/claude- actors: <32 lowercase hex> or <workspace slug>-<8 lowercase hex>"
-    );
+    ensure!(uuid(&claim.operation_id), "invalid operation identity");
     ensure!(
         claim.workspace.is_absolute(),
         "an absolute native workspace is required"
     );
     let canonical = claim.workspace.canonicalize()?;
     ensure!(canonical.is_dir(), "native workspace is not a directory");
-    let mut authorized = false;
-    for root in &grant.workspace_roots {
-        ensure!(root.is_absolute(), "grant workspace roots must be absolute");
-        authorized |= canonical.starts_with(root.canonicalize()?);
+    match (grant.version, grant.purpose.as_str()) {
+        (1, "codex-a2a") => {
+            ensure!(
+                grant.agents.is_empty(),
+                "frontend grant cannot contain named Agents"
+            );
+            ensure!(
+                claim.version == 1 && claim.thread_id.as_deref().is_some_and(uuid),
+                "invalid operation/thread identity"
+            );
+            ensure!(
+                issuable_actor(&claim.actor),
+                "grant permits only codex-/claude- actors: <32 lowercase hex> or <workspace slug>-<8 lowercase hex>"
+            );
+            let mut authorized = false;
+            for root in &grant.workspace_roots {
+                ensure!(root.is_absolute(), "grant workspace roots must be absolute");
+                authorized |= canonical.starts_with(root.canonicalize()?);
+            }
+            ensure!(authorized, "native workspace is outside the operator grant");
+        }
+        (2, "named-agent-a2a") => {
+            ensure!(
+                claim.version == 2 && claim.thread_id.is_none() && grant.workspace_roots.is_empty() && !grant.agents.is_empty(),
+                "named Agent grants require v2 claims without frontend thread identity or wildcard roots"
+            );
+            validate_named_agents(&grant.agents)?;
+            let authorized = grant
+                .agents
+                .iter()
+                .find(|agent| agent.name == claim.actor)
+                .context("Agent name is not explicitly granted")?;
+            ensure!(
+                canonical == authorized.canonical_workspace()?,
+                "workspace differs from the exact named Agent grant"
+            );
+        }
+        _ => bail!("unsupported operator grant"),
     }
-    ensure!(authorized, "native workspace is outside the operator grant");
     ensure!(
         grant.node_data_directory.is_absolute() && grant.state_directory.is_absolute(),
         "operator paths must be absolute"
@@ -254,6 +351,19 @@ fn prepare(grant_file: &Path, claim: Claim) -> Result<(Grant, Attempt, TlsConfig
         ca_certificate_sha256: grant.ca_certificate_sha256.clone(),
     };
     Ok((grant, attempt, tls))
+}
+
+fn validate_named_agents(agents: &[NamedAgent]) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    let mut workspaces = std::collections::HashSet::new();
+    for agent in agents {
+        ensure!(names.insert(&agent.name), "duplicate named Agent");
+        ensure!(
+            workspaces.insert(agent.canonical_workspace()?),
+            "named Agents require distinct workspaces"
+        );
+    }
+    Ok(())
 }
 
 #[inline]
@@ -457,7 +567,7 @@ mod tests {
         let (ca, ca_key) = generate_zone_ca("root").unwrap();
         certify(&data, 7, Some("DESKTOP-K2PHFNR"), &ca, &ca_key);
         let file = root.join("private").join("grant.json");
-        initialize(&file, &data, endpoint, vec![workspace.clone()]).unwrap();
+        initialize(&file, &data, endpoint, vec![workspace.clone()], vec![]).unwrap();
         (file, workspace, ca, ca_key)
     }
 
@@ -532,7 +642,7 @@ mod tests {
             version: 1,
             actor: format!("codex-{}", "a".repeat(32)),
             operation_id: "00000000-0000-4000-8000-000000000001".into(),
-            thread_id: "10000000-0000-4000-8000-000000000001".into(),
+            thread_id: Some("10000000-0000-4000-8000-000000000001".into()),
             workspace,
         };
         // The same operation stays runnable: neither attempt leaves a record.
