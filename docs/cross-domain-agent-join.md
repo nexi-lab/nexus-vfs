@@ -231,15 +231,15 @@ revoke. This typed store has no deletion/un-revoke operation. Unknown certificat
 expiry is not permission to prune a tombstone. Authority-key rotation is a
 separate reviewed operation.
 
-This deliberately does not use the legacy `GetCrl` number as a monotonic
-version: that number is currently the revoked-entry count and can decrease
-when expired entries are pruned. Signed freshness bounds an unseen foreign
-revocation; it cannot make one known before an authentic refresh. Replay within
-the accepted freshness window is not claimed absent. A native deployment must
-choose/document its refresh interval and freshness budget, fail closed when
-fresh state cannot be established, and resolve the current registered issuer
-independently on every admission. Removing an anchor still refuses the caller;
-the presence of a stored CRL does not preserve trust.
+This store keeps its own tombstones rather than trusting a fetched list's number
+alone: a `GetCrl` number is a durable, increasing sequence (`CrlIssuer`), but
+expired entries are still pruned from later lists. Signed freshness bounds an
+unseen foreign revocation; it cannot make one known before an authentic refresh.
+Replay within the accepted freshness window is not claimed absent. A native
+deployment must choose/document its refresh interval and freshness budget, fail
+closed when fresh state cannot be established, and resolve the current
+registered issuer independently on every admission. Removing an anchor still
+refuses the caller; the presence of a stored CRL does not preserve trust.
 
 `RaftCurrentAgentAuthority` now composes the actual request's selected issuer
 DER pin, SPKI address authority, trust-domain binding and serial with that

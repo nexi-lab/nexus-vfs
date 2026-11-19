@@ -18,6 +18,9 @@ use x509_parser::prelude::*;
 
 use super::{BoxedServiceDeclsBuilder, CommonArgs, ServiceBootCtx};
 
+mod revocation;
+pub(crate) use revocation::CrlSource;
+
 const OWNER_FILE: &str = ".user-runtime-owner";
 
 struct ValidatedCredential {
@@ -218,6 +221,7 @@ pub(super) async fn serve(
     owner: String,
     credential_path: PathBuf,
     backend_config: Option<PathBuf>,
+    crl: CrlSource,
 ) -> Result<()> {
     super::refuse_retired_env_vars()?;
     validate_options(&common)?;
@@ -271,10 +275,13 @@ pub(super) async fn serve(
         .to_str()
         .context("user runtime data directory must be UTF-8")?
         .to_owned();
-    let auth: Arc<dyn transport::auth::AuthProvider> =
-        Arc::new(auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
+    let revocation = revocation::RevocationGate::new(
+        auth::ApiKeyAuthProvider::cert_identity_for_user_runtime(
             initial.bundle.server_name.clone(),
-        ));
+        ),
+        initial.bundle.ca_pem.clone(),
+    );
+    let auth: Arc<dyn transport::auth::AuthProvider> = revocation.clone();
     super::plugin_loading::load(&kernel, common.plugin_dir.as_deref())?;
     let verifier_slot = Arc::new(std::sync::OnceLock::new());
     verifier_slot
@@ -396,6 +403,18 @@ pub(super) async fn serve(
     if zone_caps.set(Arc::new(capabilities)).is_err() {
         bail!("user zone capabilities were already installed");
     }
+    // Fetch the first list before serving, so an ordinary start has no window
+    // of refusals; without one every request is refused until a list arrives.
+    log_revocation_refresh(revocation.refresh(&crl).await);
+    let revocation_refresh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(revocation::REFRESH);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            log_revocation_refresh(revocation.refresh(&crl).await);
+        }
+    });
     ready.mark_ready();
     tracing::info!(owner = %owner, bind = %bind, replica = ?initial.identity.replica_id, "confined user runtime ready");
     let reload = tokio::spawn(async move {
@@ -469,10 +488,19 @@ pub(super) async fn serve(
         _ => unreachable!("runtime listener and routes belong to the same transport"),
     };
     reload.abort();
+    revocation_refresh.abort();
     tokio::task::spawn_blocking(move || zones.shutdown())
         .await
         .context("stop user runtime zones")?;
     result
+}
+
+fn log_revocation_refresh(result: std::result::Result<bool, String>) {
+    match result {
+        Ok(true) => tracing::info!("revocation list installed"),
+        Ok(false) => tracing::debug!("revocation list unchanged"),
+        Err(error) => tracing::warn!(%error, "revocation list refused"),
+    }
 }
 
 #[cfg(test)]
