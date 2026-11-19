@@ -32,9 +32,13 @@ impl CrlSource {
                     .await
                     .map_err(|error| format!("fetch revocation list from {address}: {error}"))
             }
-            Self::File(path) => tokio::fs::read(path)
-                .await
-                .map_err(|error| format!("read revocation list {}: {error}", path.display())),
+            Self::File(path) => {
+                let file = path.clone();
+                tokio::task::spawn_blocking(move || std::fs::read(file))
+                    .await
+                    .map_err(|error| format!("read revocation list {}: {error}", path.display()))?
+                    .map_err(|error| format!("read revocation list {}: {error}", path.display()))
+            }
         }
     }
 }
