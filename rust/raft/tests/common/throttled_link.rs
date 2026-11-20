@@ -147,11 +147,19 @@ async fn forward(inbound: TcpStream, shared: Arc<Shared>) {
             if rate > 0 {
                 let crossed_at = {
                     let mut free_at = shared.free_at.lock().await;
-                    let start = (*free_at).max(tokio::time::Instant::now());
+                    // Keep the byte clock across reads. Restarting at `now`
+                    // charges timer rounding and scheduling overhead for every
+                    // 2 KiB, making a Windows link substantially slower than
+                    // its configured rate. Cap idle credit at one buffer.
+                    let now = tokio::time::Instant::now();
+                    let credit = Duration::from_secs_f64(buffer.len() as f64 / rate as f64);
+                    let start = (*free_at).max(now - credit);
                     *free_at = start + Duration::from_secs_f64(read as f64 / rate as f64);
                     *free_at
                 };
-                tokio::time::sleep_until(crossed_at).await;
+                if crossed_at > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(crossed_at).await;
+                }
             }
             if to_target.write_all(&buffer[..read]).await.is_err() {
                 return;

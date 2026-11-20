@@ -56,6 +56,39 @@ const ENTRY_VALUE_BYTES: usize = 4 * 1024;
 // rate; this link needs longer for it.
 const _: () = assert!(1024 * 1024 / RATE > 30 + 8);
 
+/// Establish the wire rate independently of Raft. If OS timer rounding
+/// halves the simulated capacity, a catch-up deadline calculated from that
+/// capacity cannot distinguish a transport regression from a fixture error.
+#[tokio::test]
+async fn the_test_link_carries_a_continuous_stream_at_its_configured_rate() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const BYTES: usize = 1024 * 1024;
+    const RATE: u64 = 256 * 1024;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let link = ThrottledLink::start(&target.local_addr().unwrap().to_string(), RATE).await;
+    let mut source = TcpStream::connect(link.address()).await.unwrap();
+    let (mut sink, _) = target.accept().await.unwrap();
+    let started = Instant::now();
+    let (sent, received) = tokio::join!(
+        async { source.write_all(&vec![0x5a; BYTES]).await },
+        async {
+            let mut data = vec![0; BYTES];
+            sink.read_exact(&mut data).await.unwrap();
+            data
+        }
+    );
+    sent.unwrap();
+    let elapsed = started.elapsed();
+    assert!(received.iter().all(|&byte| byte == 0x5a));
+    let ideal = Duration::from_secs(BYTES as u64 / RATE);
+    assert!(
+        elapsed >= ideal.mul_f64(0.95) && elapsed <= ideal.mul_f64(1.25),
+        "continuous 1 MiB at 256 KiB/s took {elapsed:?}, expected about {ideal:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_backlog_crosses_a_slow_link_as_small_appends() {
     // This binary's own process: no other test reads the variable.
@@ -241,6 +274,7 @@ async fn a_pipelined_backlog_crosses_a_slow_link_one_append_at_a_time() {
     // The link turns slow and stays up; the leader writes the backlog and
     // pipelines it to the learner as it is written.
     link.set_rate(PIPELINED_RATE);
+    let bytes_before_backlog = link.bytes_toward_target();
     counting.largest_forwarded.store(0, Ordering::SeqCst);
     for i in 0..PIPELINED_ENTRIES {
         consensus(&leader)
@@ -263,9 +297,10 @@ async fn a_pipelined_backlog_crosses_a_slow_link_one_append_at_a_time() {
         assert!(
             written.elapsed() < CATCH_UP_BOUND,
             "the learner catches up within {CATCH_UP_BOUND:?} of the backlog being written \
-             (applied {}, leader commit {})",
+             (applied {}, leader commit {}, bytes forwarded since link slowed {})",
             consensus(&learner).applied_index(),
-            consensus(&leader).commit_index()
+            consensus(&leader).commit_index(),
+            link.bytes_toward_target() - bytes_before_backlog
         );
         if Instant::now() > burst_over {
             let failing = learner_progress().last_send_error;
