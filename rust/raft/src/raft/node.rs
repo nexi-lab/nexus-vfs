@@ -79,7 +79,8 @@ use read_index::{PendingRead, ReadContext, ReadReply, ReadRequestIds};
 mod replication;
 use replication::{CommitProbe, ReplicationView};
 pub use replication::{
-    LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus, REPLICATION_STALL,
+    LeaderCommit, PeerReplication, ReplicationState, ReplicationStatus, PROGRESS_WINDOW,
+    REPLICATION_STALL,
 };
 mod storage_activation;
 pub use storage_activation::{RaftMessageProtocol, StorageActivationView, StorageSubmission};
@@ -103,15 +104,16 @@ const DRIVER_CHANNEL_CAPACITY: usize = 256;
 /// Overridable via `NEXUS_SC_SNAPSHOT_THRESHOLD` (`0` disables compaction).
 const DEFAULT_SC_SNAPSHOT_THRESHOLD: u64 = 8192;
 
-/// The most a leader's compaction keeps behind the applied index for a
-/// lagging peer: half the threshold. A single-voter zone commits and compacts
-/// on the leader's own append, while its learners' last few entries are still
-/// in flight; compacting through `applied` left them below `first_index`, and
-/// each needed an InstallSnapshot of the whole zone (observed: one per
-/// compaction, about every 18 minutes, on a learner at lag 0 between them).
-fn catch_up_entries(threshold: u64) -> u64 {
-    threshold / 2
-}
+/// The most a leader's compaction keeps behind the applied index for the
+/// peers it is feeding, in snapshot thresholds. It bounds the leader's disk:
+/// between two compactions the log grows by one threshold, so the log never
+/// holds more than nine thresholds of entries, whatever a peer's link does.
+/// A peer that falls further behind than this while still advancing is
+/// being written to faster than its link carries; no log can close that gap,
+/// and it is sent the stored snapshot. Eight thresholds (65,536 entries at
+/// the default) let a peer on a slow link take an hour over a snapshot or a
+/// backlog while the zone commits 18 entries a second.
+pub const RETAINED_LOG_THRESHOLDS: u64 = 8;
 
 /// How long a read on a replica waits for this node's own earlier writes to
 /// apply before it reports the replica's lag instead of answering stale.
@@ -149,8 +151,8 @@ pub struct RaftConfig {
     pub heartbeat_tick: usize,
 
     /// Entry bytes raft-rs batches into one append message — a soft cap it
-    /// exceeds only to send one entry alone. Derived from the transport's
-    /// message bound ([`super::message_bound::APPEND_BYTES`]).
+    /// exceeds only to send one entry alone
+    /// ([`super::message_bound::CALL_PAYLOAD_BYTES`]).
     pub max_size_per_msg: u64,
 
     /// Maximum number of in-flight append messages.
@@ -179,7 +181,7 @@ impl Default for RaftConfig {
             id: 1,
             election_tick: 10,
             heartbeat_tick: 3,
-            max_size_per_msg: super::message_bound::APPEND_BYTES,
+            max_size_per_msg: super::message_bound::CALL_PAYLOAD_BYTES as u64,
             max_inflight_msgs: 256,
             is_witness: false,
             tick_interval: Duration::from_millis(10),
@@ -676,6 +678,9 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     /// it; low-churn metadata/lock zones never compact. From
     /// `NEXUS_SC_SNAPSHOT_THRESHOLD`.
     snapshot_threshold: u64,
+    /// How long a peer may go without progress before compaction stops
+    /// keeping the log for it: [`PROGRESS_WINDOW`].
+    progress_window: Duration,
     /// Set when a `ConfChange` applies, cleared when a snapshot is created.
     /// Forces a snapshot refresh (independent of the size threshold) on the next
     /// ready after a membership change, so a freshly-joined member always
@@ -1009,6 +1014,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(DEFAULT_SC_SNAPSHOT_THRESHOLD),
+            progress_window: PROGRESS_WINDOW,
             membership_changed_since_snapshot: false,
             last_index_at_snapshot: init_snap_index,
         };
@@ -2192,6 +2198,13 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         self.snapshot_threshold = threshold;
     }
 
+    /// Give a silent peer up after `window`, for tests that cannot wait out
+    /// [`PROGRESS_WINDOW`].
+    #[cfg(test)]
+    pub(crate) fn set_progress_window(&mut self, window: Duration) {
+        self.progress_window = window;
+    }
+
     /// Get the EC replication log (if present).
     /// Used by the transport loop for EC background replication.
     pub fn replication_log(&self) -> Option<&Arc<ReplicationLog>> {
@@ -2343,6 +2356,25 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// replication to that peer permanently.
     pub fn report_snapshot(&mut self, peer_id: u64, status: raft::SnapshotStatus) {
         self.raw_node.report_snapshot(peer_id, status);
+    }
+
+    /// Whether raft-rs still awaits the outcome of the snapshot at `index`
+    /// it sent `peer_id`: this node leads and the peer's `Progress` is
+    /// pending on that snapshot. Once the peer's own response, a membership
+    /// change or a change of leader moves it on, no report is owed.
+    pub fn awaits_snapshot(&self, peer_id: u64, index: u64) -> bool {
+        let raft = &self.raw_node.raft;
+        raft.state == raft::StateRole::Leader
+            && raft.prs().get(peer_id).is_some_and(|progress| {
+                progress.state == raft::ProgressState::Snapshot
+                    && progress.pending_snapshot == index
+            })
+    }
+
+    /// The last index of this node's log: on a leader, the index a peer
+    /// holds once it has everything.
+    pub fn last_log_index(&self) -> u64 {
+        self.raw_node.raft.raft_log.last_index()
     }
 
     /// Drain all pending messages from the channel and process them.
@@ -2930,25 +2962,51 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         Ok(())
     }
 
-    /// Where a compaction starts the log. A leader keeps the entries its
-    /// lagging peers still need, back to the oldest peer within
-    /// [`catch_up_entries`] of `applied`; a peer further behind gets the stored
-    /// snapshot, as it would without the tail. With every peer caught up, or
-    /// on a non-leader, the whole applied log is compacted, so a kept entry
-    /// costs only a peer's actual lag.
+    /// Where a compaction starts the log. A leader keeps the entries the
+    /// peers it is feeding still need, and compacts everything else:
+    ///
+    /// * a peer being sent a snapshot (`Progress` in `Snapshot`) continues
+    ///   from the entry after that snapshot once it installs, so the log is
+    ///   kept from there;
+    /// * any other peer that made progress within [`PROGRESS_WINDOW`] — its
+    ///   `matched` advanced or its `Progress` changed state, as the
+    ///   replication view times them — continues from `matched + 1`. That
+    ///   covers a learner whose last entries are in flight when a
+    ///   single-voter leader compacts on its own append, a peer catching up
+    ///   by appends however far behind it is, and a peer whose snapshot was
+    ///   just reported delivered and whose `matched` has not answered for it
+    ///   yet: a `matched + 1` below the log's first index keeps the log as
+    ///   it is. One threshold of entries behind `matched` is kept as well:
+    ///   a rejection that arrives after the acknowledgements it predates
+    ///   makes raft-rs, probing, send again from the rejection's hint, which
+    ///   is before `matched`. With those entries in the log that costs a
+    ///   re-send; without them, a snapshot of the whole zone;
+    /// * a peer silent for the whole window holds nothing back. When it
+    ///   answers again it is sent the stored snapshot.
+    ///
+    /// Whatever the peers need, at most [`RETAINED_LOG_THRESHOLDS`]
+    /// thresholds are kept behind `applied`. On a non-leader the whole
+    /// applied log is compacted; on a leader a kept entry costs a peer's
+    /// actual lag and the threshold behind it.
     fn compaction_start(&self, applied: u64, first: u64, threshold: u64) -> u64 {
         let raft = &self.raw_node.raft;
-        let floor = (applied + 1).saturating_sub(catch_up_entries(threshold));
         let mut start = applied + 1;
         if raft.state == raft::StateRole::Leader {
+            let view = self.replication.read();
+            let now = Instant::now();
             for (id, progress) in raft.prs().iter() {
-                let next = progress.matched + 1;
-                if *id != self.config.id && next >= floor {
-                    start = start.min(next);
+                if *id == self.config.id {
+                    continue;
+                }
+                if progress.state == raft::ProgressState::Snapshot {
+                    start = start.min(progress.pending_snapshot + 1);
+                } else if view.progressed_within(*id, self.progress_window, now) {
+                    start = start.min((progress.matched + 1).saturating_sub(threshold));
                 }
             }
         }
-        start.max(first)
+        let bound = (applied + 1).saturating_sub(RETAINED_LOG_THRESHOLDS.saturating_mul(threshold));
+        start.max(bound).max(first)
     }
 
     /// Apply committed entries to the state machine.
@@ -3474,6 +3532,7 @@ impl ZoneConsensus<super::state_machine::FullStateMachine> {
 mod tests {
     #[cfg(all(feature = "grpc", has_protos))]
     mod peer_routes;
+    mod snapshot_retention;
 
     use super::*;
     use crate::raft::state_machine::{FullStateMachine, WitnessStateMachine};

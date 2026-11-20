@@ -114,8 +114,9 @@ pub(super) fn authorize_data_zone(
     Ok(())
 }
 
-/// Bind an EC sender to its connection before applying or acknowledging data.
-pub(super) fn authorize_ec_sender(
+/// Bind the sender a request declares to its connection before applying,
+/// buffering or acknowledging its data.
+pub(super) fn authorize_declared_sender(
     extensions: &http::Extensions,
     sender: u64,
 ) -> Result<(), Status> {
@@ -421,6 +422,7 @@ fn method_paths(service: &str, methods: &[&str]) -> Arc<[String]> {
 const REPLICA_DATA_METHODS: &[&str] = &[
     "StepMessage",
     "StepStorageV1",
+    "SnapshotChunk",
     "ReplicateEntries",
     "SnapshotEcState",
     "Propose",

@@ -29,8 +29,9 @@ use super::proto::nexus::raft::{
     RenewNodeCertificateRequest, RenewNodeCertificateResponse, RenewSessionAgentRequest,
     ReplicateEntriesRequest, ReplicateEntriesResponse, RevokeAgentCertRequest,
     RevokeAgentCertResponse, RevokeKeyRequest, RevokeKeyResponse, SearchCapabilities,
-    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
-    UnregisterForeignCaRequest, UnregisterForeignCaResponse,
+    SnapshotChunkRequest, SnapshotChunkResponse, SnapshotEcStateRequest, SnapshotEcStateResponse,
+    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
+    UnregisterForeignCaResponse,
 };
 use super::{NodeAddress, Result, SharedPeerMap, TransportError};
 use crate::blob_fetcher::BlobFetcherSlot;
@@ -197,6 +198,7 @@ impl RaftGrpcServer {
         use super::node_authority::{NodeControlService, AGENT_CREDENTIAL_METHODS};
         let raft = ZoneTransportServiceImpl {
             registry: self.registry.clone(),
+            snapshots: Default::default(),
         };
         let api = ZoneApiServiceImpl {
             registry: self.registry.clone(),
@@ -643,6 +645,8 @@ async fn prepare_replica_control_reader<S: crate::raft::StateMachine + Send + Sy
 /// (etcd/tikv pattern).
 struct ZoneTransportServiceImpl {
     registry: Arc<ZoneRaftRegistry>,
+    /// Raft snapshots being received through `snapshot_chunk`.
+    snapshots: snapshot_assembly::SnapshotAssembly,
 }
 
 /// Both EC transfer paths acknowledge only commands this reader understood and
@@ -693,29 +697,45 @@ impl ZoneTransportServiceImpl {
             .map_err(|e| Status::internal(format!("failed to auto-join zone '{zone_id}': {e}")))
     }
 
-    async fn dispatch_step(
+    /// Admit a caller at a step boundary, before its payload is parsed.
+    #[allow(clippy::result_large_err)]
+    fn admit_step_caller(
         &self,
-        request: Request<StepMessageRequest>,
+        extensions: &tonic::codegen::http::Extensions,
+        zone_id: &str,
+        protocol: crate::raft::RaftMessageProtocol,
+    ) -> std::result::Result<(), Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(extensions)?;
+        }
+        super::node_authority::authorize_data_zone(extensions, &self.registry, zone_id)
+    }
+
+    /// The zone a step is for, joined on first contact.
+    #[allow(clippy::result_large_err)]
+    fn step_zone(
+        &self,
+        zone_id: &str,
+    ) -> std::result::Result<ZoneConsensus<FullStateMachine>, Status> {
+        match self.registry.get_node(zone_id) {
+            Some(node) => Ok(node),
+            None => self.join_step_zone(zone_id),
+        }
+    }
+
+    /// Step a decoded message from an admitted caller. Every raft message
+    /// reaches its zone's driver through here, whichever RPC carried it.
+    async fn step_admitted(
+        &self,
+        extensions: &tonic::codegen::http::Extensions,
+        zone_id: &str,
+        sender_address: &str,
+        message: raft::eraftpb::Message,
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
-            super::node_authority::require_authenticated_control_node(request.extensions())?;
-        }
-        super::node_authority::authorize_data_zone(
-            request.extensions(),
-            &self.registry,
-            &request.get_ref().zone_id,
-        )?;
-        let message = match parse_raft_message(&request.get_ref().message) {
-            Ok(message) => message,
-            Err(response) => return Ok(Response::new(response)),
-        };
-        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
-        let req = request.into_inner();
-        let node = match self.registry.get_node(&req.zone_id) {
-            Some(n) => n,
-            None => self.join_step_zone(&req.zone_id)?,
-        };
+        let peer = super::node_authority::authorize_raft_sender(extensions, &message)?;
+        let node = self.step_zone(zone_id)?;
+        self.snapshots.release_idle(std::time::Instant::now());
 
         // Observe the connected peer's address before stepping. Relayed
         // requests retain their logical origin in `from`; that origin does not
@@ -723,9 +743,30 @@ impl ZoneTransportServiceImpl {
         // transport layer's job (mTLS when enabled); the observation is a
         // route only, never membership.
         self.registry
-            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
+            .learn_peer_address(zone_id, peer, sender_address);
 
-        step_raft_message(&node, message, &req.zone_id, "", protocol).await
+        step_raft_message(&node, message, zone_id, "", protocol).await
+    }
+
+    async fn dispatch_step(
+        &self,
+        request: Request<StepMessageRequest>,
+        protocol: crate::raft::RaftMessageProtocol,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.admit_step_caller(request.extensions(), &request.get_ref().zone_id, protocol)?;
+        let message = match parse_raft_message(&request.get_ref().message) {
+            Ok(message) => message,
+            Err(response) => return Ok(Response::new(response)),
+        };
+        let (_, extensions, req) = request.into_parts();
+        self.step_admitted(
+            &extensions,
+            &req.zone_id,
+            &req.sender_address,
+            message,
+            protocol,
+        )
+        .await
     }
 }
 
@@ -773,6 +814,34 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             .await
     }
 
+    /// Receive one slice of a raft snapshot. The caller is admitted as the
+    /// transfer's Step RPC admits it, and the completed `MsgSnapshot` takes
+    /// that RPC's step path.
+    async fn snapshot_chunk(
+        &self,
+        request: Request<SnapshotChunkRequest>,
+    ) -> std::result::Result<Response<SnapshotChunkResponse>, Status> {
+        let protocol = snapshot_assembly::boundary_protocol(request.get_ref())?;
+        self.admit_step_caller(request.extensions(), &request.get_ref().zone_id, protocol)?;
+        let (_, extensions, req) = request.into_parts();
+        snapshot_assembly::receive_chunk(
+            &self.snapshots,
+            &extensions,
+            &req,
+            || self.step_zone(&req.zone_id).map(drop),
+            |message| {
+                self.step_admitted(
+                    &extensions,
+                    &req.zone_id,
+                    &req.sender_address,
+                    message,
+                    protocol,
+                )
+            },
+        )
+        .await
+    }
+
     /// Handle EC replication entries from a peer (Phase C).
     ///
     /// Deserializes each entry's command bytes and applies to the local state
@@ -786,7 +855,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             &self.registry,
             &request.get_ref().zone_id,
         )?;
-        super::node_authority::authorize_ec_sender(
+        super::node_authority::authorize_declared_sender(
             request.extensions(),
             request.get_ref().sender_node_id,
         )?;
@@ -847,7 +916,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             &self.registry,
             &request.get_ref().zone_id,
         )?;
-        super::node_authority::authorize_ec_sender(
+        super::node_authority::authorize_declared_sender(
             request.extensions(),
             request.get_ref().sender_node_id,
         )?;
@@ -963,6 +1032,7 @@ struct ZoneApiServiceImpl {
 
 #[path = "server/replica_join.rs"]
 mod replica_join;
+mod snapshot_assembly;
 
 impl ZoneApiServiceImpl {
     async fn blob_response(
@@ -3051,6 +3121,7 @@ impl RaftWitnessServer {
             );
             let service = WitnessServiceImpl {
                 registry: self.registry.clone(),
+                snapshots: Default::default(),
             };
             let mut builder =
                 lib::transport_primitives::apply_server_limits(tonic::transport::Server::builder());
@@ -3079,48 +3150,80 @@ impl RaftWitnessServer {
 /// Witness implementation of ZoneTransportService — routes by zone_id.
 struct WitnessServiceImpl {
     registry: Arc<WitnessZoneRegistry>,
+    /// Raft snapshots being received through `snapshot_chunk`.
+    snapshots: snapshot_assembly::SnapshotAssembly,
 }
 
 impl WitnessServiceImpl {
+    /// Admit a caller at a step boundary, before its payload is parsed.
+    #[allow(clippy::result_large_err)]
+    fn admit_step_caller(
+        extensions: &tonic::codegen::http::Extensions,
+        protocol: crate::raft::RaftMessageProtocol,
+    ) -> std::result::Result<(), Status> {
+        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+            super::node_authority::require_authenticated_control_node(extensions)?;
+        }
+        Ok(())
+    }
+
+    /// The zone a step is for. An unknown zone is joined on first contact
+    /// (dynamic federation) with `skip_bootstrap=true`; the leader's
+    /// snapshot brings its ConfState.
+    #[allow(clippy::result_large_err)]
+    fn step_zone(
+        &self,
+        zone_id: &str,
+    ) -> std::result::Result<ZoneConsensus<WitnessStateMachine>, Status> {
+        if let Some(node) = self.registry.get_node(zone_id) {
+            return Ok(node);
+        }
+        let handle = tokio::runtime::Handle::current();
+        self.registry
+            .auto_join_zone(zone_id, &handle)
+            .map_err(|e| Status::internal(format!("Failed to auto-join zone '{zone_id}': {e}")))
+    }
+
+    /// Step a decoded message from an admitted caller. Every raft message
+    /// reaches its zone's driver through here, whichever RPC carried it.
+    async fn step_admitted(
+        &self,
+        extensions: &tonic::codegen::http::Extensions,
+        zone_id: &str,
+        sender_address: &str,
+        message: raft::eraftpb::Message,
+        protocol: crate::raft::RaftMessageProtocol,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        let peer = super::node_authority::authorize_raft_sender(extensions, &message)?;
+        let node = self.step_zone(zone_id)?;
+        self.snapshots.release_idle(std::time::Instant::now());
+
+        // Learn the sender's advertise address from this inbound exchange.
+        self.registry
+            .learn_peer_address(zone_id, peer, sender_address);
+
+        step_raft_message(&node, message, zone_id, "[Witness]", protocol).await
+    }
+
     async fn dispatch_step(
         &self,
         request: Request<StepMessageRequest>,
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
-            super::node_authority::require_authenticated_control_node(request.extensions())?;
-        }
+        Self::admit_step_caller(request.extensions(), protocol)?;
         let message = match parse_raft_message(&request.get_ref().message) {
             Ok(message) => message,
             Err(response) => return Ok(Response::new(response)),
         };
-        let peer = super::node_authority::authorize_raft_sender(request.extensions(), &message)?;
-        let req = request.into_inner();
-
-        // Route by zone_id — auto-join if zone not found (dynamic federation)
-        let node = match self.registry.get_node(&req.zone_id) {
-            Some(n) => n,
-            None => {
-                // Auto-join: create witness zone with skip_bootstrap=true.
-                // Leader will send snapshot with correct ConfState.
-                let handle = tokio::runtime::Handle::current();
-                match self.registry.auto_join_zone(&req.zone_id, &handle) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        return Err(Status::internal(format!(
-                            "Failed to auto-join zone '{}': {}",
-                            req.zone_id, e
-                        )));
-                    }
-                }
-            }
-        };
-
-        // Learn sender's advertise address from this inbound StepMessage.
-        self.registry
-            .learn_peer_address(&req.zone_id, peer, &req.sender_address);
-
-        step_raft_message(&node, message, &req.zone_id, "[Witness]", protocol).await
+        let (_, extensions, req) = request.into_parts();
+        self.step_admitted(
+            &extensions,
+            &req.zone_id,
+            &req.sender_address,
+            message,
+            protocol,
+        )
+        .await
     }
 }
 
@@ -3164,6 +3267,32 @@ impl ZoneTransportService for WitnessServiceImpl {
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
         self.dispatch_step(request, crate::raft::RaftMessageProtocol::ReplicaControlV1)
             .await
+    }
+
+    /// Receive one slice of a raft snapshot, as a full node does.
+    async fn snapshot_chunk(
+        &self,
+        request: Request<SnapshotChunkRequest>,
+    ) -> std::result::Result<Response<SnapshotChunkResponse>, Status> {
+        let protocol = snapshot_assembly::boundary_protocol(request.get_ref())?;
+        Self::admit_step_caller(request.extensions(), protocol)?;
+        let (_, extensions, req) = request.into_parts();
+        snapshot_assembly::receive_chunk(
+            &self.snapshots,
+            &extensions,
+            &req,
+            || self.step_zone(&req.zone_id).map(drop),
+            |message| {
+                self.step_admitted(
+                    &extensions,
+                    &req.zone_id,
+                    &req.sender_address,
+                    message,
+                    protocol,
+                )
+            },
+        )
+        .await
     }
 
     /// Witness nodes do not participate in EC replication.
@@ -3229,6 +3358,7 @@ mod tests {
         let registry = Arc::new(ZoneRaftRegistry::new(tmp_dir.path().to_path_buf(), 1));
         let svc = super::ZoneTransportServiceImpl {
             registry: registry.clone(),
+            snapshots: Default::default(),
         };
 
         let req = Request::new(StepMessageRequest {

@@ -25,8 +25,8 @@ use lib::transport_primitives::{FederatedClientCertVerifier, ForeignCaAnchor};
 use nexus_raft::transport::proto::{
     zone_api_service_client::ZoneApiServiceClient,
     zone_transport_service_client::ZoneTransportServiceClient, EcReplicationEntry,
-    MintSessionAgentRequest, ProposeRequest, ReplicateEntriesRequest, SnapshotEcStateRequest,
-    StepMessageRequest,
+    MintSessionAgentRequest, ProposeRequest, ReplicateEntriesRequest, SnapshotChunkRequest,
+    SnapshotEcStateRequest, StepBoundary, StepMessageRequest,
 };
 use nexus_raft::{
     prelude::Command,
@@ -54,6 +54,23 @@ async fn connect(address: &str, ca: &[u8], cert: Vec<u8>, key: Vec<u8>) -> Chann
         .connect()
         .await
         .unwrap()
+}
+
+/// One slice of a snapshot transfer from `sender`, through `boundary`.
+fn snapshot_slice(zone: &str, sender: u64, boundary: StepBoundary) -> SnapshotChunkRequest {
+    SnapshotChunkRequest {
+        zone_id: zone.into(),
+        sender_address: "127.0.0.1:19996".into(),
+        sender_node_id: sender,
+        boundary: boundary as i32,
+        snapshot_index: 10,
+        snapshot_term: 1,
+        total_bytes: 8,
+        sha256: vec![0; 32],
+        offset: 0,
+        data: b"four".to_vec(),
+        message: Vec::new(),
+    }
 }
 
 async fn listener_ready(address: &str) {
@@ -592,6 +609,32 @@ async fn assert_owner_replica_data_scope(
         tonic::Code::PermissionDenied
     );
 
+    // A snapshot transfer is admitted as the Step RPC it names: a member
+    // replica through the data boundaries, as itself, into its own zone.
+    assert_eq!(
+        member_transport
+            .snapshot_chunk(snapshot_slice(ZONE, 4, StepBoundary::Legacy))
+            .await
+            .unwrap()
+            .into_inner()
+            .next_offset,
+        4
+    );
+    for refused in [
+        snapshot_slice(ZONE, 4, StepBoundary::ReplicaControlV1),
+        snapshot_slice(ZONE, 1, StepBoundary::Legacy),
+        snapshot_slice("root", 4, StepBoundary::Legacy),
+    ] {
+        assert_eq!(
+            member_transport
+                .snapshot_chunk(refused)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     let (cert, key) =
         generate_user_replica_cert("session-outsider", "charlie", 5, 300, ca, ca_key).unwrap();
     let channel = connect(address, ca, cert, key).await;
@@ -672,6 +715,16 @@ async fn assert_owner_replica_data_scope(
                     message: snapshot.write_to_bytes().unwrap(),
                     sender_address: "127.0.0.1:19997".into()
                 })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+    for zone in [ZONE, "unadmitted-data"] {
+        assert_eq!(
+            transport
+                .snapshot_chunk(snapshot_slice(zone, 5, StepBoundary::Legacy))
                 .await
                 .unwrap_err()
                 .code(),
@@ -1288,6 +1341,53 @@ async fn witness_checks_the_authenticated_sender_before_auto_join() {
             .code(),
         tonic::Code::PermissionDenied
     );
+    // A snapshot transfer passes the same doors as the Step RPC it names.
+    for (caller, sender, zone) in [
+        (&mut transport, 7, "chunk-forged-witness-zone"),
+        (&mut replica, 2, "chunk-replica-witness-zone"),
+    ] {
+        assert_eq!(
+            caller
+                .snapshot_chunk(snapshot_slice(zone, sender, StepBoundary::Legacy))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(registry.get_node(zone).is_none());
+        assert!(!private.path().join(zone).exists());
+    }
+    assert_eq!(
+        transport
+            .snapshot_chunk(snapshot_slice(
+                "chunk-unbounded-witness-zone",
+                2,
+                StepBoundary::Unspecified
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert!(registry.get_node("chunk-unbounded-witness-zone").is_none());
+    for (boundary, zone) in [
+        (StepBoundary::Legacy, "chunk-witness-zone"),
+        (StepBoundary::ReplicaControlV1, "chunk-control-witness-zone"),
+    ] {
+        assert_eq!(
+            transport
+                .snapshot_chunk(snapshot_slice(zone, 2, boundary))
+                .await
+                .unwrap()
+                .into_inner()
+                .next_offset,
+            4
+        );
+        assert!(
+            registry.get_node(zone).is_some(),
+            "joined on first contact, as by a step"
+        );
+    }
     stop.send(()).unwrap();
     running.await.unwrap();
     registry.shutdown().released().await;

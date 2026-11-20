@@ -15,8 +15,10 @@
 //!
 //! All raft-rs message types (~15 types including votes, heartbeats, appends)
 //! are multiplexed through a single `StepMessage` RPC as opaque protobuf v2
-//! bytes (etcd/tikv pattern). EC replication uses a separate `ReplicateEntries`
-//! RPC for async peer sync.
+//! bytes (etcd/tikv pattern). A snapshot's data crosses in slices through
+//! `SnapshotChunk`, and its `MsgSnapshot` is stepped once they are all
+//! there. EC replication uses a separate `ReplicateEntries` RPC for async
+//! peer sync.
 //!
 //! # Example
 //!
@@ -109,6 +111,8 @@ mod client;
 #[cfg(all(feature = "grpc", has_protos))]
 mod server;
 pub(crate) use server::PreparedRaftListener;
+#[cfg(all(feature = "grpc", has_protos))]
+mod snapshot_transfer;
 #[cfg(all(feature = "grpc", has_protos))]
 mod transport_loop;
 
@@ -524,14 +528,14 @@ pub(crate) fn start_zone<S: crate::raft::StateMachine + 'static>(
         ..Default::default()
     };
     handle.set_forward_ctx(
-        RaftClientPool::with_config(client_config.clone()),
+        RaftClientPool::with_config(client_config),
         peers.clone(),
         zone_id.to_string(),
     );
     let transport_loop = TransportLoop::new(
         driver,
         peers.clone(),
-        RaftClientPool::with_config(client_config),
+        RaftClientPool::with_config(transport_loop::client_config(tls.clone())),
     )
     .with_zone_id(zone_id.to_string())
     .with_self_address(advertise.clone());

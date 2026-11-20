@@ -92,6 +92,8 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 regex = { workspace = true }
+# Byte-level forwarding in the throttled test link (tests/common/throttled_link.rs).
+tokio = { version = "1", features = ["io-util"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [features]

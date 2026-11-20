@@ -3,12 +3,11 @@
 //!
 //! A single-voter zone commits and compacts on the leader's own append, so at
 //! each compaction a learner's last few entries are typically still in
-//! flight. Compacting the whole log up to the applied index left those entries
-//! below `first_index`, and every compaction then needed an InstallSnapshot of
-//! the whole zone. Production showed one per compaction, about every 18
-//! minutes, on a learner at lag 0 between them. The leader now keeps the
-//! entries a lagging peer still needs, up to half the compaction threshold,
-//! and no more.
+//! flight. A compaction of the whole log up to the applied index would put
+//! those entries below `first_index`, and every compaction would then need an
+//! InstallSnapshot of the whole zone. The leader keeps the entries a peer it
+//! is still feeding needs, from that peer's `matched` index on, and one
+//! compaction threshold behind it, and no more.
 //!
 //! Topology: a founder (sole voter, leader) and a learner behind a
 //! [`LossyLink`]. Every write happens while the link starves the learner, so
@@ -35,7 +34,7 @@ use tempfile::TempDir;
 
 const ZONE: &str = "sharedzone";
 const SNAPSHOT_THRESHOLD: u64 = 16;
-/// Entries written per starved window; below the tail of `SNAPSHOT_THRESHOLD / 2`.
+/// Entries written per starved window.
 const LAG: u64 = 3;
 const BUDGET: Duration = Duration::from_secs(30);
 
@@ -188,7 +187,8 @@ async fn a_learner_behind_by_a_few_entries_at_compaction_catches_up_by_appends()
     drop((leader, learner, leader_zm, learner_zm));
 
     // The leader did compact, and kept exactly what the learner lacked at its
-    // last compaction: at least one entry, at most the window's writes.
+    // last compaction — at least one entry, at most the window's writes —
+    // and the threshold of entries behind what it had acknowledged.
     let storage = RaftStorage::open(raft_dir(leader_dir.path())).expect("reopen leader log");
     let first = storage.first_index_impl().expect("first index");
     let snapshot = raft::Storage::snapshot(&storage, 0, 0).expect("stored snapshot");
@@ -199,9 +199,9 @@ async fn a_learner_behind_by_a_few_entries_at_compaction_catches_up_by_appends()
     );
     let kept = snapshot_index + 1 - first;
     assert!(
-        (1..=LAG).contains(&kept),
+        (SNAPSHOT_THRESHOLD + 1..=SNAPSHOT_THRESHOLD + LAG).contains(&kept),
         "kept {kept} entries before snapshot {snapshot_index} (first index {first}, applied {applied}); \
-         expected the learner's lag of 1..={LAG}"
+         expected the learner's lag of 1..={LAG} and the threshold behind it"
     );
     assert_eq!(
         raft::Storage::term(&storage, first - 1).expect("term(first_index - 1)"),
