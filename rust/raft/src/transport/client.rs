@@ -1611,6 +1611,13 @@ pub async fn call_mint_agent_rpc(
 pub struct MintAgentChannel(ZoneApiServiceClient<Channel>);
 
 impl MintAgentChannel {
+    /// Observe the selected issuer's applied records before an explicit enrollment recovery.
+    pub async fn list_keys(
+        &mut self,
+    ) -> Result<std::result::Result<Vec<(String, Vec<u8>)>, String>> {
+        list_keys(&mut self.0).await
+    }
+
     pub async fn connect(
         peer_addr: &str,
         tls: Option<super::TlsConfig>,
@@ -1780,6 +1787,12 @@ pub async fn call_list_keys_rpc(
     timeout_secs: u64,
 ) -> Result<std::result::Result<Vec<(String, Vec<u8>)>, String>> {
     let mut client = connect_zone_api(peer_addr, tls, timeout_secs, "ListKeys").await?;
+    list_keys(&mut client).await
+}
+
+async fn list_keys(
+    client: &mut ZoneApiServiceClient<Channel>,
+) -> Result<std::result::Result<Vec<(String, Vec<u8>)>, String>> {
     let response = client
         .list_keys(ListKeysRequest {})
         .await
