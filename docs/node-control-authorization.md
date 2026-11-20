@@ -33,7 +33,7 @@ flowchart LR
 
 The shared data-zone authorizer checks tenant zone naming, local residency and
 the live Raft membership before parsing payloads, learning routes or reading
-data. Its paths are `StepMessage` (including Raft snapshots),
+data. Its paths are `StepMessage`, `SnapshotChunk` (Raft snapshots),
 `ReplicateEntries` (EC WAL), `SnapshotEcState`, `Propose`, `Query`,
 `GetClusterInfo`, `GetSearchCapabilities` and `ReadZoneBlob`.
 

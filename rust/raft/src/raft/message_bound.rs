@@ -9,10 +9,22 @@
 //!
 //! * the transport refuses to send an encoded raft message larger than
 //!   [`MAX_RAFT_PAYLOAD_BYTES`];
-//! * raft-rs batches at most [`APPEND_BYTES`] of entries per append, a soft
-//!   cap it exceeds only to send one entry alone;
 //! * a proposal whose entry would exceed [`MAX_ENTRY_BYTES`] is refused
 //!   before it enters the log, so no append can ever need more.
+//!
+//! Far below that bound, [`CALL_PAYLOAD_BYTES`] is what one call normally
+//! carries, so that replication crosses a slow link as many short calls:
+//!
+//! * raft-rs batches at most that many bytes of entries per append, a soft
+//!   cap it exceeds only to send one entry alone. Such an entry is the one
+//!   payload that cannot be split: its call's deadline grows with it at the
+//!   transport's floor rate (`transport_loop::SEND_FLOOR_BYTES_PER_SEC`),
+//!   and a link slower than that floor cannot deliver it;
+//! * a snapshot is as large as the zone's state, not as any message.
+//!   Its data never travels inside a raft message: the transport sends it in
+//!   slices of that size (`transport::snapshot_transfer`), up to
+//!   [`MAX_SNAPSHOT_BYTES`] in all, and the `MsgSnapshot` that follows them
+//!   carries none of it.
 
 use super::{RaftError, Result};
 
@@ -35,13 +47,24 @@ const ENTRY_ENVELOPE_BYTES: usize = 16 * 1024;
 /// [`MAX_RAFT_PAYLOAD_BYTES`].
 pub const MAX_ENTRY_BYTES: usize = MAX_RAFT_PAYLOAD_BYTES - ENTRY_ENVELOPE_BYTES;
 
-/// raft-rs's per-append entry budget (`max_size_per_msg`). Small, so a
-/// backlog crosses a slow link as many short sends rather than few that
-/// outlast their deadline; the field framing of many tiny entries can at
-/// most double it, which still fits.
-pub const APPEND_BYTES: u64 = 1024 * 1024;
+/// The payload one replication call carries: raft-rs's per-append entry
+/// budget (`max_size_per_msg`) and the size of one snapshot slice. Small
+/// enough to cross a link of a few KiB/s inside one call's base deadline, so
+/// a backlog or a snapshot advances call by call instead of outlasting a
+/// deadline as a whole; large enough that a fast link is not paced by round
+/// trips. The floor is a link that carries this much within the base
+/// deadline of 30 s, about 2 KiB/s: below it no call completes and
+/// replication to the peer stands still. The field framing of many tiny
+/// entries can at most double an append, which still fits.
+pub const CALL_PAYLOAD_BYTES: usize = 64 * 1024;
 
-const _: () = assert!(2 * APPEND_BYTES as usize + ENTRY_ENVELOPE_BYTES <= MAX_RAFT_PAYLOAD_BYTES);
+const _: () = assert!(2 * CALL_PAYLOAD_BYTES + ENTRY_ENVELOPE_BYTES <= MAX_RAFT_PAYLOAD_BYTES);
+
+/// The largest snapshot the transport transfers. A snapshot is assembled in
+/// the receiver's memory and restored from there, and a transfer names its
+/// size before a byte is sent: a receiver keeps nothing of one declared
+/// larger, and a sender does not start one.
+pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Refuse an entry of `bytes` that no append could carry. Called before the
 /// data reaches raft-rs, and before a follower forwards it.

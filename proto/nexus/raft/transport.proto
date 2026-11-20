@@ -60,6 +60,26 @@ service ZoneTransportService {
   // and it resumes incremental replication from there. Still EC (bypasses
   // Raft consensus).
   rpc SnapshotEcState(SnapshotEcStateRequest) returns (SnapshotEcStateResponse);
+
+  // SnapshotChunk carries one slice of a raft snapshot's data, so a snapshot
+  // far larger than one message crosses a slow link as many short calls. The
+  // sender names the snapshot (raft index and term, byte length, SHA-256) on
+  // every call; the receiver keeps the bytes received so far in memory, one
+  // snapshot per zone, and answers with the offset it expects next. A
+  // snapshot declared larger than the receiver's snapshot bound is refused
+  // before a byte is kept. A call is idempotent: only a slice at the
+  // expected offset is appended, any other is answered with the expected
+  // offset, and an empty slice asks where to resume. Another snapshot for
+  // the zone, or another sender, replaces what is held. The last byte
+  // verifies the data against the digest; a mismatch is refused and the
+  // bytes are dropped. The call that carries `message` completes the
+  // transfer: the receiver puts the verified data into that MsgSnapshot and
+  // admits it exactly as the Step RPC named by `boundary` admits a raft
+  // message, and keeps the data until that admission succeeded, so the
+  // completing call can be repeated. Every call is admitted by that RPC's
+  // caller checks. An unavailable method is a refusal; a snapshot is never
+  // sent through a Step RPC instead.
+  rpc SnapshotChunk(SnapshotChunkRequest) returns (SnapshotChunkResponse);
 }
 
 // ZoneApiService provides the client-facing API for zone operations.
@@ -924,6 +944,50 @@ message StepMessageRequest {
 message StepMessageResponse {
   bool success = 1;
   optional string error = 2;
+}
+
+// === SnapshotChunk (Raft Snapshot Transfer) ===
+
+// The Step RPC whose admission a snapshot transfer goes through.
+enum StepBoundary {
+  STEP_BOUNDARY_UNSPECIFIED = 0;
+  // StepMessage.
+  STEP_BOUNDARY_LEGACY = 1;
+  // StepReplicaControlV1.
+  STEP_BOUNDARY_REPLICA_CONTROL_V1 = 2;
+}
+
+// SnapshotChunkRequest carries one slice of one raft snapshot's data.
+message SnapshotChunkRequest {
+  string zone_id = 1;
+  // Sender's advertise address, as in StepMessageRequest.
+  string sender_address = 2;
+  // The sending member: the `from` of the MsgSnapshot being transferred.
+  uint64 sender_node_id = 3;
+  // The Step RPC this transfer is admitted through.
+  StepBoundary boundary = 4;
+
+  // The snapshot's identity: its raft metadata index and term, and the
+  // length and SHA-256 of its data.
+  uint64 snapshot_index = 5;
+  uint64 snapshot_term = 6;
+  uint64 total_bytes = 7;
+  bytes sha256 = 8;
+
+  // Where `data` starts in the snapshot's data. `data` may be empty.
+  uint64 offset = 9;
+  bytes data = 10;
+
+  // Completing call only: the serialized eraftpb::Message (MsgSnapshot)
+  // with its snapshot data left empty.
+  bytes message = 11;
+}
+
+// SnapshotChunkResponse reports the receiver's position in the snapshot.
+message SnapshotChunkResponse {
+  // The offset the receiver expects next. On the completing call,
+  // `total_bytes` means the snapshot was verified and admitted.
+  uint64 next_offset = 1;
 }
 
 // === EC Replication Messages (Phase C) ===

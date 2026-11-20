@@ -8,7 +8,7 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use nexus_raft::raft::message_bound::MAX_RAFT_MESSAGE_BYTES;
@@ -16,8 +16,8 @@ use nexus_raft::transport::proto::nexus::raft::{
     zone_transport_service_client::ZoneTransportServiceClient,
     zone_transport_service_server::{ZoneTransportService, ZoneTransportServiceServer},
     PrepareReplicaControlReaderRequest, PrepareReplicaControlReaderResponse,
-    ReplicateEntriesRequest, ReplicateEntriesResponse, SnapshotEcStateRequest,
-    SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
+    ReplicateEntriesRequest, ReplicateEntriesResponse, SnapshotChunkRequest, SnapshotChunkResponse,
+    SnapshotEcStateRequest, SnapshotEcStateResponse, StepMessageRequest, StepMessageResponse,
 };
 use protobuf::Message as _;
 use raft::eraftpb::MessageType;
@@ -26,17 +26,24 @@ use tonic::{Request, Response, Status};
 
 /// Forward everything.
 pub const PASS: u8 = 0;
-/// Refuse appends and snapshots (`Unavailable`); pass heartbeats and the rest.
+/// Refuse appends and snapshot transfer calls (`Unavailable`); pass
+/// heartbeats and the rest.
 pub const STARVE: u8 = 1;
-/// Answer the next snapshot "delivered" without forwarding it, then pass.
+/// Answer every call of the next snapshot transfer "received" without
+/// forwarding any, then pass.
 pub const SWALLOW_NEXT_SNAPSHOT: u8 = 2;
 
 /// The node's side of the network, as the other members see it.
 pub struct LossyLink {
     mode: AtomicU8,
     target: ZoneTransportServiceClient<Channel>,
+    /// Snapshot transfers whose completing call was forwarded.
     pub snapshots_forwarded: AtomicUsize,
+    /// The raft index of the snapshot last forwarded.
+    pub last_snapshot_index: AtomicU64,
+    /// Snapshot transfers answered "delivered" and never forwarded.
     pub snapshots_swallowed: AtomicUsize,
+    /// Snapshot transfer calls refused while starving.
     pub snapshots_refused: AtomicUsize,
     /// The largest raft message forwarded, in encoded bytes.
     pub largest_forwarded: AtomicUsize,
@@ -55,6 +62,7 @@ impl LossyLink {
             mode: AtomicU8::new(PASS),
             target,
             snapshots_forwarded: AtomicUsize::new(0),
+            last_snapshot_index: AtomicU64::new(0),
             snapshots_swallowed: AtomicUsize::new(0),
             snapshots_refused: AtomicUsize::new(0),
             largest_forwarded: AtomicUsize::new(0),
@@ -81,31 +89,46 @@ impl LossyLink {
         let message_type = raft::eraftpb::Message::parse_from_bytes(&request.get_ref().message)
             .map(|message| message.get_msg_type())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let snapshot = message_type == MessageType::MsgSnapshot;
-        match self.mode.load(Ordering::SeqCst) {
-            STARVE if snapshot || message_type == MessageType::MsgAppend => {
-                if snapshot {
-                    self.snapshots_refused.fetch_add(1, Ordering::SeqCst);
-                }
-                return Err(Status::unavailable("lossy link: starving the learner"));
-            }
-            SWALLOW_NEXT_SNAPSHOT if snapshot => {
-                // Delivered, as far as the sender can tell; never installed.
-                self.set(PASS);
-                self.snapshots_swallowed.fetch_add(1, Ordering::SeqCst);
-                return Ok(Response::new(StepMessageResponse {
-                    success: true,
-                    error: None,
-                }));
-            }
-            _ => {}
-        }
-        if snapshot {
-            self.snapshots_forwarded.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == STARVE && message_type == MessageType::MsgAppend {
+            return Err(Status::unavailable("lossy link: starving the learner"));
         }
         self.largest_forwarded
             .fetch_max(request.get_ref().message.len(), Ordering::SeqCst);
         self.target.clone().step_message(request.into_inner()).await
+    }
+
+    async fn chunk(
+        &self,
+        request: Request<SnapshotChunkRequest>,
+    ) -> Result<Response<SnapshotChunkResponse>, Status> {
+        let call = request.get_ref();
+        let completing = !call.message.is_empty();
+        match self.mode.load(Ordering::SeqCst) {
+            STARVE => {
+                self.snapshots_refused.fetch_add(1, Ordering::SeqCst);
+                return Err(Status::unavailable("lossy link: starving the learner"));
+            }
+            SWALLOW_NEXT_SNAPSHOT => {
+                // Delivered, as far as the sender can tell; never installed.
+                if completing {
+                    self.set(PASS);
+                    self.snapshots_swallowed.fetch_add(1, Ordering::SeqCst);
+                }
+                return Ok(Response::new(SnapshotChunkResponse {
+                    next_offset: call.offset + call.data.len() as u64,
+                }));
+            }
+            _ => {}
+        }
+        if completing {
+            self.snapshots_forwarded.fetch_add(1, Ordering::SeqCst);
+            self.last_snapshot_index
+                .store(call.snapshot_index, Ordering::SeqCst);
+        }
+        self.target
+            .clone()
+            .snapshot_chunk(request.into_inner())
+            .await
     }
 }
 
@@ -146,6 +169,13 @@ impl ZoneTransportService for LossyLink {
             .clone()
             .prepare_replica_control_reader_v1(request.into_inner())
             .await
+    }
+
+    async fn snapshot_chunk(
+        &self,
+        request: Request<SnapshotChunkRequest>,
+    ) -> Result<Response<SnapshotChunkResponse>, Status> {
+        self.chunk(request).await
     }
 
     async fn replicate_entries(

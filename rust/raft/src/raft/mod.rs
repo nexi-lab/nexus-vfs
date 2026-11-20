@@ -79,7 +79,7 @@ pub use membership_policy::MembershipPolicy;
 pub use node::{
     LeaderCommit, PeerReplication, RaftConfig, RaftMessageProtocol, RaftMsg, ReplicationState,
     ReplicationStatus, StorageActivationView, StorageSubmission, ZoneConsensus,
-    ZoneConsensusDriver, REPLICATION_STALL,
+    ZoneConsensusDriver, PROGRESS_WINDOW, REPLICATION_STALL, RETAINED_LOG_THRESHOLDS,
 };
 #[cfg(all(feature = "grpc", has_protos))]
 pub(crate) use node::{MemberRegistration, MembershipSnapshot};

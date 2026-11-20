@@ -47,6 +47,11 @@ jobs:
         run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wakeup::'
       - name: "Database bootstrap: Owned WAL I/O and background retirement on the native filesystem"
         run: 'cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_protected_zone_metadata -- record_wal::'
+      - name: "Raft catch-up: resumable snapshots and bounded appends"
+        if: runner.os != 'Linux'
+        run: |
+          cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --lib -- transport::snapshot_transfer::tests raft::node::tests::snapshot_retention
+          cargo --config .github/ci/functional-tests.toml test --locked -p raft@0.1.0 --test test_append_backlog_slow_link --test test_snapshot_transfer_compaction --test test_snapshot_redelivery
       - name: "CAS publication: Kernel boot and CAS publication on the native filesystem"
         run: cargo --config .github/ci/functional-tests.toml test -p kernel --test cas_publication --test boot_metastore
       - name: "CAS publication: Reject malformed content identifiers before filesystem access"

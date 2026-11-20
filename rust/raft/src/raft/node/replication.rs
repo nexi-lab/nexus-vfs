@@ -30,6 +30,15 @@ use super::read_index::ReadContext;
 /// flight. The one threshold for `doctor --live` alarms and the logs.
 pub const REPLICATION_STALL: Duration = Duration::from_secs(30);
 
+/// How long a peer goes without acknowledged progress before it is given
+/// up: the leader stops keeping its log for the peer, and a snapshot
+/// transfer to it is reported failed. Several times the deadline of a call
+/// carrying `CALL_PAYLOAD_BYTES` plus the longest retry delay, so a peer outlives
+/// what a link recovers from by itself — a dropped connection, a re-dial, a
+/// restart — and is given up only when it stays away. Giving up loses
+/// nothing a snapshot cannot restore.
+pub const PROGRESS_WINDOW: Duration = Duration::from_secs(5 * 60);
+
 /// How often a follower asks the leader for its commit index.
 pub(super) const COMMIT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// A probe unanswered for this long is abandoned and replaced: raft-rs drops a
@@ -283,6 +292,22 @@ impl ReplicationView {
         failing.count
     }
 
+    /// Whether the leader got somewhere with `peer` within `window`: its
+    /// `matched` advanced or reached the commit index, or its `Progress`
+    /// changed state. A peer not observed yet has had no time to.
+    pub(super) fn progressed_within(&self, peer: u64, window: Duration, now: Instant) -> bool {
+        let Some((commit, peers)) = &self.leader else {
+            return true;
+        };
+        peers.get(&peer).is_none_or(|watch| {
+            watch
+                .matched
+                .stalled_behind(*commit, now)
+                .min(now.saturating_duration_since(watch.state_since))
+                < window
+        })
+    }
+
     /// Point-in-time status, durations measured at `now`.
     pub(super) fn status(&self, now: Instant) -> ReplicationStatus {
         let mut status = ReplicationStatus::default();
@@ -404,6 +429,52 @@ mod tests {
         let caught_up = view.status(t2 + Duration::from_secs(5));
         assert_eq!(caught_up.peers[0].stalled_for, Duration::ZERO);
         assert_eq!(caught_up.peers[0].in_state_for, Duration::from_secs(5));
+    }
+
+    /// A peer counts as progressing while it is caught up, for a window
+    /// after its `matched` last advanced, and for a window after its
+    /// `Progress` last changed state; a peer silent in one state for the
+    /// whole window does not, and an unobserved one does.
+    #[test]
+    fn a_peer_progressed_within_the_window_of_its_last_advance_or_state_change() {
+        let window = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut view = ReplicationView::default();
+        assert!(view.progressed_within(7, window, t0), "no leader view yet");
+        view.observe_leader(100, [peer(7, ProgressState::Probe, 90)].into_iter(), t0);
+        assert!(view.progressed_within(8, window, at(1000)), "unobserved");
+        assert!(view.progressed_within(7, window, at(299)));
+        assert!(
+            !view.progressed_within(7, window, at(300)),
+            "behind and in one state for the whole window"
+        );
+
+        // `matched` advances while still behind: the window starts again.
+        view.observe_leader(
+            100,
+            [peer(7, ProgressState::Probe, 95)].into_iter(),
+            at(400),
+        );
+        assert!(view.progressed_within(7, window, at(699)));
+        assert!(!view.progressed_within(7, window, at(700)));
+
+        // A state change alone starts it again too.
+        view.observe_leader(
+            100,
+            [peer(7, ProgressState::Replicate, 95)].into_iter(),
+            at(800),
+        );
+        assert!(view.progressed_within(7, window, at(1099)));
+        assert!(!view.progressed_within(7, window, at(1100)));
+
+        // Caught up, it progresses however long nothing changes.
+        view.observe_leader(
+            100,
+            [peer(7, ProgressState::Replicate, 100)].into_iter(),
+            at(1200),
+        );
+        assert!(view.progressed_within(7, window, at(100_000)));
     }
 
     #[test]

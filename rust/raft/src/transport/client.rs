@@ -15,8 +15,9 @@ use super::proto::nexus::raft::{
     PrepareReplicaControlReaderResponse, ProposeRequest, PutMetadata, QueryRequest, RaftCommand,
     RaftQuery, RegisterForeignCaRequest, ReleaseLock, RemoveVoterRequest,
     RenewLocalNodeCertificateRequest, RenewNodeCertificateRequest, RenewSessionAgentRequest,
-    ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotEcStateRequest,
-    StepMessageRequest, StepMessageResponse, UnregisterForeignCaRequest,
+    ReplicateEntriesRequest, RevokeAgentCertRequest, RevokeKeyRequest, SnapshotChunkRequest,
+    SnapshotEcStateRequest, StepBoundary, StepMessageRequest, StepMessageResponse,
+    UnregisterForeignCaRequest,
 };
 use super::{NodeAddress, Result, TransportError};
 use lib::transport_primitives::{SharedTlsConfig, TlsSnapshot};
@@ -332,6 +333,16 @@ impl Default for RaftClientPool {
     }
 }
 
+/// Each step protocol's boundary, as a snapshot transfer names it on the wire.
+impl From<crate::raft::RaftMessageProtocol> for StepBoundary {
+    fn from(protocol: crate::raft::RaftMessageProtocol) -> Self {
+        match protocol {
+            crate::raft::RaftMessageProtocol::Legacy => Self::Legacy,
+            crate::raft::RaftMessageProtocol::ReplicaControlV1 => Self::ReplicaControlV1,
+        }
+    }
+}
+
 /// A single gRPC client for communicating with a Raft node.
 #[derive(Clone)]
 pub struct RaftClient {
@@ -534,6 +545,20 @@ impl RaftClient {
             })
             .await?;
         decode_step_response(response.into_inner())
+    }
+
+    /// Send one slice of a raft snapshot, or its completing call, and return
+    /// the offset the peer expects next. A transfer admitted through the
+    /// replica-control boundary uses the exact Node channel, as
+    /// [`Self::step_replica_control_v1`] does.
+    pub async fn snapshot_chunk(&mut self, request: SnapshotChunkRequest) -> Result<u64> {
+        if request.boundary == StepBoundary::ReplicaControlV1 as i32 && !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "replica-control transport requires an exact cluster Node channel".into(),
+            ));
+        }
+        let response = self.inner_mut()?.snapshot_chunk(request).await?;
+        Ok(response.into_inner().next_offset)
     }
 
     /// Send a batch of EC replication entries to this peer.

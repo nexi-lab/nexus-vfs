@@ -1,7 +1,8 @@
 //! A learner that misses the snapshot it needs converges without a restart.
 //!
-//! The leader compacts its log past a learner that is a few entries behind,
-//! so the only way to catch the learner up is a snapshot — and that snapshot
+//! The leader writes past its retained-log bound while a learner is starved
+//! of entries and compacts past it, so the only way to catch the learner up
+//! is a snapshot — and that snapshot
 //! is lost after the transport reported it delivered (the receiver accepted
 //! the RPC and never installed it). raft-rs holds the learner's `Progress` in
 //! `Snapshot`, where nothing but heartbeats is sent, until the application
@@ -37,13 +38,16 @@ use std::time::{Duration, Instant};
 
 use lossy_link::{LossyLink, STARVE, SWALLOW_NEXT_SNAPSHOT};
 use nexus_raft::prelude::{Command, FullStateMachine, RaftError, ZoneConsensus};
-use nexus_raft::raft::ReplicationState;
+use nexus_raft::raft::{ReplicationState, RETAINED_LOG_THRESHOLDS};
 use nexus_raft::transport::call_join_zone_rpc;
 use nexus_raft::ZoneManager;
 use tempfile::TempDir;
 
 const ZONE: &str = "sharedzone";
 const SNAPSHOT_THRESHOLD: u64 = 16;
+/// Entries written while the learner is starved: more than the leader keeps
+/// for a peer it is still trying to feed.
+const STARVED_WRITES: u64 = (RETAINED_LOG_THRESHOLDS + 2) * SNAPSHOT_THRESHOLD;
 const BUDGET: Duration = Duration::from_secs(30);
 
 fn node_dir() -> (TempDir, u64) {
@@ -165,10 +169,10 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     // ── Starved: heartbeats only, while the leader compacts past it. ──
     link.set(STARVE);
     let behind = learner.applied_index();
-    for i in 0..(4 * SNAPSHOT_THRESHOLD) {
+    for i in 0..STARVED_WRITES {
         write(&leader, &format!("/during/{i}")).await;
     }
-    let newest = format!("/during/{}", 4 * SNAPSHOT_THRESHOLD - 1);
+    let newest = format!("/during/{}", STARVED_WRITES - 1);
     eventually("the leader catches the learner up only by snapshot", || {
         link.snapshots_refused.load(Ordering::SeqCst) > 0
     })
