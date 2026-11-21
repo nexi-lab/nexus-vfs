@@ -5020,7 +5020,8 @@ mod tests {
             let td = tempfile::tempdir().unwrap();
             let ms: Arc<dyn crate::meta_store::MetaStore> =
                 Arc::new(LocalMetaStore::open(&td.path().join("meta.redb")).unwrap());
-            k.add_mount("/data", "root", None, Some(ms), None, false)
+            let store = Arc::new(TestObjectStore::default());
+            k.add_mount("/data", "root", Some(store), Some(ms), None, false)
                 .unwrap();
 
             // Seed the target through a system context, so the only thing that

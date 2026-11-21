@@ -262,7 +262,7 @@ async fn inspect_target_over_tcp_preserves_lstat_and_rechecks_target_grants() {
     server.await.unwrap();
 }
 
-async fn serve(
+pub(crate) async fn serve(
     service: VfsServiceImpl,
 ) -> (
     NexusVfsServiceClient<tonic::transport::Channel>,

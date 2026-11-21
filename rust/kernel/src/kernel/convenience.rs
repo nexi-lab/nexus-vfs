@@ -147,19 +147,16 @@ pub trait KernelConvenience: KernelSyscall {
         self.sys_read(path, ctx, timeout_ms, offset)
     }
 
-    /// Tier 2 write: create-or-overwrite.
-    ///
-    /// Composes `sys_write` + `setattr_update` for POSIX
-    /// `open(O_CREAT|O_WRONLY) + write(2) + close(2)` semantics.
-    /// When `sys_write` returns miss (file doesn't exist) and
-    /// `offset == 0`, creates a DT_REG entry and retries.
+    /// Create or replace through the same completed write as the syscall surface.
     fn write(
         &self,
         path: &str,
         ctx: &OperationContext,
         content: &[u8],
         offset: u64,
-    ) -> Result<SysWriteResult, KernelError>;
+    ) -> Result<SysWriteResult, KernelError> {
+        self.sys_write(path, ctx, content, offset)
+    }
 
     /// Tier 2 `mkdir` — create a directory.
     ///
@@ -590,52 +587,5 @@ impl KernelConvenience for Kernel {
         _zone_id: &str,
     ) -> Result<Vec<(String, Option<String>)>, KernelError> {
         self.metastore_get_file_metadata_bulk(paths, key)
-    }
-
-    fn write(
-        &self,
-        path: &str,
-        ctx: &OperationContext,
-        content: &[u8],
-        offset: u64,
-    ) -> Result<SysWriteResult, KernelError> {
-        // Tier 2 create-or-overwrite. On miss + offset==0, creates DT_REG
-        // via the same route object sys_write uses internally, then retries.
-        // Uses sys_write_with_link_depth (kernel-internal) to guarantee the
-        // create and retry share the identical metastore resolution path.
-        let result = self.sys_write_with_link_depth(path, ctx, content, offset, 1)?;
-        if !result.hit && offset == 0 {
-            // Route-scoped create: resolve the same route sys_write uses,
-            // build a bare DT_REG entry, put it through the route metastore.
-            let route = self
-                .vfs_router
-                .route(path, &ctx.zone_id)
-                .ok_or_else(|| KernelError::FileNotFound(path.to_string()))?;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let meta = self.build_metadata(
-                path,
-                &route.zone_id,
-                crate::meta_store::DT_REG,
-                0,
-                None,
-                0, // gen — first write, will be incremented by sys_write
-                1,
-                None,
-                Some(now_ms),
-                Some(now_ms),
-            );
-            self.with_metastore_route(&route, |ms| ms.put(path, meta))
-                .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
-                .and_then(|r| {
-                    r.map_err(|e| {
-                        KernelError::from_metastore(&e, format!("write create({path}): {e:?}"))
-                    })
-                })?;
-            return self.sys_write_with_link_depth(path, ctx, content, offset, 1);
-        }
-        Ok(result)
     }
 }
