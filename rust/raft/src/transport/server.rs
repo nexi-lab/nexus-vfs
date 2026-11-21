@@ -2900,16 +2900,22 @@ impl WitnessZoneRegistry {
         }
     }
 
-    /// Join each of `zones` at boot, one task per zone: each resumes and
-    /// retries on its own (see [`Self::bootstrap_or_join_zone`]), so a zone
-    /// whose leader cannot be reached delays no other.
+    /// Resume any legacy root from its own storage. Each data node owns its
+    /// private root, so only named federation zones request voter admission.
     pub fn join_at_boot(
         self: &Arc<Self>,
         zones: Vec<String>,
         retry_interval: std::time::Duration,
     ) -> Vec<JoinHandle<()>> {
+        let root = contracts::ROOT_ZONE_ID;
+        if self.holds_zone(root) {
+            if let Err(error) = self.auto_join_zone(root, &tokio::runtime::Handle::current()) {
+                tracing::error!(zone = root, %error, "Could not resume stored witness root");
+            }
+        }
         zones
             .into_iter()
+            .filter(|zone_id| zone_id != root)
             .map(|zone_id| {
                 let registry = Arc::clone(self);
                 tokio::spawn(async move {
