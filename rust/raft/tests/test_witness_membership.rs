@@ -223,3 +223,46 @@ async fn two_data_nodes_and_a_witness_survive_each_single_loss_and_roll_back() {
     stop(peer_manager).await;
     stop(founder_manager).await;
 }
+
+/// A named-zone witness can restart an existing root store, but does not
+/// request a vote in any seed's node-local root, even if listed at boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_witness_only_resumes_root_from_its_own_disk() {
+    let root = contracts::ROOT_ZONE_ID;
+    let founder = Node::new();
+    let witness = Witness::new();
+    let manager = found(&founder, Vec::new()).await;
+    let private_root = manager
+        .create_zone(root)
+        .expect("create private root")
+        .consensus_node();
+
+    let fresh = witness.boot(&[&founder], &[root, ZONE]).await;
+    assert_eq!(fresh.boot.len(), 1);
+    eventually("the named zone to have both voters", || async {
+        sorted(consensus(&manager).voters()) == sorted(vec![founder.id, witness.id])
+            && fresh.follows(founder.id)
+    })
+    .await;
+    assert!(fresh.zone(root).is_none());
+    assert_eq!(private_root.voters(), vec![founder.id]);
+
+    // Represent an installation with root storage already on disk. Opening
+    // that store on restart must not request membership from a seed.
+    fresh
+        .registry
+        .auto_join_zone(root, &tokio::runtime::Handle::current())
+        .expect("initialize the local legacy store");
+    fresh.stop().await;
+    let resumed = witness.boot(&[&founder], &[ZONE]).await;
+    assert_eq!(resumed.boot.len(), 1);
+    assert!(resumed.zone(root).is_some());
+    eventually("named zone to resume after restart", || async {
+        resumed.follows(founder.id)
+    })
+    .await;
+    assert_eq!(private_root.voters(), vec![founder.id]);
+
+    resumed.stop().await;
+    stop(manager).await;
+}

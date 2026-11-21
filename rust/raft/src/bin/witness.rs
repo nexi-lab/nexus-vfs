@@ -178,16 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Witness server starting on {}", bind_addr);
 
-        // Join every boot zone in parallel with the gRPC server, each on its
-        // own task: a zone held on disk resumes at once, then JoinZone against
-        // NEXUS_PEERS re-asserts the voter role until a leader accepts. Under
-        // the opaque-ID contract the witness's id is hostname-derived but the
-        // data plane's ids are random, so the witness joins like any other
-        // late-arriving voter and never founds a zone.
-        let join_zones: Vec<String> = std::iter::once(contracts::ROOT_ZONE_ID.to_string())
-            .chain(federation_zones.iter().cloned())
-            .collect();
-        registry.join_at_boot(join_zones, std::time::Duration::from_secs(2));
+        // Named federation zones join independently. A previously held root
+        // resumes from storage, without requesting admission to a seed's root.
+        registry.join_at_boot(federation_zones, std::time::Duration::from_secs(2));
 
         let shutdown_registry = registry.clone();
         let shutdown = async move {

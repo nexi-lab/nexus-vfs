@@ -91,10 +91,11 @@ whose address changed, and every member of a zone that predates the record. A
 zone with fixed local membership (the isolated local root) has no network
 members and does not register; neither does a member without an advertise
 address. A zone that is not resident runs no Raft and registers when it next
-becomes resident. A witness makes the zones it joins at boot (root and
-`NEXUS_FEDERATION_ZONES`) resident when it starts, each on its own, resuming one
-it holds on disk from its own storage before re-sending JoinZone; any other zone
-becomes resident when a member's message reaches it. A witness never founds a
+becomes resident. A witness joins the named zones in `NEXUS_FEDERATION_ZONES`
+independently at startup. For a named zone it already holds, it resumes from
+storage before re-sending JoinZone. A legacy root resumes from storage without
+requesting admission to a data node's private root. Other zones become resident
+when a member's message reaches the witness. A witness never founds a
 zone: a replica it opens has no ConfState until its storage or the leader
 supplies one.
 
