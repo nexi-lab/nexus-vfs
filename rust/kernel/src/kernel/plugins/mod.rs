@@ -16,6 +16,7 @@ use std::sync::Arc;
 use contracts::OperationContext;
 use nexus_plugin_abi::{KernelHandle, PluginKind};
 
+use crate::kernel::syscall::KernelSyscall;
 use crate::kernel::Kernel;
 
 pub use loader::PluginGrpcEndpoint;
@@ -252,21 +253,16 @@ unsafe extern "C" fn kernel_cb_sys_write(
         Ok(s) => s,
         Err(_) => return -2,
     };
-    let content = if data.is_null() || data_len == 0 {
-        vec![]
+    let content = if data_len == 0 {
+        &[]
+    } else if data.is_null() {
+        return -2;
     } else {
-        std::slice::from_raw_parts(data, data_len).to_vec()
+        std::slice::from_raw_parts(data, data_len)
     };
-    let ctx = system_ctx();
-    let req = crate::kernel::WriteRequest {
-        path: path.to_string(),
-        content,
-        offset,
-    };
-    let results = kernel.sys_write(&[req], &ctx);
-    match results.into_iter().next() {
-        Some(Ok(_)) => 0,
-        _ => -3,
+    match KernelSyscall::sys_write(kernel, path, &system_ctx(), content, offset) {
+        Ok(_) => 0,
+        Err(_) => -3,
     }
 }
 
@@ -545,4 +541,22 @@ fn parse_stat_batch_input(json: &str) -> Vec<String> {
         rest = chars.as_str();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn plugin_write_reports_an_unhandled_empty_write() {
+        let kernel = Arc::new(Kernel::new());
+        kernel.trie_register("/virtual", 1).unwrap();
+        let handle = kernel.build_kernel_handle();
+        let path = CString::new("/virtual").unwrap();
+        // SAFETY: the kernel and path outlive the call, and the buffer length is zero.
+        let status =
+            unsafe { (handle.sys_write)(handle.kernel_ptr, path.as_ptr(), std::ptr::null(), 0, 0) };
+        assert_ne!(status, 0);
+    }
 }

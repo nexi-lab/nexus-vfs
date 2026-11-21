@@ -1491,30 +1491,13 @@ impl NexusVfsService for VfsServiceImpl {
         // runs the SAME §13 write gate + from-stamp hooks and, on the DT_STREAM
         // branch, appends via `StreamManager::write_nowait` (push + wake tail
         // readers); `size` is the offset the frame landed at. Offload like the
-        // Write RPC — `sys_write` may block on a lock. (Mailbox paths are
-        // mounted, so the route resolves; an append to an unmounted stream is a
-        // no-op miss — no production mailbox is unmounted.)
+        // Write RPC — `sys_write` may block on a lock.
         let kernel = self.kernel.clone();
         let path = req.path;
-        let path_for_err = path.clone();
         let data = req.data;
         let write_res =
             run_blocking(move || KernelSyscall::sys_write(&*kernel, &path, &ctx, &data, 0)).await?;
         match write_res {
-            // `hit == false` means sys_write did NOT append (an unmounted /
-            // non-stream path, or backpressure). Its `size` is then 0 — which
-            // as an `offset` reads exactly like "your frame landed first in the
-            // stream". Reporting that as success is how #276 turned a dropped
-            // mailbox message into two green RPCs; an append that did not
-            // happen is an error.
-            Ok(result) if !result.hit => Ok(Response::new(StreamWriteResponse {
-                offset: 0,
-                is_error: true,
-                error_payload: encode_rpc_error(
-                    RpcErrorCode::InternalError,
-                    &format!("stream append at {path_for_err} did not land (no DT_STREAM backend accepted the frame)"),
-                ),
-            })),
             Ok(result) => Ok(Response::new(StreamWriteResponse {
                 offset: result.size,
                 is_error: false,
@@ -1766,16 +1749,7 @@ impl NexusVfsService for VfsServiceImpl {
             Ok(v) => v,
             Err(s) => return Err(s),
         };
-        // No federation guard: write_batch composes per-item KernelConvenience
-        // ::write on the SSOT, which honors ctx.zone_perms in the permission
-        // gate (kernel::dispatch.rs:101).
-
-        // Tier 2 `write_batch`: create-or-overwrite per item, each item
-        // independent. One bad path no longer aborts the batch the way
-        // the generic `write_batch` Call did (it looped Tier 1 sys_write
-        // and `return Err`d on the first failure — and never created
-        // missing files). The positional per-item result vector matches
-        // the input order.
+        // Each item uses the ordinary completed write and retains its own outcome.
         let items: Vec<(String, Vec<u8>)> = req
             .items
             .into_iter()
@@ -3572,6 +3546,104 @@ pub(crate) mod tests {
             !nb.timed_out,
             "a non-blocking empty read must NOT set timed_out"
         );
+    }
+
+    #[tokio::test]
+    async fn write_acknowledgements_distinguish_empty_files_from_unhandled_writes() {
+        use kernel::kernel::vfs_proto::BatchWriteItemRequest;
+        use kernel::lock_manager::LockMode;
+
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            backends::storage::path_local::PathLocalBackend::new(root.path(), false).unwrap();
+        let ctx = OperationContext::new("test", "root", true, None, true);
+        let kernel = Arc::new(Kernel::new());
+        kernel
+            .mount(
+                "/",
+                MountOptions::new(&ctx, "local").with_backend(Arc::new(store)),
+            )
+            .unwrap();
+        kernel.set_vfs_lock_timeout(0);
+        kernel.trie_register("/virtual", 1).unwrap();
+        let (mut client, stop, server) =
+            crate::grpc_metadata_access_tests::serve(VfsServiceImpl::for_test(Arc::clone(&kernel)))
+                .await;
+        let write = |path: &str, content: &[u8]| WriteRequest {
+            path: path.into(),
+            content: content.into(),
+            auth_token: "test-key".into(),
+        };
+        let first = client
+            .write(write("/busy", b"original"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!first.is_error);
+        let locks = kernel.lock_manager_arc();
+        let handle = locks.blocking_acquire("/busy", LockMode::Write, 0);
+        assert_ne!(handle, 0);
+
+        let busy = client
+            .write(write("/busy", b"replacement"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(busy.is_error);
+        assert!(String::from_utf8_lossy(&busy.error_payload).contains("write lock timed out"));
+        let unhandled = client
+            .write(write("/virtual", b""))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(unhandled.is_error);
+        let empty = client
+            .write(write("/empty", b""))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!empty.is_error);
+        assert_eq!(empty.size, 0);
+
+        let results = client
+            .batch_write(BatchWriteRequest {
+                auth_token: "test-key".into(),
+                items: [
+                    ("/busy", b"second".as_slice()),
+                    ("/virtual", b"miss"),
+                    ("/created", b""),
+                ]
+                .into_iter()
+                .map(|(path, bytes)| BatchWriteItemRequest {
+                    path: path.into(),
+                    content: bytes.into(),
+                })
+                .collect(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .results;
+        assert_eq!(
+            results.iter().map(|r| r.is_error).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        assert!(locks.do_release(handle));
+        assert!(kernel.trie_unregister(1));
+        assert_eq!(
+            std::fs::read(root.path().join("busy")).unwrap(),
+            b"original"
+        );
+        let read = KernelSyscall::sys_read(&*kernel, "/busy", &ctx, 0, 0).unwrap();
+        assert_eq!(read.data.unwrap(), b"original");
+        assert_eq!(kernel.sys_stat("/busy", "root").unwrap().gen, first.gen);
+        assert!(kernel.sys_stat("/virtual", "root").is_none());
+        for path in ["/created", "/empty"] {
+            assert_eq!(kernel.sys_stat(path, "root").unwrap().size, 0);
+        }
+        drop(client);
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

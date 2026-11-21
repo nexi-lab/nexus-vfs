@@ -95,6 +95,7 @@ pub trait KernelSyscall: Send + Sync + 'static {
         offset: u64,
     ) -> Result<SysReadResult, KernelError>;
 
+    /// Returns success only when the destination accepted the write.
     fn sys_write(
         &self,
         path: &str,
@@ -232,7 +233,14 @@ impl KernelSyscall for crate::kernel::Kernel {
         content: &[u8],
         offset: u64,
     ) -> Result<SysWriteResult, KernelError> {
-        self.sys_write_with_link_depth(path, ctx, content, offset, 1)
+        let written = self.sys_write_with_link_depth(path, ctx, content, offset, 1)?;
+        if written.hit {
+            Ok(written)
+        } else {
+            Err(KernelError::IOError(format!(
+                "write was not handled at {path}"
+            )))
+        }
     }
 
     fn sys_unlink(

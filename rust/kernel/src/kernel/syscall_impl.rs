@@ -1032,7 +1032,9 @@ impl Kernel {
             self.lock_manager
                 .blocking_acquire(path, LockMode::Write, self.vfs_lock_timeout_ms());
         if lock_handle == 0 {
-            return miss();
+            return Err(KernelError::WouldBlock(format!(
+                "write lock timed out at {path}"
+            )));
         }
 
         let result = self.commit_write_through(WriteCommitInput {
@@ -3451,7 +3453,10 @@ impl Kernel {
 
             // Lock timeout check
             if lock_handles[i] == 0 {
-                results.push(Ok(write_miss()));
+                results.push(Err(KernelError::WouldBlock(format!(
+                    "write lock timed out at {}",
+                    req.path
+                ))));
                 continue;
             }
 
