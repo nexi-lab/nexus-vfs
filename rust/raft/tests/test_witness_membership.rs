@@ -160,9 +160,18 @@ async fn two_data_nodes_and_a_witness_survive_each_single_loss_and_roll_back() {
     })
     .await;
     let running_witness = witness.boot(&[&founder, &peer], &[ZONE]).await;
-    eventually("the witness to rejoin", || async {
-        running_witness.follows(founder.id)
-    })
+    eventually(
+        "all three to agree on a live leader after witness restart",
+        || async {
+            consensus(&founder_manager)
+                .leader_id()
+                .is_some_and(|leader| {
+                    (leader == founder.id || leader == peer.id)
+                        && consensus(&peer_manager).leader_id() == Some(leader)
+                        && running_witness.follows(leader)
+                })
+        },
+    )
     .await;
 
     stop(founder_manager).await;
