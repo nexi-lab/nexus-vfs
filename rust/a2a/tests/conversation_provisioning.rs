@@ -540,11 +540,11 @@ fn the_reader_register_is_left_to_the_consumer() {
 /// treat one as already indexed rather than fail, and the shared reader must still
 /// resolve it. Failing here would strand every conversation such a cluster already has.
 #[test]
-fn a_legacy_plain_entry_is_tolerated_and_still_resolves() {
+fn a_legacy_entry_without_content_survives_reprovisioning() {
     let kernel = Kernel::new();
     let ctx = provisioning_ctx();
 
-    // Plant the OLD shape by hand: a plain entry whose body is the target path.
+    // A legacy node could leave this entry behind even when its content write missed.
     let cid = conversation_id("win-ai", "mac-ai");
     let target = format!("{CONVERSATIONS_BASE}/{cid}");
     let alias = agent_conversation_link_path("win-ai", "mac-ai");
@@ -574,10 +574,10 @@ fn a_legacy_plain_entry_is_tolerated_and_still_resolves() {
             None,
         )
         .expect("plant a legacy plain entry");
-    // The trait form, not Kernel's inherent batch `sys_write` — the legacy writer was
-    // the single-path one.
-    KernelSyscall::sys_write(&kernel, &alias, &ctx, target.as_bytes(), 0)
-        .expect("legacy entries carry the target as bytes");
+    assert!(
+        KernelSyscall::sys_write(&kernel, &alias, &ctx, target.as_bytes(), 0).is_err(),
+        "a kernel without content storage must report a failed body write"
+    );
 
     // Provisioning again must NOT fail on it — re-typing is impossible, so the only
     // alternative to tolerance is a permanent error on a conversation that works.
@@ -598,7 +598,6 @@ fn a_legacy_plain_entry_is_tolerated_and_still_resolves() {
         None,
         "a legacy plain entry cannot resolve where bytes are dropped — that is why the          index moved into metadata"
     );
-    let _ = &target;
 
     // The new shape, same kernel, same absence of a content store: it resolves.
     let fresh = agent_conversation_link_path("win-ai", "other-ai");
