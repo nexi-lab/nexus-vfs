@@ -97,3 +97,129 @@ async fn a_boot_zone_without_a_leader_does_not_delay_another() {
     booted.stop().await;
     stop(founder_zm).await;
 }
+
+/// Upgrade the existing single voter and learner, then exercise each of the
+/// three two-member quorums with real writes. Finally restore the original
+/// membership through the same JoinZone and RemoveVoter endpoints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_data_nodes_and_a_witness_survive_each_single_loss_and_roll_back() {
+    use nexus_raft::transport::{call_join_zone_rpc, call_remove_voter_rpc};
+
+    let founder = Node::new();
+    let peer = Node::new();
+    let witness = Witness::new();
+    let founder_manager = found(&founder, Vec::new()).await;
+    let peer_manager = peer.start(vec![founder.endpoint()]).await;
+    join_as_learner(&peer_manager, &peer, &founder, &peer.bind).await;
+    write(&founder_manager, "/before-promotion").await;
+    eventually("the learner to apply the first write", || {
+        has_key(&peer_manager, "/before-promotion")
+    })
+    .await;
+
+    let running_witness = witness.boot(&[&founder, &peer], &[ZONE]).await;
+    eventually("the witness to join the original voter", || async {
+        sorted(consensus(&founder_manager).voters()) == sorted(vec![founder.id, witness.id])
+            && running_witness.follows(founder.id)
+    })
+    .await;
+    eventually("the caught-up learner to promote via JoinZone", || async {
+        let join = call_join_zone_rpc(
+            &founder.endpoint(),
+            ZONE,
+            peer.id,
+            &peer.bind,
+            false,
+            None,
+            5,
+        )
+        .await
+        .expect("call JoinZone");
+        assert!(
+            join.success || join.catching_up,
+            "JoinZone: {:?}",
+            join.error
+        );
+        join.success
+    })
+    .await;
+    let voters = sorted(vec![founder.id, peer.id, witness.id]);
+    eventually("all three to agree on the voting membership", || async {
+        sorted(consensus(&founder_manager).voters()) == voters
+            && sorted(consensus(&peer_manager).voters()) == voters
+            && running_witness
+                .zone(ZONE)
+                .is_some_and(|z| sorted(z.voters()) == voters)
+    })
+    .await;
+
+    running_witness.stop().await;
+    write(&founder_manager, "/without-witness").await;
+    eventually("both data nodes to apply without the witness", || {
+        has_key(&peer_manager, "/without-witness")
+    })
+    .await;
+    let running_witness = witness.boot(&[&founder, &peer], &[ZONE]).await;
+    eventually("the witness to rejoin", || async {
+        running_witness.follows(founder.id)
+    })
+    .await;
+
+    stop(founder_manager).await;
+    await_leader(&peer_manager, peer.id).await;
+    write(&peer_manager, "/without-founder").await;
+    let founder_manager = restart_member(&founder, vec![peer.endpoint()]).await;
+    eventually("the founder to recover the peer's write", || {
+        has_key(&founder_manager, "/without-founder")
+    })
+    .await;
+
+    stop(peer_manager).await;
+    await_leader(&founder_manager, founder.id).await;
+    write(&founder_manager, "/without-peer").await;
+    let peer_manager = restart_member(&peer, vec![founder.endpoint()]).await;
+    eventually("the peer to recover the founder's write", || {
+        has_key(&peer_manager, "/without-peer")
+    })
+    .await;
+
+    // Roll back one member at a time while both data nodes can acknowledge.
+    running_witness.stop().await;
+    for id in [witness.id, peer.id] {
+        let removed = call_remove_voter_rpc(&founder.endpoint(), ZONE, id, None, 5)
+            .await
+            .expect("call RemoveVoter");
+        assert!(removed.success, "RemoveVoter({id}): {:?}", removed.error);
+    }
+    let joined = call_join_zone_rpc(
+        &founder.endpoint(),
+        ZONE,
+        peer.id,
+        &peer.bind,
+        true,
+        None,
+        5,
+    )
+    .await
+    .expect("restore learner");
+    assert!(joined.success, "JoinZone(learner): {:?}", joined.error);
+    write(&founder_manager, "/after-rollback").await;
+    eventually("the original learner to apply after rollback", || {
+        has_key(&peer_manager, "/after-rollback")
+    })
+    .await;
+    let config = cluster_info(&founder.endpoint())
+        .await
+        .config
+        .expect("founder membership");
+    assert_eq!(
+        config.voters.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![founder.id]
+    );
+    assert_eq!(
+        config.learners.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![peer.id]
+    );
+    stop(peer_manager).await;
+    stop(founder_manager).await;
+}
