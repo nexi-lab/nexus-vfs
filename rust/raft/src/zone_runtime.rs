@@ -1020,6 +1020,10 @@ impl ZoneRuntimeBackend {
                 .leader_commit
                 .map(|commit| millis(commit.observed_ago)),
             stalled_ms: millis(replication.stalled_for),
+            replica_behind_total: status.has_store.then_some(replication.replica_behind_total),
+            committed_not_visible_total: status
+                .has_store
+                .then_some(replication.committed_not_visible_total),
         }
     }
 }
