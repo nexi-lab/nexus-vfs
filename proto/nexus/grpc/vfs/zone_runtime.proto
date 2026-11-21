@@ -152,6 +152,9 @@ message ClusterFacts {
   // Milliseconds applied_index has stood still while behind
   // leader_commit_index; 0 when caught up.
   uint64 stalled_ms = 12;
+  // Local totals since this zone's Raft runtime started. Absent on older nodes.
+  optional uint64 replica_behind_total = 13;
+  optional uint64 committed_not_visible_total = 14;
 }
 
 // The leader's view of one other member's replication.

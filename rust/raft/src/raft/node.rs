@@ -1280,7 +1280,39 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             tokio::time::Instant::now() + OWN_WRITES_READ_BUDGET,
         )
         .await
-        .map_err(|applied| RaftError::ReplicaBehind { required, applied })
+        .map_err(|applied| {
+            let total = self
+                .replication
+                .write()
+                .replica_behind
+                .record(Instant::now());
+            self.log_visibility_refusal("ReplicaBehind", total, Some(required), applied);
+            RaftError::ReplicaBehind { required, applied }
+        })
+    }
+
+    fn log_visibility_refusal(
+        &self,
+        reason: &str,
+        total: Option<u64>,
+        required: Option<u64>,
+        applied: u64,
+    ) {
+        if let Some(total) = total {
+            #[cfg(all(feature = "grpc", has_protos))]
+            let zone = self.forward_ctx.as_ref().map(|ctx| ctx.zone_id.as_str());
+            #[cfg(not(all(feature = "grpc", has_protos)))]
+            let zone: Option<&str> = None;
+            tracing::warn!(
+                node_id = self.id(),
+                zone,
+                reason,
+                refusals_total = total,
+                required_index = required,
+                applied_index = applied,
+                "Raft local visibility deadline reached"
+            );
+        }
     }
 
     /// What this node observes about replication: per-peer progress on the
@@ -1732,15 +1764,24 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 .ok()
                 .and_then(Result::ok),
         };
-        if let Some(index) = index {
+        let applied = if let Some(index) = index {
             self.own_write_floor.fetch_max(index, Ordering::AcqRel);
-            if self.await_applied(index, deadline).await.is_ok() {
-                return Ok(committed.result);
+            match self.await_applied(index, deadline).await {
+                Ok(()) => return Ok(committed.result),
+                Err(applied) => applied,
             }
-        }
+        } else {
+            self.applied_index()
+        };
+        let total = self
+            .replication
+            .write()
+            .committed_not_visible
+            .record(Instant::now());
+        self.log_visibility_refusal("CommittedNotVisible", total, index, applied);
         Err(RaftError::CommittedNotVisible {
             index,
-            applied: self.applied_index(),
+            applied,
             result: Box::new(committed.result),
         })
     }

@@ -507,6 +507,14 @@ fn audit_replication(
         "leader     = {}  term = {}  commit = {}  applied = {}",
         facts.leader_id, facts.term, facts.commit_index, facts.applied_index
     ));
+    if let (Some(reads), Some(writes)) = (
+        facts.replica_behind_total,
+        facts.committed_not_visible_total,
+    ) {
+        report.lines.push(format!(
+            "visibility refusals since zone start: ReplicaBehind = {reads}  CommittedNotVisible = {writes}"
+        ));
+    }
     for peer in &facts.peers {
         let lag = facts.commit_index.saturating_sub(peer.matched);
         let role = if peer.learner { "learner" } else { "voter" };
@@ -641,6 +649,27 @@ mod replication_tests {
             .iter()
             .map(|alarm| alarm.split(':').next().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn reports_visibility_totals_only_when_the_node_supports_them() {
+        let report = |facts| audit_replication(&resident(facts), Duration::from_secs(30));
+        let legacy = report(ClusterFacts::default());
+        assert!(!legacy
+            .lines
+            .iter()
+            .any(|line| line.contains("visibility refusals")));
+        for (reads, writes) in [(0, 0), (7, 2)] {
+            let observed = report(ClusterFacts {
+                replica_behind_total: Some(reads),
+                committed_not_visible_total: Some(writes),
+                ..Default::default()
+            });
+            assert!(observed.lines.iter().any(|line| line.contains(&format!(
+                "ReplicaBehind = {reads}  CommittedNotVisible = {writes}"
+            ))));
+            assert_eq!(observed.alarms, legacy.alarms);
+        }
     }
 
     /// The incident: the leader holds a learner in Snapshot while the

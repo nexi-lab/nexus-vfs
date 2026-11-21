@@ -205,6 +205,7 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     assert_eq!(learner.applied_index(), behind);
 
     let via_learner = "/written/through/the/learner";
+    let before = learner.replication();
     let committed = match learner
         .propose(Command::SetMetadata {
             key: via_learner.into(),
@@ -230,6 +231,15 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         }
         other => panic!("a read after the learner's own write must report the lag, got {other:?}"),
     }
+    let refused = learner.replication();
+    assert_eq!(
+        refused.replica_behind_total,
+        before.replica_behind_total + 1
+    );
+    assert_eq!(
+        refused.committed_not_visible_total,
+        before.committed_not_visible_total + 1
+    );
 
     // A caller already waiting for the write is released by the catch-up,
     // whichever of snapshot install or entry apply brings it.
@@ -264,6 +274,12 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         .own_writes_visible()
         .await
         .expect("the learner's own write is visible to its reads now");
+    let healed = learner.replication();
+    assert_eq!(healed.replica_behind_total, refused.replica_behind_total);
+    assert_eq!(
+        healed.committed_not_visible_total,
+        refused.committed_not_visible_total
+    );
     assert!(has(&learner, via_learner).await);
     write(&leader, "/after").await;
     eventually("the leader sees the learner replicating again", || {

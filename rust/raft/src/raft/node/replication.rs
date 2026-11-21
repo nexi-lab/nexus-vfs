@@ -110,6 +110,32 @@ pub struct ReplicationStatus {
     /// How long this replica's applied index has stood still while behind
     /// `leader_commit`; zero when caught up.
     pub stalled_for: Duration,
+    /// Reads refused because this replica had not applied its own writes.
+    pub replica_behind_total: u64,
+    /// Forwarded writes confirmed committed but not yet visible locally.
+    pub committed_not_visible_total: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RefusalCounter {
+    total: u64,
+    last_logged: Option<Instant>,
+}
+
+impl RefusalCounter {
+    /// Count every refusal. Return the total for the first warning and at
+    /// most once per stall interval thereafter while refusals continue.
+    pub(super) fn record(&mut self, now: Instant) -> Option<u64> {
+        self.total = self.total.saturating_add(1);
+        if self
+            .last_logged
+            .is_some_and(|last| now.saturating_duration_since(last) < REPLICATION_STALL)
+        {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(self.total)
+    }
 }
 
 /// An index and the instant it last changed.
@@ -180,6 +206,8 @@ struct PeerWatch {
 /// Observations shared between the driver (writer) and the handle (reader).
 #[derive(Debug, Default)]
 pub(super) struct ReplicationView {
+    pub(super) replica_behind: RefusalCounter,
+    pub(super) committed_not_visible: RefusalCounter,
     /// Leader only: commit index and each other member's progress.
     leader: Option<(u64, HashMap<u64, PeerWatch>)>,
     /// Counts leader observations, to sweep members that left the tracker.
@@ -310,7 +338,11 @@ impl ReplicationView {
 
     /// Point-in-time status, durations measured at `now`.
     pub(super) fn status(&self, now: Instant) -> ReplicationStatus {
-        let mut status = ReplicationStatus::default();
+        let mut status = ReplicationStatus {
+            replica_behind_total: self.replica_behind.total,
+            committed_not_visible_total: self.committed_not_visible.total,
+            ..Default::default()
+        };
         if let Some((commit, peers)) = &self.leader {
             status.peers = peers
                 .iter()
@@ -396,6 +428,21 @@ impl CommitProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_refusals_count_between_warnings() {
+        let mut view = ReplicationView::default();
+        let start = Instant::now();
+        assert_eq!(view.replica_behind.record(start), Some(1));
+        assert_eq!(view.replica_behind.record(start), None);
+        assert_eq!(view.committed_not_visible.record(start), Some(1));
+        assert_eq!(view.status(start).replica_behind_total, 2);
+        assert_eq!(view.status(start).committed_not_visible_total, 1);
+        assert_eq!(
+            view.replica_behind.record(start + REPLICATION_STALL),
+            Some(3)
+        );
+    }
 
     fn peer(id: u64, state: ProgressState, matched: u64) -> (u64, ProgressState, u64, u64, bool) {
         (id, state, matched, matched + 1, true)
