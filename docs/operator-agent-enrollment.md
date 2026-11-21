@@ -68,7 +68,7 @@ to the pinned cluster CA and name the pinned Node. Endpoint, key paths and
 authority are never accepted from the claim. Changing an owner/CA or grant is an
 explicit operator action; this command does not discover or adopt a replacement.
 
-An actor with an attempt record only replays it, without opening a channel.
+In ordinary enrollment, an actor with an attempt record only replays it, without opening a channel.
 Otherwise the command first establishes the channel to the one endpoint, which
 sends no request; then, before sending MintAgent, an exclusive owner-only synced
 attempt record reserves the original actor/operation/request/target. At most one
@@ -79,6 +79,30 @@ refusal, response loss, persistence failure or a crash after reservation is
 **Unknown**, even when the error appears to precede submission. No retry,
 fallback, new actor or new operation is elected. Absence of a result does not
 prove that the replicated name claim was not committed.
+
+### Recovering an original reservation
+
+For an interrupted enrollment, supply the exact original claim on stdin to
+`nexus-agent-enroll --grant /absolute/private/node-grant.json --recover-unissued`.
+Run this explicitly for the selected operation. Keep the bridge's automatic
+enrollment command in its ordinary mode.
+
+Recovery requires the existing reservation to match the actor, operation,
+thread, workspace, canonical path, issuer endpoint, cluster CA and owning
+Node. A legacy reservation pins the exact Node leaf by SHA-256. It can replay
+under the current grant when that same validated leaf is still installed.
+A changed legacy leaf requires separate ownership evidence.
+
+A valid local receipt replays offline. When both the receipt and bundle path
+are absent, the client asks the selected issuer for its applied name records
+using `ListKeys`. A reported name, a refused listing or partial local
+material leaves the operation Unknown. Following an empty observation, the
+operator can issue only through `MintAgent` with `allow_existing=false`.
+Raft's conditional insertion of the permanent name decides the outcome even
+if a concurrent or previously delayed request commits. Repeating an explicit
+recovery after success returns the same receipt. A lost reply after commit
+with no recoverable local bundle leaves the name occupied and requires
+separate operator handling. The original reservation stays in place throughout.
 
 On success stdout contains only a bounded public receipt:
 

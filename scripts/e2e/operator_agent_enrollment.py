@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import time
 
@@ -150,9 +151,12 @@ class Journey:
         self.proof["sourceCommit"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
 
-    def request(self, label, claim, grant=None):
+    def request(self, label, claim, grant=None, *, recover=False):
+        args = [str(self.operator), "--grant", str(grant or self.grant)]
+        if recover:
+            args.append("--recover-unissued")
         result = subprocess.run(
-            [str(self.operator), "--grant", str(grant or self.grant)],
+            args,
             input=json.dumps(claim).encode(), capture_output=True, env=self.node.env, timeout=30,
         )
         (self.output / f"{label}.stdout.json").write_bytes(result.stdout)
@@ -175,6 +179,52 @@ class Journey:
     def refused(self, label, claim, grant, detail):
         response = self.request(label, claim, grant)
         assert response == {"outcome": "not_submitted", "detail": detail}, (label, response)
+
+    def reconcile_reserved(self, state, first, receipt):
+        """Use a leaf-pinned reservation left before the original RPC was sent."""
+        claim = self.claim("9", "9")
+        pending = state / (claim["actor"] + ".attempt.json")
+        assert self.request("no-original-reservation", claim, recover=True)["outcome"] == "unknown"
+        assert not pending.exists()
+        first_file = state / (first["actor"] + ".attempt.json")
+        template = json.loads(first_file.read_text(encoding="utf-8"))
+        cert = ssl.PEM_cert_to_DER_cert((self.data / "tls/node.pem").read_text(encoding="ascii"))
+        legacy = dict(template, ownerCertificateSha256=hashlib.sha256(cert).hexdigest())
+        del legacy["ownerNodeIdentity"]
+        # Existing receipts still replay after upgrading the client, including offline.
+        first_file.write_text(json.dumps(legacy), encoding="utf-8")
+        self.node.stop()
+        assert self.request("legacy-receipt-offline", first) == receipt
+        self.node.start()
+        legacy["claim"] = claim
+        pending.write_text(json.dumps(legacy | {"ownerCertificateSha256": "0" * 64}), encoding="utf-8")
+        mismatch = self.request("different-original-leaf", claim, recover=True)
+        assert mismatch["outcome"] == "unknown" and "different Node certificate" in mismatch["detail"], mismatch
+        pending.write_text(json.dumps(legacy), encoding="utf-8")
+        original = pending.read_bytes()
+        self.node.stop()
+        assert self.request("recover-offline", claim, recover=True)["outcome"] == "unknown"
+        self.node.start()
+        assert self.request("still-ordinary-unknown", claim)["outcome"] == "unknown"
+        assert self.request("different-recovery-operation", self.claim("9", "8"), recover=True)["outcome"] == "unknown"
+        bundle = self.data / "agents" / claim["actor"]
+        assert not bundle.exists()
+        partial = state / (claim["actor"] + ".result.json")
+        partial.write_text("{", encoding="utf-8")
+        assert self.request("partial-receipt", claim, recover=True)["outcome"] == "unknown"
+        assert partial.read_text(encoding="utf-8") == "{" and not bundle.exists()
+        partial.unlink()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(self.request, f"explicit-recovery-{i}", claim, recover=True) for i in range(2)]
+            responses = [job.result() for job in jobs]
+        assert any(x.get("actor") == claim["actor"] for x in responses), responses
+        selected = self.request("settled-ordinary-replay", claim)
+        assert selected["operationId"] == claim["operationId"] and Path(selected["credentialDirectory"]).samefile(bundle)
+        assert all(x == selected or x.get("outcome") == "unknown" for x in responses)
+        key = digest(bundle / "agent-key.pem")
+        assert self.request("settled-explicit-replay", claim, recover=True) == selected
+        assert digest(bundle / "agent-key.pem") == key and pending.read_bytes() == original
+        self.proof.update(legacyReceiptOffline=True, concurrentExplicitRecovery=True)
 
     def run(self):
         self.node.start()
@@ -214,6 +264,7 @@ class Journey:
         assert self.request("replay", first) == receipt
         assert all((credential / name).read_bytes() == value for name, value in original.items())
         assert self.request("different-operation", self.claim("a", "2"))["outcome"] == "unknown"
+        self.reconcile_reserved(state, first, receipt)
         if os.name == "posix":
             assert self.grant.stat().st_mode & 0o777 == 0o600
             assert (credential / "agent-key.pem").stat().st_mode & 0o777 == 0o600
@@ -270,6 +321,8 @@ class Journey:
         assert numeric_cn not in report, report
         self.node.start()
         assert self.request("unknown-after-restart", first, elsewhere)["outcome"] == "unknown"
+        held = self.request("held-name-explicit-recovery", first, elsewhere, recover=True)
+        assert held["outcome"] == "unknown" and "issuer already records" in held["detail"], held
         assert pending.read_bytes() == attempt, "Recovery must retain the original operation"
         assert not credential.exists(), "No offline mint or second RPC"
 

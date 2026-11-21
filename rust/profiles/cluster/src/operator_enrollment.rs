@@ -2,7 +2,7 @@
 //!
 //! This uses the existing Node-gated MintAgent RPC, TLS loader and credential
 //! writer. It never opens the auth store, signs offline, elects another subject
-//! or retries an RPC. The local attempt is a client recovery receipt, not an
+//! or retries an RPC automatically. The local attempt is a client recovery receipt, not an
 //! additional identity registry: the existing replicated name claim governs.
 
 use std::io::Read;
@@ -25,6 +25,9 @@ struct Args {
     grant: PathBuf,
     #[arg(long)]
     initialize: bool,
+    /// Reconcile the original reservation and conditionally issue its still-unclaimed name.
+    #[arg(long, conflicts_with = "initialize")]
+    recover_unissued: bool,
     #[arg(long, requires = "initialize")]
     data_dir: Option<PathBuf>,
     #[arg(long, requires = "initialize")]
@@ -51,7 +54,7 @@ pub fn main() -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(run(&args.grant))
+        .block_on(run(&args.grant, args.recover_unissued))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -132,6 +135,23 @@ struct Attempt {
     canonical_workspace: PathBuf,
     endpoint: String,
     owner_node_identity: String,
+    ca_certificate_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredAttempt {
+    Current(Attempt),
+    LeafBound(LeafBoundAttempt),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LeafBoundAttempt {
+    claim: Claim,
+    canonical_workspace: PathBuf,
+    endpoint: String,
+    owner_certificate_sha256: String,
     ca_certificate_sha256: String,
 }
 
@@ -286,7 +306,7 @@ fn validate_target(grant: &Grant) -> Result<TlsConfig> {
 enum Failure {
     /// Nothing was reserved or sent: the same operation may run again.
     NotSubmitted(anyhow::Error),
-    /// The reserved request may have committed: it is never resubmitted.
+    /// An existing reservation or submission cannot be settled by this invocation.
     Unknown(anyhow::Error),
 }
 
@@ -294,16 +314,26 @@ async fn issue(
     grant: Grant,
     attempt: Attempt,
     tls: TlsConfig,
+    recover_unissued: bool,
 ) -> std::result::Result<Receipt, Failure> {
     let actor = &attempt.claim.actor;
     let attempt_file = grant.state_directory.join(format!("{actor}.attempt.json"));
     let result_file = grant.state_directory.join(format!("{actor}.result.json"));
+    let certificate = tls.cert_pem.clone();
+    if recover_unissued {
+        verify_reservation(&attempt, &attempt_file, &certificate).map_err(Failure::Unknown)?;
+        return reconcile(&grant, &attempt, tls, &result_file)
+            .await
+            .map_err(Failure::Unknown);
+    }
     let reservation =
         serde_json::to_vec(&attempt).map_err(|error| Failure::NotSubmitted(error.into()))?;
     std::fs::create_dir_all(&grant.state_directory)
         .map_err(|error| Failure::NotSubmitted(error.into()))?;
-    let replay =
-        || recover(&grant, &attempt, &attempt_file, &result_file).map_err(Failure::Unknown);
+    let replay = || {
+        verify_reservation(&attempt, &attempt_file, &certificate).map_err(Failure::Unknown)?;
+        replay_receipt(&grant, &attempt, &result_file).map_err(Failure::Unknown)
+    };
     // A reserved operation only replays its local receipt; it opens no channel.
     if !matches!(
         std::fs::symlink_metadata(&attempt_file),
@@ -330,19 +360,68 @@ async fn issue(
         .map_err(Failure::Unknown)
 }
 
-/// Replay a reserved operation from its local receipt; never sends a request.
-fn recover(
-    grant: &Grant,
-    attempt: &Attempt,
-    attempt_file: &Path,
-    result_file: &Path,
-) -> Result<Receipt> {
-    let actor = &attempt.claim.actor;
-    let previous: Attempt = read_json(attempt_file)?;
+fn verify_reservation(attempt: &Attempt, attempt_file: &Path, certificate: &[u8]) -> Result<()> {
+    let previous = match read_json::<StoredAttempt>(attempt_file)
+        .context("could not read the original enrollment reservation")?
+    {
+        StoredAttempt::Current(record) => record,
+        StoredAttempt::LeafBound(record) => {
+            ensure!(super::certificate_sha256_hex(certificate)? == record.owner_certificate_sha256,
+                "original reservation pins a different Node certificate; operator recovery required");
+            Attempt {
+                claim: record.claim,
+                canonical_workspace: record.canonical_workspace,
+                endpoint: record.endpoint,
+                owner_node_identity: attempt.owner_node_identity.clone(),
+                ca_certificate_sha256: record.ca_certificate_sha256,
+            }
+        }
+    };
     ensure!(
         previous == *attempt,
         "actor is reserved by another operation or target; operator recovery required"
     );
+    Ok(())
+}
+
+/// Only ENOENT means absence. A dangling link or unreadable record blocks issuance.
+fn absent(file: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(file) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// An operator can settle an existing reservation against its original issuer.
+/// The listing can lag. The issuer's atomic name creation decides who wins,
+/// including if the original request is still committing.
+async fn reconcile(
+    grant: &Grant,
+    attempt: &Attempt,
+    tls: TlsConfig,
+    result_file: &Path,
+) -> Result<Receipt> {
+    if !absent(result_file)? {
+        return replay_receipt(grant, attempt, result_file);
+    }
+    let actor = &attempt.claim.actor;
+    ensure!(
+        absent(&grant.node_data_directory.join("agents").join(actor))?,
+        "local credential path exists without an issuance receipt; inspect the original bundle"
+    );
+    let mut channel = MintAgentChannel::connect(&grant.endpoint, Some(tls), 10).await?;
+    let key = auth::agent_store_key(actor);
+    let records = channel.list_keys().await?.map_err(anyhow::Error::msg)?;
+    ensure!(
+        !records.iter().any(|(id, _)| id == &key),
+        "issuer already records the original actor; no replacement credential requested"
+    );
+    submit(grant, attempt, channel, result_file).await
+}
+
+fn replay_receipt(grant: &Grant, attempt: &Attempt, result_file: &Path) -> Result<Receipt> {
+    let actor = &attempt.claim.actor;
     let receipt: Receipt = read_json(result_file).context(
         "original issuance may have committed; no RPC retry; operator recovery required",
     )?;
@@ -368,11 +447,7 @@ async fn submit(
 ) -> Result<Receipt> {
     let actor = &attempt.claim.actor;
     ensure!(
-        !grant
-            .node_data_directory
-            .join("agents")
-            .join(actor)
-            .exists(),
+        absent(&grant.node_data_directory.join("agents").join(actor))?,
         "credential path already exists; operator recovery required"
     );
     let response = channel.mint(actor, actor, false).await?;
@@ -407,7 +482,7 @@ async fn submit(
 }
 
 /// Bounded public JSON stdin/stdout; private key bytes never enter stdout.
-pub(super) async fn run(grant: &Path) -> Result<()> {
+pub(super) async fn run(grant: &Path, recover_unissued: bool) -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().take(8193).read_to_end(&mut input)?;
     let prepared = (|| {
@@ -417,7 +492,8 @@ pub(super) async fn run(grant: &Path) -> Result<()> {
         prepare(grant, serde_json::from_slice(&input)?)
     })();
     let outcome = match prepared {
-        Ok((grant, attempt, tls)) => issue(grant, attempt, tls).await,
+        Ok((grant, attempt, tls)) => issue(grant, attempt, tls, recover_unissued).await,
+        Err(error) if recover_unissued => Err(Failure::Unknown(error)),
         Err(error) => Err(Failure::NotSubmitted(error)),
     };
     let result = match outcome {
@@ -541,7 +617,7 @@ mod tests {
             let reservation = grant
                 .state_directory
                 .join(format!("{}.attempt.json", claim.actor));
-            let Err(Failure::NotSubmitted(error)) = issue(grant, attempt, tls).await else {
+            let Err(Failure::NotSubmitted(error)) = issue(grant, attempt, tls, false).await else {
                 panic!("a refused connection must be reported as not submitted");
             };
             assert!(error.to_string().contains("connect"), "{error}");
