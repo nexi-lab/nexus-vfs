@@ -146,7 +146,9 @@ impl Kernel {
                         Some(route) => {
                             Self::with_captured_metastore_route(route, |ms| ms.get(&path))
                                 .transpose()
-                                .map_err(|e| KernelError::IOError(format!("path metadata: {e:?}")))?
+                                .map_err(|e| {
+                                    KernelError::from_metastore(&e, format!("path metadata: {e}"))
+                                })?
                                 .flatten()
                         }
                         None => self.metastore_get(&path).ok().flatten(),

@@ -973,6 +973,9 @@ impl Kernel {
                     Err(crate::stream_manager::StreamManagerError::Backend(
                         crate::stream::StreamError::Closed(msg),
                     )) => return Err(KernelError::StreamClosed(msg.to_string())),
+                    Err(crate::stream_manager::StreamManagerError::Backend(
+                        crate::stream::StreamError::MetadataVisibility(error),
+                    )) => return Err(KernelError::MetadataVisibility(error)),
                     // The append failed and the backend said why. Which stream,
                     // the reason as given, and whether it may have committed —
                     // what a client needs to decide between a retry and a
@@ -1267,7 +1270,7 @@ impl Kernel {
                         r.map_err(|e| {
                             KernelError::from_metastore(
                                 &e,
-                                format!("metastore_put({}): {e:?}", input.path),
+                                format!("metastore_put({}): {e}", input.path),
                             )
                         })
                     });
@@ -1707,7 +1710,7 @@ impl Kernel {
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
             .and_then(|r| {
                 r.map_err(|e| {
-                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e}"))
                 })
             });
         if let Err(e) = del_res {
@@ -2619,47 +2622,22 @@ impl Kernel {
             });
         }
 
-        // §2.7. Federation-peer mount side effect: when this mount has
-        // no local backend (placeholder MountEntry installed by
-        // wire_mount_core on the non-SSOT node) but carries a
-        // `target_zone_id`, FIRE the peer's typed
-        // `NexusVFSService.Mkdir` so the SSOT-side LocalConnector
-        // materialises the host fs directory.  CRITICAL: this is a
-        // SUPPLEMENT, not a defer-and-return — the local-side flow
-        // BELOW (existence check + metastore.put for the DT_DIR row)
-        // STILL runs so the joiner's VFSRouter has the DT_DIR
-        // routable IMMEDIATELY for subsequent ops on children of
-        // the new dir.  Raft LWW dedupes the peer's mirror put
-        // against ours on apply.
-        //
-        // This is the corrected-design fix for reverted PR #82's
-        // mkdir/rename/setattr regression: pure defer-to-peer
-        // (which works for sys_write / sys_unlink because their
-        // SSOT is BYTES) broke mkdir's routing because the joiner
-        // needed the row LOCAL immediately, not async via raft
-        // apply.  See `feedback_defer_to_peer_only_for_byte_ops`
-        // memory for the full rationale.
-        //
-        // Best-effort: `supplement_mkdir` swallows dispatch failure
-        // (no reachable voter / RPC error / coordinator without an
-        // installed FederationGrpcOps) — the local-side flow proceeds
-        // regardless, preserving the legacy "metadata-only mkdir on
-        // backend-less mount succeeds" shape.  PR #81-equivalent
-        // silent-miss semantics.
+        // Check this mount's explicit and implicit directory entries before
+        // issuing any mkdir. A failed observation cannot authorize creation.
+        let (explicit_exists, implicit_exists) = self
+            .with_metastore_route(&route, |ms| {
+                let explicit = ms.exists(path)?;
+                let implicit = !explicit && ms.is_implicit_directory(path)?;
+                Ok((explicit, implicit))
+            })
+            .transpose()
+            .map_err(|e| KernelError::from_metastore(&e, format!("mkdir lookup({path}): {e}")))?
+            .unwrap_or_default();
+
+        // A mount served by a peer also needs its native directory created.
+        // The local metadata path supplies the inode used for routing children.
         route.supplement_mkdir(self, path, parents, exist_ok);
 
-        // 3. Existence check: explicit entry OR implicit directory (children
-        //    exist under this prefix). Eliminates Python's router.route() +
-        //    metastore.get() + is_implicit_directory() pre-check (Crossing 3a).
-        let explicit_exists = self
-            .with_metastore(&route.mount_point, |ms| ms.exists(path).unwrap_or(false))
-            .unwrap_or(false);
-        let implicit_exists = !explicit_exists
-            && self
-                .with_metastore(&route.mount_point, |ms| {
-                    ms.is_implicit_directory(path).unwrap_or(false)
-                })
-                .unwrap_or(false);
         if explicit_exists || implicit_exists {
             if !exist_ok && !parents {
                 return Err(KernelError::IOError(format!(
@@ -2718,9 +2696,7 @@ impl Kernel {
         // 7. Atomic commit via the per-mount metastore Arc on RouteResult.
         self.with_metastore_route(&route, |ms| ms.put(path, meta))
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
-            .map_err(|e| {
-                KernelError::from_metastore(&e, format!("metastore_put({path}): {e:?}"))
-            })?;
+            .map_err(|e| KernelError::from_metastore(&e, format!("metastore_put({path}): {e}")))?;
 
         // 8. OBSERVE-phase dispatch (§11 OBSERVE): queue DirCreate.
         // Only fires on the newly-created path — the early return at
@@ -2759,7 +2735,11 @@ impl Kernel {
                         break;
                     }
                     let exists = self
-                        .with_metastore_route(route, |ms| ms.exists(cur).unwrap_or(true))
+                        .with_metastore_route(route, |ms| ms.exists(cur))
+                        .transpose()
+                        .map_err(|e| {
+                            KernelError::from_metastore(&e, format!("mkdir parent({cur}): {e}"))
+                        })?
                         .unwrap_or(true);
                     if !exists {
                         to_create.push(cur.to_string());
@@ -2788,7 +2768,7 @@ impl Kernel {
             self.with_metastore_route(route, |ms| ms.put(dir_ref, meta))
                 .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
                 .map_err(|e| {
-                    KernelError::from_metastore(&e, format!("metastore_put({dir_ref}): {e:?}"))
+                    KernelError::from_metastore(&e, format!("metastore_put({dir_ref}): {e}"))
                 })?;
         }
         Ok(())
@@ -2836,7 +2816,7 @@ impl Kernel {
                     .map(|entry| entry.map_or(DT_DIR, |m| m.entry_type))
             })
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))?
-            .map_err(|e| KernelError::IOError(format!("metastore_get({path}): {e:?}")))?;
+            .map_err(|e| KernelError::from_metastore(&e, format!("metastore_get({path}): {e}")))?;
 
         // DT_MOUNT(2) / DT_EXTERNAL_STORAGE(5) → Python handles unmount
         if entry_type == 2 || entry_type == 5 {
@@ -2855,7 +2835,7 @@ impl Kernel {
             .with_metastore_route(&route, |ms| {
                 let prefix = format!("{}/", path.trim_end_matches('/'));
                 let children = ms.list(&prefix).map_err(|e| {
-                    KernelError::IOError(format!("metastore_list({prefix}): {e:?}"))
+                    KernelError::from_metastore(&e, format!("metastore_list({prefix}): {e}"))
                 })?;
 
                 if !children.is_empty() {
@@ -2869,7 +2849,7 @@ impl Kernel {
                     ms.delete_batch(&child_paths).map_err(|e| {
                         KernelError::from_metastore(
                             &e,
-                            format!("metastore_delete_batch({path}): {e:?}"),
+                            format!("metastore_delete_batch({path}): {e}"),
                         )
                     })
                 } else {
@@ -2926,7 +2906,7 @@ impl Kernel {
             .ok_or_else(|| KernelError::IOError("no metastore wired".into()))
             .and_then(|result| {
                 result.map_err(|e| {
-                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+                    KernelError::from_metastore(&e, format!("metastore_delete({path}): {e}"))
                 })
             });
         if let Err(err) = delete_result {

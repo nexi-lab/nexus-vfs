@@ -121,7 +121,19 @@ or `readdir` answers `unknown Call method`. Use the methods above.
 
 An RPC that fails in transport rejects with `gRPC <op> failed: <details>`. An
 RPC that reaches the server but fails there rejects with the server's error
-payload verbatim.
+payload verbatim as its message. For a metadata visibility refusal, read
+`NexusVfsError.visibility` (also available on `NexusRpcError`). A
+`ReplicaBehind` read has `required_index` and `applied_index`. It can be
+retried when the replica catches up. A `CommittedNotVisible` metadata write
+has `applied_index` and, when reported by the authority, `committed_index`.
+That step committed. Reconcile the enclosing operation before replaying it.
+For a mailbox send, use the original message ID to check delivery.
+
+Both reasons use decimal strings for all indices. On the wire the object is
+the JSON error envelope's `data` field (including `InspectTarget` and
+`Mkdir`), or JSON bytes in the `nexus-visibility-bin` gRPC trailer on
+`UNAVAILABLE` from `Stat` or `BatchStat`. Older servers and unrelated
+failures can omit the detail.
 
 The conditional pair exposes `NexusConditionalContentError.kind` and the
 snapshot/replacement results defined in the

@@ -438,6 +438,37 @@ function zoneApiConstructor(): grpc.ServiceClientConstructor {
   return cachedZoneApiConstructor
 }
 
+/** Local visibility of a metadata step. Indices are decimal u64 strings. */
+export type MetadataVisibility =
+  | { reason: 'ReplicaBehind'; required_index: string; applied_index: string }
+  | { reason: 'CommittedNotVisible'; committed_index?: string; applied_index: string }
+
+export class NexusVfsError extends Error {
+  constructor(message: string, readonly visibility?: MetadataVisibility) {
+    super(message)
+    this.name = 'NexusVfsError'
+  }
+}
+
+function parseJson(bytes?: Buffer): unknown {
+  if (!bytes?.length) return undefined
+  try { return JSON.parse(bytes.toString('utf8')) } catch { return undefined }
+}
+
+function visibilityFrom(value: unknown): MetadataVisibility | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const { reason, applied_index, required_index, committed_index } = value as Record<string, unknown>
+  const isIndex = (n: unknown): n is string => typeof n === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(n)
+    && (n.length < 20 || n <= '18446744073709551615')
+  if (!isIndex(applied_index)) return undefined
+  if (reason === 'ReplicaBehind' && isIndex(required_index)) return { reason, required_index, applied_index }
+  if (reason === 'CommittedNotVisible') {
+    if (committed_index === undefined) return { reason, applied_index }
+    if (isIndex(committed_index)) return { reason, committed_index, applied_index }
+  }
+  return undefined
+}
+
 /**
  * A failed RPC, carrying the gRPC status as data.
  *
@@ -445,7 +476,7 @@ function zoneApiConstructor(): grpc.ServiceClientConstructor {
  * to do next reads {@link status}: matching the text means a server-supplied
  * detail that happens to contain a status name is misread as that status.
  */
-export class NexusRpcError extends Error {
+export class NexusRpcError extends NexusVfsError {
   /** Numeric gRPC status code. */
   readonly code: number
   /** Status name, e.g. `DEADLINE_EXCEEDED`. */
@@ -453,8 +484,8 @@ export class NexusRpcError extends Error {
   /** The operation label this client used, e.g. `stream read`. */
   readonly operation: string
 
-  constructor(code: number, status: string, operation: string, detail: string) {
-    super(`gRPC ${operation} failed: ${status}: ${detail}`)
+  constructor(code: number, status: string, operation: string, detail: string, visibility?: MetadataVisibility) {
+    super(`gRPC ${operation} failed: ${status}: ${detail}`, visibility)
     this.name = 'NexusRpcError'
     this.code = code
     this.status = status
@@ -527,7 +558,10 @@ function invoke<Req, Res>(
       if (call) calls?.delete(call)
       if (error) {
         const status = String(grpc.status[error.code] ?? error.code)
-        reject(new NexusRpcError(error.code, status, operation, error.details || error.message))
+        const trailer = error.metadata?.get('nexus-visibility-bin')[0]
+        const visibility = error.code === grpc.status.UNAVAILABLE && Buffer.isBuffer(trailer)
+          ? visibilityFrom(parseJson(trailer)) : undefined
+        reject(new NexusRpcError(error.code, status, operation, error.details || error.message, visibility))
         return
       }
       resolve(response)
@@ -571,7 +605,10 @@ function toGrpcTarget(endpoint: string): string {
 /** An in-band VFS error: the RPC succeeded, the operation did not. */
 function vfsError(payload: Buffer | undefined, operation: string): Error {
   const detail = payload?.length ? payload.toString('utf8') : `gRPC ${operation} failed`
-  return new Error(detail)
+  const envelope = parseJson(payload)
+  const visibility = envelope && typeof envelope === 'object' && 'data' in envelope
+    ? visibilityFrom(envelope.data) : undefined
+  return new NexusVfsError(detail, visibility)
 }
 
 function conditionalCallError(error: unknown, isWrite: boolean): NexusConditionalContentError {
