@@ -1341,7 +1341,6 @@ impl ZoneApiService for ZoneApiServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
-        let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
 
         tracing::debug!(
             "Received query request: zone={}, read_from_leader={}",
@@ -1350,6 +1349,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
         );
 
         if req.read_from_leader && !node.is_leader() {
+            let peers = self.registry.get_peers(&req.zone_id).unwrap_or_default();
             let leader_addr = node
                 .leader_id()
                 .and_then(|id| peers.get(&id))
@@ -1374,112 +1374,114 @@ impl ZoneApiService for ZoneApiServiceImpl {
             }
         };
 
-        let query_result = match proto_query.query {
-            Some(ProtoQueryVariant::GetMetadata(gm)) => {
-                node.with_state_machine(|sm| match sm.get_metadata(&gm.path) {
-                    Ok(Some(data)) => {
-                        let metadata =
-                            super::proto::nexus::core::FileMetadata::decode(data.as_slice()).ok();
-                        RaftQueryResponse {
-                            success: true,
-                            error: None,
-                            result: Some(ProtoQueryResultVariant::GetMetadataResult(
-                                GetMetadataResult { metadata },
-                            )),
-                        }
-                    }
-                    Ok(None) => RaftQueryResponse {
+        let evaluate = |sm: &FullStateMachine| match proto_query.query {
+            Some(ProtoQueryVariant::GetMetadata(gm)) => match sm.get_metadata(&gm.path) {
+                Ok(Some(data)) => {
+                    let metadata =
+                        super::proto::nexus::core::FileMetadata::decode(data.as_slice()).ok();
+                    RaftQueryResponse {
                         success: true,
                         error: None,
                         result: Some(ProtoQueryResultVariant::GetMetadataResult(
-                            GetMetadataResult { metadata: None },
+                            GetMetadataResult { metadata },
                         )),
-                    },
-                    Err(e) => RaftQueryResponse {
-                        success: false,
-                        error: Some(format!("Query failed: {}", e)),
-                        result: None,
-                    },
-                })
-                .await
-            }
-            Some(ProtoQueryVariant::ListMetadata(lm)) => {
-                node.with_state_machine(|sm| match sm.list_metadata(&lm.prefix) {
-                    Ok(items) => {
-                        let proto_items: Vec<_> = items
-                            .into_iter()
-                            .filter_map(|(_, data)| {
-                                super::proto::nexus::core::FileMetadata::decode(data.as_slice())
-                                    .ok()
-                            })
-                            .take(if lm.limit > 0 {
-                                lm.limit as usize
-                            } else {
-                                usize::MAX
-                            })
-                            .collect();
-                        RaftQueryResponse {
-                            success: true,
-                            error: None,
-                            result: Some(ProtoQueryResultVariant::ListMetadataResult(
-                                ListMetadataResult {
-                                    items: proto_items,
-                                    next_cursor: None,
-                                    has_more: false,
-                                },
-                            )),
-                        }
                     }
-                    Err(e) => RaftQueryResponse {
-                        success: false,
-                        error: Some(format!("List failed: {}", e)),
-                        result: None,
-                    },
-                })
-                .await
-            }
-            Some(ProtoQueryVariant::GetLockInfo(gli)) => {
-                node.with_state_machine(|sm| match sm.get_lock(&gli.lock_id) {
-                    Ok(Some(lock_info)) => {
-                        let first_holder = lock_info.holders.first();
-                        RaftQueryResponse {
-                            success: true,
-                            error: None,
-                            result: Some(ProtoQueryResultVariant::LockInfoResult(LockInfoResult {
-                                exists: true,
-                                holder_id: first_holder.map(|h| h.holder_info.clone()),
-                                expires_at_ms: first_holder
-                                    .map(|h| (h.expires_at * 1000) as i64)
-                                    .unwrap_or(0),
-                                max_holders: lock_info.max_holders as i32,
-                                current_holders: lock_info.holders.len() as i32,
-                            })),
-                        }
+                }
+                Ok(None) => RaftQueryResponse {
+                    success: true,
+                    error: None,
+                    result: Some(ProtoQueryResultVariant::GetMetadataResult(
+                        GetMetadataResult { metadata: None },
+                    )),
+                },
+                Err(e) => RaftQueryResponse {
+                    success: false,
+                    error: Some(format!("Query failed: {}", e)),
+                    result: None,
+                },
+            },
+            Some(ProtoQueryVariant::ListMetadata(lm)) => match sm.list_metadata(&lm.prefix) {
+                Ok(items) => {
+                    let proto_items: Vec<_> = items
+                        .into_iter()
+                        .filter_map(|(_, data)| {
+                            super::proto::nexus::core::FileMetadata::decode(data.as_slice()).ok()
+                        })
+                        .take(if lm.limit > 0 {
+                            lm.limit as usize
+                        } else {
+                            usize::MAX
+                        })
+                        .collect();
+                    RaftQueryResponse {
+                        success: true,
+                        error: None,
+                        result: Some(ProtoQueryResultVariant::ListMetadataResult(
+                            ListMetadataResult {
+                                items: proto_items,
+                                next_cursor: None,
+                                has_more: false,
+                            },
+                        )),
                     }
-                    Ok(None) => RaftQueryResponse {
+                }
+                Err(e) => RaftQueryResponse {
+                    success: false,
+                    error: Some(format!("List failed: {}", e)),
+                    result: None,
+                },
+            },
+            Some(ProtoQueryVariant::GetLockInfo(gli)) => match sm.get_lock(&gli.lock_id) {
+                Ok(Some(lock_info)) => {
+                    let first_holder = lock_info.holders.first();
+                    RaftQueryResponse {
                         success: true,
                         error: None,
                         result: Some(ProtoQueryResultVariant::LockInfoResult(LockInfoResult {
-                            exists: false,
-                            holder_id: None,
-                            expires_at_ms: 0,
-                            max_holders: 0,
-                            current_holders: 0,
+                            exists: true,
+                            holder_id: first_holder.map(|h| h.holder_info.clone()),
+                            expires_at_ms: first_holder
+                                .map(|h| (h.expires_at * 1000) as i64)
+                                .unwrap_or(0),
+                            max_holders: lock_info.max_holders as i32,
+                            current_holders: lock_info.holders.len() as i32,
                         })),
-                    },
-                    Err(e) => RaftQueryResponse {
-                        success: false,
-                        error: Some(format!("Lock query failed: {}", e)),
-                        result: None,
-                    },
-                })
-                .await
-            }
+                    }
+                }
+                Ok(None) => RaftQueryResponse {
+                    success: true,
+                    error: None,
+                    result: Some(ProtoQueryResultVariant::LockInfoResult(LockInfoResult {
+                        exists: false,
+                        holder_id: None,
+                        expires_at_ms: 0,
+                        max_holders: 0,
+                        current_holders: 0,
+                    })),
+                },
+                Err(e) => RaftQueryResponse {
+                    success: false,
+                    error: Some(format!("Lock query failed: {}", e)),
+                    result: None,
+                },
+            },
             None => RaftQueryResponse {
                 success: false,
                 error: Some("Unknown query type".to_string()),
                 result: None,
             },
+        };
+
+        let query_result = if req.read_from_leader {
+            tokio::time::timeout(
+                crate::raft::REPLICA_READ_BUDGET,
+                node.read_linearizable(evaluate),
+            )
+            .await
+            .map_err(|_| Status::unavailable("zone query read barrier timed out"))?
+            .map_err(|error| Status::unavailable(error.to_string()))?
+        } else {
+            node.with_state_machine(evaluate).await
         };
 
         let error = query_result.error.clone();
