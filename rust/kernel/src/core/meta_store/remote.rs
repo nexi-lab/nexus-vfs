@@ -85,6 +85,9 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(None);
+            }
             return Err(MetaStoreError::IOError(format!(
                 "remote sys_stat failed for {path}"
             )));
@@ -207,6 +210,9 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(false);
+            }
             return Err(MetaStoreError::IOError(format!(
                 "remote access failed for {path}"
             )));
@@ -233,6 +239,9 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(false);
+            }
             return Err(MetaStoreError::IOError(format!(
                 "remote directory lookup failed for {path}"
             )));

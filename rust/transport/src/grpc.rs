@@ -2020,7 +2020,7 @@ pub enum RpcErrorCode {
     InvalidPath = -32004,
     PermissionError = -32003,
     AccessDenied = -32018,
-    FileNotFound = -32007,
+    FileNotFound = contracts::constants::RPC_FILE_NOT_FOUND as isize,
     ValidationError = -32005,
     Conflict = -32006,
     /// Stream read below the retention floor (Kafka OffsetOutOfRange): the
@@ -2502,7 +2502,10 @@ pub(crate) mod tests {
                     let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
                     match self.blobs.lock().unwrap().get(path) {
                         Some(b) => Self::ok(serde_json::json!({"result": {"size": b.len()}})),
-                        None => Self::call_err(&format!("sys_stat({path}): not found")),
+                        None => Ok(Response::new(CallResponse {
+                            payload: encode_rpc_error(RpcErrorCode::FileNotFound, "file not found"),
+                            is_error: true,
+                        })),
                     }
                 }
                 "sys_rename" => {

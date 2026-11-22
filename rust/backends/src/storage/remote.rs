@@ -245,7 +245,12 @@ impl ObjectStore for RemoteBackend {
             .call("sys_stat", &bytes)
             .map_err(|e| StorageError::IOError(std::io::Error::other(e)))?;
         if is_error {
-            return Err(StorageError::NotFound(content_id.to_string()));
+            if kernel::rpc_transport::is_file_not_found(&resp) {
+                return Err(StorageError::NotFound(content_id.to_string()));
+            }
+            return Err(StorageError::IOError(std::io::Error::other(format!(
+                "remote Stat failed for {path}"
+            ))));
         }
         let value: serde_json::Value = serde_json::from_slice(&resp)
             .map_err(|e| StorageError::IOError(std::io::Error::other(e.to_string())))?;

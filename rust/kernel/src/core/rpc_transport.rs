@@ -26,6 +26,16 @@ pub struct TlsConfig {
     pub key_pem: Option<Vec<u8>>,
 }
 
+/// Decode the explicit file-not-found response of the generic Call protocol.
+pub fn is_file_not_found(payload: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct RpcError {
+        code: i32,
+    }
+    serde_json::from_slice::<RpcError>(payload)
+        .is_ok_and(|error| error.code == contracts::constants::RPC_FILE_NOT_FOUND)
+}
+
 /// Tonic gRPC transport — single channel to a remote Nexus server.
 ///
 /// Holds a shared tokio runtime and a pre-connected tonic Channel.
