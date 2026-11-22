@@ -1646,6 +1646,17 @@ impl FullStateMachine {
             .collect()
     }
 
+    /// Whether the metadata range for the directory contains at least one child.
+    pub(crate) fn has_metadata_children(&self, path: &str) -> Result<bool> {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut found = false;
+        self.metadata.for_each_prefix(prefix.as_bytes(), |_, _| {
+            found = true;
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     /// List all metadata with prefix.
     pub fn list_metadata(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut result = Vec::new();

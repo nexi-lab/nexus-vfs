@@ -28,8 +28,8 @@ pub use crate::extensions::record_protection::{RecordProtection, RecordProtectio
 
 pub use crate::abc::meta_store::{
     pas_update_content_id, FileMetadata, MetaStore, MetaStoreError, PaginatedList, PathEtag,
-    PathValueStr, PutIfVersionResult, StreamSegment, DT_DIR, DT_EXTERNAL_STORAGE, DT_LINK,
-    DT_MOUNT, DT_PIPE, DT_REG, DT_STREAM,
+    PathValueStr, PutIfVersionResult, StatLookup, StreamSegment, DT_DIR, DT_EXTERNAL_STORAGE,
+    DT_LINK, DT_MOUNT, DT_PIPE, DT_REG, DT_STREAM,
 };
 
 use dashmap::DashMap;
@@ -550,6 +550,25 @@ impl MetaStore for LocalMetaStore {
             }
         }
         Ok(results)
+    }
+
+    fn is_implicit_directory(&self, path: &str) -> Result<bool, MetaStoreError> {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaStoreError::IOError(e.to_string()))?;
+        let table = read
+            .open_table(METADATA_TABLE)
+            .map_err(|e| MetaStoreError::IOError(e.to_string()))?;
+        let mut range = table
+            .range(prefix.as_str()..)
+            .map_err(|e| MetaStoreError::IOError(e.to_string()))?;
+        let first = range
+            .next()
+            .transpose()
+            .map_err(|e| MetaStoreError::IOError(e.to_string()))?;
+        Ok(first.is_some_and(|(key, _)| key.value().starts_with(&prefix)))
     }
 
     fn exists(&self, path: &str) -> Result<bool, MetaStoreError> {

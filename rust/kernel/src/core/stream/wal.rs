@@ -395,6 +395,7 @@ impl WalStreamCore {
         self.store
             .append_stream_entry(&self.prefix, data)
             .map_err(|e| match e {
+                MetaStoreError::Unavailable(why) => MetaStoreError::Unavailable(at(why)),
                 MetaStoreError::OutcomeUnknown(why) => MetaStoreError::OutcomeUnknown(at(why)),
                 MetaStoreError::IOError(why) => MetaStoreError::IOError(at(why)),
                 other @ MetaStoreError::NotFound(_) => {
@@ -798,7 +799,9 @@ impl StreamBackend for WalStreamCore {
                 // `StreamError::OutcomeUnknown`.
                 Err(match e {
                     MetaStoreError::OutcomeUnknown(why) => StreamError::OutcomeUnknown(why),
-                    MetaStoreError::IOError(why) => StreamError::NotReplicated(why),
+                    MetaStoreError::IOError(why) | MetaStoreError::Unavailable(why) => {
+                        StreamError::NotReplicated(why)
+                    }
                     other @ MetaStoreError::NotFound(_) => {
                         StreamError::NotReplicated(other.to_string())
                     }

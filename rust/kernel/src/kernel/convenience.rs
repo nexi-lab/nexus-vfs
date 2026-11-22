@@ -9,8 +9,6 @@
 //! overhead matters.
 
 use std::any::Any;
-use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::syscall::KernelSyscall;
@@ -20,7 +18,6 @@ use super::{
 };
 use crate::abc::object_store::ObjectStore;
 use crate::meta_store::{MetaStore, DT_EXTERNAL_STORAGE, DT_MOUNT, DT_REG};
-use crate::vfs_router::RouteResult;
 use crate::ROOT_ZONE_ID;
 use lib::search::{build_search_mode, grep::GrepMatch, search_lines};
 
@@ -515,49 +512,12 @@ impl KernelConvenience for Kernel {
     }
 
     fn stat_batch(&self, paths: &[String], zone_id: &str) -> Vec<Option<StatResult>> {
-        // A mount's metastore accepts only paths routed to that mount. Keep
-        // one vectored read per mount and restore the caller's original order.
-        let mut groups = BTreeMap::<String, Vec<(usize, Option<RouteResult>)>>::new();
-        for (index, path) in paths.iter().enumerate() {
-            let route = self.vfs_router.route(path, zone_id);
-            let mount_point = route
-                .as_ref()
-                .map(|route| route.mount_point.clone())
-                .unwrap_or_default();
-            groups.entry(mount_point).or_default().push((index, route));
-        }
-        let mut results: Vec<_> = (0..paths.len()).map(|_| None).collect();
-        for (mount_point, indices) in groups {
-            let group_paths: Cow<'_, [String]> = if indices.len() == paths.len() {
-                Cow::Borrowed(paths)
-            } else {
-                Cow::Owned(
-                    indices
-                        .iter()
-                        .map(|(index, _)| paths[*index].clone())
-                        .collect(),
-                )
-            };
-            match self.with_metastore(&mount_point, |ms| ms.get_batch(&group_paths)) {
-                Some(Ok(metas)) if metas.len() == indices.len() => {
-                    for ((index, route), metadata) in indices.into_iter().zip(metas) {
-                        results[index] = match (metadata, route) {
-                            (Some(metadata), Some(route)) => {
-                                self.stat_from_metadata(&paths[index], zone_id, route, metadata)
-                            }
-                            (Some(metadata), None) => Some(StatResult::from(metadata)),
-                            (None, _) => self.sys_stat(&paths[index], zone_id),
-                        };
-                    }
-                }
-                _ => {
-                    for (index, _) in indices {
-                        results[index] = self.sys_stat(&paths[index], zone_id);
-                    }
-                }
-            }
-        }
-        results
+        self.try_stat_batch(paths, zone_id).unwrap_or_else(|_| {
+            paths
+                .iter()
+                .map(|path| self.sys_stat(path, zone_id))
+                .collect()
+        })
     }
 
     fn set_xattr(

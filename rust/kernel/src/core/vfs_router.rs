@@ -278,20 +278,18 @@ impl RouteResult {
     // existing `via_federation_read` arm.  No syscall site needs to
     // dispatch a write to a peer anymore.
 
-    /// Pure-defer stat: peer's `NexusVFSService.Stat` is authoritative
-    /// for the placeholder mount.  Returns `Some(BackendStat)` on hit,
-    /// `None` for non-federation routes or no-peer-hit (the latter is
-    /// indistinguishable from "real not found" — same legacy semantics).
-    #[inline]
+    /// Ask the backing peer when this route has no local backend.
     pub fn via_federation_stat(
         &self,
         kernel: &crate::kernel::Kernel,
         peer_path: &str,
-    ) -> Option<crate::abc::object_store::BackendStat> {
-        let target_zone = self.federation_target_zone()?;
+    ) -> Result<Option<crate::abc::object_store::BackendStat>, crate::kernel::KernelError> {
+        let Some(target) = self.federation_target_zone() else {
+            return Ok(None);
+        };
         kernel
             .distributed_coordinator()
-            .peer_stat(kernel, target_zone, peer_path)
+            .peer_stat(kernel, target, peer_path)
     }
 
     /// Pure-defer readdir: peer's `NexusVFSService.Readdir` enumerates
@@ -1592,12 +1590,12 @@ mod tests {
             _kernel: &crate::kernel::Kernel,
             target_zone: &str,
             peer_path: &str,
-        ) -> Option<BackendStat> {
+        ) -> Result<Option<BackendStat>, crate::kernel::KernelError> {
             self.record(format!("peer_stat(target={target_zone}, path={peer_path})"));
-            Some(BackendStat {
+            Ok(Some(BackendStat {
                 size: 42,
                 is_dir: false,
-            })
+            }))
         }
         fn peer_list_dir(
             &self,
@@ -1710,6 +1708,7 @@ mod tests {
         let fake = install_recording_coordinator(&kernel);
         assert!(route_non_federation()
             .via_federation_stat(&kernel, "/x")
+            .unwrap()
             .is_none());
         assert!(
             fake.calls().is_empty(),
@@ -1724,6 +1723,7 @@ mod tests {
         let fake = install_recording_coordinator(&kernel);
         let stat = route_federation_peer()
             .via_federation_stat(&kernel, "/x")
+            .unwrap()
             .expect("peer dispatch should surface the coordinator hit");
         assert_eq!(stat.size, 42);
         assert_eq!(fake.calls(), vec!["peer_stat(target=sharedzone, path=/x)"]);

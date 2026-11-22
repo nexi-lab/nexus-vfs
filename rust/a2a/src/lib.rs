@@ -140,7 +140,8 @@ pub fn ensure_conversation<K: KernelSyscall>(
     // the stream and the links leave a transcript with no index, and this
     // early return would then skip repairing it forever.
     if kernel
-        .sys_stat(&transcript, contracts::ROOT_ZONE_ID)
+        .try_stat(&transcript, contracts::ROOT_ZONE_ID)
+        .map_err(|error| error.to_string())?
         .is_some()
     {
         return Ok(());
@@ -268,7 +269,10 @@ fn index_conversation<K: KernelSyscall>(
     // them is not possible — so a pre-existing entry is treated as already indexed
     // rather than as a failure. `conversation_root_of` reads both shapes, which is
     // what keeps those conversations discoverable instead of stranding them.
-    if let Some(existing) = kernel.sys_stat(alias, &ctx.zone_id) {
+    if let Some(existing) = kernel
+        .try_stat(alias, &ctx.zone_id)
+        .map_err(|error| error.to_string())?
+    {
         if existing.entry_type == DT_LINK || existing.entry_type == DT_REG {
             return Ok(());
         }

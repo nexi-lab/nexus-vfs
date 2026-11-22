@@ -146,6 +146,13 @@ pub trait KernelSyscall: Send + Sync + 'static {
     ) -> Result<SysSetAttrResult, KernelError>;
 
     fn sys_stat(&self, path: &str, zone_id: &str) -> Option<StatResult>;
+    /// A namespace observation that preserves failure. Implementations that cannot
+    /// verify absence refuse operations that depend on it.
+    fn try_stat(&self, path: &str, zone_id: &str) -> Result<Option<StatResult>, KernelError> {
+        self.sys_stat(path, zone_id)
+            .map(Some)
+            .ok_or_else(|| KernelError::IOError("kernel could not confirm Stat absence".into()))
+    }
 
     fn sys_rename(
         &self,
@@ -302,6 +309,10 @@ impl KernelSyscall for crate::kernel::Kernel {
             source,
             remote_metastore,
         )
+    }
+
+    fn try_stat(&self, path: &str, zone_id: &str) -> Result<Option<StatResult>, KernelError> {
+        Self::try_stat(self, path, zone_id)
     }
 
     fn sys_stat(&self, path: &str, zone_id: &str) -> Option<StatResult> {

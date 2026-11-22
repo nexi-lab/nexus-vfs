@@ -108,6 +108,7 @@ mod mount;
 mod observability;
 mod peer_content;
 mod plugins;
+mod stat;
 pub mod syscall;
 pub mod syscall_async;
 mod syscall_impl;
@@ -178,6 +179,7 @@ impl KernelError {
         message: String,
     ) -> Self {
         match error {
+            crate::meta_store::MetaStoreError::Unavailable(_) => Self::WouldBlock(message),
             crate::meta_store::MetaStoreError::OutcomeUnknown(_) => Self::OutcomeUnknown(message),
             _ => Self::IOError(message),
         }

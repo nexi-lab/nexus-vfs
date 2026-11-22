@@ -108,9 +108,18 @@ pub struct FileMetadata {
     pub owner_id: Option<String>,
 }
 
+/// Namespace observation after a point lookup missed in the local projection.
+pub enum StatLookup {
+    Entry(Box<FileMetadata>),
+    Directory,
+    Missing,
+}
+
 /// Error type for `MetaStore` operations.
 #[derive(Debug)]
 pub enum MetaStoreError {
+    /// The authority could not provide a current read.
+    Unavailable(String),
     /// Key not found.
     NotFound(String),
     /// Underlying I/O or storage error. For a replicated write it is an outcome
@@ -137,6 +146,7 @@ pub enum MetaStoreError {
 impl std::fmt::Display for MetaStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unavailable(message) => f.write_str(message),
             Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
             Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),
             Self::OutcomeUnknown(msg) => {
@@ -252,6 +262,21 @@ pub trait MetaStore: Send + Sync {
             results.push(self.get(path)?);
         }
         Ok(results)
+    }
+
+    /// Resolve local misses before reporting absence, in input order. A replicated
+    /// store confirms them against one applied, quorum-ordered view.
+    fn resolve_stat_misses(&self, paths: &[&str]) -> Result<Vec<StatLookup>, MetaStoreError> {
+        paths
+            .iter()
+            .map(|path| {
+                Ok(if self.is_implicit_directory(path)? {
+                    StatLookup::Directory
+                } else {
+                    StatLookup::Missing
+                })
+            })
+            .collect()
     }
 
     /// Batch delete: remove metadata for multiple paths.

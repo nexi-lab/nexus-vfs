@@ -116,7 +116,7 @@ impl Kernel {
             self.check_permission_with_route(path, route, permission, ctx)
         })?;
         let entry_type = self
-            .sys_stat(&resolved.path, &ctx.zone_id)
+            .try_stat(&resolved.path, &ctx.zone_id)?
             .map(|stat| stat.entry_type);
         Ok(IoTarget {
             path: resolved.path,

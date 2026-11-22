@@ -277,8 +277,8 @@ unsafe extern "C" fn kernel_cb_sys_stat(
         Ok(s) => s,
         Err(_) => return -2,
     };
-    match kernel.sys_stat(path, contracts::ROOT_ZONE_ID) {
-        Some(result) => {
+    match kernel.try_stat(path, contracts::ROOT_ZONE_ID) {
+        Ok(Some(result)) => {
             #[derive(serde::Serialize)]
             struct Reply<'a> {
                 path: &'a str,
@@ -301,7 +301,8 @@ unsafe extern "C" fn kernel_cb_sys_stat(
             yield_host_buf(json, out_json, out_len);
             0
         }
-        None => -1, // NotFound
+        Ok(None) => -1, // NotFound
+        Err(_) => -3,
     }
 }
 
@@ -486,8 +487,9 @@ unsafe extern "C" fn kernel_cb_sys_stat_batch(
     // shape `["/foo","/bar"]` (or with the `"` and `\` escapes the
     // callback's matching output side handles) is accepted.
     let paths = parse_stat_batch_input(paths_json);
-    use crate::kernel::convenience::KernelConvenience;
-    let results = kernel.stat_batch(&paths, contracts::ROOT_ZONE_ID);
+    let Ok(results) = kernel.try_stat_batch(&paths, contracts::ROOT_ZONE_ID) else {
+        return -3;
+    };
     // Hand-roll the response JSON.  Output shape per kernel-side
     // entry:
     //   * `Some(StatResult)` → `[<size>, <entry_type>]`

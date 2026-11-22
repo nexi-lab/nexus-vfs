@@ -11,6 +11,8 @@
 //! | `BatchRead`                      | Pure Rust → `Kernel::sys_read` (batch)   |
 //! | `Call`                           | Kernel-native service dispatcher         |
 
+pub(crate) const PEER_STAT: &str = "x-nexus-peer-stat";
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -883,6 +885,7 @@ impl NexusVfsService for VfsServiceImpl {
     }
 
     async fn stat(&self, req: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        let peer_probe = req.metadata().contains_key(PEER_STAT);
         let (mut ctx, req) = match self.authenticate(req).await {
             Ok(v) => v,
             Err(s) => return Ok(Response::new(error_stat(s))),
@@ -893,9 +896,28 @@ impl NexusVfsService for VfsServiceImpl {
         if let Err(status) = self.authorize_path(&req.path, Permission::Read, &ctx) {
             return Ok(Response::new(error_stat(status)));
         }
-        // `sys_stat` returns `Option` — `None` is "no such path", a
-        // normal result surfaced as `found = false` (not an error).
-        let stat = self.kernel.sys_stat(&req.path, &ctx.zone_id);
+        let observation = if peer_probe {
+            if ctx.subject_type != "node" && !ctx.is_system {
+                return Err(Status::permission_denied(
+                    "peer Stat requires a node identity",
+                ));
+            }
+            self.kernel.stat_for_peer(&req.path, &ctx.zone_id)
+        } else {
+            self.kernel.try_stat(&req.path, &ctx.zone_id)
+        };
+        let stat = match observation {
+            Ok(stat) => stat,
+            Err(KernelError::WouldBlock(message)) => return Err(Status::unavailable(message)),
+            Err(error) => {
+                let (code, message) = self.map_kernel_err(error);
+                return Ok(Response::new(StatResponse {
+                    is_error: true,
+                    error_payload: encode_rpc_error(code, &message),
+                    ..Default::default()
+                }));
+            }
+        };
         match stat {
             Some(s) => Ok(Response::new(StatResponse {
                 found: true,
@@ -1707,10 +1729,10 @@ impl NexusVfsService for VfsServiceImpl {
             self.authorize_path(path, Permission::Read, &ctx)?;
         }
 
-        // KernelConvenience::stat_batch picks the optimized path on
-        // Kernel — single redb read txn via `with_metastore::get_batch`,
-        // falling back to per-path sys_stat for implicit dirs / synthetic views.
-        let results = KernelConvenience::stat_batch(&*self.kernel, &req.paths, &ctx.zone_id);
+        let results = self
+            .kernel
+            .try_stat_batch(&req.paths, &ctx.zone_id)
+            .map_err(stat_status)?;
         let mapped: Vec<BatchStatItem> = results
             .into_iter()
             .map(|opt| match opt {
@@ -1982,6 +2004,15 @@ fn vfs_routes<T: NexusVfsService>(svc: T, max_message_bytes: usize) -> tonic::se
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+pub(crate) fn stat_status(error: KernelError) -> Status {
+    match error {
+        KernelError::WouldBlock(msg) => Status::unavailable(msg),
+        KernelError::PermissionDenied(msg) => Status::permission_denied(msg),
+        KernelError::InvalidPath(msg) => Status::invalid_argument(msg),
+        other => Status::internal(other.to_string()),
+    }
+}
 
 /// Wire error codes returned in typed VFS RPC error payloads.
 #[derive(Copy, Clone)]

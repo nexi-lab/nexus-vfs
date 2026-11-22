@@ -348,8 +348,10 @@ pub trait DistributedCoordinator: Send + Sync + 'static {
         kernel: &crate::kernel::Kernel,
         target_zone: &str,
         peer_path: &str,
-    ) -> Option<BackendStat> {
-        None
+    ) -> Result<Option<BackendStat>, crate::kernel::KernelError> {
+        Err(crate::kernel::KernelError::Federation(
+            "peer Stat is unavailable".into(),
+        ))
     }
 
     /// Enumerate children on the SSOT peer.  Pure-defer pattern.

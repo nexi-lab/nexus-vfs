@@ -76,6 +76,8 @@ pub use state_machine::{
 
 pub use membership_policy::MembershipPolicy;
 #[cfg(feature = "consensus")]
+pub(crate) use node::REPLICA_READ_BUDGET;
+#[cfg(feature = "consensus")]
 pub use node::{
     LeaderCommit, PeerReplication, RaftConfig, RaftMessageProtocol, RaftMsg, ReplicationState,
     ReplicationStatus, StorageActivationView, StorageSubmission, ZoneConsensus,
