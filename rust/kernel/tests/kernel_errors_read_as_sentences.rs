@@ -37,6 +37,13 @@ fn one_of_each() -> Vec<KernelError> {
         KernelError::StreamExists("/streams/s".into()),
         KernelError::StreamNotFound("/streams/s".into()),
         KernelError::StreamTruncated(64, 12),
+        KernelError::MetadataVisibility(kernel::meta_store::VisibilityError {
+            reason: kernel::meta_store::MetadataVisibility::ReplicaBehind {
+                required: 9,
+                applied: 7,
+            },
+            message: "replica has applied through 7".into(),
+        }),
         KernelError::WouldBlock("/streams/s".into()),
         KernelError::PermissionDenied("zone b not in token".into()),
         KernelError::BackendError("s3: read-only bucket".into()),

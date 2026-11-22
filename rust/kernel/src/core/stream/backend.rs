@@ -6,6 +6,7 @@
 
 #[derive(Debug)]
 pub enum StreamError {
+    MetadataVisibility(crate::meta_store::VisibilityError),
     Closed(&'static str),
     Full(usize, usize),
     Empty,

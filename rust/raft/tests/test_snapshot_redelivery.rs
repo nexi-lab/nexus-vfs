@@ -176,7 +176,7 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     let view = ZoneMetaStore::new_arc(learner.clone(), runtime.clone(), "/shared".into());
     fs.mount(
         "/shared",
-        MountOptions::new(&ctx, "memory").with_metastore(view),
+        MountOptions::new(&ctx, "memory").with_metastore(view.clone()),
     )
     .unwrap();
     let published = ZoneMetaStore::new(leader.clone(), runtime, "/shared".into());
@@ -235,26 +235,34 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     );
     assert_eq!(learner.applied_index(), behind);
 
-    let via_learner = "/written/through/the/learner";
+    use kernel::meta_store::{MetaStoreError, MetadataVisibility, VisibilityError};
+    let via_learner = "/shared/forwarded";
     let before = learner.replication();
-    let committed = match learner
-        .propose(Command::SetMetadata {
-            key: via_learner.into(),
-            value: b"v".to_vec(),
-        })
-        .await
-    {
-        Err(RaftError::CommittedNotVisible { index, applied, .. }) => {
-            let index = index.expect("a current leader reports the index it applied at");
-            assert!(applied < index, "lag reported: applied {applied} < {index}");
+    let receipt = view.put(
+        via_learner,
+        FileMetadata {
+            path: via_learner.into(),
+            size: 17,
+            ..Default::default()
+        },
+    );
+    let committed = match receipt {
+        Err(MetaStoreError::Visibility(VisibilityError {
+            reason:
+                MetadataVisibility::CommittedNotVisible {
+                    committed: Some(index),
+                    applied,
+                },
+            ..
+        })) => {
+            assert!(applied < index && index <= leader.commit_index());
             index
         }
-        other => panic!("a write the learner cannot see must say so, got {other:?}"),
+        other => {
+            panic!("a committed put must report the applied and covering indices, got {other:?}")
+        }
     };
-    assert!(
-        has(&leader, via_learner).await,
-        "the write committed on the leader"
-    );
+    assert_eq!(published.get(via_learner).unwrap().unwrap().size, 17);
     match learner.own_writes_visible().await {
         Err(RaftError::ReplicaBehind { required, applied }) => {
             assert!(required >= committed, "the floor covers the write");
@@ -275,7 +283,9 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     // This time the learner itself submitted a committed, unapplied write.
     assert!(matches!(
         fs.try_stat_batch(&[marker.into(), "/shared/missing".into()], "root"),
-        Err(KernelError::WouldBlock(_))
+        Err(KernelError::MetadataVisibility(VisibilityError {
+            reason: MetadataVisibility::ReplicaBehind { required, applied }, ..
+        })) if required >= committed && applied < committed
     ));
     let after_batch = learner.replication();
     assert_eq!(
@@ -338,7 +348,7 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         healed.committed_not_visible_total,
         refused.committed_not_visible_total
     );
-    assert!(has(&learner, via_learner).await);
+    assert_eq!(view.get(via_learner).unwrap().unwrap().size, 17);
     write(&leader, "/after").await;
     eventually("the leader sees the learner replicating again", || {
         learner_progress(&leader, learner_id).is_some_and(|peer| {

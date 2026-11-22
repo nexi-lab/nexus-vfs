@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as grpc from '@grpc/grpc-js'
+import { NexusRpcError, NexusVfsError } from '../dist/index.js'
 import { fixture } from './helpers/vfs-fixture.mjs'
 
 test('batch stat preserves the single-path metadata decoder, duplicates and missing positions', async () => {
@@ -78,5 +79,37 @@ test('directory deletion opts into the existing recursive RPC and preserves auth
     ])
     await assert.rejects(client.delete('/denied', 'owner-token', { recursive: true }), /PERMISSION_DENIED/)
     assert.equal(requests[2].auth_token, 'owner-token')
+  } finally { await close() }
+})
+
+test('metadata visibility survives both VFS error channels with lossless indices', async () => {
+  const read = { reason: 'ReplicaBehind', required_index: '18446744073709551615', applied_index: '9' }
+  const write = { reason: 'CommittedNotVisible', applied_index: '9' }
+  const { client, close } = await fixture({
+    stat(call, reply) {
+      const metadata = new grpc.Metadata()
+      if (call.request.path === '/lag') metadata.set('nexus-visibility-bin', Buffer.from(JSON.stringify(read)))
+      reply({ code: grpc.status.UNAVAILABLE, details: 'ReplicaBehind', metadata })
+    },
+    mkdir(call, reply) {
+      const data = call.request.path === '/commit' ? write : { ...write, applied_index: 9 }
+      reply(null, { is_error: true, error_payload: Buffer.from(JSON.stringify({ code: -32603, message: 'committed', data })) })
+    },
+  })
+  try {
+    await assert.rejects(client.stat('/lag', ''), e => {
+      assert.ok(e instanceof NexusRpcError)
+      assert.equal(e.code, grpc.status.UNAVAILABLE)
+      assert.deepEqual(e.visibility, read)
+      return true
+    })
+    await assert.rejects(client.mkdir('/commit', ''), e => {
+      assert.ok(e instanceof NexusVfsError)
+      assert.deepEqual(e.visibility, write)
+      return true
+    })
+    for (const call of [() => client.stat('/legacy', ''), () => client.mkdir('/malformed', '')]) {
+      await assert.rejects(call, e => e instanceof NexusVfsError && e.visibility === undefined)
+    }
   } finally { await close() }
 })

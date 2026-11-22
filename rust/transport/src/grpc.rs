@@ -403,24 +403,6 @@ impl VfsServiceImpl {
         .await
     }
 
-    /// Pick the RPC code; take the message from the error itself.
-    ///
-    /// This used to do both, and the message half ended in
-    /// `other => format!("{:?}", other)` — so a variant with a hand-written arm
-    /// reached a client as a sentence while every other one arrived as
-    /// `IOError("Directory not empty: /ws/a")`, Rust's internal vocabulary in a
-    /// protocol message (#350). Adding an arm per variant would have fixed the shape
-    /// by writing the kernel's messages a second time, here, where they would drift
-    /// from the ones the kernel logs.
-    ///
-    /// So `KernelError` owns its message (`Display`) and this decides only the code.
-    /// A variant nobody has classified yet still lands under `InternalError`, but it
-    /// can no longer arrive as a Debug dump — which is the part a client could not
-    /// parse and an operator could not read.
-    pub(crate) fn map_kernel_err(&self, err: KernelError) -> (RpcErrorCode, String) {
-        (kernel_err_code(&err), err.to_string())
-    }
-
     /// Construct the requested backend through the registered provider, then
     /// install it through the kernel. Provider capabilities follow the binary's
     /// compiled drivers; an unavailable driver cannot acknowledge a mount.
@@ -557,16 +539,13 @@ impl VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             },
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                SetattrResponse {
-                    path: String::new(),
-                    created: false,
-                    entry_type: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }
-            }
+            Err(err) => SetattrResponse {
+                path: String::new(),
+                created: false,
+                entry_type: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            },
         }
     }
 
@@ -613,16 +592,13 @@ impl VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             },
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                SetattrResponse {
-                    path: String::new(),
-                    created: false,
-                    entry_type: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }
-            }
+            Err(err) => SetattrResponse {
+                path: String::new(),
+                created: false,
+                entry_type: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            },
         }
     }
 
@@ -712,13 +688,10 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             },
-            Err(error) => {
-                let (code, message) = self.map_kernel_err(error);
-                ChmodResponse {
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &message),
-                }
-            }
+            Err(error) => ChmodResponse {
+                is_error: true,
+                error_payload: encode_kernel_error(&error),
+            },
         }))
     }
 
@@ -759,20 +732,17 @@ impl NexusVfsService for VfsServiceImpl {
                     post_hook_needed: result.post_hook_needed,
                 }))
             }
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(ReadResponse {
-                    content: Vec::new(),
-                    content_id: String::new(),
-                    size: 0,
-                    gen: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                    entry_type: 0,
-                    stream_next_offset: None,
-                    post_hook_needed: false,
-                }))
-            }
+            Err(err) => Ok(Response::new(ReadResponse {
+                content: Vec::new(),
+                content_id: String::new(),
+                size: 0,
+                gen: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+                entry_type: 0,
+                stream_next_offset: None,
+                post_hook_needed: false,
+            })),
         }
     }
 
@@ -798,16 +768,13 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(WriteResponse {
-                    content_id: String::new(),
-                    size: 0,
-                    gen: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(WriteResponse {
+                content_id: String::new(),
+                size: 0,
+                gen: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -844,7 +811,6 @@ impl NexusVfsService for VfsServiceImpl {
                 size: result.size,
             })),
             Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
                 Ok(Response::new(DeleteResponse {
                     // Definite non-success on kernel error: emit
                     // `Some(false)` so the wire tells the client
@@ -852,7 +818,7 @@ impl NexusVfsService for VfsServiceImpl {
                     // — distinct from "field never populated".
                     success: Some(false),
                     is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
+                    error_payload: encode_kernel_error(&err),
                     entry_type: 0,
                     path: String::new(),
                     content_id: String::new(),
@@ -873,14 +839,11 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(MkdirResponse {
-                    hit: false,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(MkdirResponse {
+                hit: false,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -908,12 +871,13 @@ impl NexusVfsService for VfsServiceImpl {
         };
         let stat = match observation {
             Ok(stat) => stat,
-            Err(KernelError::WouldBlock(message)) => return Err(Status::unavailable(message)),
+            Err(error @ (KernelError::WouldBlock(_) | KernelError::MetadataVisibility(_))) => {
+                return Err(stat_status(error))
+            }
             Err(error) => {
-                let (code, message) = self.map_kernel_err(error);
                 return Ok(Response::new(StatResponse {
                     is_error: true,
-                    error_payload: encode_rpc_error(code, &message),
+                    error_payload: encode_kernel_error(&error),
                     ..Default::default()
                 }));
             }
@@ -972,14 +936,11 @@ impl NexusVfsService for VfsServiceImpl {
                     entry_type: target.entry_type.map(i32::from),
                     ..Default::default()
                 },
-                Err(error) => {
-                    let (code, message) = self.map_kernel_err(error);
-                    InspectTargetResponse {
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &message),
-                        ..Default::default()
-                    }
-                }
+                Err(error) => InspectTargetResponse {
+                    is_error: true,
+                    error_payload: encode_kernel_error(&error),
+                    ..Default::default()
+                },
             },
         ))
     }
@@ -1039,11 +1000,10 @@ impl NexusVfsService for VfsServiceImpl {
             {
                 Ok(e) => e,
                 Err(err) => {
-                    let (code, msg) = self.map_kernel_err(err);
                     return Ok(Response::new(ReaddirResponse {
                         entries: Vec::new(),
                         is_error: true,
-                        error_payload: encode_rpc_error(code, &msg),
+                        error_payload: encode_kernel_error(&err),
                     }));
                 }
             }
@@ -1117,20 +1077,17 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(RenameResponse {
-                    hit: false,
-                    success: false,
-                    is_directory: false,
-                    old_content_id: None,
-                    old_size: None,
-                    old_version: None,
-                    old_modified_at_ms: None,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(RenameResponse {
+                hit: false,
+                success: false,
+                is_directory: false,
+                old_content_id: None,
+                old_size: None,
+                old_version: None,
+                old_modified_at_ms: None,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1156,19 +1113,16 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(CopyResponse {
-                    hit: false,
-                    dst_path: String::new(),
-                    content_id: None,
-                    size: 0,
-                    version: 0,
-                    gen: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(CopyResponse {
+                hit: false,
+                dst_path: String::new(),
+                content_id: None,
+                size: 0,
+                version: 0,
+                gen: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1203,15 +1157,12 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(LockResponse {
-                    acquired: false,
-                    lock_id: String::new(),
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(LockResponse {
+                acquired: false,
+                lock_id: String::new(),
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1242,14 +1193,11 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(UnlockResponse {
-                    released: false,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(UnlockResponse {
+                released: false,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1320,15 +1268,12 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(GetXattrResponse {
-                    found: false,
-                    value: String::new(),
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(GetXattrResponse {
+                found: false,
+                value: String::new(),
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1354,13 +1299,10 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(SetXattrResponse {
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(SetXattrResponse {
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1390,14 +1332,11 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(GetXattrBulkResponse {
-                    items: Vec::new(),
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(GetXattrBulkResponse {
+                items: Vec::new(),
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1414,13 +1353,10 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(IpcAck {
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(IpcAck {
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1472,13 +1408,10 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(IpcAck {
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(IpcAck {
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1525,14 +1458,11 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(StreamWriteResponse {
-                    offset: 0,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(StreamWriteResponse {
+                offset: 0,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1593,17 +1523,14 @@ impl NexusVfsService for VfsServiceImpl {
                 error_payload: Vec::new(),
                 timed_out: true,
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(StreamReadAtResponse {
-                    data: Vec::new(),
-                    next_offset: 0,
-                    eof: false,
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                    timed_out: false,
-                }))
-            }
+            Err(err) => Ok(Response::new(StreamReadAtResponse {
+                data: Vec::new(),
+                next_offset: 0,
+                eof: false,
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+                timed_out: false,
+            })),
         }
     }
 
@@ -1623,14 +1550,11 @@ impl NexusVfsService for VfsServiceImpl {
                 is_error: false,
                 error_payload: Vec::new(),
             })),
-            Err(err) => {
-                let (code, msg) = self.map_kernel_err(err);
-                Ok(Response::new(StreamCollectAllResponse {
-                    data: Vec::new(),
-                    is_error: true,
-                    error_payload: encode_rpc_error(code, &msg),
-                }))
-            }
+            Err(err) => Ok(Response::new(StreamCollectAllResponse {
+                data: Vec::new(),
+                is_error: true,
+                error_payload: encode_kernel_error(&err),
+            })),
         }
     }
 
@@ -1696,16 +1620,13 @@ impl NexusVfsService for VfsServiceImpl {
                     content_id: r.content_id.unwrap_or_default(),
                     gen: r.gen,
                 },
-                Err(e) => {
-                    let (code, msg) = self.map_kernel_err(e);
-                    BatchReadItemResponse {
-                        content: Vec::new(),
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &msg),
-                        content_id: String::new(),
-                        gen: 0,
-                    }
-                }
+                Err(e) => BatchReadItemResponse {
+                    content: Vec::new(),
+                    is_error: true,
+                    error_payload: encode_kernel_error(&e),
+                    content_id: String::new(),
+                    gen: 0,
+                },
             })
             .collect();
 
@@ -1794,17 +1715,14 @@ impl NexusVfsService for VfsServiceImpl {
                     is_error: false,
                     error_payload: Vec::new(),
                 },
-                Err(e) => {
-                    let (code, msg) = self.map_kernel_err(e);
-                    BatchWriteItemResponse {
-                        content_id: String::new(),
-                        size: 0,
-                        gen: 0,
-                        version: 0,
-                        is_error: true,
-                        error_payload: encode_rpc_error(code, &msg),
-                    }
-                }
+                Err(e) => BatchWriteItemResponse {
+                    content_id: String::new(),
+                    size: 0,
+                    gen: 0,
+                    version: 0,
+                    is_error: true,
+                    error_payload: encode_kernel_error(&e),
+                },
             })
             .collect();
 
@@ -2007,6 +1925,16 @@ fn vfs_routes<T: NexusVfsService>(svc: T, max_message_bytes: usize) -> tonic::se
 
 pub(crate) fn stat_status(error: KernelError) -> Status {
     match error {
+        KernelError::MetadataVisibility(error) => {
+            let mut status = Status::unavailable(error.message);
+            status.metadata_mut().insert_bin(
+                "nexus-visibility-bin",
+                tonic::metadata::MetadataValue::from_bytes(
+                    visibility_data(error.reason).to_string().as_bytes(),
+                ),
+            );
+            status
+        }
         KernelError::WouldBlock(msg) => Status::unavailable(msg),
         KernelError::PermissionDenied(msg) => Status::permission_denied(msg),
         KernelError::InvalidPath(msg) => Status::invalid_argument(msg),
@@ -2065,16 +1993,46 @@ fn kernel_err_code(err: &KernelError) -> RpcErrorCode {
     }
 }
 
-pub(crate) fn encode_rpc_error(code: RpcErrorCode, message: &str) -> Vec<u8> {
-    encode_rpc_error_bytes(code, message)
+fn visibility_data(reason: kernel::meta_store::MetadataVisibility) -> serde_json::Value {
+    use kernel::meta_store::MetadataVisibility;
+    use serde_json::json;
+    match reason {
+        MetadataVisibility::ReplicaBehind { required, applied } => json!({
+            "reason": "ReplicaBehind", "required_index": required.to_string(), "applied_index": applied.to_string(),
+        }),
+        MetadataVisibility::CommittedNotVisible { committed, applied } => {
+            let mut data =
+                json!({"reason":"CommittedNotVisible", "applied_index":applied.to_string()});
+            if let Some(index) = committed {
+                data["committed_index"] = json!(index.to_string());
+            }
+            data
+        }
+    }
 }
 
-pub(crate) fn encode_rpc_error_bytes(code: RpcErrorCode, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "code": code as i64,
-        "message": message,
-    }))
-    .unwrap_or_else(|_| b"{}".to_vec())
+fn encode_kernel_error(error: &KernelError) -> Vec<u8> {
+    let data = match error {
+        KernelError::MetadataVisibility(detail) => Some(visibility_data(detail.reason)),
+        _ => None,
+    };
+    rpc_error_payload(kernel_err_code(error), &error.to_string(), data)
+}
+
+pub(crate) fn encode_rpc_error(code: RpcErrorCode, message: &str) -> Vec<u8> {
+    rpc_error_payload(code, message, None)
+}
+
+fn rpc_error_payload(
+    code: RpcErrorCode,
+    message: &str,
+    data: Option<serde_json::Value>,
+) -> Vec<u8> {
+    let mut envelope = serde_json::json!({ "code": code as i64, "message": message });
+    if let Some(data) = data {
+        envelope["data"] = data;
+    }
+    envelope.to_string().into_bytes()
 }
 
 fn error_read(status: Status) -> ReadResponse {
@@ -2084,7 +2042,7 @@ fn error_read(status: Status) -> ReadResponse {
         size: 0,
         gen: 0,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
         entry_type: 0,
         stream_next_offset: None,
         post_hook_needed: false,
@@ -2097,7 +2055,7 @@ fn error_write(status: Status) -> WriteResponse {
         size: 0,
         gen: 0,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2107,7 +2065,7 @@ fn error_delete(status: Status) -> DeleteResponse {
         // contract on `optional bool success`.
         success: Some(false),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
         entry_type: 0,
         path: String::new(),
         content_id: String::new(),
@@ -2119,7 +2077,7 @@ fn error_mkdir(status: Status) -> MkdirResponse {
     MkdirResponse {
         hit: false,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2127,14 +2085,14 @@ fn error_readdir(status: Status) -> ReaddirResponse {
     ReaddirResponse {
         entries: Vec::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
 fn error_ipc_ack(status: Status) -> IpcAck {
     IpcAck {
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2142,7 +2100,7 @@ fn error_ipc_has(status: Status) -> IpcHasResponse {
     IpcHasResponse {
         present: false,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2150,7 +2108,7 @@ fn error_stream_write(status: Status) -> StreamWriteResponse {
     StreamWriteResponse {
         offset: 0,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2160,7 +2118,7 @@ fn error_stream_read(status: Status) -> StreamReadAtResponse {
         next_offset: 0,
         eof: false,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
         timed_out: false,
     }
 }
@@ -2169,7 +2127,7 @@ fn error_stream_collect(status: Status) -> StreamCollectAllResponse {
     StreamCollectAllResponse {
         data: Vec::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2178,14 +2136,14 @@ fn error_get_xattr(status: Status) -> GetXattrResponse {
         found: false,
         value: String::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
 fn error_set_xattr(status: Status) -> SetXattrResponse {
     SetXattrResponse {
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2193,7 +2151,7 @@ fn error_get_xattr_bulk(status: Status) -> GetXattrBulkResponse {
     GetXattrBulkResponse {
         items: Vec::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2202,7 +2160,7 @@ fn error_lock(status: Status) -> LockResponse {
         acquired: false,
         lock_id: String::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2210,7 +2168,7 @@ fn error_unlock(status: Status) -> UnlockResponse {
     UnlockResponse {
         released: false,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2220,7 +2178,7 @@ fn error_watch(status: Status) -> WatchResponse {
         path: String::new(),
         event_type: String::new(),
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2234,7 +2192,7 @@ fn error_rename(status: Status) -> RenameResponse {
         old_version: None,
         old_modified_at_ms: None,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2247,7 +2205,7 @@ fn error_copy(status: Status) -> CopyResponse {
         version: 0,
         gen: 0,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2271,14 +2229,14 @@ fn error_setattr(status: Status) -> SetattrResponse {
         created: false,
         entry_type: 0,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
 fn error_chmod(status: Status) -> ChmodResponse {
     ChmodResponse {
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
     }
 }
 
@@ -2286,7 +2244,7 @@ fn error_stat(status: Status) -> StatResponse {
     StatResponse {
         found: false,
         is_error: true,
-        error_payload: encode_rpc_error_bytes(status_to_code(&status), status.message()),
+        error_payload: encode_rpc_error(status_to_code(&status), status.message()),
         ..Default::default()
     }
 }

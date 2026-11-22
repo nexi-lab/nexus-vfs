@@ -79,17 +79,16 @@ mod record_guard;
 use cache::MetadataCache;
 
 fn require_metadata_success(
-    result: CommandResult,
-    operation: &str,
-    path: &str,
+    result: &CommandResult,
+    operation: impl std::fmt::Display,
 ) -> Result<(), MetaStoreError> {
     match result {
         CommandResult::Success => Ok(()),
         CommandResult::Error(error) => Err(MetaStoreError::IOError(format!(
-            "ZoneMetaStore.{operation}({path}) rejected: {error}"
+            "{operation} rejected: {error}"
         ))),
         _ => Err(MetaStoreError::IOError(format!(
-            "ZoneMetaStore.{operation}({path}): unexpected apply result"
+            "{operation}: unexpected apply result"
         ))),
     }
 }
@@ -402,7 +401,11 @@ impl ZoneMetaStore {
             return Ok(());
         }
         bridge_block_on(&self.runtime, node.own_writes_visible()).map_err(|e| {
-            MetaStoreError::Unavailable(format!("ZoneMetaStore.{operation}({path}): {e}"))
+            metadata_error(
+                &e,
+                format!("ZoneMetaStore.{operation}({path}): {e}"),
+                MetaStoreError::Unavailable,
+            )
         })
     }
 }
@@ -618,7 +621,7 @@ impl MetaStore for ZoneMetaStore {
         };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| proposal_error(format_args!("ZoneMetaStore.put({path})"), &e))?;
-        require_metadata_success(result, "put", path)
+        require_metadata_success(&result, format_args!("ZoneMetaStore.put({path})"))
     }
 
     fn delete(&self, path: &str) -> Result<bool, MetaStoreError> {
@@ -628,7 +631,7 @@ impl MetaStore for ZoneMetaStore {
         let cmd = Command::DeleteMetadata { key: zone_key };
         let result = bridge_block_on(&self.runtime, self.node()?.propose(cmd))
             .map_err(|e| proposal_error(format_args!("ZoneMetaStore.delete({path})"), &e))?;
-        require_metadata_success(result, "delete", path)?;
+        require_metadata_success(&result, format_args!("ZoneMetaStore.delete({path})"))?;
         Ok(true)
     }
 
@@ -651,7 +654,7 @@ impl MetaStore for ZoneMetaStore {
             ),
         )
         .map_err(|error| proposal_error("ZoneMetaStore.rename_path", &error))?;
-        require_metadata_success(result, "rename", old_path)
+        require_metadata_success(&result, format_args!("ZoneMetaStore.rename({old_path})"))
     }
 
     fn resolve_stat_misses(
@@ -802,15 +805,10 @@ impl MetaStore for ZoneMetaStore {
                 &e,
             )
         })?;
-        match result {
-            crate::prelude::CommandResult::Success => Ok(()),
-            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.seal_stream_segment({stream_prefix}) rejected: {e}"
-            ))),
-            _ => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.seal_stream_segment({stream_prefix}): unexpected apply result"
-            ))),
-        }
+        require_metadata_success(
+            &result,
+            format_args!("ZoneMetaStore.seal_stream_segment({stream_prefix})"),
+        )
     }
 
     fn stream_floor(&self, stream_prefix: &str) -> Result<u64, MetaStoreError> {
@@ -908,15 +906,10 @@ impl MetaStore for ZoneMetaStore {
                 &e,
             )
         })?;
-        match result {
-            crate::prelude::CommandResult::Success => Ok(()),
-            crate::prelude::CommandResult::Error(e) => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.trim_stream_segments({stream_prefix}) rejected: {e}"
-            ))),
-            _ => Err(MetaStoreError::IOError(format!(
-                "ZoneMetaStore.trim_stream_segments({stream_prefix}): unexpected apply result"
-            ))),
-        }
+        require_metadata_success(
+            &result,
+            format_args!("ZoneMetaStore.trim_stream_segments({stream_prefix})"),
+        )
     }
 }
 
@@ -946,22 +939,41 @@ fn append_offset(stream_prefix: &str, result: CommandResult) -> Result<u64, Meta
     }
 }
 
-/// A failed proposal, typed by what the raft layer knows about it. Sent with no
-/// answer, it may have committed: `OutcomeUnknown`. Otherwise the outcome is
-/// known and the message states it — refused or never sent, so nothing was
-/// applied, or committed but not yet applied on this replica: `IOError`. The
-/// two need different handling, a read-back versus a plain retry, and
-/// `RaftError::proposal_outcome_unknown` is the one place that decides which.
-///
-/// Every proposing method reports its failures through here, `operation`
-/// naming the call (`ZoneMetaStore.put(/a)`) at the head of the message.
+/// Preserve the state machine's answer even when a follower has yet to apply it.
 fn proposal_error(operation: impl std::fmt::Display, e: &RaftError) -> MetaStoreError {
-    let message = format!("{operation}: {e}");
-    if e.proposal_outcome_unknown() {
-        MetaStoreError::OutcomeUnknown(message)
-    } else {
-        MetaStoreError::IOError(message)
+    if let RaftError::CommittedNotVisible { result, .. } = e {
+        if let Err(rejected) = require_metadata_success(result, &operation) {
+            return rejected;
+        }
     }
+    let message = format!("{operation}: {e}");
+    let fallback = if e.proposal_outcome_unknown() {
+        MetaStoreError::OutcomeUnknown
+    } else {
+        MetaStoreError::IOError
+    };
+    metadata_error(e, message, fallback)
+}
+
+fn metadata_error(
+    e: &RaftError,
+    message: String,
+    fallback: fn(String) -> MetaStoreError,
+) -> MetaStoreError {
+    use kernel::meta_store::{MetadataVisibility, VisibilityError};
+    let reason = match *e {
+        RaftError::ReplicaBehind { required, applied } => {
+            MetadataVisibility::ReplicaBehind { required, applied }
+        }
+        RaftError::CommittedNotVisible { index, applied, .. } => {
+            MetadataVisibility::CommittedNotVisible {
+                committed: index,
+                applied,
+            }
+        }
+        _ => return fallback(message),
+    };
+    MetaStoreError::Visibility(VisibilityError { reason, message })
 }
 
 #[cfg(test)]
@@ -1043,8 +1055,22 @@ mod tests {
                 applied: 7,
                 result: Box::new(CommandResult::Success),
             };
+            let rejected = RaftError::CommittedNotVisible {
+                index: Some(9),
+                applied: 7,
+                result: Box::new(CommandResult::Error("protected".into())),
+            };
+            assert!(
+                matches!(proposal_error(operation, &rejected), MetaStoreError::IOError(message) if message.contains("protected"))
+            );
             match proposal_error(operation, &committed) {
-                MetaStoreError::IOError(why) => assert!(why.contains("committed"), "{why}"),
+                MetaStoreError::Visibility(error) => assert_eq!(
+                    error.reason,
+                    kernel::meta_store::MetadataVisibility::CommittedNotVisible {
+                        committed: Some(9),
+                        applied: 7
+                    }
+                ),
                 other => panic!("a committed {operation} must not read as {other:?}"),
             }
         }

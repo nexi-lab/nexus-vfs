@@ -178,6 +178,16 @@ impl kernel::meta_store::MetaStore for DelayedMetadata {
         &self,
         path: &str,
     ) -> Result<Option<kernel::meta_store::FileMetadata>, kernel::meta_store::MetaStoreError> {
+        if path == "/shared/blocked" {
+            use kernel::meta_store::{MetaStoreError, MetadataVisibility, VisibilityError};
+            return Err(MetaStoreError::Visibility(VisibilityError {
+                reason: MetadataVisibility::ReplicaBehind {
+                    required: u64::MAX,
+                    applied: 9,
+                },
+                message: "local read is behind".into(),
+            }));
+        }
         Ok(
             (path == "/shared/hot").then(|| kernel::meta_store::FileMetadata {
                 path: path.into(),
@@ -215,14 +225,22 @@ impl kernel::meta_store::MetaStore for DelayedMetadata {
         &self,
         _: &str,
     ) -> Result<Vec<kernel::meta_store::FileMetadata>, kernel::meta_store::MetaStoreError> {
-        unreachable!()
+        Ok(Vec::new())
     }
     fn put(
         &self,
-        _: &str,
+        path: &str,
         _: kernel::meta_store::FileMetadata,
     ) -> Result<(), kernel::meta_store::MetaStoreError> {
-        unreachable!()
+        use kernel::meta_store::{MetaStoreError, MetadataVisibility, VisibilityError};
+        assert_eq!(path, "/shared/new-dir");
+        Err(MetaStoreError::Visibility(VisibilityError {
+            reason: MetadataVisibility::CommittedNotVisible {
+                committed: Some(u64::MAX),
+                applied: 9,
+            },
+            message: "write committed at the authority".into(),
+        }))
     }
     fn delete(&self, _: &str) -> Result<bool, kernel::meta_store::MetaStoreError> {
         unreachable!()
@@ -303,6 +321,92 @@ async fn stat_over_tcp_distinguishes_lag_and_absence_and_groups_batch_barriers()
     assert_eq!(store.barriers.load(Ordering::SeqCst), 3);
     let missing = client.stat(stat(paths[2])).await.unwrap().into_inner();
     assert!(!missing.found && !missing.is_error);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_visibility_survives_mailbox_setup_rpc_boundaries() {
+    use kernel::kernel::convenience::{KernelConvenience, MountOptions};
+    use kernel::kernel::vfs_proto::MkdirRequest;
+    use serde_json::{json, Value};
+    let kernel = Arc::new(kernel_with_mem_backend());
+    let ctx = OperationContext::new("setup", "root", true, None, true);
+    kernel
+        .mount(
+            "/shared",
+            MountOptions::new(&ctx, "memory").with_metastore(Arc::new(DelayedMetadata::default())),
+        )
+        .unwrap();
+    let mut service = VfsServiceImpl::for_test(kernel);
+    service.auth = Arc::new(AgentAuth);
+    let (mut client, stop, server) = serve(service).await;
+    let read =
+        json!({"reason":"ReplicaBehind","required_index":u64::MAX.to_string(),"applied_index":"9"});
+    let inspect = client
+        .inspect_target(InspectTargetRequest {
+            path: "/shared/blocked/transcript".into(),
+            access: Access::Read as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(inspect.is_error);
+    let err: Value = serde_json::from_slice(&inspect.error_payload).unwrap();
+    assert_eq!(err["code"], -32603);
+    assert_eq!(err["data"], read);
+    let stat = client
+        .stat(StatRequest {
+            path: "/shared/blocked".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let batch = client
+        .batch_stat(BatchStatRequest {
+            paths: vec!["/shared/blocked".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    for status in [stat, batch] {
+        assert_eq!(status.code(), Code::Unavailable);
+        let trailer = status
+            .metadata()
+            .get_bin("nexus-visibility-bin")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&trailer).unwrap(), read);
+    }
+    let refused = client
+        .mkdir(MkdirRequest {
+            path: "/shared/blocked".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(refused.is_error && !refused.hit);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.error_payload).unwrap()["data"],
+        read
+    );
+    let mkdir = client
+        .mkdir(MkdirRequest {
+            path: "/shared/new-dir".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(mkdir.is_error && !mkdir.hit);
+    let err: Value = serde_json::from_slice(&mkdir.error_payload).unwrap();
+    assert_eq!(
+        err["data"],
+        json!({"reason":"CommittedNotVisible","committed_index":u64::MAX.to_string(),"applied_index":"9"})
+    );
     stop.send(()).unwrap();
     server.await.unwrap();
 }

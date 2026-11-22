@@ -395,6 +395,10 @@ impl WalStreamCore {
         self.store
             .append_stream_entry(&self.prefix, data)
             .map_err(|e| match e {
+                MetaStoreError::Visibility(mut error) => {
+                    error.message = at(error.message);
+                    MetaStoreError::Visibility(error)
+                }
                 MetaStoreError::Unavailable(why) => MetaStoreError::Unavailable(at(why)),
                 MetaStoreError::OutcomeUnknown(why) => MetaStoreError::OutcomeUnknown(at(why)),
                 MetaStoreError::IOError(why) => MetaStoreError::IOError(at(why)),
@@ -798,6 +802,7 @@ impl StreamBackend for WalStreamCore {
                 // entry may have committed travels with it — see
                 // `StreamError::OutcomeUnknown`.
                 Err(match e {
+                    MetaStoreError::Visibility(error) => StreamError::MetadataVisibility(error),
                     MetaStoreError::OutcomeUnknown(why) => StreamError::OutcomeUnknown(why),
                     MetaStoreError::IOError(why) | MetaStoreError::Unavailable(why) => {
                         StreamError::NotReplicated(why)

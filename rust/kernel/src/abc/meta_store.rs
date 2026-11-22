@@ -115,20 +115,36 @@ pub enum StatLookup {
     Missing,
 }
 
+/// Why a metadata operation could not observe the required revision locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataVisibility {
+    ReplicaBehind {
+        required: u64,
+        applied: u64,
+    },
+    /// A covering commit index is optional when talking to an older authority.
+    CommittedNotVisible {
+        committed: Option<u64>,
+        applied: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct VisibilityError {
+    pub reason: MetadataVisibility,
+    pub message: String,
+}
+
 /// Error type for `MetaStore` operations.
 #[derive(Debug)]
 pub enum MetaStoreError {
+    Visibility(VisibilityError),
     /// The authority could not provide a current read.
     Unavailable(String),
     /// Key not found.
     NotFound(String),
-    /// Underlying I/O or storage error. For a replicated write it is an outcome
-    /// that is known, and the message states which: refused or never sent, so
-    /// nothing was applied, or committed but not yet applied on this replica. A
-    /// write that may have committed unseen is never this; it is
-    /// [`Self::OutcomeUnknown`]. Only where an operation's contract says so
-    /// (today [`MetaStore::append_stream_entry`]) does it mean nothing was
-    /// applied.
+    /// Underlying I/O failure or a refused proposal. The operation defines
+    /// the effect of this error (see [`MetaStore::append_stream_entry`]).
     IOError(String),
     /// A replicated write was sent and no answer came back: it may have
     /// committed, so a retry may apply it twice. A caller that must not
@@ -146,6 +162,7 @@ pub enum MetaStoreError {
 impl std::fmt::Display for MetaStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Visibility(error) => f.write_str(&error.message),
             Self::Unavailable(message) => f.write_str(message),
             Self::NotFound(key) => write!(f, "metastore key not found: {key}"),
             Self::IOError(msg) => write!(f, "metastore I/O error: {msg}"),

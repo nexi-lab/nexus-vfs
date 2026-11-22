@@ -124,6 +124,7 @@ pub use plugins::PluginGrpcEndpoint;
 /// Kernel-level error type.
 #[derive(Debug, Clone)]
 pub enum KernelError {
+    MetadataVisibility(crate::meta_store::VisibilityError),
     InvalidPath(String),
     FileNotFound(String),
     FileExists(String),
@@ -166,19 +167,19 @@ pub enum KernelError {
 impl KernelError {
     /// The kernel error for a failed metastore call, worded `message`.
     ///
-    /// A write the metastore reports as possibly committed stays
-    /// [`Self::OutcomeUnknown`], so a client can tell "read back before
-    /// retrying" from a plain failure by its code rather than its text. Every
-    /// other failure is an [`Self::IOError`]. That is not promoted to
-    /// [`Self::NotCommitted`]: a metastore `IOError` may report a write that
-    /// committed but is not yet visible on this replica, and a syscall's
-    /// metadata step can follow effects of its own, so "nothing was applied"
-    /// is not something this step can promise for the whole call.
+    /// Preserve the authority's outcome and local visibility for this metadata
+    /// step. A syscall may have other effects before it reaches this step.
     pub(crate) fn from_metastore(
         error: &crate::meta_store::MetaStoreError,
         message: String,
     ) -> Self {
         match error {
+            crate::meta_store::MetaStoreError::Visibility(detail) => {
+                Self::MetadataVisibility(crate::meta_store::VisibilityError {
+                    reason: detail.reason,
+                    message,
+                })
+            }
             crate::meta_store::MetaStoreError::Unavailable(_) => Self::WouldBlock(message),
             crate::meta_store::MetaStoreError::OutcomeUnknown(_) => Self::OutcomeUnknown(message),
             _ => Self::IOError(message),
@@ -195,7 +196,7 @@ impl KernelError {
 /// The same fact spelled two ways depending on which arm existed (#350).
 ///
 /// So the message is defined HERE, once, and a boundary decides only what it must:
-/// `map_kernel_err` picks the RPC code and takes the text from this impl. A new
+/// the VFS transport picks the RPC code and takes the text from this impl. A new
 /// variant then cannot reach a client as a Debug dump — the worst it can do is land
 /// under a less specific code.
 ///
@@ -205,6 +206,7 @@ impl KernelError {
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MetadataVisibility(error) => f.write_str(&error.message),
             Self::InvalidPath(m) => write!(f, "invalid path: {m}"),
             Self::FileNotFound(p) => write!(f, "file not found: {p}"),
             Self::FileExists(p) => write!(f, "file exists: {p}"),
@@ -1411,9 +1413,9 @@ impl Kernel {
     ) -> Result<Option<crate::meta_store::FileMetadata>, KernelError> {
         let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
         match self.with_metastore(&mount_point, |ms| ms.get(path)) {
-            Some(result) => {
-                result.map_err(|e| KernelError::IOError(format!("metastore_get({path}): {e:?}")))
-            }
+            Some(result) => result.map_err(|e| {
+                KernelError::from_metastore(&e, format!("metastore_get({path}): {e}"))
+            }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
     }
@@ -1436,7 +1438,7 @@ impl Kernel {
         metadata.path = path.to_string();
         match self.with_metastore(&mount_point, move |ms| ms.put(path, metadata)) {
             Some(result) => result.map_err(|e| {
-                KernelError::from_metastore(&e, format!("metastore_put({path}): {e:?}"))
+                KernelError::from_metastore(&e, format!("metastore_put({path}): {e}"))
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -1446,7 +1448,7 @@ impl Kernel {
         let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
         match self.with_metastore(&mount_point, |ms| ms.delete(path)) {
             Some(result) => result.map_err(|e| {
-                KernelError::from_metastore(&e, format!("metastore_delete({path}): {e:?}"))
+                KernelError::from_metastore(&e, format!("metastore_delete({path}): {e}"))
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -1457,7 +1459,7 @@ impl Kernel {
     pub(crate) fn metastore_delete_batch(&self, paths: &[String]) -> Result<usize, KernelError> {
         match self.metastore.read().as_ref() {
             Some(ms) => ms.delete_batch(paths).map_err(|e| {
-                KernelError::from_metastore(&e, format!("metastore_delete_batch: {e:?}"))
+                KernelError::from_metastore(&e, format!("metastore_delete_batch: {e}"))
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -1476,7 +1478,7 @@ impl Kernel {
             Some(result) => result.map_err(|e| {
                 KernelError::from_metastore(
                     &e,
-                    format!("metastore_set_file_metadata({path}, {key}): {e:?}"),
+                    format!("metastore_set_file_metadata({path}, {key}): {e}"),
                 )
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
@@ -1491,7 +1493,10 @@ impl Kernel {
         let mount_point = self.resolve_mount_point(path, contracts::ROOT_ZONE_ID);
         match self.with_metastore(&mount_point, |ms| ms.get_file_metadata(path, key)) {
             Some(result) => result.map_err(|e| {
-                KernelError::IOError(format!("metastore_get_file_metadata({path}, {key}): {e:?}"))
+                KernelError::from_metastore(
+                    &e,
+                    format!("metastore_get_file_metadata({path}, {key}): {e}"),
+                )
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -1507,7 +1512,7 @@ impl Kernel {
         // per-mount themselves.
         match self.metastore.read().as_ref() {
             Some(ms) => ms.get_file_metadata_bulk(paths, key).map_err(|e| {
-                KernelError::IOError(format!("metastore_get_file_metadata_bulk: {e:?}"))
+                KernelError::from_metastore(&e, format!("metastore_get_file_metadata_bulk: {e}"))
             }),
             None => Err(KernelError::IOError("no metastore wired".into())),
         }
@@ -1565,11 +1570,11 @@ impl Kernel {
                 Some(route) => self
                     .with_metastore_route(&route, |ms| ms.get(ancestor))
                     .transpose()
-                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?
+                    .map_err(|e| {
+                        KernelError::from_metastore(&e, format!("read link at {ancestor}: {e}"))
+                    })?
                     .flatten(),
-                None => self
-                    .metastore_get(ancestor)
-                    .map_err(|e| KernelError::IOError(format!("read link at {ancestor}: {e:?}")))?,
+                None => self.metastore_get(ancestor)?,
             };
             if let Some(entry) = entry {
                 if let Some(target) = Self::dt_link_target(ancestor, &entry)? {
@@ -2107,7 +2112,7 @@ impl Kernel {
         let meta = match route.as_ref() {
             Some(route) => Self::with_captured_metastore_route(route, |ms| ms.get(path))
                 .transpose()
-                .map_err(|e| KernelError::IOError(format!("stream inode: {e:?}")))?
+                .map_err(|e| KernelError::from_metastore(&e, format!("stream inode: {e}")))?
                 .flatten(),
             None => self.metastore_get(path)?,
         };
@@ -2435,7 +2440,7 @@ impl Kernel {
             Some(route) => self
                 .with_metastore_route(&route, |ms| ms.put(path, meta))
                 .ok_or_else(|| KernelError::IOError("no stream metastore wired".into()))?
-                .map_err(|e| KernelError::from_metastore(&e, format!("stream inode: {e:?}"))),
+                .map_err(|e| KernelError::from_metastore(&e, format!("stream inode: {e}"))),
             None => self.metastore_put(path, meta),
         }
     }
@@ -3078,6 +3083,7 @@ fn stream_mgr_err(e: crate::stream_manager::StreamManagerError) -> KernelError {
                 // An append that did not commit is an append failure, NOT a
                 // closed stream: the reason travels verbatim so the client sees
                 // what happened instead of a Debug dump of the variant.
+                StreamError::MetadataVisibility(error) => KernelError::MetadataVisibility(error),
                 StreamError::NotReplicated(why) => {
                     KernelError::NotCommitted(format!("stream append did not commit: {why}"))
                 }
