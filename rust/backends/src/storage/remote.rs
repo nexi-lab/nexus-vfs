@@ -89,10 +89,18 @@ fn parse_stat_size_from_response(
     response: &serde_json::Value,
 ) -> Result<u64, StorageError> {
     let result = response.get("result").unwrap_or(response);
+    if result.is_null() {
+        return Err(StorageError::NotFound(path.to_owned()));
+    }
     result
         .get("size")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| StorageError::NotFound(path.to_string()))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            StorageError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid remote Stat size for {path}"),
+            ))
+        })
 }
 
 impl ObjectStore for RemoteBackend {
@@ -245,7 +253,12 @@ impl ObjectStore for RemoteBackend {
             .call("sys_stat", &bytes)
             .map_err(|e| StorageError::IOError(std::io::Error::other(e)))?;
         if is_error {
-            return Err(StorageError::NotFound(content_id.to_string()));
+            if kernel::rpc_transport::is_file_not_found(&resp) {
+                return Err(StorageError::NotFound(content_id.to_string()));
+            }
+            return Err(StorageError::IOError(std::io::Error::other(format!(
+                "remote Stat failed for {path}"
+            ))));
         }
         let value: serde_json::Value = serde_json::from_slice(&resp)
             .map_err(|e| StorageError::IOError(std::io::Error::other(e.to_string())))?;
@@ -348,6 +361,18 @@ mod tests {
         assert_eq!(parsed.content_id, "zone/shared/readback.txt");
         assert_eq!(parsed.version, "zone/shared/readback.txt");
         assert_eq!(parsed.size, 18);
+    }
+
+    #[test]
+    fn stat_size_preserves_absence_and_invalid_responses() {
+        assert!(matches!(
+            parse_stat_size_from_response("/a", &serde_json::json!({"result":null})),
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            parse_stat_size_from_response("/a", &serde_json::json!({"result":{"size":"bad"}})),
+            Err(StorageError::IOError(_))
+        ));
     }
 
     #[test]

@@ -401,8 +401,9 @@ impl ZoneMetaStore {
         if node.own_writes_applied() {
             return Ok(());
         }
-        bridge_block_on(&self.runtime, node.own_writes_visible())
-            .map_err(|e| MetaStoreError::IOError(format!("ZoneMetaStore.{operation}({path}): {e}")))
+        bridge_block_on(&self.runtime, node.own_writes_visible()).map_err(|e| {
+            MetaStoreError::Unavailable(format!("ZoneMetaStore.{operation}({path}): {e}"))
+        })
     }
 }
 
@@ -651,6 +652,40 @@ impl MetaStore for ZoneMetaStore {
         )
         .map_err(|error| proposal_error("ZoneMetaStore.rename_path", &error))?;
         require_metadata_success(result, "rename", old_path)
+    }
+
+    fn resolve_stat_misses(
+        &self,
+        paths: &[&str],
+    ) -> Result<Vec<kernel::abc::meta_store::StatLookup>, MetaStoreError> {
+        use kernel::abc::meta_store::StatLookup;
+        let keys: Vec<_> = paths.iter().map(|path| self.to_zone_key(path)).collect();
+        let read = self.node()?.read_linearizable(|state| {
+            keys.iter()
+                .map(|key| {
+                    let storage_error =
+                        |e: crate::raft::RaftError| MetaStoreError::IOError(e.to_string());
+                    if let Some(bytes) = state.get_metadata(key).map_err(storage_error)? {
+                        return self
+                            .decode_metadata(&bytes)
+                            .map(Box::new)
+                            .map(StatLookup::Entry);
+                    }
+                    Ok(
+                        if state.has_metadata_children(key).map_err(storage_error)? {
+                            StatLookup::Directory
+                        } else {
+                            StatLookup::Missing
+                        },
+                    )
+                })
+                .collect()
+        });
+        bridge_block_on(&self.runtime, async {
+            tokio::time::timeout(crate::raft::REPLICA_READ_BUDGET, read).await
+        })
+        .map_err(|_| MetaStoreError::Unavailable("zone Stat read barrier timed out".into()))?
+        .map_err(|e| MetaStoreError::Unavailable(format!("zone Stat read barrier: {e}")))?
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<KernelFileMetadata>, MetaStoreError> {

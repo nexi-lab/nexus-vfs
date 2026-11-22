@@ -239,6 +239,10 @@ impl FederationClient {
             auth_token: String::new(),
             zone_id: String::new(),
         });
+        request.metadata_mut().insert(
+            crate::grpc::PEER_STAT,
+            "1".parse().expect("static metadata"),
+        );
         request.set_timeout(self.timeout);
         let resp = client
             .stat(request)

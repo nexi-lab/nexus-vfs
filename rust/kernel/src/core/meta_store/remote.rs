@@ -85,8 +85,12 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
-            // Server reported error (path not found, etc.)
-            return Ok(None);
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(None);
+            }
+            return Err(MetaStoreError::IOError(format!(
+                "remote sys_stat failed for {path}"
+            )));
         }
 
         let value: serde_json::Value = serde_json::from_slice(&resp_bytes)
@@ -206,19 +210,22 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
-            return Ok(false);
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(false);
+            }
+            return Err(MetaStoreError::IOError(format!(
+                "remote access failed for {path}"
+            )));
         }
 
         // Server returns a bool or a JSON object with an "exists" field
         let value: serde_json::Value = serde_json::from_slice(&resp_bytes)
             .map_err(|e| MetaStoreError::IOError(format!("decode access response: {e}")))?;
         let value = unwrap_result_envelope(&value);
-        Ok(value.as_bool().unwrap_or_else(|| {
-            value
-                .get("exists")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        }))
+        value
+            .as_bool()
+            .or_else(|| value.get("exists").and_then(serde_json::Value::as_bool))
+            .ok_or_else(|| MetaStoreError::IOError("invalid remote access response".into()))
     }
 
     fn is_implicit_directory(&self, path: &str) -> Result<bool, MetaStoreError> {
@@ -232,13 +239,20 @@ impl MetaStore for RemoteMetaStore {
             .map_err(MetaStoreError::IOError)?;
 
         if is_error {
-            return Ok(false);
+            if crate::rpc_transport::is_file_not_found(&resp_bytes) {
+                return Ok(false);
+            }
+            return Err(MetaStoreError::IOError(format!(
+                "remote directory lookup failed for {path}"
+            )));
         }
 
         let value: serde_json::Value = serde_json::from_slice(&resp_bytes)
             .map_err(|e| MetaStoreError::IOError(format!("decode is_directory response: {e}")))?;
         let value = unwrap_result_envelope(&value);
-        Ok(value.as_bool().unwrap_or(false))
+        value
+            .as_bool()
+            .ok_or_else(|| MetaStoreError::IOError("invalid remote directory response".into()))
     }
 
     fn list_paginated(

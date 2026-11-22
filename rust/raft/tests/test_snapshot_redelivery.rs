@@ -166,9 +166,40 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     })
     .await;
 
+    use kernel::kernel::convenience::{KernelConvenience, MountOptions};
+    use kernel::kernel::{Kernel, KernelError, OperationContext};
+    use kernel::meta_store::{FileMetadata, MetaStore, DT_REG};
+    use nexus_raft::zone_meta_store::ZoneMetaStore;
+    let runtime = tokio::runtime::Handle::current();
+    let fs = Kernel::new();
+    let ctx = OperationContext::new("test", "root", true, None, true);
+    let view = ZoneMetaStore::new_arc(learner.clone(), runtime.clone(), "/shared".into());
+    fs.mount(
+        "/shared",
+        MountOptions::new(&ctx, "memory").with_metastore(view),
+    )
+    .unwrap();
+    let published = ZoneMetaStore::new(leader.clone(), runtime, "/shared".into());
+    let marker = "/shared/implicit/marker";
     // ── Starved: heartbeats only, while the leader compacts past it. ──
     link.set(STARVE);
     let behind = learner.applied_index();
+    published
+        .put(
+            marker,
+            FileMetadata {
+                path: marker.into(),
+                entry_type: DT_REG,
+                size: 41,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // A writer on a different node set no read-your-writes floor here.
+    assert!(matches!(
+        fs.try_stat(marker, "root"),
+        Err(KernelError::WouldBlock(_))
+    ));
     for i in 0..STARVED_WRITES {
         write(&leader, &format!("/during/{i}")).await;
     }
@@ -241,6 +272,16 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         before.committed_not_visible_total + 1
     );
 
+    // This time the learner itself submitted a committed, unapplied write.
+    assert!(matches!(
+        fs.try_stat_batch(&[marker.into(), "/shared/missing".into()], "root"),
+        Err(KernelError::WouldBlock(_))
+    ));
+    let after_batch = learner.replication();
+    assert_eq!(
+        after_batch.replica_behind_total,
+        refused.replica_behind_total + 1
+    );
     // A caller already waiting for the write is released by the catch-up,
     // whichever of snapshot install or entry apply brings it.
     let parked = tokio::spawn({
@@ -274,8 +315,25 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
         .own_writes_visible()
         .await
         .expect("the learner's own write is visible to its reads now");
+    assert_eq!(fs.try_stat(marker, "root").unwrap().unwrap().size, 41);
+    let rows = fs
+        .try_stat_batch(
+            &[
+                "/shared/implicit".into(),
+                "/shared/missing".into(),
+                marker.into(),
+            ],
+            "root",
+        )
+        .unwrap();
+    assert!(rows[0].as_ref().unwrap().is_directory);
+    assert!(rows[1].is_none());
+    assert_eq!(rows[2].as_ref().unwrap().size, 41);
     let healed = learner.replication();
-    assert_eq!(healed.replica_behind_total, refused.replica_behind_total);
+    assert_eq!(
+        healed.replica_behind_total,
+        after_batch.replica_behind_total
+    );
     assert_eq!(
         healed.committed_not_visible_total,
         refused.committed_not_visible_total
@@ -299,6 +357,17 @@ async fn a_learner_that_misses_its_catch_up_snapshot_converges_without_restart()
     })
     .await;
 
-    learner_zm.shutdown();
+    // Only the learner survives. It can still report an applied inode, while
+    // a fresh negative observation requires a quorum that no longer exists.
+    drop(published);
     leader_zm.shutdown();
+    assert_eq!(fs.try_stat(marker, "root").unwrap().unwrap().size, 41);
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        fs.try_stat("/shared/never-published", "root"),
+        Err(KernelError::WouldBlock(_))
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    drop(fs);
+    learner_zm.shutdown();
 }

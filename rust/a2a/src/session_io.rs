@@ -46,7 +46,8 @@ impl<K: KernelSyscall> SessionMailbox<K> {
         ctx.propagates_cross_node = true;
         crate::ensure_conversation(kernel.as_ref(), &ctx, &endpoint.agent, &endpoint.controller)?;
         if kernel
-            .sys_stat(&endpoint.transcript, contracts::ROOT_ZONE_ID)
+            .try_stat(&endpoint.transcript, contracts::ROOT_ZONE_ID)
+            .map_err(|error| error.to_string())?
             .is_none_or(|entry| entry.entry_type != 4)
         {
             return Err("session conversation requires a framed stream backend".into());

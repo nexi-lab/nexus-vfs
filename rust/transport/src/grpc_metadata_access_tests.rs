@@ -166,6 +166,147 @@ async fn stat_and_batch_stat_require_current_file_grants() {
     assert!(response.is_error && !response.found);
 }
 
+/// A local observation can miss even when the authority has a file.
+#[derive(Default)]
+struct DelayedMetadata {
+    ready: std::sync::atomic::AtomicBool,
+    barriers: std::sync::atomic::AtomicUsize,
+}
+
+impl kernel::meta_store::MetaStore for DelayedMetadata {
+    fn get(
+        &self,
+        path: &str,
+    ) -> Result<Option<kernel::meta_store::FileMetadata>, kernel::meta_store::MetaStoreError> {
+        Ok(
+            (path == "/shared/hot").then(|| kernel::meta_store::FileMetadata {
+                path: path.into(),
+                size: 8,
+                ..Default::default()
+            }),
+        )
+    }
+    fn resolve_stat_misses(
+        &self,
+        paths: &[&str],
+    ) -> Result<Vec<kernel::meta_store::StatLookup>, kernel::meta_store::MetaStoreError> {
+        use kernel::meta_store::{FileMetadata, MetaStoreError, StatLookup};
+        use std::sync::atomic::Ordering;
+        self.barriers.fetch_add(1, Ordering::SeqCst);
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(MetaStoreError::Unavailable("waiting for apply".into()));
+        }
+        Ok(paths
+            .iter()
+            .map(|&p| match p {
+                "/shared/cold" => StatLookup::Entry(Box::new(FileMetadata {
+                    path: p.into(),
+                    size: 41,
+                    ..Default::default()
+                })),
+                _ => StatLookup::Missing,
+            })
+            .collect())
+    }
+    fn exists(&self, path: &str) -> Result<bool, kernel::meta_store::MetaStoreError> {
+        Ok(self.get(path)?.is_some())
+    }
+    fn list(
+        &self,
+        _: &str,
+    ) -> Result<Vec<kernel::meta_store::FileMetadata>, kernel::meta_store::MetaStoreError> {
+        unreachable!()
+    }
+    fn put(
+        &self,
+        _: &str,
+        _: kernel::meta_store::FileMetadata,
+    ) -> Result<(), kernel::meta_store::MetaStoreError> {
+        unreachable!()
+    }
+    fn delete(&self, _: &str) -> Result<bool, kernel::meta_store::MetaStoreError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn stat_over_tcp_distinguishes_lag_and_absence_and_groups_batch_barriers() {
+    use kernel::kernel::convenience::{KernelConvenience, MountOptions};
+    use std::sync::atomic::Ordering;
+    let kernel = Arc::new(kernel_with_mem_backend());
+    let store = Arc::new(DelayedMetadata::default());
+    let ctx = OperationContext::new("setup", "root", true, None, true);
+    kernel
+        .mount(
+            "/shared",
+            MountOptions::new(&ctx, "memory").with_metastore(store.clone()),
+        )
+        .unwrap();
+    let grants = Arc::new(Mutex::new(HashSet::new()));
+    kernel.set_permission_provider(Arc::new(Box::new(Grants(Arc::clone(&grants)))));
+    let mut service = VfsServiceImpl::for_test(kernel);
+    service.auth = Arc::new(AgentAuth);
+    let paths = [
+        "/shared/hot",
+        "/shared/cold",
+        "/shared/missing",
+        "/shared/cold",
+    ];
+    grants
+        .lock()
+        .unwrap()
+        .extend(paths.iter().map(|p| p.to_string()));
+    let (mut client, stop, server) = serve(service).await;
+    let stat = |path: &str| {
+        Request::new(StatRequest {
+            path: path.into(),
+            ..Default::default()
+        })
+    };
+    let batch = || BatchStatRequest {
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        ..Default::default()
+    };
+    assert_eq!(
+        client.stat(stat(paths[0])).await.unwrap().into_inner().size,
+        8
+    );
+    assert_eq!(store.barriers.load(Ordering::SeqCst), 0);
+    let mut peer = stat(paths[1]);
+    peer.metadata_mut()
+        .insert(crate::grpc::PEER_STAT, "1".parse().unwrap());
+    assert_eq!(
+        client.stat(peer).await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(store.barriers.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client.stat(stat(paths[1])).await.unwrap_err().code(),
+        Code::Unavailable
+    );
+    assert_eq!(
+        client.batch_stat(batch()).await.unwrap_err().code(),
+        Code::Unavailable
+    );
+    assert_eq!(store.barriers.load(Ordering::SeqCst), 2);
+    store.ready.store(true, Ordering::SeqCst);
+    let rows = client
+        .batch_stat(batch())
+        .await
+        .unwrap()
+        .into_inner()
+        .results;
+    assert_eq!(
+        rows.iter().map(|r| (r.found, r.size)).collect::<Vec<_>>(),
+        [(true, 8), (true, 41), (false, 0), (true, 41)]
+    );
+    assert_eq!(store.barriers.load(Ordering::SeqCst), 3);
+    let missing = client.stat(stat(paths[2])).await.unwrap().into_inner();
+    assert!(!missing.found && !missing.is_error);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn inspect_target_over_tcp_preserves_lstat_and_rechecks_target_grants() {
     let (service, grants) = fixture();

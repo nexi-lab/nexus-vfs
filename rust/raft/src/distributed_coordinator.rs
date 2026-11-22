@@ -560,17 +560,27 @@ impl RaftDistributedCoordinator {
     where
         F: FnMut(&Arc<dyn FederationGrpcOps>, &str) -> Result<Option<T>, String>,
     {
-        let Some(client) = self.grpc_ops.get() else {
-            tracing::warn!(
-                op = op_name,
-                target_zone = %target_zone,
-                path = %peer_path,
-                "federation peer dispatch: grpc_ops not installed in coordinator — caller \
-                 will see empty result indistinguishable from a real empty dir; check that \
-                 `install_with_kernel` was called with a real FederationGrpcOps impl"
-            );
-            return None;
-        };
+        self.try_dispatch_to_peers(kernel, op_name, target_zone, peer_path, op)
+            .ok()
+            .flatten()
+    }
+
+    fn try_dispatch_to_peers<T, F>(
+        &self,
+        kernel: &Kernel,
+        op_name: &'static str,
+        target_zone: &str,
+        peer_path: &str,
+        op: F,
+    ) -> Result<Option<T>, String>
+    where
+        F: FnMut(&Arc<dyn FederationGrpcOps>, &str) -> Result<Option<T>, String>,
+    {
+        let client = self.grpc_ops.get().ok_or_else(|| {
+            let reason = format!("peer {op_name} unavailable in zone {target_zone}");
+            tracing::warn!(%reason);
+            reason
+        })?;
         let peers = self.zone_peers(kernel, target_zone);
         let self_addr = kernel.self_address_string();
         dispatch_to_peer_addrs(
@@ -585,15 +595,7 @@ impl RaftDistributedCoordinator {
     }
 }
 
-/// Per-syscall federation-peer iteration loop — pure function over an
-/// already-resolved peer list.
-///
-/// Split out of [`RaftDistributedCoordinator::dispatch_to_peers`] so the
-/// observability surface (the three PR #94 silent-miss `tracing::warn!`
-/// paths) and the first-hit-wins iteration semantics can be pinned
-/// directly in unit tests without standing up a `ZoneManager` /
-/// `Kernel` fixture.  The wrapper on the coordinator handles the slot
-/// + zone_peers lookups; this function handles the loop.
+/// A hit resolves the lookup. Absence requires a response from every eligible peer.
 fn dispatch_to_peer_addrs<T, F>(
     client: &Arc<dyn FederationGrpcOps>,
     op_name: &'static str,
@@ -602,34 +604,10 @@ fn dispatch_to_peer_addrs<T, F>(
     peers: &[String],
     self_addr: Option<&str>,
     mut op: F,
-) -> Option<T>
+) -> Result<Option<T>, String>
 where
     F: FnMut(&Arc<dyn FederationGrpcOps>, &str) -> Result<Option<T>, String>,
 {
-    if peers.is_empty() {
-        // `zone_peers` returned empty for a zone we believe is
-        // federated.  Three concrete deployment shapes hit this:
-        //   * The joiner hasn't actually joined the target zone yet
-        //     (boot-replay timing, sidecar didn't run, root SOLO
-        //     misconfig — see [[feedback_distributed_ssot]]).
-        //   * `zone_peers` is computed against a stale conf state
-        //     that doesn't yet contain the SSOT peer.
-        //   * The zone exists locally but has 0 voters configured
-        //     (federation never bootstrapped on this side).
-        // All three present to the caller as "directory is empty"
-        // — exactly the Mac↔Win Direction-A wedge signature.
-        // Surface at warn-level so operators can grep this single
-        // line without enabling per-module trace logging.
-        tracing::warn!(
-            op = op_name,
-            target_zone = %target_zone,
-            path = %peer_path,
-            "federation peer dispatch: zone_peers returned empty — caller will \
-             see empty result indistinguishable from a real empty dir; check that \
-             the joiner actually joined this zone (sidecar log + raft conf state)"
-        );
-        return None;
-    }
     let mut errors: Vec<String> = Vec::new();
     let mut attempted = 0usize;
     for peer_addr in peers {
@@ -640,7 +618,7 @@ where
         }
         attempted += 1;
         match op(client, peer_addr) {
-            Ok(Some(result)) => return Some(result),
+            Ok(Some(result)) => return Ok(Some(result)),
             Ok(None) => continue,
             Err(e) => {
                 tracing::debug!(
@@ -654,38 +632,15 @@ where
             }
         }
     }
-    // Fell through every voter without a hit.  Distinguish three
-    // sub-cases so operators can act:
-    //   * `attempted == 0` — every voter in `peers` was self_addr
-    //     (single-node federation arrangement; dispatch is
-    //     impossible until a peer actually joins).
-    //   * `errors.len() == attempted` — every non-self voter's
-    //     RPC errored (network / cert / WinFsp-side panic).
-    //     Surface at warn so it isn't lost in debug noise.
-    //   * Otherwise — every non-self voter returned Ok(None),
-    //     i.e., they all legitimately don't have the entry
-    //     (true miss; remain debug-level — high-volume normal case).
-    if attempted == 0 {
-        tracing::warn!(
-            op = op_name,
-            target_zone = %target_zone,
-            path = %peer_path,
-            voters = peers.len(),
-            "federation peer dispatch: all voters resolved to self_addr — no peer \
-             to dispatch to; caller will see empty result"
+    if attempted == 0 || !errors.is_empty() {
+        let failures = errors.join(" | ");
+        let reason = format!(
+            "peer {op_name} in zone {target_zone} could not resolve {peer_path} ({attempted} attempted): {failures}"
         );
-    } else if errors.len() == attempted {
-        tracing::warn!(
-            op = op_name,
-            target_zone = %target_zone,
-            path = %peer_path,
-            attempted,
-            errors = %errors.join(" | "),
-            "federation peer dispatch: every non-self voter's RPC failed; caller \
-             will see empty result indistinguishable from a real empty dir"
-        );
+        tracing::warn!(%reason);
+        return Err(reason);
     }
-    None
+    Ok(None)
 }
 
 // S3 Phase G (2026-07-05): the operator-declared `BootstrapMode` enum
@@ -2072,16 +2027,17 @@ impl DistributedCoordinator for RaftDistributedCoordinator {
         kernel: &Kernel,
         target_zone: &str,
         peer_path: &str,
-    ) -> Option<BackendStat> {
+    ) -> Result<Option<BackendStat>, kernel::kernel::KernelError> {
         // grpc_ops.stat already returns `Result<Option<BackendStat>, String>`
         // matching the dispatch_to_peers closure shape — pass through.
-        self.dispatch_to_peers::<BackendStat, _>(
+        self.try_dispatch_to_peers::<BackendStat, _>(
             kernel,
             "stat",
             target_zone,
             peer_path,
             |client, addr| client.stat(addr, peer_path),
         )
+        .map_err(kernel::kernel::KernelError::Federation)
     }
 
     fn peer_list_dir(
@@ -3514,6 +3470,8 @@ mod tests {
             self_addr,
             |c, addr| c.read(addr, "/p", 0).map(Some),
         )
+        .ok()
+        .flatten()
     }
 
     #[test]
@@ -3598,9 +3556,37 @@ mod tests {
                 }
             },
         );
-        assert_eq!(out.as_deref(), Some(&b"hit-b"[..]));
+        assert_eq!(out.unwrap().as_deref(), Some(&b"hit-b"[..]));
         let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
         assert_eq!(calls, vec!["a:2126", "b:2126"]);
+    }
+
+    #[test]
+    fn stat_absence_requires_every_eligible_peer_to_answer() {
+        let (_, client) = fake_arc();
+        let peers = vec!["a".into(), "b".into()];
+        for fail_first in [false, true] {
+            let result = dispatch_to_peer_addrs::<(), _>(
+                &client,
+                "stat",
+                "sharedzone",
+                "/p",
+                &peers,
+                None,
+                |_, addr| {
+                    if fail_first && addr == "a" {
+                        Err("offline".into())
+                    } else {
+                        Ok(None)
+                    }
+                },
+            );
+            if fail_first {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result, Ok(None));
+            }
+        }
     }
 
     #[test]
@@ -3631,7 +3617,7 @@ mod tests {
                 }
             },
         );
-        assert_eq!(out.as_deref(), Some(&b"hit-c"[..]));
+        assert_eq!(out.unwrap().as_deref(), Some(&b"hit-c"[..]));
         let calls: Vec<String> = fake.calls().into_iter().map(|(_, a)| a).collect();
         assert_eq!(calls, vec!["a:2126", "b:2126", "c:2126"]);
     }

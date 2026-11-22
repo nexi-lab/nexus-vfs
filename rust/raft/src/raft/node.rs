@@ -115,9 +115,8 @@ const DEFAULT_SC_SNAPSHOT_THRESHOLD: u64 = 8192;
 /// backlog while the zone commits 18 entries a second.
 pub const RETAINED_LOG_THRESHOLDS: u64 = 8;
 
-/// How long a read on a replica waits for this node's own earlier writes to
-/// apply before it reports the replica's lag instead of answering stale.
-pub(crate) const OWN_WRITES_READ_BUDGET: Duration = Duration::from_secs(2);
+/// Budget for a replica to establish the observation required by a metadata read.
+pub(crate) const REPLICA_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// Convert a bounded channel `TrySendError` to a `RaftError`.
 fn channel_try_send_err<T>(e: mpsc::error::TrySendError<T>) -> RaftError {
@@ -1264,7 +1263,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// A write submitted through this node records the index it committed at
     /// (`own_write_floor`); a read that follows waits here, bounded by
-    /// [`OWN_WRITES_READ_BUDGET`], until the state machine has applied through
+    /// [`REPLICA_READ_BUDGET`], until the state machine has applied through
     /// it, and otherwise fails with [`RaftError::ReplicaBehind`] rather than
     /// answering from state that predates the caller's own write. A replica
     /// that has applied them answers immediately, with no network round trip
@@ -1275,20 +1274,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             return Ok(());
         }
         let required = self.own_write_floor.load(Ordering::Acquire);
-        self.await_applied(
-            required,
-            tokio::time::Instant::now() + OWN_WRITES_READ_BUDGET,
-        )
-        .await
-        .map_err(|applied| {
-            let total = self
-                .replication
-                .write()
-                .replica_behind
-                .record(Instant::now());
-            self.log_visibility_refusal("ReplicaBehind", total, Some(required), applied);
-            RaftError::ReplicaBehind { required, applied }
-        })
+        self.await_applied(required, tokio::time::Instant::now() + REPLICA_READ_BUDGET)
+            .await
+            .map_err(|applied| {
+                let total = self
+                    .replication
+                    .write()
+                    .replica_behind
+                    .record(Instant::now());
+                self.log_visibility_refusal("ReplicaBehind", total, Some(required), applied);
+                RaftError::ReplicaBehind { required, applied }
+            })
     }
 
     fn log_visibility_refusal(
@@ -2709,6 +2705,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // Tick if needed
         if self.last_tick.elapsed() >= self.config.tick_interval {
             self.raw_node.tick();
+            self.applied_waiters.retain(|(_, reply)| !reply.is_closed());
             self.last_tick = Instant::now();
         }
 

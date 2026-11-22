@@ -478,6 +478,13 @@ impl ReadView {
         }
     }
 
+    fn exists(&self, path: &str) -> Result<bool, Status> {
+        self.kernel
+            .try_stat(path, &self.zone)
+            .map(|stat| stat.is_some())
+            .map_err(crate::grpc::stat_status)
+    }
+
     fn filter<T>(
         &self,
         values: &mut Vec<T>,
@@ -493,8 +500,7 @@ impl ReadView {
             } else {
                 // An index entry is a candidate, not a namespace fact. Check
                 // the live VFS once per path, including on warm cache hits.
-                let allowed = self.allows(path)?
-                    && (!require_existing || self.kernel.sys_stat(path, &self.zone).is_some());
+                let allowed = self.allows(path)? && (!require_existing || self.exists(path)?);
                 decisions.insert(path.to_owned(), allowed);
                 allowed
             };
@@ -580,7 +586,7 @@ impl AuthorizedPluginCall for SearchResponse {
                 if !view.allows(&path)? {
                     return Err(Status::permission_denied("search path is not readable"));
                 }
-                if view.kernel.sys_stat(&path, &view.zone).is_none() {
+                if !view.exists(&path)? {
                     return Ok(LocateResponse {
                         zone_id: view.zone,
                         ..Default::default()

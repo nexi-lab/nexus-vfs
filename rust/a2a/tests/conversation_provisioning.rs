@@ -153,6 +153,7 @@ fn stat(kernel: &Kernel, path: &str) -> StatResult {
 struct CountingKernel {
     inner: Kernel,
     setattrs: AtomicUsize,
+    stat_unavailable: bool,
     read_floor: AtomicUsize,
 }
 
@@ -160,6 +161,7 @@ impl CountingKernel {
     fn new() -> Self {
         Self {
             inner: Kernel::new(),
+            stat_unavailable: false,
             setattrs: AtomicUsize::new(0),
             read_floor: AtomicUsize::new(0),
         }
@@ -172,6 +174,16 @@ impl CountingKernel {
     fn reset(&self) {
         self.setattrs.store(0, Ordering::Relaxed);
     }
+}
+
+#[test]
+fn unavailable_transcript_observation_precedes_any_provisioning() {
+    let kernel = CountingKernel {
+        stat_unavailable: true,
+        ..CountingKernel::new()
+    };
+    assert!(ensure_conversation(&kernel, &provisioning_ctx(), "win-ai", "mac-ai").is_err());
+    assert_eq!(kernel.setattrs.load(Ordering::Relaxed), 0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,6 +274,12 @@ impl KernelSyscall for CountingKernel {
         recursive: bool,
     ) -> Result<SysUnlinkResult, KernelError> {
         KernelSyscall::sys_unlink(&self.inner, path, ctx, recursive)
+    }
+    fn try_stat(&self, path: &str, zone_id: &str) -> Result<Option<StatResult>, KernelError> {
+        if self.stat_unavailable {
+            return Err(KernelError::WouldBlock("replica is behind".into()));
+        }
+        self.inner.try_stat(path, zone_id)
     }
     fn sys_stat(&self, path: &str, zone_id: &str) -> Option<StatResult> {
         KernelSyscall::sys_stat(&self.inner, path, zone_id)

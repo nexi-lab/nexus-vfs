@@ -20,9 +20,8 @@ use crate::lock_manager::{LockManager, LockMode};
 use crate::meta_store::{FileMetadata, DT_DIR, DT_MOUNT, DT_PIPE, DT_REG, DT_STREAM};
 
 use super::{
-    validate_path_fast, Kernel, KernelError, OperationContext, StatResult, SysCopyResult,
-    SysMkdirResult, SysReadResult, SysRenameResult, SysRmdirResult, SysUnlinkResult,
-    SysWriteResult,
+    validate_path_fast, Kernel, KernelError, OperationContext, SysCopyResult, SysMkdirResult,
+    SysReadResult, SysRenameResult, SysRmdirResult, SysUnlinkResult, SysWriteResult,
 };
 
 fn backend_read_or_miss(
@@ -45,7 +44,7 @@ fn backend_read_or_miss(
 
 /// Only materialized path references use live filesystem attributes. A
 /// metadata-only regular entry, stream, pipe, or link keeps its VFS meaning.
-fn has_local_content_origin(entry: &FileMetadata, local_address: Option<&str>) -> bool {
+pub(super) fn has_local_content_origin(entry: &FileMetadata, local_address: Option<&str>) -> bool {
     entry
         .last_writer_address
         .as_deref()
@@ -53,7 +52,7 @@ fn has_local_content_origin(entry: &FileMetadata, local_address: Option<&str>) -
         .is_none_or(|writer| Some(writer) == local_address)
 }
 
-fn reference_file_metadata(
+pub(super) fn reference_file_metadata(
     route: &crate::vfs_router::RouteResult,
     entry: &FileMetadata,
     local_address: Option<&str>,
@@ -68,20 +67,6 @@ fn reference_file_metadata(
         .backend
         .as_ref()?
         .reference_metadata(&route.backend_path)
-}
-
-fn apply_reference_metadata(
-    stat: &mut StatResult,
-    metadata: crate::abc::object_store::ReferenceMetadata,
-) {
-    stat.size = metadata.size;
-    stat.mode = metadata.mode;
-    stat.is_directory = metadata.is_dir;
-    stat.entry_type = if metadata.is_dir { DT_DIR } else { DT_REG };
-    if metadata.is_dir {
-        stat.mime_type = "inode/directory".to_string();
-    }
-    stat.modified_at_ms = metadata.modified_at_ms;
 }
 
 fn materialize_reference_directory(
@@ -859,7 +844,9 @@ impl Kernel {
         //    setattr path) but is harmless on the rare cross-call cold
         //    path.
         let entry = self
-            .with_metastore_route(&route, |ms| ms.get(path).ok().flatten())
+            .with_metastore_route(&route, |store| store.get(path))
+            .transpose()
+            .map_err(|error| KernelError::from_metastore(&error, error.to_string()))?
             .flatten();
 
         // 3a. DT_LINK transparent follow
@@ -1296,340 +1283,6 @@ impl Kernel {
     }
 
     // ── sys_stat ───────────────────────────────────────────────────────
-
-    /// Rust syscall: get file metadata (pure Rust, no GIL).
-    ///
-    /// validate -> route -> dcache lookup -> return StatResult.
-    /// Returns None on dcache miss or trie-resolved paths (wrapper handles).
-    pub fn sys_stat(&self, path: &str, zone_id: &str) -> Option<StatResult> {
-        // 1. Validate
-        if validate_path_fast(path).is_err() {
-            return None;
-        }
-
-        // 2. Trie-resolved paths -> wrapper handles
-        if self.trie.lookup(path).is_some() {
-            return None;
-        }
-
-        // 2.5 Federation synthetic_views: /__sys__/zones/<id> exposes raft cluster
-        // status as a synthesised file entry; /__sys__/zones/ exposes the
-        // zone-id directory.  This is the read side of the kernel's
-        // virtual federation namespace — service-tier callers read zone
-        // state through `sys_stat` instead of a direct kernel
-        // accessor on the coordinator.
-        if let Some(stat) = self.zones_view_stat(path) {
-            return Some(stat);
-        }
-
-        // 3. Route — try VFS routing; fall back to global metastore
-        //    for paths outside any mount (e.g. /settings/* config entries).
-        let route = match self.vfs_router.route(path, zone_id) {
-            Some(r) => r,
-            None => {
-                // No mount covers this path — check global metastore directly.
-                // This is the read-side counterpart of setattr_update's global
-                // metastore fallback (same path create_nexus_fs settings boot uses).
-                return self
-                    .metastore_get(path)
-                    .ok()
-                    .flatten()
-                    .map(StatResult::from);
-            }
-        };
-        // 3.5. Mount-point synthesis (federation cross-zone mount).
-        // When ``backend_path`` is empty the routed path IS the mount
-        // point itself. For federation mounts (where the parent zone's
-        // canonical-key prefix differs from the routed ``zone_id`` — i.e.
-        // ``target_zone_id`` was set on the entry), there is no "/" entry
-        // in the target zone's metastore (the DT_MOUNT row lives in the
-        // *parent* zone's metastore, written by ``dlc.mount``). The
-        // VFSRouter is the SSOT for "this path is a mount point", so
-        // synthesise the DT_MOUNT result directly from routing structure
-        // — same pattern ``sys_mkdir`` uses ("the mount IS the
-        // directory"). Avoids a metastore round-trip and removes the
-        // need for federation to seed a dcache row at the mount root.
-        if route.backend_path.is_empty() {
-            // Mount-point root: the routed path IS the mount point itself.
-            // No metastore entry exists at the mount root — the VFS route
-            // is the SSOT. Synthesize a DT_MOUNT directory result.
-            return Some(StatResult {
-                path: path.to_string(),
-                size: 4096,
-                content_id: None,
-                mime_type: "inode/directory".to_string(),
-                is_directory: true,
-                entry_type: DT_MOUNT,
-                mode: 0o755,
-                version: 1,
-                gen: 0,
-                zone_id: Some(route.zone_id.clone()),
-                created_at_ms: None,
-                modified_at_ms: None,
-                last_writer_address: None,
-                lock: None,
-                link_target: None,
-                owner_id: None,
-            });
-        }
-
-        // 4. MetaStore lookup. The metastore impl serves cache hits from
-        //    its own internal cache (LocalMetaStore.cache /
-        //    RemoteMetaStore.cache / ZoneMetaStore.cache), so this is the
-        //    same hot-path cost as the legacy `dcache.get_entry` lookup
-        //    — relocated inside MetaStore::get instead of a kernel-global
-        //    side cache.
-        //    On miss, check implicit directory (path has children in
-        //    metastore but no explicit entry — e.g. /docs/ when
-        //    /docs/readme.md exists). Returns synthetic DT_DIR.
-        let entry: FileMetadata = match self
-            .with_metastore_route(&route, |ms| ms.get(path).ok().flatten())
-            .flatten()
-        {
-            Some(meta) => meta,
-            None => {
-                // A reference-backed file may arrive through an editor or
-                // shell without a metastore row. Its attributes come from
-                // the same physical file the backend reads, including mode.
-                if let Some(Ok(metadata)) = route
-                    .backend
-                    .as_ref()
-                    .and_then(|backend| backend.reference_metadata(&route.backend_path))
-                {
-                    let mut stat = StatResult::from(FileMetadata {
-                        path: path.to_string(),
-                        zone_id: Some(route.zone_id.clone()),
-                        ..Default::default()
-                    });
-                    apply_reference_metadata(&mut stat, metadata);
-                    return Some(stat);
-                }
-                // Implicit directory: children exist under this prefix
-                // but no explicit entry. Eliminates Python fallback to
-                // _check_is_directory() (Crossing 3a).
-                let is_implicit = self
-                    .with_metastore_route(&route, |ms| {
-                        ms.is_implicit_directory(path).unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if is_implicit {
-                    return Some(StatResult {
-                        path: path.to_string(),
-                        size: 4096,
-                        content_id: None,
-                        mime_type: "inode/directory".to_string(),
-                        is_directory: true,
-                        entry_type: DT_DIR,
-                        mode: 0o755,
-                        version: 0,
-                        gen: 0,
-                        zone_id: Some(route.zone_id.clone()),
-                        created_at_ms: None,
-                        modified_at_ms: None,
-                        last_writer_address: None,
-                        lock: None,
-                        link_target: None,
-                        owner_id: None,
-                    });
-                }
-                // Backend-only existence check.  `sys_readdir`
-                // already merges `backend.list_dir(...)` output into
-                // its result set (lines below), so a directory
-                // mounted via a driver plugin like LocalConnector
-                // enumerates the host fs entries it owns.  `sys_stat`
-                // is symmetric: ask the route's backend for a point
-                // metadata lookup via `ObjectStore::stat`.  Without
-                // this, `cd M:\<dir>\<session>` failed with ENOENT
-                // immediately after `ls` listed the directory (FUSE
-                // `open` / `get_security_by_name` calls `sys_stat`
-                // before `sys_read`, and Linux fuser clamps the
-                // subsequent read length to stat.size — which would
-                // otherwise have been 0).
-                //
-                // O(1) — backend's `stat` returns
-                // `BackendStat { size, is_dir }` directly via the
-                // `nexus_driver_stat` ABI symbol on driver plugins,
-                // or `fs::metadata` on in-process filesystem
-                // backends.
-                if let Some(backend) = route.backend.as_ref() {
-                    if let Ok(bs) = backend.stat(&route.backend_path) {
-                        return Some(StatResult {
-                            path: path.to_string(),
-                            size: if bs.is_dir { 4096 } else { bs.size },
-                            content_id: None,
-                            mime_type: if bs.is_dir {
-                                "inode/directory".to_string()
-                            } else {
-                                "application/octet-stream".to_string()
-                            },
-                            is_directory: bs.is_dir,
-                            entry_type: if bs.is_dir { DT_DIR } else { DT_REG },
-                            mode: if bs.is_dir { 0o755 } else { 0o644 },
-                            version: 0,
-                            gen: 0,
-                            zone_id: Some(route.zone_id.clone()),
-                            created_at_ms: None,
-                            modified_at_ms: None,
-                            last_writer_address: None,
-                            lock: None,
-                            link_target: None,
-                            owner_id: None,
-                        });
-                    }
-                }
-                // Federation peer dispatch — sister of sys_readdir's
-                // arm above: when the routed entry has no local
-                // backend (placeholder MountEntry shape installed by
-                // wire_mount_core for follower nodes) BUT the entry
-                // carries a `target_zone_id`, ask any non-self voter
-                // of that zone via `NexusVFSService.Stat`.  Closes the
-                // sys_stat half of the boundary leak so FUSE lookup
-                // (the gate before every cat / open / unlink) sees
-                // peer-owned entries with no Nexus-side metadata.
-                // Same shape sys_readdir uses.
-                //
-                // `via_federation_stat` returns `None` for non-federation
-                // routes (caller falls through to local stat) — the
-                // is-peer-mount predicate is encapsulated.
-                if let Some(bs) = route.via_federation_stat(self, path) {
-                    return Some(StatResult {
-                        path: path.to_string(),
-                        size: if bs.is_dir { 4096 } else { bs.size },
-                        content_id: None,
-                        mime_type: if bs.is_dir {
-                            "inode/directory".to_string()
-                        } else {
-                            "application/octet-stream".to_string()
-                        },
-                        is_directory: bs.is_dir,
-                        entry_type: if bs.is_dir { DT_DIR } else { DT_REG },
-                        mode: if bs.is_dir { 0o755 } else { 0o644 },
-                        version: 0,
-                        gen: 0,
-                        zone_id: Some(route.zone_id.clone()),
-                        created_at_ms: None,
-                        modified_at_ms: None,
-                        last_writer_address: None,
-                        lock: None,
-                        link_target: None,
-                        owner_id: None,
-                    });
-                }
-                return None;
-            }
-        };
-
-        self.stat_from_metadata(path, zone_id, route, entry)
-    }
-
-    /// Resolve live stat fields from an already-read inode for point and batch reads.
-    pub(super) fn stat_from_metadata(
-        &self,
-        path: &str,
-        zone_id: &str,
-        route: crate::vfs_router::RouteResult,
-        entry: FileMetadata,
-    ) -> Option<StatResult> {
-        // A replicated inode can name another node's bytes. That node's
-        // durable metadata remains authoritative over this node's filesystem.
-        let reference =
-            reference_file_metadata(&route, &entry, self.self_address.read().as_deref());
-        if let Some(observation) = reference {
-            let metadata = observation.ok()?;
-            let mut stat = StatResult::from(entry);
-            stat.lock = self.advisory_lock_info(path, zone_id);
-            apply_reference_metadata(&mut stat, metadata);
-            return Some(stat);
-        }
-        // Virtual directory inodes may exist without a native directory. When
-        // there is one, report its real permissions without persisting a copy.
-        if entry.entry_type == DT_DIR
-            && has_local_content_origin(&entry, self.self_address.read().as_deref())
-        {
-            if let Some(Ok(metadata)) = route
-                .backend
-                .as_ref()
-                .and_then(|backend| backend.reference_metadata(&route.backend_path))
-                .filter(|observation| observation.as_ref().is_ok_and(|metadata| metadata.is_dir))
-            {
-                let mut stat = StatResult::from(entry);
-                stat.lock = self.advisory_lock_info(path, zone_id);
-                apply_reference_metadata(&mut stat, metadata);
-                return Some(stat);
-            }
-        }
-
-        // Treat DT_MOUNT like a directory for VFS callers — a mount point is
-        // the zone-root inode, analogous to a DT_DIR from the user's view.
-        let is_dir = entry.entry_type == DT_DIR || entry.entry_type == DT_MOUNT;
-        let mime = entry
-            .mime_type
-            .as_deref()
-            .unwrap_or(if is_dir {
-                "inode/directory"
-            } else {
-                "application/octet-stream"
-            })
-            .to_string();
-
-        let lock = self.advisory_lock_info(path, zone_id);
-
-        // A DT_STREAM's byte length is its live append tail, tracked in the
-        // stream subsystem — the metastore `entry.size` is not maintained for
-        // streams (it stays at the create-time value). Report the tail so a
-        // caller (e.g. a co-hosted agent seeking its mailbox to the current
-        // end on cold start) gets the correct length through the standard
-        // metadata syscall, no separate stream-only accessor needed. Falls
-        // back to `entry.size` when the buffer isn't locally resolvable (e.g.
-        // a not-yet-materialised remote stream).
-        let size = if entry.entry_type == DT_STREAM {
-            self.stream_manager
-                .tail(&super::StreamAddress::from_route(path, zone_id, Some(&route)).key())
-                .map_or(entry.size, |tail| tail as u64)
-        } else if is_dir && entry.size == 0 {
-            4096
-        } else {
-            entry.size
-        };
-
-        // Same seam as `size` — a DT_STREAM's live modified_at_ms is
-        // the stream subsystem's last-append wall-clock, not the
-        // metastore row (which never updates on stream push since
-        // writes short-circuit into the stream buffer).  Search
-        // recency, audit staleness gates, and cross-agent mailbox
-        // catch-up all depend on this.  Falls back to
-        // `entry.modified_at_ms` when the buffer isn't locally
-        // resolvable (remote-only streams) or when the stream has
-        // never been appended to on this replica.
-        let modified_at_ms = if entry.entry_type == DT_STREAM {
-            self.stream_manager
-                .last_append_ms(
-                    &super::StreamAddress::from_route(path, zone_id, Some(&route)).key(),
-                )
-                .or(entry.modified_at_ms)
-        } else {
-            entry.modified_at_ms
-        };
-
-        Some(StatResult {
-            path: path.to_string(),
-            size,
-            content_id: entry.content_id,
-            mime_type: mime,
-            is_directory: is_dir,
-            entry_type: entry.entry_type,
-            mode: if is_dir { 0o755 } else { 0o644 },
-            version: entry.version,
-            gen: entry.gen,
-            zone_id: entry.zone_id,
-            created_at_ms: entry.created_at_ms,
-            modified_at_ms,
-            last_writer_address: entry.last_writer_address,
-            lock,
-            link_target: entry.link_target,
-            owner_id: entry.owner_id,
-        })
-    }
 
     /// Set native file permissions through the route's reference backend.
     ///
@@ -3374,16 +3027,29 @@ impl Kernel {
         // Links need the single-path recursion: it gates both spellings and
         // commits metadata at the target. The batch fast path writes directly
         // to its pre-routed backend and cannot preserve that contract.
-        if reqs.iter().any(|req| {
-            self.directory_link_target(&req.path, &ctx.zone_id)
-                .map_or(true, |target| target.is_some())
-                || self
-                    .sys_stat(&req.path, &ctx.zone_id)
-                    .is_some_and(|entry| entry.entry_type == crate::meta_store::DT_LINK)
-        }) {
+        let paths: Vec<_> = reqs.iter().map(|req| req.path.clone()).collect();
+        let stats = self.try_stat_batch(&paths, &ctx.zone_id);
+        let requires_individual_write = match &stats {
+            Ok(rows) => {
+                rows.iter()
+                    .flatten()
+                    .any(|entry| entry.entry_type == crate::meta_store::DT_LINK)
+                    || reqs.iter().any(|req| {
+                        !matches!(
+                            self.directory_link_target(&req.path, &ctx.zone_id),
+                            Ok(None)
+                        )
+                    })
+            }
+            Err(_) => true,
+        };
+        if requires_individual_write {
             return reqs
                 .iter()
                 .map(|req| {
+                    if stats.is_err() {
+                        self.try_stat(&req.path, &ctx.zone_id)?;
+                    }
                     self.sys_write_with_link_depth(&req.path, ctx, &req.content, req.offset, 1)
                 })
                 .collect();
@@ -4318,7 +3984,7 @@ impl Kernel {
             // Empty enumeration is ambiguous — resolve existence via the one
             // authority. Only reached on an empty result, so the common
             // non-empty listing keeps its exact cost.
-            match self.sys_stat(parent_path, zone_id) {
+            match self.try_stat(parent_path, zone_id)? {
                 None => return Err(KernelError::FileNotFound(parent_path.to_string())),
                 Some(s) if !s.is_directory => {
                     return Err(KernelError::InvalidPath(format!(

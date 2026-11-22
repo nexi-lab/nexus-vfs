@@ -4,6 +4,9 @@
 //! crate (``kernel``, ``raft``, ``transport``, …). Add new primitives
 //! sparingly — the bar is "used by two or more crates/tiers".
 
+/// JSON RPC error code for a file that the serving authority confirmed absent.
+pub const RPC_FILE_NOT_FOUND: i32 = -32007;
+
 /// Canonical root zone identifier.
 ///
 /// Every path routed by the kernel carries an implicit zone; an
