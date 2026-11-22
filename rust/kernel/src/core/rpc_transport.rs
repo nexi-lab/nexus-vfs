@@ -438,6 +438,17 @@ fn is_retryable(status: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_not_found_requires_a_typed_rpc_code() {
+        assert!(super::is_file_not_found(
+            br#"{"code":-32007,"message":"absent"}"#
+        ));
+        assert!(!super::is_file_not_found(
+            br#"{"code":-32603,"message":"not found"}"#
+        ));
+        assert!(!super::is_file_not_found(b"invalid"));
+    }
+
     use super::*;
 
     #[test]
