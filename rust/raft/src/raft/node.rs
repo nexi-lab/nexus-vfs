@@ -74,7 +74,13 @@ pub(crate) use member_registration::MemberRegistration;
 mod member_readback;
 #[cfg(all(feature = "grpc", has_protos))]
 use member_readback::MemberAddressView;
+mod proposal_receipt;
+#[cfg(test)]
+mod proposal_receipt_tests;
+use proposal_receipt::{ProposalReceipts, Reply as ProposalReply};
 mod read_index;
+#[cfg(test)]
+mod test_cluster;
 use read_index::{PendingRead, ReadContext, ReadReply, ReadRequestIds};
 mod replication;
 use replication::{CommitProbe, ReplicationView};
@@ -228,12 +234,6 @@ impl RaftConfig {
             ..Default::default()
         }
     }
-}
-
-/// Pending proposal waiting for commit.
-struct PendingProposal {
-    /// Channel to send result back.
-    tx: oneshot::Sender<Result<CommandResult>>,
 }
 
 /// A point-in-time snapshot of a zone's raft membership, read from the
@@ -606,11 +606,8 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
     config: RaftConfig,
-    /// Pending proposals waiting for commit, keyed by proposal ID.
-    pending: HashMap<u64, PendingProposal>,
-    /// Pending ConfChanges waiting for commit, keyed by target node_id.
-    /// Resolved in `apply_entries` when the ConfChange is committed.
-    pending_conf_changes: HashMap<u64, oneshot::Sender<Result<ConfState>>>,
+    receipts: ProposalReceipts,
+    last_waiter_cleanup: Instant,
     /// Pending linearizable reads waiting for raft-rs to emit a
     /// `ReadState`, keyed by the opaque request context we passed to
     /// `RawNode::read_index`.
@@ -984,8 +981,8 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             replica_control_active,
             state_machine,
             config,
-            pending: HashMap::new(),
-            pending_conf_changes: HashMap::new(),
+            receipts: ProposalReceipts::default(),
+            last_waiter_cleanup: Instant::now(),
             pending_reads_by_ctx: HashMap::new(),
             applied_waiters: Vec::new(),
             applied_index_atom,
@@ -2499,6 +2496,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     let _ = tx.send(Err(error));
                     return;
                 }
+                if !self.is_leader() {
+                    let _ = tx.send(Err(RaftError::NotLeader { leader_hint: None }));
+                    return;
+                }
                 let target_node_id = change.node_id;
                 tracing::debug!(
                     peer_node_id = target_node_id,
@@ -2506,8 +2507,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                 );
                 match self.raw_node.propose_conf_change(vec![], change) {
                     Ok(()) => {
-                        // Store tx — will be resolved in apply_entries when committed
-                        self.pending_conf_changes.insert(target_node_id, tx);
+                        self.await_proposed_entry(ProposalReply::Membership(tx));
                     }
                     Err(e) => {
                         let _ = tx.send(Err(RaftError::Raft(e.to_string())));
@@ -2626,13 +2626,21 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         tracing::debug!(proposal_id = id, "raft.driver.propose");
         match self.raw_node.propose(vec![], proposal_data) {
             Ok(()) => {
-                // Store pending — tx will be resolved in apply_entries
-                self.pending.insert(id, PendingProposal { tx });
+                self.await_proposed_entry(ProposalReply::Command(tx));
             }
             Err(e) => {
                 let _ = tx.send(Err(RaftError::Raft(e.to_string())));
             }
         }
+    }
+
+    // The actor is the current leader and raft-rs has appended exactly one entry.
+    fn await_proposed_entry(&mut self, reply: ProposalReply) {
+        self.receipts.insert(
+            self.raw_node.raft.raft_log.last_index(),
+            self.raw_node.raft.term,
+            reply,
+        );
     }
 
     /// Advance the Raft state machine: tick, process ready, apply entries.
@@ -2658,8 +2666,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             self.failed = true;
             self.msg_rx.close();
             while self.msg_rx.try_recv().is_ok() {}
-            self.pending.clear();
-            self.pending_conf_changes.clear();
+            self.receipts = ProposalReceipts::default();
             self.pending_reads_by_ctx.clear();
             self.applied_waiters.clear();
             self.cached_leader_id.store(0, Ordering::Release);
@@ -2705,7 +2712,11 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         // Tick if needed
         if self.last_tick.elapsed() >= self.config.tick_interval {
             self.raw_node.tick();
-            self.applied_waiters.retain(|(_, reply)| !reply.is_closed());
+            if self.last_waiter_cleanup.elapsed() >= Duration::from_secs(PROPOSAL_TIMEOUT_SECS) {
+                self.receipts.discard_closed();
+                self.applied_waiters.retain(|(_, reply)| !reply.is_closed());
+                self.last_waiter_cleanup = Instant::now();
+            }
             self.last_tick = Instant::now();
         }
 
@@ -2781,6 +2792,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             // snapshot index, so a freshly-installed follower does not re-open
             // the gate every ready.
             self.last_index_at_snapshot = snapshot.get_metadata().index;
+            self.receipts
+                .installed_snapshot(self.last_index_at_snapshot);
             #[cfg(all(feature = "grpc", has_protos))]
             {
                 self.routes_stale = true;
@@ -3052,14 +3065,18 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         let mut sm = self.state_machine.write().await;
 
         for entry in entries {
+            let waiting = self.receipts.committed(entry.index, entry.term);
             match entry.get_entry_type() {
                 // A leader's empty entry, and a V1 entry raft-rs never writes
                 // empty, have no command to apply.
                 EntryType::EntryNormal | EntryType::EntryConfChange if entry.data.is_empty() => {
                     sm.apply(entry.index, &Command::Noop)?;
+                    if let Some(reply) = waiting {
+                        reply.fail(RaftError::Raft("proposal committed as a no-op".into()));
+                    }
                 }
                 EntryType::EntryNormal => {
-                    let (proposal_id, command) = Command::from_log_data(&entry.data)?;
+                    let (_, command) = Command::from_log_data(&entry.data)?;
                     let result = sm.apply(entry.index, &command)?;
                     if command.requires_activation_qualification() {
                         self.replica_control_active = sm.replica_control_activation()?.is_some();
@@ -3069,9 +3086,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         self.routes_stale = true;
                     }
 
-                    // Notify waiting proposal (if any) — direct HashMap, no lock
-                    if let Some(proposal) = self.pending.remove(&proposal_id) {
-                        let _ = proposal.tx.send(Ok(result));
+                    if let Some(ProposalReply::Command(tx)) = waiting {
+                        let _ = tx.send(Ok(result));
                     }
                 }
                 EntryType::EntryConfChange => {
@@ -3095,10 +3111,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                                 error = %e,
                                 "raft.conf_change.rejected — advancing past rejected change",
                             );
-                            if let Some(tx) = self.pending_conf_changes.remove(&cc.node_id) {
-                                let _ = tx.send(Err(RaftError::Raft(e.to_string())));
-                            }
                             sm.apply(entry.index, &Command::Noop)?;
+                            if let Some(reply) = waiting {
+                                reply.fail(RaftError::Raft(e.to_string()));
+                            }
                             continue;
                         }
                     };
@@ -3148,7 +3164,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                     self.update_cached_status();
 
                     // Notify waiting JoinZone caller (if any)
-                    if let Some(tx) = self.pending_conf_changes.remove(&cc.node_id) {
+                    if let Some(ProposalReply::Membership(tx)) = waiting {
                         let _ = tx.send(Ok(cs));
                     }
                 }
@@ -3159,7 +3175,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                         .map_err(|e| RaftError::Serialization(e.to_string()))?;
 
                     // See EntryConfChange above — same raft-rs rejection
-                    // contract. Notify every pending caller in the batch.
+                    // contract.
                     let cs = match self.raw_node.apply_conf_change(&cc) {
                         Ok(cs) => cs,
                         Err(e) => {
@@ -3169,13 +3185,10 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
                                 error = %e,
                                 "raft.conf_change_v2.rejected — advancing past rejected change",
                             );
-                            for single in &cc.changes {
-                                if let Some(tx) = self.pending_conf_changes.remove(&single.node_id)
-                                {
-                                    let _ = tx.send(Err(RaftError::Raft(e.to_string())));
-                                }
-                            }
                             sm.apply(entry.index, &Command::Noop)?;
+                            if let Some(reply) = waiting {
+                                reply.fail(RaftError::Raft(e.to_string()));
+                            }
                             continue;
                         }
                     };
@@ -3221,11 +3234,8 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 
                     self.update_cached_status();
 
-                    // Notify waiting JoinZone callers for each added node
-                    for single in &cc.changes {
-                        if let Some(tx) = self.pending_conf_changes.remove(&single.node_id) {
-                            let _ = tx.send(Ok(cs.clone()));
-                        }
+                    if let Some(ProposalReply::Membership(tx)) = waiting {
+                        let _ = tx.send(Ok(cs));
                     }
                 }
             }

@@ -36,6 +36,14 @@ pub enum RaftError {
     #[error("proposal dropped")]
     ProposalDropped,
 
+    /// A committed entry in another term proves this proposed entry was overwritten.
+    #[error("proposal at index {index} in term {proposed_term} superseded by committed term {committed_term}")]
+    ProposalSuperseded {
+        index: u64,
+        proposed_term: u64,
+        committed_term: u64,
+    },
+
     /// The owning actor refused admission before submitting anything to Raft.
     #[error("proposal refused before submission: {0}")]
     ProposalRejected(String),
@@ -180,9 +188,10 @@ impl RaftError {
             Self::NotSubmitted { .. } => false,
             // Answered, and the answer was "not me" or an explicit rejection: nothing
             // was applied by anyone on this path.
-            Self::NotLeader { .. } | Self::ProposalRejected(_) | Self::EntryTooLarge { .. } => {
-                false
-            }
+            Self::NotLeader { .. }
+            | Self::ProposalRejected(_)
+            | Self::ProposalSuperseded { .. }
+            | Self::EntryTooLarge { .. } => false,
             // Answered, and the answer was "committed": the outcome is known.
             Self::CommittedNotVisible { .. } => false,
             // Local faults that never reached consensus.
