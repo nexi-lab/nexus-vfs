@@ -1647,6 +1647,7 @@ impl FullStateMachine {
     }
 
     /// Whether the metadata range for the directory contains at least one child.
+    #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) fn has_metadata_children(&self, path: &str) -> Result<bool> {
         let prefix = format!("{}/", path.trim_end_matches('/'));
         let mut found = false;
