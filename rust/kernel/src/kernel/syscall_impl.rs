@@ -1776,6 +1776,18 @@ impl Kernel {
         new_path: &str,
         ctx: &OperationContext,
     ) -> Result<SysRenameResult, KernelError> {
+        let mut admission = self.renames.enter()?;
+        let result = self.rename_admitted(old_path, new_path, ctx);
+        admission.completed = result.as_ref().is_ok_and(|r| r.hit && r.success);
+        result
+    }
+
+    fn rename_admitted(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        ctx: &OperationContext,
+    ) -> Result<SysRenameResult, KernelError> {
         let miss = || {
             Ok(SysRenameResult {
                 hit: false,

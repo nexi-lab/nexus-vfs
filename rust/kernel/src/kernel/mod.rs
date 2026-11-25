@@ -108,6 +108,7 @@ mod mount;
 mod observability;
 mod peer_content;
 mod plugins;
+mod rename_drain;
 mod stat;
 pub mod syscall;
 pub mod syscall_async;
@@ -599,6 +600,7 @@ pub struct Kernel {
     trie: Trie,
     // Unified lock manager: I/O lock + advisory lock + optional Raft.
     lock_manager: Arc<LockManager>,
+    renames: rename_drain::RenameDrain,
     // Shared metadata snapshots survive replacement until their I/O finishes.
     // The slot stays behind parking_lot::RwLock so
     // the setter paths (``set_metastore_path`` / ``release_metastores``)
@@ -839,6 +841,7 @@ impl Kernel {
             vfs_router: Arc::new(VFSRouter::new()),
             trie: Trie::new(),
             lock_manager: Arc::new(LockManager::new()),
+            renames: rename_drain::RenameDrain::default(),
             metastore: parking_lot::RwLock::new(Some(Arc::new(boot_metastore))),
             vfs_lock_timeout_ms: AtomicU64::new(5000),
             read_batch_max_concurrency: AtomicUsize::new(16),

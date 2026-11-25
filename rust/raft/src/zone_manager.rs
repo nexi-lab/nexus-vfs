@@ -313,7 +313,7 @@ pub struct ZoneManager {
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     /// The gRPC server task, joined by [`Self::shutdown`]: its in-flight
     /// handlers hold zone handles, and its listener holds the bind address.
-    server_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    server_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     node_id: u64,
     /// Late-bindable slot the kernel populates with a `BlobFetcher`
     /// once its root mount backend is ready. Shared with the gRPC
@@ -698,7 +698,7 @@ impl PreparedZoneManager {
             registry,
             runtime,
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
-            server_task: parking_lot::Mutex::new(server_task),
+            server_task: tokio::sync::Mutex::new(server_task),
             node_id,
             blob_fetcher_slot,
             search_capabilities_slot,
@@ -2317,25 +2317,24 @@ impl ZoneManager {
 
     /// Gracefully shut down all zones and the gRPC server.
     pub fn shutdown(&self) {
-        // Zones first: an in-flight handler of a stopped zone fails at once
-        // instead of holding the server's drain open on a live proposal.
+        bridge_block_on(self.rt().handle(), self.shutdown_async());
+    }
+
+    /// Wait for all zone and server tasks to release their resources. Cancelling
+    /// this wait leaves the original task available for another shutdown caller.
+    pub async fn shutdown_async(&self) {
         let stopped = self.registry.shutdown();
-        // Keep the shutdown owner until the server releases its resources.
-        // Concurrent callers must wait for that same completion.
-        let mut server_owner = self.server_task.lock();
-        let server = server_owner.take();
-        bridge_block_on(self.rt().handle(), async {
-            stopped.released().await;
-            if let Some(tx) = self.shutdown_tx.lock().await.take() {
-                let _ = tx.send(true);
+        stopped.released().await;
+        let mut owner = self.server_task.lock().await;
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(server) = owner.as_mut() {
+            if let Err(error) = server.await {
+                tracing::warn!(%error, "gRPC server task did not finish cleanly");
             }
-            if let Some(server) = server {
-                if let Err(error) = server.await {
-                    tracing::warn!(%error, "gRPC server task did not finish cleanly");
-                }
-            }
-        });
-        drop(server_owner);
+            owner.take();
+        }
         tracing::info!("ZoneManager local_node_id={} shut down", self.node_id);
     }
 }
