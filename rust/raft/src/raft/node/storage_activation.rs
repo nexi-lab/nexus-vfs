@@ -38,7 +38,7 @@ impl StorageActivationView {
 pub enum RaftMessageProtocol {
     Legacy,
     ReplicaControlV1,
-    AtomicNamespaceV1,
+    AtomicNamespaceV2,
 }
 
 impl RaftMessageProtocol {
@@ -47,7 +47,7 @@ impl RaftMessageProtocol {
         match self {
             Self::Legacy => ReaderFormat::Legacy,
             Self::ReplicaControlV1 => ReaderFormat::ReplicaControl,
-            Self::AtomicNamespaceV1 => ReaderFormat::AtomicNamespace,
+            Self::AtomicNamespaceV2 => ReaderFormat::AtomicNamespace,
         }
     }
 }
@@ -58,7 +58,7 @@ impl From<super::super::storage::ReaderFormat> for RaftMessageProtocol {
         match format {
             ReaderFormat::Legacy => Self::Legacy,
             ReaderFormat::ReplicaControl => Self::ReplicaControlV1,
-            ReaderFormat::AtomicNamespace => Self::AtomicNamespaceV1,
+            ReaderFormat::AtomicNamespace => Self::AtomicNamespaceV2,
         }
     }
 }
@@ -181,7 +181,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         }
         match (self.config.membership_policy, submission.protocol) {
             (_, StorageProtocol::AtomicNamespace) => {
-                if self.reader_protocol == RaftMessageProtocol::AtomicNamespaceV1
+                if self.reader_protocol == RaftMessageProtocol::AtomicNamespaceV2
                     && self.config.membership_policy == MembershipPolicy::Managed
                 {
                     Ok(())

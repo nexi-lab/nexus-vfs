@@ -14,6 +14,10 @@ pub(crate) enum StorageProtocol {
 }
 
 impl Command {
+    pub(crate) fn is_namespace_mutation(&self) -> bool {
+        self.ordinary_metadata_key().is_some() || matches!(self, Self::RenameNamespaceV1 { .. })
+    }
+
     #[cfg(feature = "consensus")]
     pub(crate) fn requires_activation_qualification(&self) -> bool {
         matches!(self, Self::ActivateReplicaControl { .. })

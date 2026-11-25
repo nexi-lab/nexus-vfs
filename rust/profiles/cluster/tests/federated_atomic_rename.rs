@@ -106,7 +106,7 @@ impl Drop for Member {
 fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
     let base = tempfile::tempdir().unwrap();
     let (ca, key) = generate_zone_ca("root").unwrap();
-    let listeners: Vec<_> = (0..3)
+    let listeners: Vec<_> = (0..4)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
     let addresses: Vec<_> = listeners
@@ -114,7 +114,7 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
         .map(|l| l.local_addr().unwrap().to_string())
         .collect();
     drop(listeners);
-    let mut members: Vec<_> = (1..=3)
+    let mut members: Vec<_> = (1..=4)
         .map(|id| {
             let dir = base.path().join(id.to_string());
             let raft = dir.join(ZONE).join("raft");
@@ -123,6 +123,7 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
             store.initialize_atomic_namespace().unwrap();
             let mut conf = store.initial_state_impl().unwrap().conf_state;
             conf.voters = vec![1, 2, 3];
+            conf.learners = vec![4];
             store.set_conf_state(&conf).unwrap();
             let (cert, secret) = generate_node_cert(id, "root", &ca, &key, &[], None).unwrap();
             fs::write(dir.join("ca"), &ca).unwrap();
@@ -136,13 +137,19 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
             }
         })
         .collect();
-    for m in &mut members {
+    for m in &mut members[..3] {
         m.start();
     }
     let leader = members[0].call("leader").as_u64().unwrap() as usize - 1;
     let reader = (leader + 1) % 3;
     let origin = (leader + 2) % 3;
     members[leader].call("seed");
+    members[3].start();
+    assert_eq!(members[3].call("read_old"), json!(BODY));
+    members[3].call("check_writer_protocol");
+    members[3].call("write_progress");
+    assert_eq!(members[leader].call("read_old"), json!(BODY));
+    members[3].kill();
     assert_eq!(members[origin].call("read_old"), json!(BODY));
     let views = members[reader].submit("watch");
     for _ in 0..12 {
@@ -239,7 +246,7 @@ async fn run_member(dir: PathBuf, mut seq: u32) {
         registry.clone(),
         ServerConfig {
             bind_address: addr.parse().unwrap(),
-            tls: Some(tls),
+            tls: Some(tls.clone()),
             ..Default::default()
         },
     );
@@ -345,6 +352,58 @@ async fn run_member(dir: PathBuf, mut seq: u32) {
                 })
                 .await
                 .unwrap();
+                json!(true)
+            }
+            "check_writer_protocol" => {
+                use nexus_raft::transport::proto::{
+                    raft_command, zone_api_service_client::ZoneApiServiceClient, DeleteMetadata,
+                    ProposeRequest, RaftCommand,
+                };
+                use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+                let leader = node.leader_id().unwrap() as usize - 1;
+                let channel = Endpoint::from_shared(format!("https://{}", addresses[leader]))
+                    .unwrap()
+                    .tls_config(
+                        ClientTlsConfig::new()
+                            .domain_name(TlsConfig::CLUSTER_SERVER_NAME)
+                            .ca_certificate(Certificate::from_pem(&tls.ca_pem))
+                            .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem)),
+                    )
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+                let mut api = ZoneApiServiceClient::new(channel);
+                let delete = Command::DeleteMetadata { key: SOURCE.into() };
+                for forwarded in [false, true] {
+                    for raw in [false, true] {
+                        let mut req = ProposeRequest {
+                            zone_id: ZONE.into(),
+                            forwarded,
+                            ..Default::default()
+                        };
+                        if raw {
+                            req.raw_command = bincode::serialize(&delete).unwrap();
+                        } else {
+                            req.command = Some(RaftCommand {
+                                command: Some(raft_command::Command::DeleteMetadata(
+                                    DeleteMetadata {
+                                        path: SOURCE.into(),
+                                        zone_id: ZONE.into(),
+                                    },
+                                )),
+                            });
+                        }
+                        let refusal = api.propose(req).await.unwrap_err();
+                        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+                    }
+                }
+                let before = node.ec_wal_bounds();
+                assert!(before.is_none());
+                assert!(node.propose_ec_local(delete.clone()).await.is_err());
+                assert_eq!(node.ec_wal_bounds(), before);
+                assert!(node.apply_ec_from_peer(delete, u64::MAX).await.is_err());
+                assert_eq!(names().await.unwrap(), [SOURCE]);
                 json!(true)
             }
             "arm" => {

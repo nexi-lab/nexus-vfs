@@ -37,7 +37,7 @@ service ZoneTransportService {
   rpc StepReplicaControlV1(StepMessageRequest) returns (StepMessageResponse);
 
   // Exchange Raft messages between members commissioned for atomic namespace operations.
-  rpc StepAtomicNamespaceV1(StepMessageRequest) returns (StepMessageResponse);
+  rpc StepAtomicNamespaceV2(StepMessageRequest) returns (StepMessageResponse);
 
   // Persist the local Raft reader floor for replica-control preparation on an
   // already hosted Managed zone. Only an authenticated cluster Node may call
@@ -451,6 +451,10 @@ message ProposeRequest {
   // Set by follower when forwarding. Prevents infinite forwarding loops
   // (if leader_hint is stale and target is also a follower).
   bool forwarded = 5;
+  // Member-forwarded namespace mutation in an atomic-namespace zone. The
+  // sender leaves both legacy command fields empty, so older receivers have
+  // no command to apply. Uses the same bincode Command as the Raft entry.
+  bytes namespace_command_v1 = 6;
 }
 
 // ProposeResponse is the response to a Propose RPC.
@@ -958,7 +962,8 @@ enum StepBoundary {
   STEP_BOUNDARY_LEGACY = 1;
   // StepReplicaControlV1.
   STEP_BOUNDARY_REPLICA_CONTROL_V1 = 2;
-  STEP_BOUNDARY_ATOMIC_NAMESPACE_V1 = 3;
+  reserved 3;
+  STEP_BOUNDARY_ATOMIC_NAMESPACE_V2 = 4;
 }
 
 // SnapshotChunkRequest carries one slice of one raft snapshot's data.

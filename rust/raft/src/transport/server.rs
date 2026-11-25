@@ -545,7 +545,7 @@ fn namespace_step_zone<S: crate::raft::StateMachine + 'static>(
     let namespace = node
         .as_ref()
         .is_some_and(ZoneConsensus::is_atomic_namespace_member);
-    if namespace != (protocol == crate::raft::RaftMessageProtocol::AtomicNamespaceV1) {
+    if namespace != (protocol == crate::raft::RaftMessageProtocol::AtomicNamespaceV2) {
         return Err(Status::failed_precondition(
             "incompatible Raft namespace reader",
         ));
@@ -831,11 +831,11 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             .await
     }
 
-    async fn step_atomic_namespace_v1(
+    async fn step_atomic_namespace_v2(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV1)
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV2)
             .await
     }
 
@@ -886,6 +886,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
+        node.require_ec_writes()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         // EC replication membership: like step_message, the peer-map
         // is the runtime SSOT under the opaque-ID contract; a static
@@ -947,6 +949,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
+        node.require_ec_writes()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         for entry in &req.entries {
             if let Err(e) = apply_ec_entry(&node, entry).await {
@@ -1223,8 +1227,30 @@ impl ZoneApiService for ZoneApiServiceImpl {
 
         // Deserialize command: prefer raw_command (bincode, from internal forwarding)
         // over proto command (from external clients).
-        let cmd = if !req.raw_command.is_empty() {
-            match bincode::deserialize::<Command>(&req.raw_command) {
+        let namespace_forward = !req.namespace_command_v1.is_empty();
+        let raw = if namespace_forward {
+            if !req.forwarded || req.command.is_some() || !req.raw_command.is_empty() {
+                return Err(Status::invalid_argument(
+                    "namespace forward must carry a single command",
+                ));
+            }
+            super::node_authority::require_authenticated_control_node(&extensions)?;
+            if !node.is_atomic_namespace_member() {
+                return Err(Status::failed_precondition(
+                    "zone does not accept namespace-format writers",
+                ));
+            }
+            if !caller.is_some_and(|id| node.is_replication_member(id)) {
+                return Err(Status::permission_denied(
+                    "namespace forward requires a zone member",
+                ));
+            }
+            &req.namespace_command_v1
+        } else {
+            &req.raw_command
+        };
+        let cmd = if !raw.is_empty() {
+            match bincode::deserialize::<Command>(raw) {
                 Ok(c) => c,
                 Err(e) => {
                     return Ok(Response::new(ProposeResponse {
@@ -1267,17 +1293,19 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // raw_command is also reachable over the generic public Propose RPC.
         // A missing dedicated file RPC does not isolate an enum variant. Return
         // a definite refusal before either direct or forwarded submission.
-        let forwarded_rename = req.forwarded
-            && node.is_atomic_namespace_member()
-            && matches!(cmd, Command::RenameNamespaceV1 { .. });
-        if forwarded_rename {
-            super::node_authority::require_authenticated_control_node(&extensions)?;
-            if !caller.is_some_and(|id| node.is_replication_member(id)) {
-                return Err(Status::permission_denied(
-                    "namespace rename requires a zone member",
-                ));
-            }
-        } else if cmd.storage_protocol().is_some() {
+        if namespace_forward && !cmd.is_namespace_mutation() {
+            return Err(Status::invalid_argument(
+                "command is outside the namespace writer protocol",
+            ));
+        }
+        if node.is_atomic_namespace_member() && cmd.is_namespace_mutation() && !namespace_forward {
+            return Err(Status::failed_precondition(
+                "zone requires the namespace writer protocol",
+            ));
+        }
+        let forwarded_rename =
+            namespace_forward && matches!(cmd, Command::RenameNamespaceV1 { .. });
+        if !forwarded_rename && cmd.storage_protocol().is_some() {
             return Err(Status::unimplemented(
                 "conditional metadata proposals are not activated",
             ));
@@ -3315,11 +3343,11 @@ impl ZoneTransportService for WitnessServiceImpl {
             .await
     }
 
-    async fn step_atomic_namespace_v1(
+    async fn step_atomic_namespace_v2(
         &self,
         request: Request<StepMessageRequest>,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
-        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV1)
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV2)
             .await
     }
 

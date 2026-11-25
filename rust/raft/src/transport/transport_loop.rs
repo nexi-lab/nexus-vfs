@@ -1637,7 +1637,7 @@ pub(super) async fn protocol_client(
 ) -> std::result::Result<RaftClient, SendFailure> {
     match protocol {
         RaftMessageProtocol::Legacy => client_pool.get(addr).await,
-        RaftMessageProtocol::AtomicNamespaceV1 | RaftMessageProtocol::ReplicaControlV1 => {
+        RaftMessageProtocol::AtomicNamespaceV2 | RaftMessageProtocol::ReplicaControlV1 => {
             client_pool.get_node(addr).await
         }
     }

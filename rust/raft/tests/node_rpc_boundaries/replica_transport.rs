@@ -340,7 +340,7 @@ async fn namespace_wire_cannot_upgrade_an_existing_replica() {
     .await;
     let mut client = ZoneTransportServiceClient::new(channel);
     let error = client
-        .step_atomic_namespace_v1(StepMessageRequest {
+        .step_atomic_namespace_v2(StepMessageRequest {
             message: heartbeat(2, 7),
             zone_id: "root".into(),
             sender_address: String::new(),

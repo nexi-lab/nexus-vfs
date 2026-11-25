@@ -338,7 +338,7 @@ impl From<crate::raft::RaftMessageProtocol> for StepBoundary {
     fn from(protocol: crate::raft::RaftMessageProtocol) -> Self {
         match protocol {
             crate::raft::RaftMessageProtocol::Legacy => Self::Legacy,
-            crate::raft::RaftMessageProtocol::AtomicNamespaceV1 => Self::AtomicNamespaceV1,
+            crate::raft::RaftMessageProtocol::AtomicNamespaceV2 => Self::AtomicNamespaceV2,
             crate::raft::RaftMessageProtocol::ReplicaControlV1 => Self::ReplicaControlV1,
         }
     }
@@ -572,8 +572,8 @@ impl RaftClient {
             sender_address,
         };
         let response = match boundary {
-            StepBoundary::AtomicNamespaceV1 => {
-                self.inner_mut()?.step_atomic_namespace_v1(request).await?
+            StepBoundary::AtomicNamespaceV2 => {
+                self.inner_mut()?.step_atomic_namespace_v2(request).await?
             }
             StepBoundary::ReplicaControlV1 => {
                 self.inner_mut()?.step_replica_control_v1(request).await?
@@ -831,6 +831,7 @@ impl RaftApiClient {
             request_id: request_id.unwrap_or_default(),
             zone_id: self.zone_id.clone(),
             raw_command: Vec::new(),
+            namespace_command_v1: Vec::new(),
             forwarded: false,
         });
 

@@ -760,6 +760,7 @@ fn put(key: &str) -> ProposeRequest {
     ProposeRequest {
         zone_id: "root".into(),
         request_id: format!("isolated-{key}"),
+        namespace_command_v1: Vec::new(),
         command: None,
         forwarded: false,
         raw_command: bincode::serialize(&Command::PutControlState {

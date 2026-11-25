@@ -162,21 +162,6 @@ pub(crate) async fn forward_propose(
     use crate::raft::RaftError;
 
     let request = propose_request(command, zone_id, true, deadline)?;
-    if matches!(command, crate::raft::Command::RenameNamespaceV1 { .. }) {
-        let mut api = client_pool
-            .get_node(leader_addr)
-            .await
-            .and_then(|peer| peer.node_api())
-            .map_err(|error| RaftError::NotSubmitted {
-                endpoint: leader_addr.endpoint.clone(),
-                reason: error.to_string(),
-            })?;
-        let response = api
-            .propose(request)
-            .await
-            .map_err(|status| RaftError::Transport(status.to_string()))?;
-        return decode_propose_response(response.into_inner());
-    }
     let mut api_client = {
         let mut cached = cached_client.lock().await;
         match cached.as_ref() {
@@ -226,6 +211,34 @@ pub(crate) async fn forward_propose(
     }
 }
 
+/// A member of the namespace-format zone submits through its node-identity channel.
+#[cfg(all(feature = "grpc", has_protos))]
+pub(crate) async fn forward_namespace_proposal(
+    pool: &RaftClientPool,
+    leader: &NodeAddress,
+    command: &crate::raft::Command,
+    zone: &str,
+    deadline: tokio::time::Instant,
+) -> crate::raft::Result<crate::raft::proposal::Committed> {
+    use crate::raft::RaftError;
+    let mut request = propose_request(command, zone, true, deadline)?;
+    let wire = request.get_mut();
+    wire.namespace_command_v1 = std::mem::take(&mut wire.raw_command);
+    let mut api = pool
+        .get_node(leader)
+        .await
+        .and_then(|peer| peer.node_api())
+        .map_err(|error| RaftError::NotSubmitted {
+            endpoint: leader.endpoint.clone(),
+            reason: error.to_string(),
+        })?;
+    let response = api
+        .propose(request)
+        .await
+        .map_err(|s| RaftError::Transport(s.to_string()))?;
+    decode_propose_response(response.into_inner())
+}
+
 /// Submit `command` to the node at `endpoint` as an original request
 /// (`forwarded=false`): that node admits it as coming from this node and may
 /// forward it to its own leader. One connection per call — for rare control
@@ -270,6 +283,7 @@ fn propose_request(
         zone_id: zone_id.to_string(),
         raw_command,
         forwarded,
+        namespace_command_v1: Vec::new(),
     });
     request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
     Ok(request)

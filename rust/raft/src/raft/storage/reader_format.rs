@@ -2,7 +2,7 @@
 
 use super::*;
 
-const NAMESPACE_INDEX: &[u8; 8] = b"NXRIDX02";
+const NAMESPACE_INDEX: &[u8; 8] = b"NXRIDX03";
 const VERSIONED_INDEX: &[u8; 8] = b"NXRIDX01";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]

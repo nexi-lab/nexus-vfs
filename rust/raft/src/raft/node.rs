@@ -946,7 +946,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         let (msg_tx, msg_rx) = mpsc::channel(DRIVER_CHANNEL_CAPACITY);
 
         let reader_protocol = RaftMessageProtocol::from(raw_node.store().reader_format()?);
-        let atomic_namespace = reader_protocol == RaftMessageProtocol::AtomicNamespaceV1;
+        let atomic_namespace = reader_protocol == RaftMessageProtocol::AtomicNamespaceV2;
         let handle = ZoneConsensus {
             atomic_namespace,
             msg_tx,
@@ -1944,6 +1944,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         );
 
         // Each failure is propagated as what it is, never rewritten to `NotLeader`.
+        if self.is_atomic_namespace_member() && command.is_namespace_mutation() {
+            return crate::transport::forward_namespace_proposal(
+                &ctx.client_pool,
+                &leader_addr,
+                command,
+                &ctx.zone_id,
+                deadline,
+            )
+            .await;
+        }
         match crate::transport::forward_propose(
             &ctx.client_pool,
             &leader_addr,
@@ -2013,6 +2023,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// Latency: ~5-50μs (redb write, no network).
     pub async fn propose_ec_local(&self, command: Command) -> Result<u64> {
+        self.require_ec_writes()?;
         // Reject BEFORE appending to the EC WAL. A successful-looking local
         // no-op would otherwise be returned as a replicated write token.
         if self
@@ -2068,6 +2079,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
         self.config.membership_policy.require_managed()?;
+        self.require_ec_writes()?;
         if self
             .state_machine
             .read()
@@ -2079,6 +2091,15 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
         let mut sm = self.state_machine.write().await;
         sm.apply_ec_with_lww(&command, entry_timestamp)
+    }
+
+    pub(crate) fn require_ec_writes(&self) -> Result<()> {
+        if self.atomic_namespace {
+            return Err(RaftError::UnsupportedOperation(
+                "zone requires Raft-committed writes",
+            ));
+        }
+        Ok(())
     }
 
     /// Check if an EC write token has been replicated to a majority.
