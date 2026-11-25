@@ -169,10 +169,16 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
         observed["old"].as_u64().unwrap() > 0 && observed["new"].as_u64().unwrap() > 0,
         "{observed}"
     );
-    members[leader].call("arm");
+    // Completion of the originating syscall requires this member to apply the
+    // command even if leadership changes between arming and submission.
+    members[origin].call("arm");
     let missing_reply = members[origin].submit("forward");
     wait(&base.path().join("committed"));
-    assert!(!missing_reply.exists(), "publisher already returned");
+    assert!(
+        !missing_reply.exists(),
+        "publisher returned before its apply barrier: {:?}",
+        fs::read_to_string(&missing_reply)
+    );
     members[origin].kill();
     assert!(members[origin].stopped_log().first_index_impl().unwrap() > learner_next);
     publish(&base.path().join("release"), &json!(true));
@@ -432,7 +438,9 @@ async fn run_member(dir: PathBuf, mut seq: u32) {
                 let anchor = base.to_owned();
                 observer = Some(
                     node.subscribe_apply_observer(move |event| {
-                        if matches!(event.command, Command::RenameNamespaceV1 { .. }) {
+                        if matches!(&event.command, Command::RenameNamespaceV1 { old_key, new_key, .. }
+                            if old_key == SOURCE && new_key == TARGET)
+                        {
                             publish(&anchor.join("committed"), &json!(true));
                             wait(&anchor.join("release"));
                         }
