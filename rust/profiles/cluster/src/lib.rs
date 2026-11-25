@@ -4087,11 +4087,17 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     // self_id)` would permanently demote the node — wrong semantics
     // for a restart-and-rejoin cycle. Out of scope for this PR; needs
     // a dedicated commitment-timeline test plan.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let origin = Arc::clone(&kernel);
+    let rename_drain = tokio::task::spawn_blocking(move || {
+        origin.drain_renames(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    })
+    .await;
     let zm_for_drain = zm.clone();
     let drain = tokio::task::spawn_blocking(move || {
         zm_for_drain.shutdown();
     });
-    match tokio::time::timeout(Duration::from_secs(10), drain).await {
+    match tokio::time::timeout_at(deadline, drain).await {
         Ok(Ok(())) => tracing::info!("ZoneManager drain complete"),
         Ok(Err(join_err)) => tracing::warn!(?join_err, "ZoneManager drain task panicked"),
         Err(_) => tracing::warn!("ZoneManager drain exceeded 10s — forcing exit"),
@@ -4107,6 +4113,7 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     .await
     .ok();
 
+    rename_drain??;
     Ok(())
 }
 
