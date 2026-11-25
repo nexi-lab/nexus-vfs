@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[test]
-fn concurrent_shutdown_waits_for_the_original_server_task() {
+fn cancelled_and_concurrent_shutdown_waiters_share_the_original_server_task() {
     let directory = tempfile::tempdir().unwrap();
     let manager = ZoneManager::isolated(directory.path().to_str().unwrap()).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -30,11 +30,23 @@ fn concurrent_shutdown_waits_for_the_original_server_task() {
         drop(listener);
         finished.store(true, Ordering::Release);
     });
-    assert!(manager.server_task.lock().replace(server).is_none());
+    assert!(manager
+        .server_task
+        .blocking_lock()
+        .replace(server)
+        .is_none());
+
+    let waiting_manager = Arc::clone(&manager);
+    let waiting = manager
+        .rt()
+        .spawn(async move { waiting_manager.shutdown_async().await });
+    stopped_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    waiting.abort();
+    assert!(manager.rt().block_on(waiting).unwrap_err().is_cancelled());
 
     let first_manager = Arc::clone(&manager);
     let first = std::thread::spawn(move || first_manager.shutdown());
-    stopped_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
     let occupied = std::net::TcpListener::bind(address).err().unwrap().kind();
 
     let (entered, entered_rx) = mpsc::channel();

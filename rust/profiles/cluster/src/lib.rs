@@ -4070,38 +4070,15 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
         handle.abort();
     }
 
-    // Drain ZoneManager: signal gRPC + zone transport loops to exit
-    // their serve_with_shutdown paths so in-flight raft messages drain
-    // cleanly. ZoneManager::shutdown() is synchronous and uses an
-    // internal bridge_block_on; call it from spawn_blocking so we
-    // don't trigger "Cannot drop a runtime" / nested-runtime panics.
-    //
-    // 10s cap matches typical k8s preStop / SIGTERM grace windows —
-    // if tonic hasn't finished draining by then, force-drop and exit
-    // rather than hang the pod.
-    //
-    // TODO(leader-transfer): on graceful shutdown of a leader we could
-    // proactively transfer leadership before drain, sparing the cluster
-    // one election round. raft-rs's `MsgTransferLeader` is not exposed
-    // through our wrapper today, and `propose_conf_change(RemoveNode,
-    // self_id)` would permanently demote the node — wrong semantics
-    // for a restart-and-rejoin cycle. Out of scope for this PR; needs
-    // a dedicated commitment-timeline test plan.
+    // The whole daemon has one grace period. Keep Raft available to admitted
+    // renames, then join its original tasks within the remaining time.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let origin = Arc::clone(&kernel);
     let rename_drain = tokio::task::spawn_blocking(move || {
         origin.drain_renames(deadline.saturating_duration_since(tokio::time::Instant::now()))
     })
     .await;
-    let zm_for_drain = zm.clone();
-    let drain = tokio::task::spawn_blocking(move || {
-        zm_for_drain.shutdown();
-    });
-    match tokio::time::timeout_at(deadline, drain).await {
-        Ok(Ok(())) => tracing::info!("ZoneManager drain complete"),
-        Ok(Err(join_err)) => tracing::warn!(?join_err, "ZoneManager drain task panicked"),
-        Err(_) => tracing::warn!("ZoneManager drain exceeded 10s — forcing exit"),
-    }
+    let zone_drain = tokio::time::timeout_at(deadline, zm.shutdown_async()).await;
 
     // Drop Kernel (which owns a nested tokio Runtime) on a blocking
     // thread — dropping it inside the current async context panics with
@@ -4114,6 +4091,8 @@ async fn run_daemon(common: CommonArgs, build_decls: BoxedServiceDeclsBuilder) -
     .ok();
 
     rename_drain??;
+    zone_drain.context("timed out draining zone tasks during shutdown")?;
+    tracing::info!("ZoneManager drain complete");
     Ok(())
 }
 
@@ -6808,8 +6787,7 @@ async fn run_auth(common: CommonArgs, action: AuthCmd) -> Result<()> {
     // The offline body is synchronous and disk-bound end to end — redb opens,
     // key-store reads and writes, and a `zm.shutdown()` that blocks on the raft
     // drain — so it belongs on the blocking pool rather than parked on an async
-    // worker for the whole command. Mirrors the daemon-shutdown drain
-    // (`spawn_blocking(|| zm.shutdown())`) and `join_zones_for_boot`.
+    // worker for the whole command, as in `join_zones_for_boot`.
     tokio::task::spawn_blocking(move || run_auth_blocking(common, action))
         .await
         .context("auth subcommand task panicked")?
