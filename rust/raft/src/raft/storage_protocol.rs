@@ -14,6 +14,7 @@ pub(crate) enum StorageProtocol {
 }
 
 impl Command {
+    #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) fn is_namespace_mutation(&self) -> bool {
         self.ordinary_metadata_key().is_some() || matches!(self, Self::RenameNamespaceV1 { .. })
     }

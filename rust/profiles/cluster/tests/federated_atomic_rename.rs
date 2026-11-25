@@ -145,6 +145,7 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
     let origin = (leader + 2) % 3;
     members[leader].call("seed");
     members[3].start();
+    members[3].call("leader");
     assert_eq!(members[3].call("read_old"), json!(BODY));
     members[3].call("check_writer_protocol");
     members[3].call("write_progress");

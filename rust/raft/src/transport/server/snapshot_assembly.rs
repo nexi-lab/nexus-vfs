@@ -772,6 +772,7 @@ mod tests {
             RaftMessageProtocol::AtomicNamespaceV2
         );
         assert!(protocol(StepBoundary::Unspecified).is_err());
+        assert!(boundary_protocol(&with(3)).is_err());
         assert!(boundary_protocol(&with(99)).is_err());
     }
 }
