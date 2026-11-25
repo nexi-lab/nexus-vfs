@@ -1637,7 +1637,9 @@ pub(super) async fn protocol_client(
 ) -> std::result::Result<RaftClient, SendFailure> {
     match protocol {
         RaftMessageProtocol::Legacy => client_pool.get(addr).await,
-        RaftMessageProtocol::ReplicaControlV1 => client_pool.get_node(addr).await,
+        RaftMessageProtocol::AtomicNamespaceV1 | RaftMessageProtocol::ReplicaControlV1 => {
+            client_pool.get_node(addr).await
+        }
     }
     .map_err(|e| SendFailure::Connection(format!("connect to {}: {e}", addr.endpoint)))
 }
@@ -1658,9 +1660,9 @@ async fn send_raft_message(
     let mut client = protocol_client(client_pool, addr, protocol).await?;
     match protocol {
         RaftMessageProtocol::Legacy => client.step_message(bytes, zone_id, self_address).await,
-        RaftMessageProtocol::ReplicaControlV1 => {
+        version => {
             client
-                .step_replica_control_v1(bytes, zone_id, self_address)
+                .step_versioned(version.into(), bytes, zone_id, self_address)
                 .await
         }
     }

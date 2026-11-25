@@ -162,6 +162,21 @@ pub(crate) async fn forward_propose(
     use crate::raft::RaftError;
 
     let request = propose_request(command, zone_id, true, deadline)?;
+    if matches!(command, crate::raft::Command::RenameNamespaceV1 { .. }) {
+        let mut api = client_pool
+            .get_node(leader_addr)
+            .await
+            .and_then(|peer| peer.node_api())
+            .map_err(|error| RaftError::NotSubmitted {
+                endpoint: leader_addr.endpoint.clone(),
+                reason: error.to_string(),
+            })?;
+        let response = api
+            .propose(request)
+            .await
+            .map_err(|status| RaftError::Transport(status.to_string()))?;
+        return decode_propose_response(response.into_inner());
+    }
     let mut api_client = {
         let mut cached = cached_client.lock().await;
         match cached.as_ref() {

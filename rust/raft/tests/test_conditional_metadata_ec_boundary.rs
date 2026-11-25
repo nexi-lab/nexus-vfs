@@ -137,6 +137,11 @@ async fn protected_ec_is_refused_before_wal_and_acknowledged_without_blocking_re
             new_key: "/conversations/private/readers/other".into(),
             is_pas: false,
         },
+        Command::RenameNamespaceV1 {
+            old_key: "/ordinary".into(),
+            new_key: "/moved".into(),
+            is_pas: false,
+        },
     ];
     let mut api = ZoneApiServiceClient::connect(format!("http://{bind}"))
         .await

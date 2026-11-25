@@ -7,6 +7,7 @@ use super::Command;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageProtocol {
     ConditionalMetadata,
+    AtomicNamespace,
     RecordLifetime,
     ReplicaControl,
     SignedCrl,
@@ -23,6 +24,7 @@ impl Command {
             Self::WriteVersionedMetadata { .. }
             | Self::AdoptProtectedMetadata { .. }
             | Self::RenameMetadata { .. } => Some(StorageProtocol::ConditionalMetadata),
+            Self::RenameNamespaceV1 { .. } => Some(StorageProtocol::AtomicNamespace),
             Self::BindRecordGuard { .. }
             | Self::GuardedRecord { .. }
             | Self::RetireRecordGuard { .. }

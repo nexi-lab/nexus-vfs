@@ -161,6 +161,16 @@ impl ZoneTransportService for LossyLink {
             .await
     }
 
+    async fn step_atomic_namespace_v1(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> Result<Response<StepMessageResponse>, Status> {
+        self.target
+            .clone()
+            .step_atomic_namespace_v1(request.into_inner())
+            .await
+    }
+
     async fn prepare_replica_control_reader_v1(
         &self,
         request: Request<PrepareReplicaControlReaderRequest>,

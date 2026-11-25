@@ -345,6 +345,12 @@ pub enum Command {
     /// Native atomic signed-CRL transition. Existing command indices stay fixed.
     /// This has a separate storage admission domain and durable reader floor.
     ApplyCrlControl(Box<contracts::crl_control::CrlControlRequest>),
+    /// Namespace-format members check both names against the committed namespace.
+    RenameNamespaceV1 {
+        old_key: String,
+        new_key: String,
+        is_pas: bool,
+    },
 }
 
 impl Command {
@@ -2008,7 +2014,7 @@ impl FullStateMachine {
                     .into(),
             )),
             Command::WriteVersionedMetadata { .. } | Command::AdoptProtectedMetadata { .. }
-                | Command::RenameMetadata { .. } | Command::BindRecordGuard { .. }
+                | Command::RenameMetadata { .. } | Command::RenameNamespaceV1 { .. } | Command::BindRecordGuard { .. }
                 | Command::GuardedRecord { .. } | Command::RetireRecordGuard { .. }
                 | Command::AdmitRecordIoOwner { .. } => Err(super::RaftError::InvalidState(
                 "versioned metadata requires a Raft-committed transaction".into(),
@@ -2464,7 +2470,12 @@ impl FullStateMachine {
                 old_key,
                 new_key,
                 is_pas,
-            } => self.rename_metadata_in_txn(txn, old_key, new_key, *is_pas),
+            } => self.rename_metadata_in_txn(txn, old_key, new_key, *is_pas, false),
+            Command::RenameNamespaceV1 {
+                old_key,
+                new_key,
+                is_pas,
+            } => self.rename_metadata_in_txn(txn, old_key, new_key, *is_pas, true),
 
             Command::Noop => Ok(CommandResult::Success),
 

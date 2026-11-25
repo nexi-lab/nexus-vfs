@@ -105,7 +105,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         observed: StorageActivationView,
     ) -> Result<PreparedReplicaControl> {
         self.validate_storage_activation_view(&observed)?;
-        if !self.replica_control_reader_prepared {
+        if self.raft_message_protocol() == crate::raft::RaftMessageProtocol::Legacy {
             return Err(RaftError::InvalidState(
                 "local replica-control reader has not prepared".into(),
             ));
@@ -154,7 +154,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         let admitted = self
             .validate_storage_activation_view(&prepared.view)
             .and_then(|()| {
-                if self.replica_control_reader_prepared {
+                if self.raft_message_protocol() != crate::raft::RaftMessageProtocol::Legacy {
                     Ok(())
                 } else {
                     Err(RaftError::InvalidState(

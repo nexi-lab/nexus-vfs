@@ -167,6 +167,9 @@ fn register_cache_invalidator(
         };
         if let Command::RenameMetadata {
             old_key, new_key, ..
+        }
+        | Command::RenameNamespaceV1 {
+            old_key, new_key, ..
         } = entry.command
         {
             let old_prefix = format!("{}/", old_key.trim_end_matches('/'));
@@ -642,7 +645,7 @@ impl MetaStore for ZoneMetaStore {
         is_pas: bool,
     ) -> Result<(), MetaStoreError> {
         let node = self.node()?;
-        if !node.supports_conditional_metadata() {
+        if !node.supports_atomic_rename() {
             return kernel::abc::meta_store::rename_metadata_path(self, old_path, new_path, is_pas);
         }
         let result = bridge_block_on(

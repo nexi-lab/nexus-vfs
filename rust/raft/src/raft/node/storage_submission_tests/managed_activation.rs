@@ -69,7 +69,10 @@ async fn activation_commits_replica_only_and_survives_original_store_reopen() {
         None,
     )
     .unwrap();
-    assert!(driver.replica_control_reader_prepared && driver.replica_control_active);
+    assert!(
+        driver.raft_message_protocol() != crate::raft::RaftMessageProtocol::Legacy
+            && driver.replica_control_active
+    );
     drive(&mut driver, handle.campaign()).await.unwrap();
     assert_eq!(
         activate(&handle, &mut driver, "later-request").await,

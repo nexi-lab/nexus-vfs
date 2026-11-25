@@ -80,7 +80,7 @@ impl RaftStorage {
         if let Some(bytes) = storage.state.get(KEY_FIRST_INDEX)? {
             reader_format::LogBoundary::decode(Some(&bytes))?;
         } else {
-            storage.update_log_boundary(None, false)?;
+            storage.update_log_boundary(None, ReaderFormat::Legacy)?;
         }
 
         Ok(storage)
@@ -410,6 +410,7 @@ impl RaftStorage {
 
 mod append;
 mod reader_format;
+pub(crate) use reader_format::ReaderFormat;
 
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {

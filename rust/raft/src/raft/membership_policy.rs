@@ -2,6 +2,7 @@
 
 #[cfg(feature = "consensus")]
 use {
+    super::storage::ReaderFormat,
     super::{Command, RaftConfig, RaftError, RaftStorage, Result, StateMachine},
     protobuf::Message,
     raft::{
@@ -33,14 +34,20 @@ impl MembershipPolicy {
     pub(crate) fn validate_entry_for_reader(
         self,
         entry: &Entry,
-        replica_reader: bool,
+        format: ReaderFormat,
     ) -> Result<()> {
         if entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty() {
             let (_, command) = Command::from_log_data(&entry.data)?;
             let protocol = command.storage_protocol();
-            let qualified_replica = replica_reader
+            let qualified_replica = format >= ReaderFormat::ReplicaControl
                 && protocol == Some(super::storage_protocol::StorageProtocol::ReplicaControl);
-            if self == Self::Managed && protocol.is_some() && !qualified_replica {
+            let namespace_rename = format == ReaderFormat::AtomicNamespace
+                && protocol == Some(super::storage_protocol::StorageProtocol::AtomicNamespace);
+            if self == Self::Managed
+                && protocol.is_some()
+                && !qualified_replica
+                && !namespace_rename
+            {
                 return Err(RaftError::Config(
                     "conditional metadata log requires qualified fixed-local storage".into(),
                 ));
@@ -55,7 +62,13 @@ impl MembershipPolicy {
         storage: &RaftStorage,
         state_machine: &dyn StateMachine,
     ) -> Result<()> {
-        let replica_reader = storage.replica_control_reader_required()?;
+        let format = storage.reader_format()?;
+        if self == Self::FixedLocal && format == ReaderFormat::AtomicNamespace {
+            return Err(invalid(
+                "cannot reopen managed namespace storage as a fixed-local group",
+            ));
+        }
+        let replica_reader = format >= ReaderFormat::ReplicaControl;
         state_machine.validate_storage_reader(self, replica_reader)?;
         if self == Self::Managed {
             let first = storage.first_index_impl()?;
@@ -100,7 +113,7 @@ impl MembershipPolicy {
         last: u64,
         local_id: Option<u64>,
     ) -> Result<()> {
-        let replica_reader = storage.replica_control_reader_required()?;
+        let format = storage.reader_format()?;
         let end = last
             .checked_add(1)
             .ok_or_else(|| invalid("stored log index is exhausted"))?;
@@ -117,7 +130,7 @@ impl MembershipPolicy {
                 return Err(invalid("stored log is incomplete"));
             }
             for entry in entries {
-                self.validate_entry_for_reader(&entry, replica_reader)?;
+                self.validate_entry_for_reader(&entry, format)?;
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {}
                     EntryType::EntryConfChange if local_id.is_some() => {
