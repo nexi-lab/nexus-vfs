@@ -44,7 +44,7 @@ fn wait(path: &Path) -> Value {
             } else {
                 dir.parent().unwrap()
             };
-            for id in 1..=3 {
+            for id in 1..=4 {
                 let log = fs::read_to_string(root.join(id.to_string()).join("child.log"))
                     .unwrap_or_default();
                 eprintln!(
@@ -70,6 +70,7 @@ impl Member {
         self.process = Some(
             Process::new(std::env::current_exe().unwrap())
                 .args(["--exact", "namespace_member", "--ignored", "--nocapture"])
+                .env("NEXUS_SC_SNAPSHOT_THRESHOLD", "2")
                 .env("NEXUS_NAMESPACE_FIXTURE", &self.dir)
                 .env("NEXUS_FIXTURE_SEQUENCE", self.seq.to_string())
                 .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -88,6 +89,10 @@ impl Member {
         let result = wait(&path);
         assert!(result.get("error").is_none(), "{op}: {result}");
         result
+    }
+    fn stopped_log(&self) -> RaftStorage {
+        assert!(self.process.is_none());
+        RaftStorage::open(self.dir.join(ZONE).join("raft")).unwrap()
     }
     fn kill(&mut self) {
         if let Some(mut p) = self.process.take() {
@@ -151,6 +156,7 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
     members[3].call("write_progress");
     assert_eq!(members[leader].call("read_old"), json!(BODY));
     members[3].kill();
+    let learner_next = members[3].stopped_log().last_index_impl().unwrap() + 1;
     assert_eq!(members[origin].call("read_old"), json!(BODY));
     let views = members[reader].submit("watch");
     for _ in 0..12 {
@@ -168,6 +174,7 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
     wait(&base.path().join("committed"));
     assert!(!missing_reply.exists(), "publisher already returned");
     members[origin].kill();
+    assert!(members[origin].stopped_log().first_index_impl().unwrap() > learner_next);
     publish(&base.path().join("release"), &json!(true));
     assert_eq!(members[reader].call("names"), json!([TARGET]));
     assert_eq!(members[reader].call("read_new"), json!(BODY));
@@ -177,6 +184,9 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
     assert_eq!(members[origin].call("read_new"), json!(BODY));
     members[leader].kill();
     members[reader].kill();
+    for voter in [reader, leader] {
+        assert!(members[voter].stopped_log().first_index_impl().unwrap() > learner_next);
+    }
     let stranded = wait(&members[origin].submit("back"));
     assert!(
         stranded.get("error").is_some(),
@@ -199,6 +209,17 @@ fn committed_follower_rename_survives_lost_reply_and_cold_reopen() {
         }),
         json!(BODY)
     );
+    // Every possible leader has compacted beyond this learner's next entry.
+    members[3].start();
+    members[3].call("leader");
+    assert_eq!(members[3].call("names"), after);
+    let path = if after == json!([SOURCE]) {
+        "read_old"
+    } else {
+        "read_new"
+    };
+    assert_eq!(members[3].call(path), json!(BODY));
+    members[3].call("write_progress");
     eprintln!("Minority returned no success; quorum recovered one complete name: {after}.");
     eprintln!("24 follower renames, {observed} quorum views, publisher killed before receipt; surviving majority and reopened publisher read exact bytes");
 }
