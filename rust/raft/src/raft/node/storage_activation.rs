@@ -213,14 +213,18 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 pub(super) async fn await_storage_commit(
     receiver: super::oneshot::Receiver<Result<super::CommandResult>>,
 ) -> Result<super::CommandResult> {
-    // Once enqueued, only a proven pre-submission refusal resolves uncertainty.
+    // A refusal or a committed replacement proves this attempt did not apply.
     match crate::raft::proposal::wait_for_commit(
         receiver,
         tokio::time::Instant::now() + std::time::Duration::from_secs(super::PROPOSAL_TIMEOUT_SECS),
     )
     .await
     {
-        Err(error @ (RaftError::NotLeader { .. } | RaftError::ProposalRejected(_))) => Err(error),
+        Err(
+            error @ (RaftError::NotLeader { .. }
+            | RaftError::ProposalRejected(_)
+            | RaftError::ProposalSuperseded { .. }),
+        ) => Err(error),
         Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
         result => result,
     }

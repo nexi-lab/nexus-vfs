@@ -62,13 +62,19 @@ pub(super) struct Cluster {
 
 impl Cluster {
     pub(super) fn new() -> Self {
+        Self::with_members(|id| node(id, &[1, 2, 3]))
+    }
+
+    pub(super) fn with_members(
+        mut build: impl FnMut(u64) -> (ZoneConsensus<FullStateMachine>, Driver, TempDir),
+    ) -> Self {
         let mut cluster = Self {
             handles: Vec::new(),
             drivers: Vec::new(),
             _dirs: Vec::new(),
         };
         for id in 1..=3 {
-            let (handle, driver, dir) = node(id, &[1, 2, 3]);
+            let (handle, driver, dir) = build(id);
             cluster.handles.push(handle);
             cluster.drivers.push(driver);
             cluster._dirs.push(dir);

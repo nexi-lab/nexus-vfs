@@ -1718,8 +1718,17 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     /// Leader-only namespace submission shared by the local syscall and its authenticated forward.
     #[cfg(all(feature = "grpc", has_protos))]
     pub(crate) async fn commit_namespace_rename(&self, command: Command) -> Result<CommandResult> {
-        self.submit_storage_command(command, StorageProtocol::AtomicNamespace)
+        match self
+            .submit_storage_command(command, StorageProtocol::AtomicNamespace)
             .await
+        {
+            // A different term committed at our slot. This leader lost the
+            // proposal, so the existing leader redirect can safely route it again.
+            Err(RaftError::ProposalSuperseded { .. }) => Err(RaftError::NotLeader {
+                leader_hint: self.leader_hint_addr(),
+            }),
+            result => result,
+        }
     }
 
     /// Propose a command with Eventual Consistency — fire and forget.
@@ -1876,52 +1885,18 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .leader_id()
             .ok_or(RaftError::NotLeader { leader_hint: None })?;
 
-        // Leader-is-self path: don't RPC-forward to ourselves.
-        //
-        // Forwarding via gRPC to our own advertised address either
-        // hits a hairpin failure (Tailscale: own public IP
-        // unreachable from self on Windows / macOS) or uselessly
-        // round-trips the proposal across two extra HTTP/2 hops
-        // back to the same process.  The reason we're in
-        // `forward_to_leader` despite being leader is the boot-time
-        // window where `submit_to_channel` ran before
-        // `update_cached_status` reflected post-election state.
-        // That window closes within one driver tick (~10ms), so
-        // bounded local retry of `submit_to_channel` resolves
-        // cleanly without ever leaving the process.
-        //
-        // PROPOSAL_TIMEOUT_SECS aligns this path's bound with the
-        // leader-path timeout above; 20ms backoff is two
-        // tick_intervals so each retry samples fresh raft state.
+        // Submit directly when the current routing observation points here.
+        // A refusal returns to the bounded retry loop, which samples the leader again.
         if leader_id == self.config.id {
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS));
-                }
-                if matches!(command, Command::RenameNamespaceV1 { .. }) {
-                    match self.commit_namespace_rename(command.clone()).await {
-                        Err(RaftError::NotLeader { .. }) => continue,
-                        result => {
-                            return Ok(super::proposal::Committed {
-                                result: result?,
-                                index: Some(self.applied_index()),
-                            })
-                        }
-                    }
-                }
-                match self.submit_to_channel(command) {
-                    Ok(rx) => {
-                        let result = super::proposal::wait_for_commit(rx, deadline).await?;
-                        return Ok(super::proposal::Committed {
-                            result,
-                            index: Some(self.applied_index()),
-                        });
-                    }
-                    Err(RaftError::NotLeader { .. }) => continue,
-                    Err(e) => return Err(e),
-                }
-            }
+            let result = if matches!(command, Command::RenameNamespaceV1 { .. }) {
+                self.commit_namespace_rename(command.clone()).await?
+            } else {
+                super::proposal::wait_for_commit(self.submit_to_channel(command)?, deadline).await?
+            };
+            return Ok(super::proposal::Committed {
+                result,
+                index: Some(self.applied_index()),
+            });
         }
 
         let leader_addr = {

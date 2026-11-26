@@ -159,3 +159,74 @@ async fn concurrent_membership_requests_for_the_same_member_get_their_own_outcom
         assert!(super::learner_ids_from_raw_node(&driver.raw_node).contains(&4));
     }
 }
+
+#[cfg(all(feature = "grpc", has_protos))]
+#[tokio::test]
+async fn a_replaced_namespace_rename_can_redirect_to_the_elected_leader() {
+    use super::test_cluster::{open_node, poll};
+    use crate::raft::RaftStorage;
+    use crate::transport::proto::nexus::core::FileMetadata;
+    use prost::Message;
+
+    let mut cluster = Cluster::with_members(|id| {
+        let dir = tempfile::tempdir().unwrap();
+        RaftStorage::open(dir.path())
+            .unwrap()
+            .initialize_atomic_namespace()
+            .unwrap();
+        let (node, driver) = open_node(id, &[1, 2, 3], dir.path());
+        (node, driver, dir)
+    });
+    cluster.elect(0).await;
+    let source = FileMetadata {
+        path: "/source".into(),
+        size: 42,
+        ..Default::default()
+    };
+    let seed = cluster.handles[0]
+        .submit_to_channel(&Command::SetMetadata {
+            key: source.path.clone(),
+            value: source.encode_to_vec(),
+        })
+        .unwrap();
+    for _ in 0..12 {
+        cluster.round(|_| true).await;
+    }
+    assert!(matches!(seed.await, Ok(Ok(CommandResult::Success))));
+
+    let rename = Command::RenameNamespaceV1 {
+        old_key: source.path.clone(),
+        new_key: "/destination".into(),
+        is_pas: false,
+    };
+    let previous = cluster.handles[0].clone();
+    let mut first = Box::pin(previous.commit_namespace_rename(rename.clone()));
+    assert!(poll(&mut first).is_pending());
+    cluster.round(|m| m.from != 1 && m.to != 1).await;
+    assert!(poll(&mut first).is_pending());
+    cluster.elect(1).await;
+    assert!(matches!(first.await, Err(RaftError::NotLeader { .. })));
+    let elected = cluster.handles[1].clone();
+    assert!(elected
+        .with_state_machine(|sm| sm.get_metadata("/source"))
+        .await
+        .unwrap()
+        .is_some());
+    let mut second = Box::pin(elected.commit_namespace_rename(rename));
+    assert!(poll(&mut second).is_pending());
+    for _ in 0..12 {
+        cluster.round(|_| true).await;
+    }
+    assert!(matches!(second.await, Ok(CommandResult::Success)));
+    for member in &cluster.handles {
+        member
+            .with_state_machine(|sm| {
+                assert!(sm.get_metadata("/source").unwrap().is_none());
+                let stored = sm.get_metadata("/destination").unwrap().unwrap();
+                let moved = FileMetadata::decode(stored.as_slice()).unwrap();
+                assert_eq!(moved.size, source.size);
+                assert_eq!(moved.path, "/destination");
+            })
+            .await;
+    }
+}
