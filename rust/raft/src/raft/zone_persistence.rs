@@ -60,22 +60,15 @@ impl ZonePersistence {
     /// Create a fresh zone dir. Returns an armed handle — if `Drop` runs
     /// before `commit()`, the dir is rolled back.
     ///
-    /// Errors if the dir already exists: a caller trying to `create` an
-    /// existing zone indicates a bug (the registry's `creating` guard +
-    /// fast-path check should have caught it upstream).
+    /// Creating the final directory claims rollback ownership. Independent
+    /// creators of the same zone receive AlreadyExists.
     pub fn create(base: &Path, zone_id: &str) -> io::Result<Self> {
         let zone_path = base.join(zone_id);
         let tombstone_path = zone_path.join(TOMBSTONE_NAME);
-        if zone_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "Zone dir '{}' already exists — caller must use open()",
-                    zone_path.display()
-                ),
-            ));
+        if let Some(parent) = zone_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        std::fs::create_dir_all(&zone_path)?;
+        std::fs::create_dir(&zone_path)?;
         Ok(Self {
             zone_path,
             tombstone_path,
@@ -290,6 +283,41 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("z1")).unwrap();
         let err = ZonePersistence::create(tmp.path(), "z1").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn competing_creators_preserve_the_committed_zone() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("data");
+        let start = std::sync::Barrier::new(8);
+        let claims = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        ZonePersistence::create(&base, "z1")
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut owners = claims.into_iter().filter_map(|claim| match claim {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                None
+            }
+        });
+        let mut winner = owners.next().expect("one creator must own the zone");
+        let marker = winner.sm_path();
+        std::fs::write(&marker, b"committed").unwrap();
+        winner.commit();
+        let competing_owners = owners.count();
+        assert_eq!(std::fs::read(marker).unwrap(), b"committed");
+        assert_eq!(competing_owners, 0);
     }
 
     #[test]
