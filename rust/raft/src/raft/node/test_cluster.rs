@@ -86,13 +86,16 @@ impl Cluster {
         let mut outgoing = Vec::new();
         for driver in &mut self.drivers {
             driver.process_messages();
-            outgoing.extend(driver.advance().await.unwrap());
+            let messages = driver.advance().await.unwrap();
+            let protocol = driver.raft_message_protocol();
+            outgoing.extend(messages.into_iter().map(|message| (protocol, message)));
         }
-        for msg in outgoing {
+        for (protocol, msg) in outgoing {
             if deliver(&msg) {
+                let (tx, _) = tokio::sync::oneshot::channel();
                 self.handles[msg.to as usize - 1]
                     .msg_tx
-                    .try_send(RaftMsg::Step { msg })
+                    .try_send(RaftMsg::StepTransport { msg, protocol, tx })
                     .unwrap();
             }
         }
