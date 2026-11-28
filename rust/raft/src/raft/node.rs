@@ -2180,9 +2180,9 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
                 )?;
             }
         }
-        if msg.has_snapshot() && !msg.get_snapshot().data.is_empty() {
-            self.state_machine.read().await.validate_snapshot_reader(
-                &msg.get_snapshot().data,
+        if msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot || msg.has_snapshot() {
+            self.state_machine.read().await.validate_raft_snapshot(
+                msg.get_snapshot(),
                 self.config.membership_policy,
                 replica_reader,
             )?;

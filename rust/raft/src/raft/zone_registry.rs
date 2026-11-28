@@ -1048,7 +1048,6 @@ impl ZoneRaftRegistry {
         let raft_storage = RaftStorage::open(persistence.raft_path()).map_err(|e| {
             TransportError::Connection(format!("Failed to open raft storage: {}", e))
         })?;
-        use raft::Storage;
         let mut state_machine = FullStateMachine::new(&store).map_err(|e| {
             TransportError::Connection(format!("Failed to create state machine: {}", e))
         })?;
@@ -1061,42 +1060,22 @@ impl ZoneRaftRegistry {
             .validate_storage_reader(config.membership_policy, replica_reader)
             .map_err(|e| TransportError::Connection(format!("Storage admission: {e}")))?;
 
-        // R14 raft-rs contract fix: rehydrate advisory lock state from
-        // any persisted snapshot before raft-rs gets the state machine.
-        //
-        // raft-rs's RaftLog::new sets `applied = first_index - 1`. If
-        // the log was compacted at index X, first_index = X+1 and
-        // raft-rs will only re-emit committed entries in [X+1..commit]
-        // on startup. It does NOT re-emit the stored snapshot itself
-        // — Ready's `snapshot` field is only populated by a *new*
-        // snapshot received from the leader at runtime.
-        //
-        // Pre-R14 this didn't matter: advisory lock state was persisted
-        // row-by-row in redb, so FullStateMachine::new loaded it from
-        // there. After R14 the BTreeMap is in-memory only; without
-        // this rehydration, any advisory holders committed before the
-        // last compact would be lost on restart. Rehydrating here
-        // keeps the post-restart state machine consistent with other
-        // replicas that are caught up via the normal log-replay path.
-        if let Ok(snap) = raft_storage.snapshot(0, 0) {
-            let meta = snap.get_metadata();
-            if meta.index > 0 && !snap.data.is_empty() {
-                state_machine
-                    .validate_snapshot_reader(&snap.data, config.membership_policy, replica_reader)
-                    .map_err(|e| TransportError::Connection(format!("Snapshot admission: {e}")))?;
-                state_machine.restore_snapshot(&snap.data).map_err(|e| {
-                    TransportError::Connection(format!(
-                        "Failed to rehydrate state machine from stored snapshot at index {}: {}",
-                        meta.index, e
-                    ))
+        // raft-rs replays the retained log on startup. The application owns
+        // restoration of the snapshot that precedes those entries.
+        if let Some(snapshot) = raft_storage
+            .recovery_snapshot()
+            .map_err(|e| TransportError::Connection(format!("Stored snapshot admission: {e}")))?
+        {
+            state_machine
+                .restore_stored_snapshot(&snapshot, config.membership_policy, replica_reader)
+                .map_err(|e| {
+                    TransportError::Connection(format!("Stored snapshot admission: {e}"))
                 })?;
-                tracing::info!(
-                    zone = %zone_id,
-                    snapshot_index = meta.index,
-                    snapshot_term = meta.term,
-                    "Rehydrated advisory lock state from stored snapshot on startup",
-                );
-            }
+            tracing::info!(
+                zone = %zone_id,
+                snapshot_index = snapshot.get_metadata().index,
+                "Restored state machine from stored snapshot",
+            );
         }
 
         // Create EC replication log (non-witness nodes only)
