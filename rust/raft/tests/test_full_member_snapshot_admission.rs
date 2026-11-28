@@ -14,6 +14,18 @@ fn put(value: &[u8]) -> Command {
     }
 }
 
+fn full_image(state: &FullStateMachine, conf: &ConfState) -> Snapshot {
+    let mut image = Snapshot {
+        data: state.snapshot().unwrap().into(),
+        ..Default::default()
+    };
+    let meta = image.mut_metadata();
+    meta.index = state.last_applied_index();
+    meta.term = 1;
+    meta.set_conf_state(conf.clone());
+    image
+}
+
 #[derive(Clone, Copy, Debug)]
 enum InvalidImage {
     Unreadable,
@@ -38,11 +50,7 @@ async fn refused(image: InvalidImage) {
             voters: vec![1],
             ..Default::default()
         };
-        let mut snap = Snapshot::default();
-        snap.data = application.snapshot().unwrap().into();
-        snap.mut_metadata().index = 4;
-        snap.mut_metadata().term = 1;
-        snap.mut_metadata().set_conf_state(conf.clone());
+        let snap = full_image(&application, &conf);
         application.apply_local(&put(b"preserve me")).unwrap();
         (snap, conf)
     };
@@ -153,11 +161,7 @@ async fn full_member_checks_the_raft_cut_before_enqueuing_a_snapshot() {
     let donor = RedbStore::open_temporary().unwrap();
     let mut donor = FullStateMachine::new(&donor).unwrap();
     donor.apply(4, &put(b"sender image")).unwrap();
-    let mut snap = Snapshot::default();
-    snap.data = donor.snapshot().unwrap().into();
-    snap.mut_metadata().index = 4;
-    snap.mut_metadata().term = 1;
-    snap.mut_metadata().set_conf_state(conf);
+    let snap = full_image(&donor, &conf);
 
     let mut message = Message {
         from: 1,
