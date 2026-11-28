@@ -465,6 +465,20 @@ pub trait StateMachine: Send + Sync {
         self.validate_snapshot_membership(data, policy)
     }
 
+    /// Admit the application image at the Raft snapshot's declared log index.
+    #[cfg(feature = "consensus")]
+    fn validate_raft_snapshot(
+        &self,
+        image: &raft::eraftpb::Snapshot,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        if image.data.is_empty() {
+            return Ok(());
+        }
+        self.validate_snapshot_reader(&image.data, policy, replica_reader)
+    }
+
     /// Admission shared by EC origin, ingress and state-machine apply.
     fn requires_strong_consistency(&self, command: &Command) -> Result<bool> {
         Ok(command.requires_conditional_sc()
@@ -2597,6 +2611,17 @@ impl StateMachine for FullStateMachine {
         self.validate_owned_snapshot_reader(&snapshot, policy, replica_reader)
     }
 
+    #[cfg(feature = "consensus")]
+    fn validate_raft_snapshot(
+        &self,
+        image: &raft::eraftpb::Snapshot,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        self.admit_raft_snapshot(image, policy, replica_reader)?;
+        Ok(())
+    }
+
     fn replica_control_activation(&self) -> Result<Option<ReplicaControlActivation>> {
         self.read_replica_control_activation()
     }
@@ -2970,6 +2995,66 @@ impl StateMachine for FullStateMachine {
         // durable state. The owning driver also checks its membership policy.
         self.validate_owned_snapshot_policy(&snapshot, super::MembershipPolicy::FixedLocal)?;
 
+        self.replace_snapshot(snapshot)
+    }
+
+    fn last_applied_index(&self) -> u64 {
+        self.last_applied.load(Ordering::Acquire)
+    }
+
+    fn last_applied_shared(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.last_applied_shared_arc())
+    }
+
+    /// Return the shared apply-side observer list so downstream holders
+    /// (``ZoneConsensus``, kernel federation wiring, DCache) can register
+    /// observers that fire on every committed metadata-path command.
+    fn apply_observers_slot(&self) -> Option<Arc<parking_lot::RwLock<Vec<ApplyObserver>>>> {
+        Some(Arc::clone(&self.apply_observers))
+    }
+
+    fn advisory_handle(&self) -> Option<Arc<Mutex<LockState>>> {
+        Some(Arc::clone(&self.advisory))
+    }
+}
+
+impl FullStateMachine {
+    #[cfg(feature = "consensus")]
+    fn admit_raft_snapshot(
+        &self,
+        image: &raft::eraftpb::Snapshot,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<Snapshot> {
+        let index = image.get_metadata().index;
+        if index == 0 || image.data.is_empty() {
+            return Err(super::RaftError::InvalidState(format!(
+                "missing full-member snapshot image or index (index {index})"
+            )));
+        }
+        let snapshot: Snapshot = bincode::deserialize(&image.data)?;
+        if snapshot.last_applied != index {
+            return Err(super::RaftError::InvalidState(format!(
+                "snapshot application index {} differs from Raft index {index}",
+                snapshot.last_applied
+            )));
+        }
+        self.validate_owned_snapshot_reader(&snapshot, policy, replica_reader)?;
+        Ok(snapshot)
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(super) fn restore_stored_snapshot(
+        &mut self,
+        image: &raft::eraftpb::Snapshot,
+        policy: super::MembershipPolicy,
+        replica_reader: bool,
+    ) -> Result<()> {
+        let snapshot = self.admit_raft_snapshot(image, policy, replica_reader)?;
+        self.replace_snapshot(snapshot)
+    }
+
+    fn replace_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
         // Atomic restore for metadata: clear + repopulate in a single
         // redb transaction. Advisory locks are in-memory only — they
         // are replaced under their own mutex after the redb commit.
@@ -3055,25 +3140,6 @@ impl StateMachine for FullStateMachine {
             .store(snapshot.last_applied, Ordering::Release);
 
         Ok(())
-    }
-
-    fn last_applied_index(&self) -> u64 {
-        self.last_applied.load(Ordering::Acquire)
-    }
-
-    fn last_applied_shared(&self) -> Option<Arc<AtomicU64>> {
-        Some(self.last_applied_shared_arc())
-    }
-
-    /// Return the shared apply-side observer list so downstream holders
-    /// (``ZoneConsensus``, kernel federation wiring, DCache) can register
-    /// observers that fire on every committed metadata-path command.
-    fn apply_observers_slot(&self) -> Option<Arc<parking_lot::RwLock<Vec<ApplyObserver>>>> {
-        Some(Arc::clone(&self.apply_observers))
-    }
-
-    fn advisory_handle(&self) -> Option<Arc<Mutex<LockState>>> {
-        Some(Arc::clone(&self.advisory))
     }
 }
 

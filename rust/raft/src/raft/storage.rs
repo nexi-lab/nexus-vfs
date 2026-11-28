@@ -106,6 +106,43 @@ impl RaftStorage {
             .map_err(|e| RaftError::Storage(format!("initial_state: {e}")))
     }
 
+    fn stored_snapshot(&self) -> Result<Option<Snapshot>> {
+        self.state
+            .get(KEY_SNAPSHOT)?
+            .map(|bytes| {
+                protobuf::Message::parse_from_bytes(&bytes)
+                    .map_err(|e| RaftError::Serialization(e.to_string()))
+            })
+            .transpose()
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(super) fn recovery_snapshot(&self) -> Result<Option<Snapshot>> {
+        let image = self.stored_snapshot()?;
+        let index = image.as_ref().map_or(0, |s| s.get_metadata().index);
+        let boundary = self.first_index_impl()?.saturating_sub(1);
+        if index < boundary {
+            return Err(RaftError::InvalidState(format!(
+                "snapshot index {index} precedes compacted log boundary {boundary}"
+            )));
+        }
+        if image.is_some() {
+            let commit = self.initial_state_impl()?.hard_state.commit;
+            if index > commit {
+                return Err(RaftError::InvalidState(format!(
+                    "snapshot index {index} exceeds durable commit {commit}"
+                )));
+            }
+            let last = self.last_index_impl()?;
+            if commit > last {
+                return Err(RaftError::InvalidState(format!(
+                    "durable commit {commit} exceeds last retained index {last} after snapshot {index}"
+                )));
+            }
+        }
+        Ok(image)
+    }
+
     /// Get the first index in the log.
     pub fn first_index_impl(&self) -> Result<u64> {
         Ok(reader_format::LogBoundary::decode(self.state.get(KEY_FIRST_INDEX)?.as_deref())?.index)
@@ -517,10 +554,8 @@ impl Storage for RaftStorage {
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        match self.state.get(KEY_SNAPSHOT).map_err(to_raft_error)? {
-            Some(bytes) => {
-                let snapshot: Snapshot = protobuf::Message::parse_from_bytes(&bytes)
-                    .map_err(|e| RaftCoreError::Store(RaftStorageError::Other(Box::new(e))))?;
+        match self.stored_snapshot().map_err(to_raft_error)? {
+            Some(snapshot) => {
                 // raft-rs contract: the returned snapshot MUST cover at least
                 // `request_index` (the leader is catching a follower up to it).
                 // A stored snapshot that under-covers is not usable yet — report
