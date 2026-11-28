@@ -826,6 +826,13 @@ impl wire::zone_transport_service_server::ZoneTransportService for Forgetful {
         Err(tonic::Status::unimplemented("not part of this receiver"))
     }
 
+    async fn step_atomic_namespace_v2(
+        &self,
+        _: tonic::Request<wire::StepMessageRequest>,
+    ) -> Result<tonic::Response<wire::StepMessageResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not part of this receiver"))
+    }
+
     async fn prepare_replica_control_reader_v1(
         &self,
         _: tonic::Request<wire::PrepareReplicaControlReaderRequest>,

@@ -537,6 +537,22 @@ fn parse_raft_message(
     })
 }
 
+/// Only an explicitly commissioned member may exchange namespace-format traffic.
+fn namespace_step_zone<S: crate::raft::StateMachine + 'static>(
+    node: Option<ZoneConsensus<S>>,
+    protocol: crate::raft::RaftMessageProtocol,
+) -> std::result::Result<Option<ZoneConsensus<S>>, Status> {
+    let namespace = node
+        .as_ref()
+        .is_some_and(ZoneConsensus::is_atomic_namespace_member);
+    if namespace != (protocol == crate::raft::RaftMessageProtocol::AtomicNamespaceV2) {
+        return Err(Status::failed_precondition(
+            "incompatible Raft namespace reader",
+        ));
+    }
+    Ok(node)
+}
+
 /// Step an admitted message with the same full-node and witness semantics.
 async fn step_raft_message<S: crate::raft::StateMachine + Send + Sync + 'static>(
     node: &ZoneConsensus<S>,
@@ -705,7 +721,7 @@ impl ZoneTransportServiceImpl {
         zone_id: &str,
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<(), Status> {
-        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+        if protocol != crate::raft::RaftMessageProtocol::Legacy {
             super::node_authority::require_authenticated_control_node(extensions)?;
         }
         super::node_authority::authorize_data_zone(extensions, &self.registry, zone_id)
@@ -716,8 +732,9 @@ impl ZoneTransportServiceImpl {
     fn step_zone(
         &self,
         zone_id: &str,
+        protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<ZoneConsensus<FullStateMachine>, Status> {
-        match self.registry.get_node(zone_id) {
+        match namespace_step_zone(self.registry.get_node(zone_id), protocol)? {
             Some(node) => Ok(node),
             None => self.join_step_zone(zone_id),
         }
@@ -734,7 +751,7 @@ impl ZoneTransportServiceImpl {
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
         let peer = super::node_authority::authorize_raft_sender(extensions, &message)?;
-        let node = self.step_zone(zone_id)?;
+        let node = self.step_zone(zone_id, protocol)?;
         self.snapshots.release_idle(std::time::Instant::now());
 
         // Observe the connected peer's address before stepping. Relayed
@@ -814,6 +831,14 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             .await
     }
 
+    async fn step_atomic_namespace_v2(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV2)
+            .await
+    }
+
     /// Receive one slice of a raft snapshot. The caller is admitted as the
     /// transfer's Step RPC admits it, and the completed `MsgSnapshot` takes
     /// that RPC's step path.
@@ -828,7 +853,7 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
             &self.snapshots,
             &extensions,
             &req,
-            || self.step_zone(&req.zone_id).map(drop),
+            || self.step_zone(&req.zone_id, protocol).map(drop),
             |message| {
                 self.step_admitted(
                     &extensions,
@@ -861,6 +886,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
+        node.require_ec_writes()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         // EC replication membership: like step_message, the peer-map
         // is the runtime SSOT under the opaque-ID contract; a static
@@ -922,6 +949,8 @@ impl ZoneTransportService for ZoneTransportServiceImpl {
         )?;
         let req = request.into_inner();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
+        node.require_ec_writes()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         for entry in &req.entries {
             if let Err(e) = apply_ec_entry(&node, entry).await {
@@ -1186,7 +1215,7 @@ impl ZoneApiService for ZoneApiServiceImpl {
             &request.get_ref().zone_id,
         )?;
         let caller = super::node_authority::authenticated_node_id(request.extensions())?;
-        let req = request.into_inner();
+        let (_, extensions, req) = request.into_parts();
         let node = get_zone_node(&self.registry, &req.zone_id)?;
 
         tracing::debug!(
@@ -1198,8 +1227,30 @@ impl ZoneApiService for ZoneApiServiceImpl {
 
         // Deserialize command: prefer raw_command (bincode, from internal forwarding)
         // over proto command (from external clients).
-        let cmd = if !req.raw_command.is_empty() {
-            match bincode::deserialize::<Command>(&req.raw_command) {
+        let namespace_forward = !req.namespace_command_v1.is_empty();
+        let raw = if namespace_forward {
+            if !req.forwarded || req.command.is_some() || !req.raw_command.is_empty() {
+                return Err(Status::invalid_argument(
+                    "namespace forward must carry a single command",
+                ));
+            }
+            super::node_authority::require_authenticated_control_node(&extensions)?;
+            if !node.is_atomic_namespace_member() {
+                return Err(Status::failed_precondition(
+                    "zone does not accept namespace-format writers",
+                ));
+            }
+            if !caller.is_some_and(|id| node.is_replication_member(id)) {
+                return Err(Status::permission_denied(
+                    "namespace forward requires a zone member",
+                ));
+            }
+            &req.namespace_command_v1
+        } else {
+            &req.raw_command
+        };
+        let cmd = if !raw.is_empty() {
+            match bincode::deserialize::<Command>(raw) {
                 Ok(c) => c,
                 Err(e) => {
                     return Ok(Response::new(ProposeResponse {
@@ -1242,7 +1293,19 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // raw_command is also reachable over the generic public Propose RPC.
         // A missing dedicated file RPC does not isolate an enum variant. Return
         // a definite refusal before either direct or forwarded submission.
-        if cmd.storage_protocol().is_some() {
+        if namespace_forward && !cmd.is_namespace_mutation() {
+            return Err(Status::invalid_argument(
+                "command is outside the namespace writer protocol",
+            ));
+        }
+        if node.is_atomic_namespace_member() && cmd.is_namespace_mutation() && !namespace_forward {
+            return Err(Status::failed_precondition(
+                "zone requires the namespace writer protocol",
+            ));
+        }
+        let forwarded_rename =
+            namespace_forward && matches!(cmd, Command::RenameNamespaceV1 { .. });
+        if !forwarded_rename && cmd.storage_protocol().is_some() {
             return Err(Status::unimplemented(
                 "conditional metadata proposals are not activated",
             ));
@@ -1264,7 +1327,9 @@ impl ZoneApiService for ZoneApiServiceImpl {
         // Use submit_to_channel (leader-only, no forwarding) for forwarded
         // requests to prevent infinite loops. For direct requests, use
         // propose() which may forward to leader transparently.
-        let result = if req.forwarded {
+        let result = if forwarded_rename {
+            node.commit_namespace_rename(cmd).await
+        } else if req.forwarded {
             // Forwarded request: must be handled locally (no re-forwarding)
             match node.submit_to_channel(&cmd) {
                 Ok(rx) => {
@@ -3169,7 +3234,7 @@ impl WitnessServiceImpl {
         extensions: &tonic::codegen::http::Extensions,
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<(), Status> {
-        if protocol == crate::raft::RaftMessageProtocol::ReplicaControlV1 {
+        if protocol != crate::raft::RaftMessageProtocol::Legacy {
             super::node_authority::require_authenticated_control_node(extensions)?;
         }
         Ok(())
@@ -3182,8 +3247,9 @@ impl WitnessServiceImpl {
     fn step_zone(
         &self,
         zone_id: &str,
+        protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<ZoneConsensus<WitnessStateMachine>, Status> {
-        if let Some(node) = self.registry.get_node(zone_id) {
+        if let Some(node) = namespace_step_zone(self.registry.get_node(zone_id), protocol)? {
             return Ok(node);
         }
         let handle = tokio::runtime::Handle::current();
@@ -3203,7 +3269,7 @@ impl WitnessServiceImpl {
         protocol: crate::raft::RaftMessageProtocol,
     ) -> std::result::Result<Response<StepMessageResponse>, Status> {
         let peer = super::node_authority::authorize_raft_sender(extensions, &message)?;
-        let node = self.step_zone(zone_id)?;
+        let node = self.step_zone(zone_id, protocol)?;
         self.snapshots.release_idle(std::time::Instant::now());
 
         // Learn the sender's advertise address from this inbound exchange.
@@ -3277,6 +3343,14 @@ impl ZoneTransportService for WitnessServiceImpl {
             .await
     }
 
+    async fn step_atomic_namespace_v2(
+        &self,
+        request: Request<StepMessageRequest>,
+    ) -> std::result::Result<Response<StepMessageResponse>, Status> {
+        self.dispatch_step(request, crate::raft::RaftMessageProtocol::AtomicNamespaceV2)
+            .await
+    }
+
     /// Receive one slice of a raft snapshot, as a full node does.
     async fn snapshot_chunk(
         &self,
@@ -3289,7 +3363,7 @@ impl ZoneTransportService for WitnessServiceImpl {
             &self.snapshots,
             &extensions,
             &req,
-            || self.step_zone(&req.zone_id).map(drop),
+            || self.step_zone(&req.zone_id, protocol).map(drop),
             |message| {
                 self.step_admitted(
                     &extensions,

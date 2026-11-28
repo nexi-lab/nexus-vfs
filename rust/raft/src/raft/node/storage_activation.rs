@@ -38,6 +38,29 @@ impl StorageActivationView {
 pub enum RaftMessageProtocol {
     Legacy,
     ReplicaControlV1,
+    AtomicNamespaceV2,
+}
+
+impl RaftMessageProtocol {
+    pub(super) fn reader_format(self) -> super::super::storage::ReaderFormat {
+        use super::super::storage::ReaderFormat;
+        match self {
+            Self::Legacy => ReaderFormat::Legacy,
+            Self::ReplicaControlV1 => ReaderFormat::ReplicaControl,
+            Self::AtomicNamespaceV2 => ReaderFormat::AtomicNamespace,
+        }
+    }
+}
+
+impl From<super::super::storage::ReaderFormat> for RaftMessageProtocol {
+    fn from(format: super::super::storage::ReaderFormat) -> Self {
+        use super::super::storage::ReaderFormat;
+        match format {
+            ReaderFormat::Legacy => Self::Legacy,
+            ReaderFormat::ReplicaControl => Self::ReplicaControlV1,
+            ReaderFormat::AtomicNamespace => Self::AtomicNamespaceV2,
+        }
+    }
 }
 
 /// A typed proposal constructed by its native storage authority.
@@ -54,9 +77,9 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         if self.failed {
             return Err(RaftError::InvalidState("Raft driver has failed".into()));
         }
-        if !self.replica_control_reader_prepared {
+        if self.reader_protocol == RaftMessageProtocol::Legacy {
             self.raw_node.store().prepare_replica_control_reader()?;
-            self.replica_control_reader_prepared = true;
+            self.reader_protocol = RaftMessageProtocol::ReplicaControlV1;
         }
         Ok(())
     }
@@ -64,11 +87,7 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
     /// The outbound dialect follows the original durable reader floor.
     /// This derived driver cache is initialized from storage on every boot.
     pub fn raft_message_protocol(&self) -> RaftMessageProtocol {
-        if self.replica_control_reader_prepared {
-            RaftMessageProtocol::ReplicaControlV1
-        } else {
-            RaftMessageProtocol::Legacy
-        }
+        self.reader_protocol
     }
 
     pub(super) fn admit_raft_protocol(&mut self, protocol: RaftMessageProtocol) -> Result<()> {
@@ -76,14 +95,19 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
         if self.failed {
             return Err(RaftError::InvalidState("Raft driver has failed".into()));
         }
-        match protocol {
-            RaftMessageProtocol::ReplicaControlV1 => self.prepare_replica_control_reader(),
-            RaftMessageProtocol::Legacy if self.replica_control_reader_prepared => {
+        match (self.reader_protocol, protocol) {
+            (current, offered) if current == offered => Ok(()),
+            (RaftMessageProtocol::Legacy, RaftMessageProtocol::ReplicaControlV1) => {
+                self.prepare_replica_control_reader()
+            }
+            (RaftMessageProtocol::ReplicaControlV1, RaftMessageProtocol::Legacy) => {
                 Err(RaftError::UnsupportedOperation(
                     "prepared reader requires replica-control transport",
                 ))
             }
-            RaftMessageProtocol::Legacy => Ok(()),
+            _ => Err(RaftError::UnsupportedOperation(
+                "incompatible Raft namespace reader",
+            )),
         }
     }
 
@@ -156,9 +180,21 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
             self.validate_storage_activation_view(observed)?;
         }
         match (self.config.membership_policy, submission.protocol) {
+            (_, StorageProtocol::AtomicNamespace) => {
+                if self.reader_protocol == RaftMessageProtocol::AtomicNamespaceV2
+                    && self.config.membership_policy == MembershipPolicy::Managed
+                {
+                    Ok(())
+                } else {
+                    Err(RaftError::UnsupportedOperation(
+                        "atomic namespace is not enabled",
+                    ))
+                }
+            }
             (MembershipPolicy::FixedLocal, _) if submission.configuration.is_none() => Ok(()),
             (MembershipPolicy::Managed, StorageProtocol::ReplicaControl)
-                if self.replica_control_reader_prepared && self.replica_control_active =>
+                if self.reader_protocol != RaftMessageProtocol::Legacy
+                    && self.replica_control_active =>
             {
                 Ok(())
             }
@@ -177,14 +213,18 @@ impl<S: StateMachine + 'static> ZoneConsensusDriver<S> {
 pub(super) async fn await_storage_commit(
     receiver: super::oneshot::Receiver<Result<super::CommandResult>>,
 ) -> Result<super::CommandResult> {
-    // Once enqueued, only a proven pre-submission refusal resolves uncertainty.
+    // A refusal or a committed replacement proves this attempt did not apply.
     match crate::raft::proposal::wait_for_commit(
         receiver,
         tokio::time::Instant::now() + std::time::Duration::from_secs(super::PROPOSAL_TIMEOUT_SECS),
     )
     .await
     {
-        Err(error @ (RaftError::NotLeader { .. } | RaftError::ProposalRejected(_))) => Err(error),
+        Err(
+            error @ (RaftError::NotLeader { .. }
+            | RaftError::ProposalRejected(_)
+            | RaftError::ProposalSuperseded { .. }),
+        ) => Err(error),
         Err(error) => Err(RaftError::ProposalOutcomeUnknown(error.to_string())),
         result => result,
     }

@@ -62,13 +62,19 @@ pub(super) struct Cluster {
 
 impl Cluster {
     pub(super) fn new() -> Self {
+        Self::with_members(|id| node(id, &[1, 2, 3]))
+    }
+
+    pub(super) fn with_members(
+        mut build: impl FnMut(u64) -> (ZoneConsensus<FullStateMachine>, Driver, TempDir),
+    ) -> Self {
         let mut cluster = Self {
             handles: Vec::new(),
             drivers: Vec::new(),
             _dirs: Vec::new(),
         };
         for id in 1..=3 {
-            let (handle, driver, dir) = node(id, &[1, 2, 3]);
+            let (handle, driver, dir) = build(id);
             cluster.handles.push(handle);
             cluster.drivers.push(driver);
             cluster._dirs.push(dir);
@@ -80,13 +86,16 @@ impl Cluster {
         let mut outgoing = Vec::new();
         for driver in &mut self.drivers {
             driver.process_messages();
-            outgoing.extend(driver.advance().await.unwrap());
+            let messages = driver.advance().await.unwrap();
+            let protocol = driver.raft_message_protocol();
+            outgoing.extend(messages.into_iter().map(|message| (protocol, message)));
         }
-        for msg in outgoing {
+        for (protocol, msg) in outgoing {
             if deliver(&msg) {
+                let (tx, _) = tokio::sync::oneshot::channel();
                 self.handles[msg.to as usize - 1]
                     .msg_tx
-                    .try_send(RaftMsg::Step { msg })
+                    .try_send(RaftMsg::StepTransport { msg, protocol, tx })
                     .unwrap();
             }
         }

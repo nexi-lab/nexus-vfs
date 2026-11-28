@@ -475,6 +475,7 @@ pub struct ZoneConsensus<S: StateMachine + 'static> {
     /// Capacity: [`DRIVER_CHANNEL_CAPACITY`]. Provides backpressure when
     /// the driver cannot keep up with incoming messages.
     msg_tx: mpsc::Sender<RaftMsg>,
+    atomic_namespace: bool,
     /// Shared state machine for read-only queries (no channel needed).
     state_machine: Arc<RwLock<S>>,
     /// Node configuration.
@@ -556,6 +557,7 @@ impl<S: StateMachine + 'static> Clone for ZoneConsensus<S> {
     fn clone(&self) -> Self {
         Self {
             msg_tx: self.msg_tx.clone(),
+            atomic_namespace: self.atomic_namespace,
             state_machine: self.state_machine.clone(),
             config: self.config.clone(),
             cached_leader_id: self.cached_leader_id.clone(),
@@ -599,7 +601,7 @@ pub struct ZoneConsensusDriver<S: StateMachine + 'static> {
     incarnation: Arc<()>,
     membership_epoch: Option<u64>,
     /// Derived from the mandatory Raft reader floor; updated after its commit.
-    replica_control_reader_prepared: bool,
+    reader_protocol: RaftMessageProtocol,
     /// Derived from committed state at boot, apply and snapshot installation.
     replica_control_active: bool,
     /// Shared state machine (shared with handle for reads).
@@ -943,7 +945,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         // Bounded channel with backpressure
         let (msg_tx, msg_rx) = mpsc::channel(DRIVER_CHANNEL_CAPACITY);
 
+        let reader_protocol = RaftMessageProtocol::from(raw_node.store().reader_format()?);
+        let atomic_namespace = reader_protocol == RaftMessageProtocol::AtomicNamespaceV2;
         let handle = ZoneConsensus {
+            atomic_namespace,
             msg_tx,
             state_machine: state_machine.clone(),
             config: config.clone(),
@@ -971,13 +976,12 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .map(|f| f.saturating_sub(1))
             .unwrap_or(0);
 
-        let replica_control_reader_prepared = raw_node.store().replica_control_reader_required()?;
         let read_request_ids = ReadRequestIds::new(config.id);
         let driver = ZoneConsensusDriver {
             raw_node,
             incarnation: Arc::new(()),
             membership_epoch: Some(0),
-            replica_control_reader_prepared,
+            reader_protocol,
             replica_control_active,
             state_machine,
             config,
@@ -1530,6 +1534,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         self.config.membership_policy == super::MembershipPolicy::FixedLocal
     }
 
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn supports_atomic_rename(&self) -> bool {
+        self.atomic_namespace || self.supports_conditional_metadata()
+    }
+
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) fn is_atomic_namespace_member(&self) -> bool {
+        self.atomic_namespace && self.config.membership_policy == super::MembershipPolicy::Managed
+    }
+
     /// Publish through the existing SC actor on an enforced isolated runtime.
     /// Generic and forwarded proposal doors retain their activation refusal.
     #[cfg(all(feature = "grpc", has_protos))]
@@ -1588,6 +1602,10 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             StorageProtocol::ReplicaControl => (
                 self.supports_replica_binding().await?,
                 "replica binding protocol is not activated",
+            ),
+            StorageProtocol::AtomicNamespace => (
+                self.is_atomic_namespace_member(),
+                "atomic namespace is not enabled",
             ),
             StorageProtocol::ConditionalMetadata | StorageProtocol::RecordLifetime => (
                 self.supports_conditional_metadata(),
@@ -1673,15 +1691,44 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         new_key: String,
         is_pas: bool,
     ) -> Result<CommandResult> {
-        self.submit_storage_command(
-            Command::RenameMetadata {
-                old_key,
-                new_key,
-                is_pas,
-            },
-            StorageProtocol::ConditionalMetadata,
-        )
-        .await
+        if !self.is_atomic_namespace_member() {
+            return self
+                .submit_storage_command(
+                    Command::RenameMetadata {
+                        old_key,
+                        new_key,
+                        is_pas,
+                    },
+                    StorageProtocol::ConditionalMetadata,
+                )
+                .await;
+        }
+        let command = Command::RenameNamespaceV1 {
+            old_key,
+            new_key,
+            is_pas,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(PROPOSAL_TIMEOUT_SECS);
+        match self.commit_namespace_rename(command.clone()).await {
+            Err(RaftError::NotLeader { .. }) => self.forward_to_leader(command, deadline).await,
+            result => result,
+        }
+    }
+
+    /// Leader-only namespace submission shared by the local syscall and its authenticated forward.
+    #[cfg(all(feature = "grpc", has_protos))]
+    pub(crate) async fn commit_namespace_rename(&self, command: Command) -> Result<CommandResult> {
+        match self
+            .submit_storage_command(command, StorageProtocol::AtomicNamespace)
+            .await
+        {
+            // A different term committed at our slot. This leader lost the
+            // proposal, so the existing leader redirect can safely route it again.
+            Err(RaftError::ProposalSuperseded { .. }) => Err(RaftError::NotLeader {
+                leader_hint: self.leader_hint_addr(),
+            }),
+            result => result,
+        }
     }
 
     /// Propose a command with Eventual Consistency — fire and forget.
@@ -1838,41 +1885,18 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             .leader_id()
             .ok_or(RaftError::NotLeader { leader_hint: None })?;
 
-        // Leader-is-self path: don't RPC-forward to ourselves.
-        //
-        // Forwarding via gRPC to our own advertised address either
-        // hits a hairpin failure (Tailscale: own public IP
-        // unreachable from self on Windows / macOS) or uselessly
-        // round-trips the proposal across two extra HTTP/2 hops
-        // back to the same process.  The reason we're in
-        // `forward_to_leader` despite being leader is the boot-time
-        // window where `submit_to_channel` ran before
-        // `update_cached_status` reflected post-election state.
-        // That window closes within one driver tick (~10ms), so
-        // bounded local retry of `submit_to_channel` resolves
-        // cleanly without ever leaving the process.
-        //
-        // PROPOSAL_TIMEOUT_SECS aligns this path's bound with the
-        // leader-path timeout above; 20ms backoff is two
-        // tick_intervals so each retry samples fresh raft state.
+        // Submit directly when the current routing observation points here.
+        // A refusal returns to the bounded retry loop, which samples the leader again.
         if leader_id == self.config.id {
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(RaftError::Timeout(PROPOSAL_TIMEOUT_SECS));
-                }
-                match self.submit_to_channel(command) {
-                    Ok(rx) => {
-                        let result = super::proposal::wait_for_commit(rx, deadline).await?;
-                        return Ok(super::proposal::Committed {
-                            result,
-                            index: Some(self.applied_index()),
-                        });
-                    }
-                    Err(RaftError::NotLeader { .. }) => continue,
-                    Err(e) => return Err(e),
-                }
-            }
+            let result = if matches!(command, Command::RenameNamespaceV1 { .. }) {
+                self.commit_namespace_rename(command.clone()).await?
+            } else {
+                super::proposal::wait_for_commit(self.submit_to_channel(command)?, deadline).await?
+            };
+            return Ok(super::proposal::Committed {
+                result,
+                index: Some(self.applied_index()),
+            });
         }
 
         let leader_addr = {
@@ -1895,6 +1919,16 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         );
 
         // Each failure is propagated as what it is, never rewritten to `NotLeader`.
+        if self.is_atomic_namespace_member() && command.is_namespace_mutation() {
+            return crate::transport::forward_namespace_proposal(
+                &ctx.client_pool,
+                &leader_addr,
+                command,
+                &ctx.zone_id,
+                deadline,
+            )
+            .await;
+        }
         match crate::transport::forward_propose(
             &ctx.client_pool,
             &leader_addr,
@@ -1964,6 +1998,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
     ///
     /// Latency: ~5-50μs (redb write, no network).
     pub async fn propose_ec_local(&self, command: Command) -> Result<u64> {
+        self.require_ec_writes()?;
         // Reject BEFORE appending to the EC WAL. A successful-looking local
         // no-op would otherwise be returned as a replicated write token.
         if self
@@ -2019,6 +2054,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         entry_timestamp: u64,
     ) -> Result<CommandResult> {
         self.config.membership_policy.require_managed()?;
+        self.require_ec_writes()?;
         if self
             .state_machine
             .read()
@@ -2030,6 +2066,15 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         }
         let mut sm = self.state_machine.write().await;
         sm.apply_ec_with_lww(&command, entry_timestamp)
+    }
+
+    pub(crate) fn require_ec_writes(&self) -> Result<()> {
+        if self.atomic_namespace {
+            return Err(RaftError::UnsupportedOperation(
+                "zone requires Raft-committed writes",
+            ));
+        }
+        Ok(())
     }
 
     /// Check if an EC write token has been replicated to a majority.
@@ -2166,7 +2211,7 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
         protocol: RaftMessageProtocol,
     ) -> Result<()> {
         self.config.membership_policy.require_managed()?;
-        let replica_reader = protocol == RaftMessageProtocol::ReplicaControlV1;
+        let replica_reader = protocol != RaftMessageProtocol::Legacy;
         // ReadIndex also carries entries, whose data is an opaque request
         // context. Only proposal/append entries contain serialized commands.
         if matches!(
@@ -2176,7 +2221,11 @@ impl<S: StateMachine + 'static> ZoneConsensus<S> {
             for entry in &msg.entries {
                 self.config.membership_policy.validate_entry_for_reader(
                     entry,
-                    replica_reader && msg.get_msg_type() == raft::eraftpb::MessageType::MsgAppend,
+                    if msg.get_msg_type() == raft::eraftpb::MessageType::MsgAppend {
+                        protocol.reader_format()
+                    } else {
+                        super::storage::ReaderFormat::Legacy
+                    },
                 )?;
             }
         }

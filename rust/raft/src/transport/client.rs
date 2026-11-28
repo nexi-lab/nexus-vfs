@@ -338,6 +338,7 @@ impl From<crate::raft::RaftMessageProtocol> for StepBoundary {
     fn from(protocol: crate::raft::RaftMessageProtocol) -> Self {
         match protocol {
             crate::raft::RaftMessageProtocol::Legacy => Self::Legacy,
+            crate::raft::RaftMessageProtocol::AtomicNamespaceV2 => Self::AtomicNamespaceV2,
             crate::raft::RaftMessageProtocol::ReplicaControlV1 => Self::ReplicaControlV1,
         }
     }
@@ -349,6 +350,7 @@ pub struct RaftClient {
     endpoint: String,
     config: ClientConfig,
     tls_snapshot: TlsSnapshot,
+    channel: Channel,
     inner: ZoneTransportServiceClient<Channel>,
     is_node_channel: bool,
 }
@@ -417,7 +419,7 @@ impl RaftClient {
             }
             None => lib::transport_primitives::create_channel(endpoint, &channel_config).await?,
         };
-        let inner = bounded!(ZoneTransportServiceClient::new(channel));
+        let inner = bounded!(ZoneTransportServiceClient::new(channel.clone()));
         if !config.tls.is_current(&tls_snapshot) {
             return Err(TransportError::Connection(
                 "Raft TLS configuration changed while connecting".into(),
@@ -429,6 +431,7 @@ impl RaftClient {
             config,
             tls_snapshot,
             inner,
+            channel,
             is_node_channel: matches!(expected, Some((_, PeerRole::Node))),
         })
     }
@@ -436,6 +439,17 @@ impl RaftClient {
     /// Get the endpoint this client is connected to.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Construct a zone API facade over this same authenticated peer connection.
+    pub(super) fn node_api(&self) -> Result<ZoneApiServiceClient<Channel>> {
+        require_current_credentials(&self.config, &self.tls_snapshot)?;
+        if !self.is_node_channel {
+            return Err(TransportError::Connection(
+                "namespace forwarding requires a cluster Node channel".into(),
+            ));
+        }
+        Ok(zone_api_client(self.channel.clone()))
     }
 
     /// Prepare the original remote reader through its owning Raft driver.
@@ -531,19 +545,45 @@ impl RaftClient {
         zone_id: String,
         sender_address: String,
     ) -> Result<()> {
+        self.step_versioned(
+            StepBoundary::ReplicaControlV1,
+            message_bytes,
+            zone_id,
+            sender_address,
+        )
+        .await
+    }
+
+    pub(crate) async fn step_versioned(
+        &mut self,
+        boundary: StepBoundary,
+        message: Vec<u8>,
+        zone_id: String,
+        sender_address: String,
+    ) -> Result<()> {
         if !self.is_node_channel {
             return Err(TransportError::Connection(
                 "replica-control transport requires an exact cluster Node channel".into(),
             ));
         }
-        let response = self
-            .inner_mut()?
-            .step_replica_control_v1(StepMessageRequest {
-                message: message_bytes,
-                zone_id,
-                sender_address,
-            })
-            .await?;
+        let request = StepMessageRequest {
+            message,
+            zone_id,
+            sender_address,
+        };
+        let response = match boundary {
+            StepBoundary::AtomicNamespaceV2 => {
+                self.inner_mut()?.step_atomic_namespace_v2(request).await?
+            }
+            StepBoundary::ReplicaControlV1 => {
+                self.inner_mut()?.step_replica_control_v1(request).await?
+            }
+            _ => {
+                return Err(TransportError::Connection(
+                    "expected a versioned Raft peer exchange".into(),
+                ))
+            }
+        };
         decode_step_response(response.into_inner())
     }
 
@@ -552,7 +592,7 @@ impl RaftClient {
     /// replica-control boundary uses the exact Node channel, as
     /// [`Self::step_replica_control_v1`] does.
     pub async fn snapshot_chunk(&mut self, request: SnapshotChunkRequest) -> Result<u64> {
-        if request.boundary == StepBoundary::ReplicaControlV1 as i32 && !self.is_node_channel {
+        if request.boundary != StepBoundary::Legacy as i32 && !self.is_node_channel {
             return Err(TransportError::Connection(
                 "replica-control transport requires an exact cluster Node channel".into(),
             ));
@@ -791,6 +831,7 @@ impl RaftApiClient {
             request_id: request_id.unwrap_or_default(),
             zone_id: self.zone_id.clone(),
             raw_command: Vec::new(),
+            namespace_command_v1: Vec::new(),
             forwarded: false,
         });
 
@@ -2037,7 +2078,8 @@ mod tests {
             endpoint: "http://[::1]:1".to_string(),
             tls_snapshot: config.tls.snapshot(),
             config,
-            inner: bounded!(ZoneTransportServiceClient::new(channel)),
+            inner: bounded!(ZoneTransportServiceClient::new(channel.clone())),
+            channel,
             is_node_channel: false,
         }
     }

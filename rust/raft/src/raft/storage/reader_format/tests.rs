@@ -135,7 +135,7 @@ fn unknown_reader_format_cannot_be_reopened_or_replaced_by_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let storage = RaftStorage::open(directory.path()).unwrap();
     storage.append(&entries(1, 4)).unwrap();
-    let unknown = [b"NXRIDX02".as_slice(), &1u64.to_be_bytes()].concat();
+    let unknown = [b"NXRIDX99".as_slice(), &1u64.to_be_bytes()].concat();
     storage.state.set(KEY_FIRST_INDEX, &unknown).unwrap();
     let before = (rows(&storage.state), rows(&storage.entries));
     for result in [
@@ -164,5 +164,36 @@ fn unknown_reader_format_cannot_be_reopened_or_replaced_by_snapshot() {
             rows(&store.tree(TREE_ENTRIES).unwrap())
         ),
         before
+    );
+}
+
+#[test]
+#[cfg(all(feature = "grpc", has_protos))]
+fn namespace_reader_survives_snapshot_and_rejects_retrofitting_a_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RaftStorage::open(dir.path()).unwrap();
+    store
+        .set_conf_state(snapshot(1).get_metadata().get_conf_state())
+        .unwrap();
+    assert!(store.initialize_atomic_namespace().is_err());
+    assert_eq!(store.reader_format().unwrap(), ReaderFormat::Legacy);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RaftStorage::open(dir.path()).unwrap();
+    store.initialize_atomic_namespace().unwrap();
+    store.prepare_replica_control_reader().unwrap();
+    store.apply_snapshot(&snapshot(8)).unwrap();
+    store.append(&entries(9, 12)).unwrap();
+    store.compact(10).unwrap();
+    assert_eq!(
+        store.reader_format().unwrap(),
+        ReaderFormat::AtomicNamespace
+    );
+    drop(store);
+    let store = RaftStorage::open(dir.path()).unwrap();
+    assert_eq!(store.first_index_impl().unwrap(), 10);
+    assert_eq!(
+        store.reader_format().unwrap(),
+        ReaderFormat::AtomicNamespace
     );
 }

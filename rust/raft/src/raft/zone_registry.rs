@@ -1078,8 +1078,12 @@ impl ZoneRaftRegistry {
             );
         }
 
-        // Create EC replication log (non-witness nodes only)
-        let replication_log = if !config.is_witness {
+        let reader_format = raft_storage.reader_format().map_err(|e| {
+            TransportError::Connection(format!("Failed to read zone {zone_id} storage format: {e}"))
+        })?;
+        let replication_log = if !config.is_witness
+            && reader_format != super::storage::ReaderFormat::AtomicNamespace
+        {
             let log = ReplicationLog::new(&store, config.id).map_err(|e| {
                 TransportError::Connection(format!("Failed to create ReplicationLog: {}", e))
             })?;

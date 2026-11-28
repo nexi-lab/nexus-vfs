@@ -2679,6 +2679,7 @@ dependencies = [
  "axum",
  "backends",
  "base64 0.22.1",
+ "bincode",
  "clap",
  "contracts",
  "ed25519-dalek",

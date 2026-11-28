@@ -255,6 +255,7 @@ pub(super) fn boundary_protocol(
 ) -> Result<RaftMessageProtocol, Status> {
     match StepBoundary::try_from(request.boundary) {
         Ok(StepBoundary::Legacy) => Ok(RaftMessageProtocol::Legacy),
+        Ok(StepBoundary::AtomicNamespaceV2) => Ok(RaftMessageProtocol::AtomicNamespaceV2),
         Ok(StepBoundary::ReplicaControlV1) => Ok(RaftMessageProtocol::ReplicaControlV1),
         Ok(StepBoundary::Unspecified) | Err(_) => Err(Status::invalid_argument(
             "snapshot transfer names no step boundary",
@@ -766,7 +767,12 @@ mod tests {
             protocol(StepBoundary::ReplicaControlV1).unwrap(),
             RaftMessageProtocol::ReplicaControlV1
         );
+        assert_eq!(
+            protocol(StepBoundary::AtomicNamespaceV2).unwrap(),
+            RaftMessageProtocol::AtomicNamespaceV2
+        );
         assert!(protocol(StepBoundary::Unspecified).is_err());
+        assert!(boundary_protocol(&with(3)).is_err());
         assert!(boundary_protocol(&with(99)).is_err());
     }
 }

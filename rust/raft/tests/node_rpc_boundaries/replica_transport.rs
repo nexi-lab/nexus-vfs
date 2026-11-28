@@ -322,3 +322,41 @@ async fn original_transport_loop_uses_required_wire_for_new_learner_and_replicat
             .contains(&2));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_wire_cannot_upgrade_an_existing_replica() {
+    let (ca, key) = generate_zone_ca("root").unwrap();
+    let server = PeerServer::start(node_tls(&ca, &key, 7)).await;
+    let tls = node_tls(&ca, &key, 2);
+    let channel = connect(
+        server
+            .endpoint
+            .trim_start_matches("https://")
+            .trim_start_matches("http://"),
+        &ca,
+        tls.cert_pem.clone(),
+        tls.key_pem.clone(),
+    )
+    .await;
+    let mut client = ZoneTransportServiceClient::new(channel);
+    let error = client
+        .step_atomic_namespace_v2(StepMessageRequest {
+            message: heartbeat(2, 7),
+            zone_id: "root".into(),
+            sender_address: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    let clients = pool(tls);
+    let address = NodeAddress::new(7, server.endpoint.clone());
+    let mut legacy = clients.get(&address).await.unwrap();
+    legacy
+        .step_message(heartbeat(2, 7), "root".into(), String::new())
+        .await
+        .unwrap();
+    let dir = server.shutdown_preserving_storage().await;
+    assert!(!reopened(dir.path())
+        .replica_control_reader_required()
+        .unwrap());
+}

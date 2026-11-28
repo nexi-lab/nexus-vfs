@@ -115,6 +115,7 @@ async fn wrong_storage_door_refuses_before_enqueue_and_correct_door_commits() {
         for wrong in [
             StorageProtocol::ConditionalMetadata,
             StorageProtocol::RecordLifetime,
+            StorageProtocol::AtomicNamespace,
             StorageProtocol::ReplicaControl,
             StorageProtocol::SignedCrl,
         ] {
